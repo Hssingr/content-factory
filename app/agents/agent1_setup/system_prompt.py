@@ -1,9 +1,11 @@
-import json
 import logging
+import re
 
-from app.services.claude_client import call_claude
+from app.services.claude_client import call_claude, parse_claude_json
 
 logger = logging.getLogger(__name__)
+
+PROMPT_VERSION = "1.1"  # bump when any prompt below changes behaviour
 
 # Keep this prompt stable across releases — edits invalidate the API-level cache
 # for all users. Must stay above ~800 chars to trigger cache_control: ephemeral.
@@ -134,8 +136,9 @@ You are a social media publishing expert. Given a channel's language, audience l
 niche, tone, and videos-per-week target, return the optimal publish schedule as JSON.
 
 Rules:
-1. Respond with ONLY a JSON object — no preamble, no code fence.
-2. `optimal_days` must be a JSON array of lowercase weekday names
+1. Return ONLY valid JSON. No markdown. No code fence. No extra keys.
+2. Never invent timezone strings — use only valid IANA identifiers (e.g. "Europe/Paris").
+3. `optimal_days` must be a JSON array of lowercase weekday names
    (e.g. ["friday", "saturday"]). Length must equal videos_per_week.
 3. `optimal_hour_start` and `optimal_hour_end` are integers 0–23 in the LOCAL timezone.
 4. `timezone` must be a valid IANA timezone string matching the language audience
@@ -180,15 +183,14 @@ def suggest_publish_timing(
     )
     raw = call_claude(_TIMING_SYSTEM_PROMPT, user_message, max_tokens=256)
 
-    import re as _re
-    cleaned = _re.sub(r"```(?:json)?\s*([\s\S]*?)```", r"\1", raw).strip()
-    try:
-        data = json.loads(cleaned)
-    except json.JSONDecodeError as exc:
-        logger.error("suggest_publish_timing JSON error: %s | raw: %.200s", exc, raw)
-        raise ValueError(f"Invalid timing response from Claude: {exc}") from exc
+    data = parse_claude_json(
+        raw,
+        required_keys=["timezone", "optimal_days", "optimal_hour_start", "optimal_hour_end"],
+        type_checks={"timezone": str, "optimal_days": list,
+                     "optimal_hour_start": int, "optimal_hour_end": int},
+    )
 
-    # Ensure optimal_days length matches videos_per_week
+    # Warn if Claude returned wrong number of publish days
     days = data.get("optimal_days", [])
     if len(days) != videos_per_week:
         logger.warning(

@@ -1,11 +1,65 @@
+import json
 import logging
-import time
+import re
+import time as _time
 
 import anthropic
 
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+def parse_claude_json(text: str, required_keys: list[str], type_checks: dict | None = None) -> dict:
+    """Shared JSON parser for all Claude responses.
+
+    Strips accidental code fences, parses JSON, validates required keys,
+    and optionally checks value types.
+
+    Args:
+        text:        Raw text from Claude.
+        required_keys: Keys that must be present (raises ValueError if missing).
+        type_checks: Optional dict mapping key → expected Python type.
+                     e.g. {"issues": list, "overall_status": str}
+
+    Returns:
+        Parsed dict.
+
+    Raises:
+        ValueError: If JSON is malformed, a required key is absent,
+                    or a type check fails.
+    """
+    cleaned = re.sub(r"```(?:json)?\s*([\s\S]*?)```", r"\1", text).strip()
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        logger.error("Claude JSON parse error: %s | Raw (first 300): %.300s", exc, text)
+        raise ValueError(f"Claude returned invalid JSON: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise ValueError(f"Claude returned non-object JSON (got {type(data).__name__})")
+
+    missing = [k for k in required_keys if k not in data]
+    if missing:
+        logger.error("Missing keys %s in Claude response: %.300s", missing, text)
+        raise ValueError(f"Claude response missing required keys: {missing}")
+
+    if type_checks:
+        for key, expected_type in type_checks.items():
+            if key in data and not isinstance(data[key], expected_type):
+                raise ValueError(
+                    f"Claude response key '{key}' expected {expected_type.__name__}, "
+                    f"got {type(data[key]).__name__}"
+                )
+
+    # Log unexpected keys as warnings (CLAUDE.md: reject unknown keys unless explicitly allowed)
+    if type_checks:
+        known_keys = set(required_keys) | set(type_checks)
+        extra = set(data.keys()) - known_keys
+        if extra:
+            logger.warning("Claude returned unexpected keys (ignored): %s", sorted(extra))
+
+    return data
 
 _MAX_RETRIES = 3
 _BACKOFF_BASE = 2
@@ -51,8 +105,15 @@ def call_claude(system_prompt: str, user_message: str, max_tokens: int = 1024) -
     else:
         system = system_prompt
 
+    prompt_chars = len(system_prompt) + len(user_message)
+    logger.info(
+        "call_claude start: model=%s max_tokens=%d prompt_chars=%d (~%d tokens est.)",
+        settings.claude_model, max_tokens, prompt_chars, prompt_chars // 4,
+    )
+
     last_exc: Exception | None = None
     for attempt in range(_MAX_RETRIES):
+        _t0 = _time.monotonic()
         try:
             response = _get_client().messages.create(
                 model=settings.claude_model,
@@ -60,11 +121,14 @@ def call_claude(system_prompt: str, user_message: str, max_tokens: int = 1024) -
                 system=system,
                 messages=[{"role": "user", "content": user_message}],
             )
-            logger.debug(
-                "call_claude attempt=%d cache_read=%s input_tokens=%s",
+            elapsed_ms = int((_time.monotonic() - _t0) * 1000)
+            logger.info(
+                "call_claude ok: attempt=%d elapsed_ms=%d input_tokens=%d output_tokens=%d cache_read=%d",
                 attempt + 1,
-                getattr(response.usage, "cache_read_input_tokens", 0),
+                elapsed_ms,
                 response.usage.input_tokens,
+                response.usage.output_tokens,
+                getattr(response.usage, "cache_read_input_tokens", 0),
             )
             block = response.content[0]
             if not isinstance(block, anthropic.types.TextBlock):
@@ -79,7 +143,7 @@ def call_claude(system_prompt: str, user_message: str, max_tokens: int = 1024) -
             if attempt < _MAX_RETRIES - 1:
                 wait = _BACKOFF_BASE ** attempt
                 logger.warning("Transient error (%s), retrying in %ds", type(exc).__name__, wait)
-                time.sleep(wait)
+                _time.sleep(wait)
         except anthropic.APIConnectionError as exc:
             logger.error("Connection error (config issue, not retrying): %s", exc)
             raise
@@ -143,7 +207,7 @@ def call_claude_with_tools(
         except (anthropic.RateLimitError, anthropic.APITimeoutError) as exc:
             wait = _BACKOFF_BASE ** min(round_num, 2)
             logger.warning("Tool loop transient error (round %d): %s — retrying in %ds", round_num + 1, exc, wait)
-            time.sleep(wait)
+            _time.sleep(wait)
             continue
         except anthropic.APIConnectionError as exc:
             logger.error("Tool loop connection error: %s", exc)
@@ -152,71 +216,60 @@ def call_claude_with_tools(
             logger.error("Tool loop API error: %s", exc)
             raise
 
-        logger.debug(
-            "call_claude_with_tools round=%d stop_reason=%s input_tokens=%s",
-            round_num + 1, response.stop_reason, response.usage.input_tokens,
-        )
-
-        tool_uses = [b for b in response.content if b.type == "tool_use"]
-
-        # Dump the first block's full structure to understand the web_search format
-        if round_num == 0 or response.stop_reason != "tool_use":
-            for i, b in enumerate(response.content[:3]):
-                try:
-                    dump = b.model_dump() if hasattr(b, 'model_dump') else vars(b)
-                except Exception:
-                    dump = str(b)
-                logger.info("Block[%d]: %s", i, dump)
+        # Count content block types for logging (don't dump full content — too verbose)
+        block_types = {}
+        for b in response.content:
+            t = getattr(b, 'type', type(b).__name__)
+            block_types[t] = block_types.get(t, 0) + 1
 
         logger.info(
-            "call_claude_with_tools round=%d stop_reason=%s tool_uses=%d content_types=%s",
+            "call_claude_with_tools round=%d stop_reason=%s blocks=%s input_tokens=%d output_tokens=%d",
             round_num + 1,
             response.stop_reason,
-            len(tool_uses),
-            [type(b).__name__ for b in response.content],
+            dict(block_types),
+            response.usage.input_tokens,
+            response.usage.output_tokens,
         )
 
-        if response.stop_reason != "tool_use" or not tool_uses:
-            # Try to find ANY text across all possible attributes
-            # (web_search blocks may store text in non-standard locations)
-            final_text = ""
-            for b in response.content:
-                # Check .text (standard TextBlock)
-                t = getattr(b, 'text', None)
-                if t:
-                    final_text = t
-                    continue
-                # Check inside nested structures (e.g. web search result content)
-                for attr in ('content', 'output', 'result'):
-                    val = getattr(b, attr, None)
-                    if isinstance(val, str) and val:
-                        final_text = val
-                        break
-                    if isinstance(val, list):
-                        for item in val:
-                            t = getattr(item, 'text', None) or (item.get('text') if isinstance(item, dict) else None)
-                            if t:
-                                final_text = t
+        # ── pause_turn: Anthropic executed a server-side tool (web_search_20250305)
+        # and has embedded the results in response.content. Append the assistant
+        # message and re-call — Anthropic injects the search results automatically.
+        if response.stop_reason == "pause_turn":
+            messages.append({"role": "assistant", "content": response.content})
+            continue
 
-            if not final_text:
-                logger.error(
-                    "No usable text in final response. content=%s",
-                    [(type(b).__name__, b.model_dump() if hasattr(b, 'model_dump') else str(b))
-                     for b in response.content[:5]],
-                )
-                raise ValueError("No text block in final Claude response")
-            return final_text.strip()
+        # ── tool_use: Claude wants to call a client-side tool (rare with web_search)
+        tool_uses = [b for b in response.content if getattr(b, 'type', None) == "tool_use"]
+        if response.stop_reason == "tool_use" and tool_uses:
+            messages.append({"role": "assistant", "content": response.content})
+            messages.append({
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": tu.id, "content": "Search completed."}
+                    for tu in tool_uses
+                ],
+            })
+            continue
 
-        # Continue loop: acknowledge each tool_use.
-        # For server-side tools (web_search_20250305), Anthropic executes the search;
-        # we pass "Search completed." so Claude knows to proceed with the results it has.
-        messages.append({"role": "assistant", "content": response.content})
-        messages.append({
-            "role": "user",
-            "content": [
-                {"type": "tool_result", "tool_use_id": tu.id, "content": "Search completed."}
-                for tu in tool_uses
-            ],
-        })
+        # ── end_turn (or any other stop_reason): extract the final text answer.
+        # Only look at blocks with type=="text" and non-empty .text; skip
+        # server_tool_use, web_search_tool_result, and other structured blocks.
+        final_text = ""
+        for b in response.content:
+            block_type = getattr(b, 'type', None)
+            block_text = getattr(b, 'text', None)
+            if block_type == "text" and block_text and block_text.strip():
+                final_text = block_text.strip()
+
+        if not final_text:
+            logger.error(
+                "No usable text block in final response (stop_reason=%s). "
+                "Block types: %s",
+                response.stop_reason,
+                dict(block_types),
+            )
+            raise ValueError("No text block in final Claude response")
+
+        return final_text
 
     raise ValueError(f"call_claude_with_tools: exceeded max_rounds={max_rounds}")

@@ -26,8 +26,9 @@ Rules:
 - Skip: promotional content, ads, stickied posts, meta announcements, duplicate stories
 - Check multiple sources if needed before deciding on the best story
 
-CRITICAL — your FINAL response must be ONLY a raw JSON object with NO explanation,
-NO reasoning, NO preamble, NO code fence. Start immediately with { and end with }.
+CRITICAL — Return ONLY valid JSON. No markdown. No code fence. No extra keys.
+Start immediately with { and end with }. Never invent facts, URLs, titles, or statistics.
+Only include information you actually found by browsing.
 
 Required format:
 {"title":"...","body":"200-500 word summary","url":"...","language":"en","published_at":"ISO8601 or null","upvotes":0,"comments":0}\
@@ -35,8 +36,9 @@ Required format:
 
 _REFORMAT_SYSTEM_PROMPT = """\
 Convert the story information below into a single JSON object.
-Respond with ONLY the JSON — no explanation, no code fence, start with {.
-Required keys: title, body, url, language, published_at (ISO8601 or null), upvotes, comments.\
+Return ONLY valid JSON. No markdown. No code fence. No extra keys. Start with {.
+Required keys: title, body, url, language, published_at (ISO8601 or null), upvotes, comments.
+Never invent facts, URLs, or details not present in the input.\
 """
 
 
@@ -95,7 +97,7 @@ def fetch(
         reformatted = call_claude(
             _REFORMAT_SYSTEM_PROMPT,
             f"Story information:\n{raw[:3000]}",
-            max_tokens=512,
+            max_tokens=2048,   # body can be 200-500 words; 512 was too small
         )
         story = _parse_story(reformatted)
         if story:
@@ -106,6 +108,14 @@ def fetch(
 
     logger.error("Could not extract a valid story from Claude's response")
     return None
+
+
+def _safe_int(value) -> int:
+    """Convert a Claude-returned value to int without crashing on bad input."""
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _parse_story(text: str) -> Story | None:
@@ -120,7 +130,15 @@ def _parse_story(text: str) -> Story | None:
             cleaned = match.group(0)
 
     try:
-        data = json.loads(cleaned)
+        # Use raw_decode so we stop at the end of the first valid JSON object
+        # and silently ignore any trailing text Claude added after the closing }.
+        decoder = json.JSONDecoder()
+        data, end_idx = decoder.raw_decode(cleaned)
+        if end_idx < len(cleaned.rstrip()):
+            logger.debug(
+                "Ignored extra content after JSON (first 60 chars): %.60s",
+                cleaned[end_idx:].strip(),
+            )
     except json.JSONDecodeError as exc:
         logger.error("Fetcher JSON parse error: %s | Raw (first 300): %.300s", exc, text)
         return None
@@ -150,6 +168,6 @@ def _parse_story(text: str) -> Story | None:
         source_type="web",
         source_value="claude_web_search",
         published_at=published_at,
-        upvotes=int(data.get("upvotes") or 0),
-        comments=int(data.get("comments") or 0),
+        upvotes=_safe_int(data.get("upvotes")),
+        comments=_safe_int(data.get("comments")),
     )

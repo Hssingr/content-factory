@@ -410,3 +410,98 @@ Rules:
 - Production: claude-sonnet-4-6 (full quality)
 - Model is set via CLAUDE_MODEL in .env — never hardcoded
 - Switch to Sonnet only when testing output quality, not pipeline logic
+
+## Prompt Engineering Rules for Claude API Calls
+
+When modifying or adding prompts used by the application, follow these rules:
+
+1. Each Claude prompt must have one clear responsibility only.
+2. Prefer strict JSON output schemas for any programmatic response.
+3. Prompts must explicitly say: “Return ONLY valid JSON. No markdown. No code fence. No extra keys.”
+4. Never rely only on prompt instructions for validation; add Python-side parsing and schema checks.
+5. Do not fabricate sources, facts, URLs, RSS feeds, or subreddits.
+6. For script generation, preserve factual grounding from the source material and avoid invented details.
+7. For revision/correction tasks, apply minimal changes unless a full rewrite is explicitly requested.
+8. Keep stable system prompts separate from dynamic user/context data to improve Claude prompt caching.
+9. Do not truncate scripts when asking Claude to revise full scripts unless the task is explicitly partial.
+10. After changing prompts, update related parsing/validation code and run tests or add tests when missing.
+
+## Reliability Rules
+
+When generating production code:
+
+1. Prefer deterministic behavior over creative behavior.
+2. Validate every Claude JSON response in Python.
+3. Never trust AI output without schema validation.
+4. Business rules belong in Python, not prompts.
+5. Prompts generate content; code enforces correctness.
+6. Never send partial data when expecting full regeneration.
+7. Log token usage, response time, and failures for every Claude call.
+8. All prompt changes must preserve backward compatibility unless explicitly approved.
+9. Every system prompt must have a version identifier.
+10. If Claude cannot determine an answer reliably, return an explicit error instead of guessing.
+
+# Whenever Claude returns JSON:
+
+- Parse with json.loads()
+- Validate required keys
+- Validate value types
+- Reject unknown keys unless explicitly allowed
+- Raise ValueError on schema mismatch
+
+# Token Budget Rules
+
+- Never send more than 80% of model context window.
+- Truncate source material before sending to Claude.
+- Prefer summaries over raw content when context exceeds 10k characters.
+- Log prompt length and estimated token count.
+
+# Determinism Rules
+
+For:
+- validation
+- scoring
+- ranking
+- classification
+
+Claude must:
+- use fixed criteria
+- avoid subjective wording
+- produce repeatable outputs
+
+# Business rules belong in Python.
+
+Prompts may:
+- generate content
+- classify content
+- summarize content
+
+Prompts must NOT:
+- implement workflow decisions
+- decide retries
+- decide database state transitions
+- enforce authorization
+
+# Every system prompt must expose:
+
+PROMPT_VERSION = "1.0"
+
+When behavior changes:
+- increment version
+- document reason
+
+# Hallucination Prevention
+
+Claude must never:
+
+- invent URLs
+- invent RSS feeds
+- invent Reddit communities
+- invent source facts
+- invent statistics
+
+# If information is unavailable:
+return explicit failure.
+
+# Never send partial scripts to a revision prompt
+when expecting a full-script response.

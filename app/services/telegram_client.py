@@ -134,17 +134,29 @@ def send_message_sync(
     if not settings.telegram_bot_token:
         logger.warning("TELEGRAM_BOT_TOKEN not set — send_message_sync skipped")
         return None
-    try:
-        resp = httpx.post(
-            f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage",
-            json={"chat_id": str(chat_id), "text": text, "parse_mode": parse_mode},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        return str(resp.json()["result"]["message_id"])
-    except Exception as exc:
-        logger.error("Sync Telegram send failed: %s", exc)
-        return None
+
+    url = f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage"
+
+    # Try with requested parse_mode first; fall back to plain text on 400
+    # (Markdown fails when the message contains unescaped special characters)
+    for mode in (parse_mode, None):
+        payload: dict = {"chat_id": str(chat_id), "text": text}
+        if mode:
+            payload["parse_mode"] = mode
+        try:
+            resp = httpx.post(url, json=payload, timeout=10)
+            if resp.status_code == 400 and mode is not None:
+                logger.warning("Telegram 400 with parse_mode=%s — retrying as plain text", mode)
+                continue
+            resp.raise_for_status()
+            return str(resp.json()["result"]["message_id"])
+        except httpx.HTTPStatusError as exc:
+            logger.error("Sync Telegram send failed: %s", exc)
+            return None
+        except Exception as exc:
+            logger.error("Sync Telegram send failed: %s", exc)
+            return None
+    return None
 
 
 async def stop_polling() -> None:

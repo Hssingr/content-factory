@@ -1,10 +1,10 @@
-import json
 import logging
-import re
 
-from app.services.claude_client import call_claude
+from app.services.claude_client import call_claude, parse_claude_json
 
 logger = logging.getLogger(__name__)
+
+PROMPT_VERSION = "1.1"  # bump when any prompt below changes behaviour
 
 # ── System prompts (>800 chars → call_claude applies cache_control: ephemeral) ──
 
@@ -46,7 +46,7 @@ LINGUISTIC NATURALNESS (MINOR)
 
 == Output ==
 
-Respond with ONLY valid JSON — no preamble, no code fence:
+Return ONLY valid JSON. No markdown. No code fence. No extra keys.
 {
   "overall_status": "PASSED | MINOR_ISSUES | MAJOR_ISSUES",
   "issues": [
@@ -60,7 +60,8 @@ Respond with ONLY valid JSON — no preamble, no code fence:
   ]
 }
 
-If no issues are found, return {"overall_status": "PASSED", "issues": []}.\
+If no issues are found, return {"overall_status": "PASSED", "issues": []}.
+Never invent issues that are not actually present in the scripts provided.\
 """
 
 _CORRECTION_SYSTEM_PROMPT = """\
@@ -73,12 +74,12 @@ rewrite sections that are not affected.
 Rules:
 1. Preserve all [SECTION N:] markers, [INTRO], and [OUTRO] structure in video_script.
 2. Keep the voice_script in the same language as the original.
-3. Do not change the story, key facts, or overall narrative.
+3. Do not change the story, key facts, or overall narrative. Never invent new facts.
 4. If minimum_length is flagged, expand existing sections with more depth, examples, or
    context — never pad with filler. The voice_script must reach at least 700 words.
 5. When fixing linguistic_naturalness, rewrite the affected sentences entirely rather
    than patching individual words — half-fixed awkward phrasing is worse than original.
-6. Respond with ONLY valid JSON — no preamble, no code fence:
+6. Return ONLY valid JSON. No markdown. No code fence. No extra keys.
    {"video_script": "...", "voice_script": "..."}\
 """
 
@@ -117,8 +118,10 @@ def validate_scripts(scripts_by_language: dict[str, dict], channel) -> dict:
         + "\n\n".join(sections)
     )
 
-    raw = call_claude(_VALIDATION_SYSTEM_PROMPT, user_message, max_tokens=1024)
-    return _parse_json(raw, required_keys=["overall_status", "issues"])
+    # max_tokens=2048 — validation with many languages + many issues can exceed 1024
+    raw = call_claude(_VALIDATION_SYSTEM_PROMPT, user_message, max_tokens=2048)
+    return parse_claude_json(raw, required_keys=["overall_status", "issues"],
+                             type_checks={"overall_status": str, "issues": list})
 
 
 def auto_correct_script(
@@ -159,23 +162,5 @@ def auto_correct_script(
     )
 
     raw = call_claude(_CORRECTION_SYSTEM_PROMPT, user_message, max_tokens=4096)
-    return _parse_json(raw, required_keys=["video_script", "voice_script"])
-
-
-# ── Internal helpers ──────────────────────────────────────────────────────────
-
-def _parse_json(text: str, required_keys: list[str]) -> dict:
-    """Parse a JSON response from Claude, stripping any accidental code fences."""
-    cleaned = re.sub(r"```(?:json)?\s*([\s\S]*?)```", r"\1", text).strip()
-    try:
-        data = json.loads(cleaned)
-    except json.JSONDecodeError as exc:
-        logger.error("Agent 3 JSON parse error: %s | Raw (first 300): %.300s", exc, text)
-        raise ValueError(f"Claude returned invalid JSON: {exc}") from exc
-
-    missing = [k for k in required_keys if k not in data]
-    if missing:
-        logger.error("Missing keys %s in response: %.300s", missing, text)
-        raise ValueError(f"Claude response missing required keys: {missing}")
-
-    return data
+    return parse_claude_json(raw, required_keys=["video_script", "voice_script"],
+                             type_checks={"video_script": str, "voice_script": str})
