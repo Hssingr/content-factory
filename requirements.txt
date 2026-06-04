@@ -1,0 +1,45 @@
+# Web framework
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+
+# Database
+sqlalchemy==2.0.36
+alembic==1.14.0
+psycopg2-binary==2.9.10
+
+# Queue / Workers
+celery[redis]==5.4.0
+redis==5.2.0
+
+# Scheduler
+apscheduler==3.10.4
+
+# Settings / Config
+python-dotenv==1.0.1
+pydantic-settings==2.6.1
+pydantic==2.10.2
+
+# Encryption
+cryptography==44.0.0
+
+# Claude API
+anthropic==0.40.0
+
+# HTTP
+httpx==0.28.0
+aiofiles==24.1.0
+
+# Telegram
+python-telegram-bot==21.7
+
+# Image processing
+Pillow==11.0.0
+
+# Audio / Video utilities
+mutagen==1.47.0
+
+# Auth
+PyJWT==2.13.0
+
+# Utilities
+python-multipart==0.0.12

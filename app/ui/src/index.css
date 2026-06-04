@@ -1,0 +1,65 @@
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: system-ui, -apple-system, sans-serif;
+  background: #0f0f13;
+  color: #e2e2e8;
+  min-height: 100vh;
+}
+
+.app {
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 24px 16px;
+}
+
+/* ── Header ────────────────────────────────── */
+.app-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 28px;
+}
+
+.app-header h1 {
+  font-size: 1.25rem;
+  font-weight: 600;
+  color: #f4f4f8;
+}
+
+/* ── Tabs ──────────────────────────────────── */
+.tab-nav {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid #2e2e40;
+  margin-bottom: 28px;
+}
+
+.tab-btn {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  padding: 10px 20px;
+  color: #888;
+  font-size: 0.9rem;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.tab-btn:hover:not(:disabled) { color: #e2e2e8; }
+.tab-btn.active { color: #818cf8; border-bottom-color: #818cf8; }
+.tab-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+
+/* ── Tab panels ────────────────────────────── */
+.tab-panel h2 {
+  font-size: 1rem;
+  font-weight: 600;
+  margin-bottom: 20px;
+  color: #c4c4d4;
+}
+
+.placeholder {
+  color: #555;
+  font-style: italic;
+  font-size: 0.9rem;
+}

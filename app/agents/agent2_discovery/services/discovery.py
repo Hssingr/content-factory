@@ -1,0 +1,105 @@
+import logging
+import uuid
+from datetime import datetime, timedelta, timezone
+
+from sqlalchemy.orm import Session
+
+from app.models import Channel, ChannelConfig, ChannelSource, Content, ContentValidation
+from app.agents.agent2_discovery.services.story import Story
+from app.agents.agent2_discovery.services.fetcher import fetch as claude_fetch
+
+logger = logging.getLogger(__name__)
+
+_DEFAULT_TIMEOUT_HOURS = 24
+
+
+def run_discovery(channel_id: uuid.UUID, db: Session) -> tuple[Content, Story] | None:
+    """Main entry point for Agent 2 — discover the best story for a channel.
+
+    Pipeline:
+      1. Load channel sources + config from DB
+      2. Ask Claude to autonomously browse all sources and find the best story
+      3. Deduplicate against ``content.content_hash``
+      4. Persist ``Content`` (PENDING_APPROVAL) + ``ContentValidation`` (PENDING)
+
+    Args:
+        channel_id: UUID of an active channel.
+        db:         SQLAlchemy session — caller is responsible for lifecycle.
+
+    Returns:
+        ``(Content, Story)`` so the next pipeline step (script generation) has
+        both the DB record and the raw story body for Claude.
+        Returns ``None`` on any blocking error or if no new story is found.
+    """
+    channel = db.get(Channel, channel_id)
+    if not channel:
+        logger.error("Channel %s not found", channel_id)
+        return None
+
+    if not channel.active:
+        logger.info("Channel %s is not active — skipping discovery", channel_id)
+        return None
+
+    sources: list[ChannelSource] = (
+        db.query(ChannelSource)
+        .filter(ChannelSource.channel_id == channel_id)
+        .all()
+    )
+    if not sources:
+        logger.warning("Channel %s has no sources configured", channel_id)
+        return None
+
+    config: ChannelConfig | None = db.get(ChannelConfig, channel_id)
+    timeout_hours = config.validation_timeout_hours if config else _DEFAULT_TIMEOUT_HOURS
+
+    # ── 1. Claude autonomously browses all sources ────────────────────────────
+    sources_list = [
+        (s.source_value, s.source_type, float(s.trust_score))
+        for s in sources
+    ]
+    story = claude_fetch(sources_list, niche=channel.niche)
+
+    if story is None:
+        logger.info("No story found for channel %s", channel_id)
+        return None
+
+    # ── 2. Deduplicate ────────────────────────────────────────────────────────
+    existing = db.query(Content.content_hash).filter(
+        Content.content_hash == story.content_hash
+    ).first()
+
+    if existing:
+        logger.info(
+            "Story '%s' is already in the DB (duplicate) — skipping",
+            story.title[:60],
+        )
+        return None
+
+    # ── 3. Persist Content + ContentValidation ────────────────────────────────
+    content = Content(
+        channel_id=channel_id,
+        source_url=story.url,
+        source_language=story.language,
+        content_hash=story.content_hash,
+        title=story.title,
+        status="PENDING_APPROVAL",
+    )
+    db.add(content)
+    db.flush()
+
+    now = datetime.now(timezone.utc)
+    validation = ContentValidation(
+        content_id=content.id,
+        status="PENDING",
+        revision_count=0,
+        timeout_at=now + timedelta(hours=timeout_hours),
+    )
+    db.add(validation)
+    db.commit()
+    db.refresh(content)
+
+    logger.info(
+        "Content %s created for channel %s — '%s'",
+        content.id, channel_id, story.title[:80],
+    )
+    return content, story
