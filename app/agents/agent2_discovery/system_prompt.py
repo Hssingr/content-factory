@@ -187,7 +187,7 @@ def generate_native_script(
         f"Source video script:\n{video_script}\n\n"
         f"Source voice script:\n{voice_script}"
     )
-    response = call_claude(_NATIVE_SCRIPTS_SYSTEM_PROMPT, user_message, max_tokens=4096)
+    response = call_claude(_NATIVE_SCRIPTS_SYSTEM_PROMPT, user_message, max_tokens=8192)
     return parse_claude_json(response, required_keys=["video_script", "voice_script"],
                              type_checks={"video_script": str, "voice_script": str})
 
@@ -230,6 +230,6 @@ def generate_revised_scripts(current_scripts: dict, feedback: str, channel) -> d
         f"Current voice script:\n{current_scripts.get('voice_script', '')}\n\n"
         f"User feedback:\n{feedback}"
     )
-    response = call_claude(_REVISION_SYSTEM_PROMPT, user_message, max_tokens=4096)
+    response = call_claude(_REVISION_SYSTEM_PROMPT, user_message, max_tokens=8192)
     return parse_claude_json(response, required_keys=["title", "video_script", "voice_script"],
                              type_checks={"title": str, "video_script": str, "voice_script": str})
