@@ -65,15 +65,29 @@ content-factory/
     │   │   ├── system_prompt.py   # suggest_field(), suggest_publish_timing()
     │   │   ├── routers/           # users, channels, suggest, voices
     │   │   └── services/          # users, channels, elevenlabs
-    │   └── agent2_discovery/      # Content Discovery agent
-    │       ├── system_prompt.py   # generate_scripts(), generate_telegram_summary(),
-    │       │                      # generate_native_script(), generate_revised_scripts()
-    │       ├── routers/           # discovery, telegram webhook
-    │       └── services/          # discovery, fetcher (Claude web_search), story,
-    │                              # scripts (multilingual), validation (Telegram loop)
+    │   ├── agent2_discovery/      # Content Discovery agent
+    │   │   ├── system_prompt.py   # generate_scripts(), generate_telegram_summary(),
+    │   │   │                      # generate_native_script(), generate_revised_scripts()
+    │   │   ├── routers/           # discovery, telegram webhook
+    │   │   └── services/          # discovery, fetcher (Claude web_search), story,
+    │   │                          # scripts (multilingual), validation (Telegram loop)
+    │   └── agent5_video/          # Video Generation agent
+    │       ├── system_prompt.py   # enrich_sections_with_visuals(), validate_sections_with_claude(),
+    │       │                      # validate_assembly_with_claude() — PROMPT_VERSION 1.0
+    │       ├── subagents/
+    │       │   ├── section_splitter.py   # Parses [INTRO]/[SECTION N]/[OUTRO] → timed sections
+    │       │   ├── section_validator.py  # Claude validation loop (max 3 rounds, best-attempt fallback)
+    │       │   ├── assembly_validator.py # Media relevance check + re-fetch REPLACE sections
+    │       │   └── shorts_cutter.py      # Groups sections into Shorts segments with part labels
+    │       └── services/
+    │           ├── stock_fetcher.py      # Fetches media from Pexels/Unsplash per section
+    │           ├── subtitles.py          # Standard captions + karaoke chunks from Whisper
+    │           ├── remotion_builder.py   # Assembles JSON props for Remotion compositions
+    │           ├── renderer.py           # Calls Remotion CLI via subprocess
+    │           └── video.py              # Orchestrator: runs steps 1-9 per language
     ├── scheduler/
-    │   ├── __init__.py            # Celery app + 5 beat tasks
-    │   └── tasks.py               # 7 Celery tasks (5 periodic + 2 on-demand)
+    │   ├── __init__.py            # Celery app + 8 beat tasks
+    │   └── tasks.py               # 10 Celery tasks (6 periodic + 4 on-demand)
     ├── publishers/                # (upcoming — Agent 7)
     └── ui/                        # React SPA (Vite 4 + React 18)
         ├── package.json
@@ -213,7 +227,7 @@ Auth is stubbed in development — no token needed.
 
 ## Scheduler (Celery Beat)
 
-5 periodic tasks + 2 on-demand tasks. Start with:
+6 periodic tasks + 4 on-demand tasks. Start with:
 ```bash
 celery -A app.scheduler worker --loglevel=info    # workers
 celery -A app.scheduler beat --loglevel=info      # beat scheduler
@@ -226,6 +240,9 @@ celery -A app.scheduler beat --loglevel=info      # beat scheduler
 | `pickup_approved_content` | Every 15 min | Fires `run_multilingual_generation` for APPROVED content |
 | `schedule_content_creation` | Every hour | D-1 trigger: fires discovery at user's configured `pipeline_run_hour` when next publish is tomorrow |
 | `dispatch_publishing` | Every 30 min | Logs content due for publish (placeholder — Agent 7 will upload) |
+| `pickup_scripts_ready` | Every 15 min | Fires `run_agent3_validation` for SCRIPTS_READY content |
+| `pickup_scripts_validated` | Every 15 min | Fires `run_agent4_for_content` for SCRIPTS_VALIDATED content |
+| `pickup_audio_done` | Every 15 min | Fires `run_agent5_for_content` for AUDIO_DONE content |
 
 ---
 
@@ -256,8 +273,8 @@ Notable schema decisions:
 | 2 | Agent 1 — Channel Setup (25 API endpoints + React SPA) | ✅ Done |
 | 3 | Agent 2 — Content Discovery + Telegram validation + Celery scheduler | ✅ Done |
 | 4 | Agent 3 — Script Validation (MAJOR auto-correct, MINOR Telegram, duration + Shorts breakpoints) | ✅ Done |
-| 5 | Agent 4 — Audio (ElevenLabs + Whisper) | 🔜 |
-| 6 | Agent 5 — Video (Remotion + sub-agents) | 🔜 |
+| 5 | Agent 4 — Audio (ElevenLabs + Whisper) | ✅ Done |
+| 6 | Agent 5 — Video (Remotion + sub-agents) | ✅ Done |
 | 7 | Agent 6 — Thumbnails + Metadata | 🔜 |
 | 8 | Agent 7 — Publishing + proxies | 🔜 |
 | 9 | Agent 8 — Analytics (last) | 🔜 |

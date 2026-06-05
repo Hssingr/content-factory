@@ -52,4 +52,14 @@ celery_app.conf.beat_schedule = {
         "task": "app.scheduler.tasks.pickup_scripts_ready",
         "schedule": crontab(minute="*/15"),            # every 15 minutes
     },
+    # Agent 4: generate audio for all validated scripts
+    "pickup-scripts-validated": {
+        "task": "app.scheduler.tasks.pickup_scripts_validated",
+        "schedule": crontab(minute="*/15"),            # every 15 minutes
+    },
+    # Agent 5: generate video for all audio-done content
+    "pickup-audio-done": {
+        "task": "app.scheduler.tasks.pickup_audio_done",
+        "schedule": crontab(minute="*/15"),            # every 15 minutes
+    },
 }

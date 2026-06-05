@@ -597,3 +597,173 @@ def handle_minor_timeout(content_id: str) -> None:
         logger.error("handle_minor_timeout error for %s: %s", content_id, exc)
     finally:
         db.close()
+
+
+# ── Agent 4 — Audio Generation tasks ─────────────────────────────────────────
+
+@celery_app.task(name="app.scheduler.tasks.pickup_scripts_validated")
+def pickup_scripts_validated() -> int:
+    """Trigger Agent 4 audio generation for every content with status SCRIPTS_VALIDATED.
+
+    Runs every 15 minutes. Atomically transitions each item to GENERATING_AUDIO
+    inside ``run_agent4_for_content`` so concurrent beats cannot double-process.
+
+    Returns:
+        Number of audio generation tasks dispatched.
+    """
+    from app.database import _get_session_factory
+    from app.models import Content
+
+    db = _get_session_factory()()
+    dispatched = 0
+    try:
+        validated = db.query(Content).filter(Content.status == "SCRIPTS_VALIDATED").all()
+        for content in validated:
+            run_agent4_for_content.delay(str(content.id))
+            dispatched += 1
+    finally:
+        db.close()
+
+    if dispatched:
+        logger.info("pickup_scripts_validated: %d task(s) dispatched", dispatched)
+    return dispatched
+
+
+@celery_app.task(
+    name="app.scheduler.tasks.run_agent4_for_content",
+    bind=True,
+    max_retries=2,
+    default_retry_delay=120,
+)
+def run_agent4_for_content(self, content_id: str) -> None:
+    """Run the full Agent 4 audio generation pipeline for one content item.
+
+    For each validated script language:
+      1. ElevenLabs TTS → mp3 bytes
+      2. Save to disk + measure exact duration with mutagen
+      3. Whisper transcription → word-level timestamps
+      4. Recalculate Shorts breakpoints from real timestamps
+      5. Persist AudioFile record; update Script with real values
+
+    Sets ``content.status = "AUDIO_DONE"`` on full success,
+    ``"FAILED"`` if all languages fail.
+
+    Args:
+        content_id: UUID string of content with status ``SCRIPTS_VALIDATED``.
+    """
+    from app.database import _get_session_factory
+    from app.models import Content
+    from app.agents.agent4_audio.services.audio import run_audio_generation
+
+    cid = uuid.UUID(content_id)
+    db = _get_session_factory()()
+    try:
+        content: Content | None = db.get(Content, cid)
+        if not content:
+            logger.warning("Content %s not found — skipping", content_id)
+            return
+        if content.status not in ("SCRIPTS_VALIDATED", "AUDIO_DONE"):
+            logger.debug(
+                "Content %s status=%s — skipping audio generation",
+                content_id, content.status,
+            )
+            return
+
+        run_audio_generation(cid, db)
+
+    except Exception as exc:
+        logger.error("run_agent4_for_content error for %s: %s", content_id, exc)
+        db.rollback()
+        try:
+            raise self.retry(exc=exc)
+        except self.MaxRetriesExceededError:
+            logger.error("Max retries reached for Agent 4 audio of %s", content_id)
+    finally:
+        db.close()
+
+
+# ── Agent 5 — Video Generation tasks ─────────────────────────────────────────
+
+@celery_app.task(name="app.scheduler.tasks.pickup_audio_done")
+def pickup_audio_done() -> int:
+    """Trigger Agent 5 video generation for every content with status AUDIO_DONE.
+
+    Runs every 15 minutes. Atomically transitions each item to GENERATING_VIDEO
+    inside ``run_agent5_for_content`` so concurrent beats cannot double-process.
+
+    Returns:
+        Number of video generation tasks dispatched.
+    """
+    from app.database import _get_session_factory
+    from app.models import Content
+
+    db = _get_session_factory()()
+    dispatched = 0
+    try:
+        ready = db.query(Content).filter(Content.status == "AUDIO_DONE").all()
+        for content in ready:
+            run_agent5_for_content.delay(str(content.id))
+            dispatched += 1
+    finally:
+        db.close()
+
+    if dispatched:
+        logger.info("pickup_audio_done: %d task(s) dispatched", dispatched)
+    return dispatched
+
+
+@celery_app.task(
+    name="app.scheduler.tasks.run_agent5_for_content",
+    bind=True,
+    max_retries=2,
+    default_retry_delay=300,   # 5 minutes — renders can take a while
+)
+def run_agent5_for_content(self, content_id: str) -> None:
+    """Run the full Agent 5 video generation pipeline for one content item.
+
+    For each validated audio language:
+      1. Section Splitter   — parse script → timed sections
+      2. Section Validator  — validate/enrich sections (Claude, up to 3 rounds)
+      3. Save video_sections to DB
+      4. Stock fetcher      — fetch actual image/video URLs
+      5. Assembly Validator — validate media relevance (Claude, 1 pass)
+      6. Shorts Cutter      — group sections into Short segments
+      7. Subtitles          — standard (main) + karaoke (Shorts)
+      8. Remotion builder   — write JSON props files
+      9. Remotion renderer  — render MP4s, save VideoRender records
+
+    Sets ``content.status = "VIDEO_DONE"`` on full success,
+    ``"FAILED"`` if all languages fail.
+
+    Args:
+        content_id: UUID string of content with status ``AUDIO_DONE``.
+    """
+    from app.database import _get_session_factory
+    from app.models import Content
+    from app.agents.agent5_video.services.video import run_video_generation
+
+    cid = uuid.UUID(content_id)
+    db = _get_session_factory()()
+    try:
+        content: Content | None = db.get(Content, cid)
+        if not content:
+            logger.warning("Content %s not found — skipping", content_id)
+            return
+        if content.status not in ("AUDIO_DONE", "GENERATING_VIDEO"):
+            logger.debug(
+                "Content %s status=%s — skipping video generation",
+                content_id, content.status,
+            )
+            return
+
+        run_video_generation(cid, db)
+
+    except Exception as exc:
+        logger.error("run_agent5_for_content error for %s: %s", content_id, exc)
+        db.rollback()
+        try:
+            raise self.retry(exc=exc)
+        except self.MaxRetriesExceededError:
+            logger.error("Max retries reached for Agent 5 video of %s", content_id)
+    finally:
+        db.close()

@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     agent3_minor_timeout_minutes: int = 5
 
     remotion_path: str = "./remotion"
+    media_path: str = "./media"      # base directory for audio/video files
 
 
 settings = Settings()

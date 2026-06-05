@@ -15,3 +15,4 @@ node_modules/
 remotion/node_modules/
 *.log
 media/
+media/**

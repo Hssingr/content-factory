@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Full Agent 2 → Agent 3 end-to-end test script.
+Full Agent 2 → Agent 3 → Agent 4 end-to-end test script.
 
 Steps:
   1. Discovery    — Claude browses your sources, picks the best story
@@ -8,16 +8,20 @@ Steps:
   3. Telegram     — sends summary to your phone, waits for APPROVE / CHANGE
   4. Multilingual — generates culturally adapted scripts for every channel language
   5. Agent 3      — validates all scripts, auto-corrects MAJOR issues
-  6. Summary      — prints final DB state
+  6. Agent 4      — ElevenLabs TTS + Whisper transcription + breakpoints recalculation
+  7. Summary      — prints final DB state (scripts + audio files)
 
 Usage:
     source venv/bin/activate
 
-    # Full run (discovery → Agent 3):
+    # Full run (discovery → Agent 4):
     python test_full_pipeline.py [channel_id]
 
     # Skip steps 1 & 2 — use an existing content_id (already has scripts in DB):
     python test_full_pipeline.py --from-content <content_id>
+
+    # Jump directly to Agent 4 — content already has SCRIPTS_VALIDATED status:
+    python test_full_pipeline.py --from-audio <content_id>
 
 If no channel_id is given, uses the first active channel found.
 """
@@ -106,21 +110,86 @@ def poll_telegram(bot_token: str, expected_reply_to_id: str, timeout_sec: int = 
     return "APPROVE", "timeout"
 
 
+# ── Shared summary helper ─────────────────────────────────────────────────────
+
+def _print_audio_summary(content_id: uuid.UUID, audio_ok: bool) -> None:
+    """Print audio file results from the DB."""
+    from app.models import AudioFile
+    db = _db()
+    audio_files = (
+        db.query(AudioFile)
+        .filter(AudioFile.content_id == content_id)
+        .all()
+    )
+    db.close()
+
+    if not audio_files:
+        if audio_ok:
+            print("  ⚠ No AudioFile records found despite reported success")
+        return
+
+    print(f"\n  Audio files ({len(audio_files)} language(s)):")
+    for af in sorted(audio_files, key=lambda a: a.language):
+        bp  = len(af.shorts_breakpoints or [])
+        wc  = len(af.whisper_transcript or [])
+        dur = af.duration_ms / 1000
+        print(
+            f"    [{af.language}]  {dur:.1f}s ({dur / 60:.1f}min)"
+            f"  {bp} breakpoints  {wc} whisper words"
+        )
+        # Show first 3 Whisper words as a sample
+        if af.whisper_transcript:
+            sample = af.whisper_transcript[:3]
+            print(f"             Whisper sample: {sample}")
+
+
 # ── Main pipeline ─────────────────────────────────────────────────────────────
 
-def run(channel_id_str: str | None = None, from_content_id_str: str | None = None) -> None:  
+def run(
+    channel_id_str: str | None = None,
+    from_content_id_str: str | None = None,
+    from_audio_id_str: str | None = None,
+) -> None:
     from app.config import settings
-    from app.models import Channel, ChannelConfig, ChannelSource, Content, ContentValidation, Script
+    from app.models import AudioFile, Channel, ChannelConfig, ChannelSource, Content, ContentValidation, Script
     from app.agents.agent2_discovery.services.discovery import run_discovery
     from app.agents.agent2_discovery.services.scripts import generate_multilingual_scripts
     from app.agents.agent2_discovery.services.validation import send_for_validation, _handle_change
     from app.agents.agent2_discovery.system_prompt import generate_scripts
     from app.agents.agent3_validation.services.validation import run_validation
+    from app.agents.agent4_audio.services.audio import run_audio_generation
     from app.agents.agent3_validation.services.estimator import estimate_duration_sec
 
     print(SEP)
-    print("  FULL PIPELINE TEST  —  Agent 2 → Agent 3")
+    print("  FULL PIPELINE TEST  —  Agent 2 → Agent 3 → Agent 4")
     print(SEP)
+
+    # ── --from-audio shortcut: jump directly to Agent 4 ──────────────────────
+    if from_audio_id_str:
+        content_id = uuid.UUID(from_audio_id_str)
+        db = _db()
+        content = db.get(Content, content_id)
+        if not content:
+            print(f"\nERROR: Content not found: {content_id}")
+            db.close()
+            return
+        channel_id = content.channel_id
+        db.close()
+
+        print(f"\n  Jumping to Agent 4 for content {content_id}")
+        print(f"  Content status: {content.status}")
+
+        print(STEP("STEP 6: Agent 4 — ElevenLabs TTS + Whisper"))
+        db = _db()
+        content = db.get(Content, content_id)
+        if content.status not in ("SCRIPTS_VALIDATED", "AUDIO_DONE"):
+            content.status = "SCRIPTS_VALIDATED"
+            db.commit()
+        audio_ok = run_audio_generation(content_id, db)
+        db.close()
+
+        _print_audio_summary(content_id, audio_ok)
+        return
 
     # ── Find channel / existing content ───────────────────────────────────────
     db = _db()
@@ -334,8 +403,23 @@ def run(channel_id_str: str | None = None, from_content_id_str: str | None = Non
     passed = run_validation(content_id, db)
     db.close()
 
-    # ── STEP 6: Final summary ─────────────────────────────────────────────────
-    print(STEP("STEP 6: Final state"))
+    # ── STEP 6: Agent 4 — Audio generation ───────────────────────────────────
+    print(STEP("STEP 6: Agent 4 — ElevenLabs TTS + Whisper"))
+
+    if passed:
+        db = _db()
+        content = db.get(Content, content_id)
+        if content.status not in ("SCRIPTS_VALIDATED", "AUDIO_DONE"):
+            content.status = "SCRIPTS_VALIDATED"
+            db.commit()
+        audio_ok = run_audio_generation(content_id, db)
+        db.close()
+    else:
+        print("  ⚠ Agent 3 did not pass — skipping Agent 4")
+        audio_ok = False
+
+    # ── STEP 7: Final summary ─────────────────────────────────────────────────
+    print(STEP("STEP 7: Final state"))
 
     db = _db()
     content = db.get(Content, content_id)
@@ -368,10 +452,14 @@ def run(channel_id_str: str | None = None, from_content_id_str: str | None = Non
             f"  {wc}w  {dur:.0f}s ({dur / 60:.1f}min)  {bp} breakpoints"
         )
 
+    _print_audio_summary(content_id, audio_ok)
+
     print()
     print(SEP)
-    if passed:
-        print(f"  ✅  COMPLETE — content is {content.status} → ready for Agent 4")
+    if audio_ok:
+        print(f"  ✅  COMPLETE — content is {content.status} → ready for Agent 5")
+    elif passed:
+        print(f"  ⚠️   AGENT 4 FAILED — check ELEVENLABS_API_KEY and OPENAI_API_KEY in .env")
     else:
         print(f"  ⚠️   BLOCKED — MAJOR issues remain → check Telegram for PROCEED/REVALIDATE")
     print(SEP)
@@ -396,9 +484,16 @@ if __name__ == "__main__":
         help="Skip discovery and source script generation, using an existing content UUID.",
     )
 
+    parser.add_argument(
+        "--from-audio",
+        dest="from_audio_id",
+        help="Jump directly to Agent 4 using an existing content UUID (must be SCRIPTS_VALIDATED).",
+    )
+
     args = parser.parse_args()
 
     run(
         channel_id_str=args.channel_id,
         from_content_id_str=args.from_content_id,
+        from_audio_id_str=args.from_audio_id,
     )
