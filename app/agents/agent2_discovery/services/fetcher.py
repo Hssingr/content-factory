@@ -45,6 +45,7 @@ Never invent facts, URLs, or details not present in the input.\
 def fetch(
     sources: list[tuple[str, str, float]],
     niche: str,
+    exclude: list[dict] | None = None,
 ) -> Story | None:
     """Ask Claude to autonomously browse all sources and return the best story.
 
@@ -56,6 +57,10 @@ def fetch(
     Args:
         sources: List of (source_value, source_type, trust_score) tuples.
         niche:   Channel niche description.
+        exclude: Optional list of ``{"title", "url"}`` dicts for stories already
+                 rejected this run (by the Story Scoring Gate) — Claude is told
+                 not to propose any of them again, so retries surface a genuinely
+                 different candidate instead of looping on the same story.
 
     Returns:
         The best Story found, or None on error.
@@ -68,9 +73,19 @@ def fetch(
         f"  - [{stype}] {svalue}  (trust={trust:.1f})"
         for svalue, stype, trust in sources
     )
+    exclude_block = ""
+    if exclude:
+        exclude_lines = "\n".join(
+            f"  - {c.get('title', '')!r} ({c.get('url', '')})" for c in exclude
+        )
+        exclude_block = (
+            "\n\nDo NOT propose any of these stories again — they were already "
+            f"rejected this run, find a genuinely different one:\n{exclude_lines}"
+        )
     user_message = (
         f"Channel niche: {niche}\n\n"
-        f"Sources to explore:\n{source_lines}\n\n"
+        f"Sources to explore:\n{source_lines}"
+        f"{exclude_block}\n\n"
         "Browse the sources, find the best story, then output ONLY the JSON object."
     )
 

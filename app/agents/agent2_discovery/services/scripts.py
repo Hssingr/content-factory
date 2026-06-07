@@ -3,9 +3,76 @@ import logging
 from sqlalchemy.orm import Session
 
 from app.models import Channel, ChannelConfig, ChannelLanguage, Content, Script
-from app.agents.agent2_discovery.system_prompt import generate_native_script
+from app.agents.agent2_discovery.system_prompt import (
+    assess_script_quality,
+    generate_native_script,
+    rewrite_script_for_quality,
+)
 
 logger = logging.getLogger(__name__)
+
+_MAX_QUALITY_REWRITES = 2
+
+
+def run_script_quality_gate(scripts: dict, channel: Channel, script_format: str = "youtube_long") -> dict:
+    """Run the Script Quality Gate — assess retention quality, rewrite if needed.
+
+    Distinct from Agent 3's technical validator: this checks whether a normal
+    YouTube viewer would actually keep watching (hook, clarity, pacing, generic
+    AI phrasing, TTS readability) using fixed editorial criteria. Runs BEFORE
+    persistence/Telegram so the user only ever sees retention-worthy scripts.
+
+    Loops at most ``_MAX_QUALITY_REWRITES`` times: assess → if NEEDS_REWRITE,
+    rewrite the FULL script preserving facts/markers, then re-assess. If still
+    NEEDS_REWRITE after the limit, the latest version is kept and a warning is
+    logged — the pipeline never blocks on this check.
+
+    Args:
+        scripts:       Dict with ``title``, ``video_script``, ``voice_script``
+                       (source-language, output of ``generate_scripts()``).
+        channel:       Channel ORM object (provides niche and tone as context).
+        script_format: Format key from ``channel_config.script_format``.
+
+    Returns:
+        The final scripts dict — rewritten if the gate required it, otherwise
+        the original. Always has ``title``, ``video_script``, ``voice_script``.
+    """
+    current = scripts
+    for attempt in range(1, _MAX_QUALITY_REWRITES + 1):
+        try:
+            review = assess_script_quality(current, channel, script_format=script_format)
+        except Exception as exc:
+            logger.error("Script Quality Gate assessment failed (attempt %d): %s — keeping script as-is", attempt, exc)
+            return current
+
+        status = review.get("status", "PASSED")
+        issues = review.get("issues", [])
+        high = sum(1 for i in issues if i.get("severity") == "HIGH")
+        logger.info(
+            "Script Quality Gate: status=%s issues=%d (high=%d) attempt=%d",
+            status, len(issues), high, attempt,
+        )
+        for issue in issues:
+            logger.info(
+                "Script quality issue [%s/%s]: %s -> %s",
+                issue.get("severity", "?"), issue.get("category", "?"),
+                issue.get("description", ""), issue.get("fix", ""),
+            )
+
+        if status == "PASSED" or not issues:
+            return current
+
+        try:
+            current = rewrite_script_for_quality(current, issues, channel, script_format=script_format)
+        except Exception as exc:
+            logger.error("Script Quality Gate rewrite failed (attempt %d): %s — keeping prior script", attempt, exc)
+            return current
+
+    logger.warning(
+        "Script Quality Gate: still NEEDS_REWRITE after %d attempt(s) — proceeding with latest version",
+        _MAX_QUALITY_REWRITES,
+    )
+    return current
 
 
 def generate_multilingual_scripts(

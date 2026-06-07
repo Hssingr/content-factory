@@ -15,6 +15,45 @@ _MARKER_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 
+# Punctuation cleanup — collapses patterns that make TTS narration sound robotic:
+# spaced/repeated ellipses ("... ...", ". . .", "....") and dashes/exclamations
+# typed for emphasis but read aloud as unnatural pauses or vocal spikes.
+_ELLIPSIS_RUN_RE   = re.compile(r"\.(?:\s*\.){1,}")
+_DASH_RUN_RE       = re.compile(r"(?:[—–-]\s*){2,}")
+_PUNCT_REPEAT_RE   = re.compile(r"([!?])\1+")
+_MULTI_SPACE_RE    = re.compile(r"[ \t]{2,}")
+_BLANK_LINES_RE    = re.compile(r"\n{3,}")
+_TRAILING_SPACE_RE = re.compile(r"[ \t]+\n")
+
+
+def _collapse_dash_run(match: re.Match) -> str:
+    """Collapse a repeated-dash run to one dash, keeping a trailing space if present."""
+    return "— " if match.group(0)[-1].isspace() else "—"
+
+
+def _normalize_voice_script(text: str) -> str:
+    """Clean up narration text so it reads naturally when spoken by TTS.
+
+    Collapses excessive ellipses and repeated dashes/exclamations into a single
+    natural pause marker, removes duplicate blank lines, and trims trailing
+    whitespace — all *before* the script reaches ElevenLabs. This keeps pauses
+    intentional (one "..." per reveal, one "—" per turn, as instructed in the
+    script-writing prompts) rather than accidental artifacts of punctuation runs.
+
+    Args:
+        text: Marker-stripped narrator text.
+
+    Returns:
+        Normalized narrator text, ready for TTS.
+    """
+    text = _ELLIPSIS_RUN_RE.sub("...", text)
+    text = _DASH_RUN_RE.sub(_collapse_dash_run, text)
+    text = _PUNCT_REPEAT_RE.sub(r"\1", text)
+    text = _MULTI_SPACE_RE.sub(" ", text)
+    text = _TRAILING_SPACE_RE.sub("\n", text)
+    text = _BLANK_LINES_RE.sub("\n\n", text)
+    return text.strip()
+
 # ElevenLabs multilingual model — supports all 6 channel languages (fr/en/de/es/it/pt)
 _MODEL_ID      = "eleven_multilingual_v2"
 _OUTPUT_FORMAT = "mp3_44100_128"   # 44 100 Hz stereo, 128 kbps
@@ -24,13 +63,15 @@ _OUTPUT_FORMAT = "mp3_44100_128"   # 44 100 Hz stereo, 128 kbps
 # similarity_boost : 0–1  (how closely to mimic the original voice clone)
 # style            : 0–1  (style exaggeration; v2 models only)
 # use_speaker_boost: improves clarity at slight latency cost
+# speed            : 0.7–1.2 (1.0 = natural rate; slower reads as more authoritative/
+#                    documentary-grade, faster suits energetic/short-form delivery)
 _EMOTION_SETTINGS: dict[str, dict] = {
-    "neutral":       {"stability": 0.75, "similarity_boost": 0.75, "style": 0.00, "use_speaker_boost": True},
-    "calm":          {"stability": 0.85, "similarity_boost": 0.80, "style": 0.00, "use_speaker_boost": True},
-    "warm":          {"stability": 0.65, "similarity_boost": 0.80, "style": 0.15, "use_speaker_boost": True},
-    "authoritative": {"stability": 0.80, "similarity_boost": 0.85, "style": 0.20, "use_speaker_boost": True},
-    "enthusiastic":  {"stability": 0.45, "similarity_boost": 0.75, "style": 0.45, "use_speaker_boost": True},
-    "dramatic":      {"stability": 0.30, "similarity_boost": 0.70, "style": 0.60, "use_speaker_boost": True},
+    "neutral":       {"stability": 0.75, "similarity_boost": 0.75, "style": 0.00, "use_speaker_boost": True, "speed": 0.97},
+    "calm":          {"stability": 0.85, "similarity_boost": 0.80, "style": 0.00, "use_speaker_boost": True, "speed": 0.93},
+    "warm":          {"stability": 0.65, "similarity_boost": 0.80, "style": 0.15, "use_speaker_boost": True, "speed": 0.97},
+    "authoritative": {"stability": 0.80, "similarity_boost": 0.85, "style": 0.20, "use_speaker_boost": True, "speed": 0.93},
+    "enthusiastic":  {"stability": 0.45, "similarity_boost": 0.75, "style": 0.45, "use_speaker_boost": True, "speed": 1.05},
+    "dramatic":      {"stability": 0.30, "similarity_boost": 0.70, "style": 0.60, "use_speaker_boost": True, "speed": 0.92},
 }
 _DEFAULT_EMOTION = "neutral"
 
@@ -55,7 +96,7 @@ def generate_audio(voice_script: str, voice_id: str, emotion: str | None) -> byt
         RuntimeError: If ELEVENLABS_API_KEY is not configured.
         Exception:    On any ElevenLabs API error.
     """
-    voice_script = _MARKER_RE.sub("", voice_script).strip()
+    voice_script = _normalize_voice_script(_MARKER_RE.sub("", voice_script))
 
     resolved_emotion = emotion or _DEFAULT_EMOTION
     if resolved_emotion not in _EMOTION_SETTINGS:

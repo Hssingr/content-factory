@@ -28,6 +28,7 @@ _VALID_TRANSITIONS       = {"cut", "crossfade", "dip_to_black", "whip_pan", "zoo
 _VALID_OVERLAY_POSITIONS = {"center", "lower_third", "top_left", "top_right", "none"}
 _VALID_VISUAL_TYPES      = {"b-roll", "action", "text_overlay", "document", "map", "screenshot", "generated_visual"}
 _VALID_PRIORITIES        = {"essential", "optional"}
+_VALID_VISUAL_CATEGORIES = {"person", "place", "object", "document", "screen", "map", "abstract", "text"}
 
 _DEFAULT_EFFECT           = "slow_zoom"
 _DEFAULT_GRADE            = "desaturated"
@@ -35,6 +36,7 @@ _DEFAULT_TRANSITION       = "cut"
 _DEFAULT_OVERLAY_POSITION = "none"
 _DEFAULT_VISUAL_TYPE      = "b-roll"
 _DEFAULT_PRIORITY         = "essential"
+_DEFAULT_VISUAL_CATEGORY  = "place"
 
 # Phrase-locating prefix lengths, longest first — tolerates Whisper transcription drift
 _PREFIX_LENGTHS = (None, 5, 3)
@@ -106,9 +108,9 @@ def map_storyboard_beats_to_timestamps(
     Returns:
         List of renderable beat-section dicts (one per input beat, in order), each
         with: beat_order, section_order, section_marker, audio_start_ms, audio_end_ms,
-        duration_sec, script_text, visual_intent, visual_type, search_query,
-        fallback_query, effect, color_grade, transition_to_next, overlay_text,
-        overlay_position, priority.
+        duration_sec, script_text, visual_intent, visual_type, visual_category,
+        avoid_reason, search_query, fallback_query, effect, color_grade,
+        transition_to_next, overlay_text, overlay_position, priority.
     """
     flat = _flatten_transcript(whisper_transcript)
     beats = _normalize_beat_order(beats)
@@ -336,6 +338,8 @@ def _build_beat_section(beat: dict, index: int, start_ms: int, end_ms: int, scri
         "script_text": script_text,
         "visual_intent": str(beat.get("visual_intent", "")),
         "visual_type": _safe_enum(beat.get("visual_type"), _VALID_VISUAL_TYPES, _DEFAULT_VISUAL_TYPE),
+        "visual_category": _safe_enum(beat.get("visual_category"), _VALID_VISUAL_CATEGORIES, _DEFAULT_VISUAL_CATEGORY),
+        "avoid_reason": str(beat.get("avoid_reason", "") or ""),
         "search_query": str(beat.get("search_query", "")),
         "fallback_query": str(beat.get("fallback_query", "")),
         "effect": _safe_enum(beat.get("effect"), _VALID_EFFECTS, _DEFAULT_EFFECT),

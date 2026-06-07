@@ -155,6 +155,7 @@ def run_agent2_for_channel(self, channel_id: str) -> None:
     from app.database import _get_session_factory
     from app.models import Channel, ChannelConfig, Script
     from app.agents.agent2_discovery.services.discovery import run_discovery
+    from app.agents.agent2_discovery.services.scripts import run_script_quality_gate
     from app.agents.agent2_discovery.services.validation import send_for_validation
     from app.agents.agent2_discovery.system_prompt import generate_scripts
 
@@ -184,6 +185,11 @@ def run_agent2_for_channel(self, channel_id: str) -> None:
 
         logger.info("Generating scripts for content %s… (format=%s)", content.id, script_format)
         scripts = generate_scripts(story, channel, script_format=script_format)
+
+        # ── 2b. Script Quality Gate — retention review, rewrite if needed ─────
+        scripts = run_script_quality_gate(scripts, channel, script_format=script_format)
+        hook_excerpt = scripts.get("voice_script", "").strip()[:300].replace("\n", " ")
+        logger.info("Final script hook (first 300 chars) for content %s: %r", content.id, hook_excerpt)
 
         # ── 3. Persist Script + update Content title ──────────────────────────
         content.title = scripts.get("title", content.title)

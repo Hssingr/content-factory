@@ -16,22 +16,100 @@ Whisper transcript format: [{"word": str, "start": float, "end": float}]
 """
 
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 
-# Caption chunk limits
-_MAX_WORDS_STANDARD   = 8
-_MAX_DURATION_MS      = 3000   # split chunk if it would exceed 3 s
-_MAX_WORDS_KARAOKE    = 5      # smaller chunks for karaoke style (easier to follow)
+# Caption chunk limits — chunks split on natural phrase/sentence boundaries with a
+# minimum size, rather than purely on a word-count or duration ceiling that could
+# fire mid-phrase and produce broken-fragment captions.
+_MIN_WORDS_STANDARD      = 3
+_TARGET_WORDS_STANDARD   = 7
+_MAX_WORDS_STANDARD      = 12
+_MAX_DURATION_MS         = 4500   # split chunk if it would exceed 4.5 s
+
+_MIN_WORDS_KARAOKE       = 2
+_TARGET_WORDS_KARAOKE    = 4
+_MAX_WORDS_KARAOKE       = 6      # smaller chunks for karaoke style (easier to follow)
+_MAX_DURATION_MS_KARAOKE = 3000
 
 _DEFAULT_KARAOKE_COLOR = "#FFD700"
+
+_SENTENCE_END_RE = re.compile(r"[.!?…]$")
+_CLAUSE_END_RE   = re.compile(r"[,;:—–]$")
+
+
+def _chunk_transcript(
+    whisper_transcript: list[dict],
+    min_words: int,
+    target_words: int,
+    max_words: int,
+    max_duration_ms: int,
+) -> list[list[dict]]:
+    """Group Whisper words into readable caption chunks on natural boundaries.
+
+    Splits preferentially at sentence-ending punctuation (``.!?…``), then at
+    clause-ending punctuation (``,;:—–``) once the chunk has reached
+    ``target_words``, and only falls back to a hard word-count/duration ceiling
+    when no natural boundary appears in time. A trailing chunk smaller than
+    ``min_words`` is merged into the previous chunk so captions never end on an
+    orphaned one- or two-word fragment.
+
+    Args:
+        whisper_transcript: Word-level Whisper output
+                            (``[{"word": str, "start": float, "end": float}]``).
+        min_words:          Minimum words before a punctuation-based split is allowed.
+        target_words:       Word count at which a clause-boundary split becomes preferred.
+        max_words:          Hard ceiling — always split once a chunk reaches this size.
+        max_duration_ms:    Hard ceiling — always split once a chunk reaches this duration.
+
+    Returns:
+        List of chunks; each chunk is a list of
+        ``{"word": str, "start_ms": int, "end_ms": int}`` dicts, in order.
+    """
+    chunks: list[list[dict]] = []
+    current: list[dict] = []
+
+    for word_data in whisper_transcript:
+        word = word_data.get("word", "").strip()
+        if not word:
+            continue
+
+        current.append({
+            "word":     word,
+            "start_ms": int(word_data.get("start", 0) * 1000),
+            "end_ms":   int(word_data.get("end", 0) * 1000),
+        })
+
+        n        = len(current)
+        duration = current[-1]["end_ms"] - current[0]["start_ms"]
+
+        if n >= max_words or duration >= max_duration_ms:
+            chunks.append(current)
+            current = []
+        elif n >= min_words and _SENTENCE_END_RE.search(word):
+            chunks.append(current)
+            current = []
+        elif n >= target_words and _CLAUSE_END_RE.search(word):
+            chunks.append(current)
+            current = []
+
+    if current:
+        if chunks and len(current) < min_words:
+            chunks[-1].extend(current)
+        else:
+            chunks.append(current)
+
+    return chunks
 
 
 def build_standard_subtitles(whisper_transcript: list[dict]) -> list[dict]:
     """Generate standard subtitle captions from Whisper word timestamps.
 
-    Chunks are split when they reach MAX_WORDS or MAX_DURATION_MS, whichever
-    comes first. Timestamps come directly from Whisper — no approximation.
+    Chunks split on natural sentence/clause boundaries (with minimum-size and
+    hard-ceiling safeguards via ``_chunk_transcript``) so captions read as clean,
+    grammatically coherent phrases rather than broken word fragments. Timestamps
+    come directly from Whisper — no approximation.
 
     Args:
         whisper_transcript: Word-level Whisper output.
@@ -44,47 +122,28 @@ def build_standard_subtitles(whisper_transcript: list[dict]) -> list[dict]:
     if not whisper_transcript:
         return []
 
-    captions: list[dict] = []
-    chunk_words: list[str] = []
-    chunk_start_ms: int    = 0
-    chunk_end_ms: int      = 0
+    chunks = _chunk_transcript(
+        whisper_transcript,
+        min_words=_MIN_WORDS_STANDARD,
+        target_words=_TARGET_WORDS_STANDARD,
+        max_words=_MAX_WORDS_STANDARD,
+        max_duration_ms=_MAX_DURATION_MS,
+    )
+    captions = [
+        {
+            "text":     " ".join(w["word"] for w in chunk),
+            "start_ms": chunk[0]["start_ms"],
+            "end_ms":   chunk[-1]["end_ms"],
+        }
+        for chunk in chunks
+    ]
 
-    for word_data in whisper_transcript:
-        word       = word_data.get("word", "").strip()
-        start_ms   = int(word_data.get("start", 0) * 1000)
-        end_ms_val = int(word_data.get("end", 0) * 1000)
-
-        if not word:
-            continue
-
-        if not chunk_words:
-            # Start a new chunk
-            chunk_start_ms = start_ms
-
-        chunk_words.append(word)
-        chunk_end_ms = end_ms_val
-
-        # Check split conditions
-        duration = chunk_end_ms - chunk_start_ms
-        if len(chunk_words) >= _MAX_WORDS_STANDARD or duration >= _MAX_DURATION_MS:
-            captions.append({
-                "text":     " ".join(chunk_words),
-                "start_ms": chunk_start_ms,
-                "end_ms":   chunk_end_ms,
-            })
-            chunk_words    = []
-            chunk_start_ms = 0
-            chunk_end_ms   = 0
-
-    # Flush remaining words
-    if chunk_words:
-        captions.append({
-            "text":     " ".join(chunk_words),
-            "start_ms": chunk_start_ms,
-            "end_ms":   chunk_end_ms,
-        })
-
-    logger.info("Standard subtitles: %d caption(s)", len(captions))
+    total_words = sum(len(c["text"].split()) for c in captions)
+    avg_words   = total_words / len(captions) if captions else 0.0
+    logger.info(
+        "Standard subtitles: %d caption(s), avg %.1f words/caption",
+        len(captions), avg_words,
+    )
     return captions
 
 
@@ -110,44 +169,22 @@ def build_karaoke_subtitles(
     if not whisper_transcript:
         return []
 
-    chunks: list[dict] = []
-    chunk_words: list[dict] = []
-    chunk_start_ms: int     = 0
-    chunk_end_ms: int       = 0
-
-    for word_data in whisper_transcript:
-        word       = word_data.get("word", "").strip()
-        start_ms   = int(word_data.get("start", 0) * 1000)
-        end_ms_val = int(word_data.get("end", 0) * 1000)
-
-        if not word:
-            continue
-
-        if not chunk_words:
-            chunk_start_ms = start_ms
-
-        chunk_words.append({"w": word, "s": start_ms, "e": end_ms_val})
-        chunk_end_ms = end_ms_val
-
-        duration = chunk_end_ms - chunk_start_ms
-        if len(chunk_words) >= _MAX_WORDS_KARAOKE or duration >= _MAX_DURATION_MS:
-            chunks.append({
-                "words":        chunk_words,
-                "start_ms":     chunk_start_ms,
-                "end_ms":       chunk_end_ms,
-                "active_color": active_color,
-            })
-            chunk_words    = []
-            chunk_start_ms = 0
-            chunk_end_ms   = 0
-
-    if chunk_words:
-        chunks.append({
-            "words":        chunk_words,
-            "start_ms":     chunk_start_ms,
-            "end_ms":       chunk_end_ms,
+    raw_chunks = _chunk_transcript(
+        whisper_transcript,
+        min_words=_MIN_WORDS_KARAOKE,
+        target_words=_TARGET_WORDS_KARAOKE,
+        max_words=_MAX_WORDS_KARAOKE,
+        max_duration_ms=_MAX_DURATION_MS_KARAOKE,
+    )
+    chunks = [
+        {
+            "words":        [{"w": w["word"], "s": w["start_ms"], "e": w["end_ms"]} for w in chunk],
+            "start_ms":     chunk[0]["start_ms"],
+            "end_ms":       chunk[-1]["end_ms"],
             "active_color": active_color,
-        })
+        }
+        for chunk in raw_chunks
+    ]
 
     logger.info("Karaoke subtitles: %d chunk(s)", len(chunks))
     return chunks

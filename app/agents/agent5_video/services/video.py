@@ -9,9 +9,17 @@ Orchestrates the full per-language video pipeline:
   3. Stock fetcher           — fetch actual media URLs per beat/section
   4. Media Validation Agent  — Claude reviews fetched media, replacement loop
                                (storyboard beats only — max 2 passes)
+  4b. Repetition detection   — Python-side anti-slideshow guard: flags repeated/
+                               near-repeated visuals (keyword families, duplicate
+                               media, consecutive same-subject queries) and
+                               re-fetches them via each beat's fallback_query
   5. Assembly Validator      — validate overall assembly quality (Claude, 1 pass)
   6. Shorts Cutter           — group sections into Short segments
   7. Subtitles generator     — standard (main) + karaoke (Shorts) from Whisper timestamps
+  7b. Viewer Experience      — Claude reviews the final plan as a real viewer would
+      Validator                (intro, script, visuals, captions, audio, pacing);
+                               one deterministic repair pass, then skip render if
+                               still NEEDS_FIXES
   8. Remotion builder        — write JSON props files
   9. Remotion renderer       — call Remotion CLI, save VideoRender records
 
@@ -28,7 +36,9 @@ Status transitions:
 
 import json
 import logging
+import re
 import uuid
+from collections import Counter
 from pathlib import Path
 
 from sqlalchemy.orm import Session
@@ -43,14 +53,229 @@ from app.agents.agent5_video.subagents.storyboard import split_into_beats
 from app.agents.agent5_video.subagents.media_validator import validate_and_replace_media
 from app.agents.agent5_video.subagents.assembly_validator import validate_assembly
 from app.agents.agent5_video.subagents.shorts_cutter import cut_shorts
-from app.agents.agent5_video.services.stock_fetcher import fetch_all_sections, fetch_all_beats
+from app.agents.agent5_video.services.stock_fetcher import (
+    fetch_all_sections, fetch_all_beats, fetch_for_beat, fetch_for_section,
+)
 from app.agents.agent5_video.services.subtitles import (
     build_standard_subtitles, build_karaoke_subtitles,
 )
 from app.agents.agent5_video.services.remotion_builder import build_main_props, build_short_props
 from app.agents.agent5_video.services.renderer import render_main_video, render_short
+from app.agents.agent5_video.system_prompt import assess_viewer_experience
 
 logger = logging.getLogger(__name__)
+
+# ── Visual repetition detection (anti-slideshow guard, runs before assembly) ──
+# Keyword families grouped from the user-reported "repetitive dark corridor
+# slideshow" symptom — overused generic b-roll defaults that read as filler.
+_REPETITION_KEYWORD_FAMILIES: list[set[str]] = [
+    {"corridor", "hallway"},
+    {"dark room", "empty room"},
+    {"forest"},
+    {"office"},
+    {"silhouette", "shadow"},
+]
+_REPETITION_WINDOW = 5      # how many nearby beats count as "nearby"
+_REPETITION_THRESHOLD = 3   # 3+ nearby beats from the same family → force replacement
+
+_SUBJECT_WORD_RE = re.compile(r"[a-zà-öø-ÿ0-9']+", re.IGNORECASE)
+_SUBJECT_STOPWORDS = {"a", "an", "the", "of", "in", "on", "at", "with", "and", "or", "to", "for", "from"}
+
+_MARKER_STRIP_RE = re.compile(r"^\s*\[(INTRO|OUTRO|SECTION[^\]]*)\]\s*$", re.IGNORECASE | re.MULTILINE)
+
+_MAX_VIEWER_REPAIR_PASSES = 1
+
+
+def _script_hook(voice_script: str, length: int = 300) -> str:
+    """Return the narration opening with timing markers stripped, for quality prompts."""
+    return _MARKER_STRIP_RE.sub("", voice_script or "").strip()[:length]
+
+
+def _keyword_family(query: str) -> frozenset[str] | None:
+    """Return the overused-keyword family a search query matches, if any."""
+    q = query.lower()
+    for family in _REPETITION_KEYWORD_FAMILIES:
+        if any(keyword in q for keyword in family):
+            return frozenset(family)
+    return None
+
+
+def _subject(query: str) -> str:
+    """Extract the first two significant words of a search query as its 'subject'."""
+    words = [w for w in _SUBJECT_WORD_RE.findall(query.lower()) if w not in _SUBJECT_STOPWORDS]
+    return " ".join(words[:2])
+
+
+def _detect_and_fix_repetition(sections: list[dict]) -> int:
+    """Detect repeated/near-repeated visuals and re-fetch them before final assembly.
+
+    This is the deterministic, Python-side complement to the Media Validation
+    Agent — a last guard against the "repetitive dark corridor slideshow" failure
+    mode, using fixed rules so detection is repeatable:
+
+      1. Keyword-family repetition: if ``_REPETITION_THRESHOLD`` or more beats
+         within a sliding window of ``_REPETITION_WINDOW`` use a search_query from
+         the same overused family (corridor/hallway, dark/empty room, forest,
+         office, silhouette/shadow), the middle/later beats are flagged.
+      2. Duplicate media: the same fetched ``media_url`` reused across beats.
+      3. Consecutive same-subject queries: back-to-back beats whose search_query
+         shares the same first two significant words.
+
+    Flagged beats are repaired by swapping in their own Claude-authored
+    ``fallback_query`` (a deliberately different visual angle) and re-fetching —
+    no extra Claude calls needed.
+
+    Args:
+        sections: Fully fetched, media-validated beat/section dicts (mutated in place).
+
+    Returns:
+        Number of beats that were flagged and successfully re-fetched.
+    """
+    flagged: set[int] = set()
+    family_hits: Counter = Counter()
+
+    families = [_keyword_family(s.get("search_query", "")) for s in sections]
+    for i in range(len(sections)):
+        window = families[i:i + _REPETITION_WINDOW]
+        counts = Counter(f for f in window if f is not None)
+        for family, count in counts.items():
+            if count >= _REPETITION_THRESHOLD:
+                matches = [i + j for j, f in enumerate(window) if f == family]
+                for idx in matches[1:]:
+                    flagged.add(idx)
+                family_hits[family] += 1
+
+    seen_urls: dict[str, int] = {}
+    for i, s in enumerate(sections):
+        url = s.get("media_url", "")
+        if not url:
+            continue
+        if url in seen_urls:
+            flagged.add(i)
+        else:
+            seen_urls[url] = i
+
+    subjects = [_subject(s.get("search_query", "")) for s in sections]
+    for i in range(1, len(sections)):
+        if subjects[i] and subjects[i] == subjects[i - 1]:
+            flagged.add(i)
+
+    if family_hits:
+        top = ", ".join(f"{'/'.join(sorted(family))}" for family in family_hits)
+        logger.info("Repetition detection: overused keyword families flagged — %s", top)
+
+    if not flagged:
+        logger.info("Repetition detection: no repeated/near-repeated visuals found")
+        return 0
+
+    fixed = 0
+    for idx in sorted(flagged):
+        s = sections[idx]
+        fallback = (s.get("fallback_query") or "").strip()
+        if not fallback or fallback.lower() == s.get("search_query", "").lower():
+            continue
+        old_url = s.get("media_url", "")
+        s["search_query"] = fallback
+        if "visual_intent" in s:
+            fetch_for_beat(s)
+        else:
+            fetch_for_section(s)
+        fixed += 1
+        logger.info(
+            "Repetition fix: beat %s — query=%r old_media=%s new_media=%s",
+            s.get("beat_order", s.get("section_order", idx)), fallback,
+            old_url[:60], s.get("media_url", "")[:60],
+        )
+
+    logger.info(
+        "Repetition detection complete: %d beat(s) flagged, %d re-fetched",
+        len(flagged), fixed,
+    )
+    return fixed
+
+
+def _check_viewer_experience(
+    sections: list[dict],
+    shorts: list[dict],
+    standard_subs: list[dict],
+    audio: AudioFile,
+    channel: Channel,
+    channel_style: str,
+    script: Script,
+    language: str,
+) -> bool:
+    """Run the final Viewer Experience Validator with one deterministic repair pass.
+
+    The last quality gate before Remotion rendering — reviews the fully assembled
+    plan (script hook, visual sequence, Shorts, captions) the way a real viewer
+    would experience it, distinct from the Assembly/Media validators which check
+    technical relevance per-beat.
+
+    If the verdict is NEEDS_FIXES, runs ``_detect_and_fix_repetition`` — the only
+    deterministic Python-side repair available at this stage — which mutates
+    ``sections`` in place; ``shorts[*]["sections"]`` hold references to the same
+    dicts (confirmed in shorts_cutter.cut_shorts), so the fix propagates without
+    rebuilding anything. Then re-checks once. If still NEEDS_FIXES, the language
+    is marked as not render-ready so a bad video is never published.
+
+    Returns:
+        True if the plan is approved, or if the check itself could not run
+        (fail-open — a Claude outage must never block rendering). False if the
+        plan still needs fixes after the repair pass — skip rendering this language.
+    """
+    total_words = sum(len(c.get("text", "").split()) for c in standard_subs)
+    avg_words   = total_words / len(standard_subs) if standard_subs else 0.0
+    hook        = _script_hook(script.voice_script)
+
+    for attempt in range(1, _MAX_VIEWER_REPAIR_PASSES + 2):
+        try:
+            review = assess_viewer_experience(
+                sections=sections,
+                shorts_count=len(shorts),
+                caption_count=len(standard_subs),
+                avg_caption_words=avg_words,
+                total_duration_ms=audio.duration_ms,
+                channel_niche=channel.niche or "",
+                channel_tone=channel.tone or "",
+                channel_style=channel_style,
+                script_hook=hook,
+            )
+        except Exception as exc:
+            logger.error(
+                "Viewer Experience Validator failed (attempt %d, language=%s): %s — proceeding without check",
+                attempt, language, exc,
+            )
+            return True
+
+        status = review.get("status", "APPROVED")
+        issues = review.get("blocking_issues", [])
+        logger.info(
+            "Viewer Experience Validator: status=%s issues=%d attempt=%d language=%s — %s",
+            status, len(issues), attempt, language, review.get("overall_comment", ""),
+        )
+        for issue in issues:
+            logger.warning(
+                "Viewer experience issue [%s]: %s -> %s",
+                issue.get("category", "?"), issue.get("issue", ""), issue.get("fix", ""),
+            )
+
+        if status == "APPROVED" or not issues:
+            return True
+
+        if attempt > _MAX_VIEWER_REPAIR_PASSES:
+            break
+
+        logger.info(
+            "Viewer Experience Validator: running repair pass (repetition fix) for language=%s",
+            language,
+        )
+        _detect_and_fix_repetition(sections)
+
+    logger.error(
+        "Viewer Experience Validator: still NEEDS_FIXES after repair pass for language=%s — skipping render",
+        language,
+    )
+    return False
 
 
 def run_video_generation(content_id: uuid.UUID, db: Session) -> bool:
@@ -235,7 +460,11 @@ def _process_language(
 
         if using_storyboard:
             sections = beats
-            logger.info("Storyboard flow: %d beat(s) for language=%s", len(sections), language)
+            overlay_count = sum(1 for b in sections if b.get("visual_type") == "text_overlay")
+            logger.info(
+                "Storyboard flow: %d beat(s), %d text_overlay beat(s) for language=%s",
+                len(sections), overlay_count, language,
+            )
         else:
             # ── Fallback: legacy Section Splitter → Section Validator ─────────
             logger.warning(
@@ -277,6 +506,9 @@ def _process_language(
             script_format=script_format,
         )
 
+    # ── 4b. Visual repetition detection (anti-slideshow guard) ────────────────
+    _detect_and_fix_repetition(sections)
+
     # ── 5. Final Assembly Validation ──────────────────────────────────────────
     sections = validate_assembly(
         sections=sections,
@@ -298,6 +530,19 @@ def _process_language(
     whisper       = audio.whisper_transcript or []
     standard_subs = build_standard_subtitles(whisper)
     karaoke_subs  = build_karaoke_subtitles(whisper, active_color=karaoke_color)
+
+    # ── 7b. Viewer Experience Validator (final pre-render gate) ───────────────
+    if not _check_viewer_experience(
+        sections=sections,
+        shorts=shorts,
+        standard_subs=standard_subs,
+        audio=audio,
+        channel=channel,
+        channel_style=channel_style,
+        script=script,
+        language=language,
+    ):
+        return False
 
     # ── 8. Remotion builder ───────────────────────────────────────────────────
     main_props_path = build_main_props(
@@ -370,8 +615,9 @@ def _load_sections_from_db(
     """Load VideoSection rows as dicts compatible with the stock fetcher.
 
     Storyboard beats persist their extra fields (visual_intent, visual_type,
-    fallback_query, transition_to_next, overlay_text, overlay_position, priority,
-    section_marker) as JSON in the otherwise-unused ``generation_prompt`` column.
+    visual_category, avoid_reason, fallback_query, transition_to_next, overlay_text,
+    overlay_position, priority, section_marker) as JSON in the otherwise-unused
+    ``generation_prompt`` column.
     They are deserialized back here so a re-entrant run keeps using the storyboard
     flow (beat-aware fetch, media validation loop, ...) instead of falling back.
     """
@@ -588,9 +834,10 @@ def _save_video_sections(
 ) -> None:
     """Persist validated sections (or storyboard beats) to video_sections (upsert by order).
 
-    Storyboard-beat-only fields (visual_intent, visual_type, fallback_query,
-    transition_to_next, overlay_text, overlay_position, priority, section_marker)
-    are JSON-serialized into the otherwise-unused ``generation_prompt`` column so
+    Storyboard-beat-only fields (visual_intent, visual_type, visual_category,
+    avoid_reason, fallback_query, transition_to_next, overlay_text, overlay_position,
+    priority, section_marker) are JSON-serialized into the otherwise-unused
+    ``generation_prompt`` column so
     they survive re-entrancy without requiring a schema migration. Legacy sections
     (no ``visual_intent``) store ``generation_prompt=None`` as before.
     """
@@ -633,6 +880,8 @@ def _beat_extras(section: dict) -> dict:
         "section_marker":     section.get("section_marker", ""),
         "visual_intent":      section.get("visual_intent", ""),
         "visual_type":        section.get("visual_type", "b-roll"),
+        "visual_category":    section.get("visual_category", "place"),
+        "avoid_reason":       section.get("avoid_reason", ""),
         "fallback_query":     section.get("fallback_query", ""),
         "transition_to_next": section.get("transition_to_next", "cut"),
         "overlay_text":       section.get("overlay_text", ""),

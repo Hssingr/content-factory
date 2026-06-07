@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.models import Channel, ChannelConfig, ChannelSource, Content, ContentValidation
 from app.agents.agent2_discovery.services.story import Story
-from app.agents.agent2_discovery.services.fetcher import fetch as claude_fetch
+from app.agents.agent2_discovery.services.scoring import run_story_scoring_gate
 
 logger = logging.getLogger(__name__)
 
@@ -18,8 +18,11 @@ def run_discovery(channel_id: uuid.UUID, db: Session) -> tuple[Content, Story] |
 
     Pipeline:
       1. Load channel sources + config from DB
-      2. Ask Claude to autonomously browse all sources and find the best story
-      3. Deduplicate against ``content.content_hash``
+      2. Story Scoring Gate — fetch up to 3 candidates, score each across nine
+         fixed dimensions, and accept only the first one that clears every gate
+         (narrative tension, visual potential, retention, and overall quality).
+         Rejected candidates never reach persistence or Telegram.
+      3. Deduplicate the accepted story against ``content.content_hash``
       4. Persist ``Content`` (PENDING_APPROVAL) + ``ContentValidation`` (PENDING)
 
     Args:
@@ -52,15 +55,24 @@ def run_discovery(channel_id: uuid.UUID, db: Session) -> tuple[Content, Story] |
     config: ChannelConfig | None = db.get(ChannelConfig, channel_id)
     timeout_hours = config.validation_timeout_hours if config else _DEFAULT_TIMEOUT_HOURS
 
-    # ── 1. Claude autonomously browses all sources ────────────────────────────
+    # ── 1. Story Scoring Gate — fetch + score candidates, accept only strong ones ─
     sources_list = [
         (s.source_value, s.source_type, float(s.trust_score))
         for s in sources
     ]
-    story = claude_fetch(sources_list, niche=channel.niche)
+    script_format = config.script_format if config else "youtube_long"
+    story = run_story_scoring_gate(
+        sources=sources_list,
+        niche=channel.niche,
+        channel=channel,
+        script_format=script_format,
+    )
 
     if story is None:
-        logger.info("No story found for channel %s", channel_id)
+        logger.info(
+            "Story Scoring Gate: no story cleared the bar for channel %s this run — skipping",
+            channel_id,
+        )
         return None
 
     # ── 2. Deduplicate ────────────────────────────────────────────────────────
