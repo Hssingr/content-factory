@@ -32,6 +32,9 @@ class Settings(BaseSettings):
 
     remotion_path: str = "./remotion"
     media_path: str = "./media"      # base directory for audio/video files
+    # Full path to the node binary to use for Remotion (must be Node ≥18).
+    # Set in .env when nvm is used: NODE_BIN=/home/user/.nvm/versions/node/v20.19.6/bin/node
+    node_bin: str = "node"
 
 
 settings = Settings()

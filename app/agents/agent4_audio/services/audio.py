@@ -8,7 +8,7 @@ from app.models import (
     Content, Script,
 )
 from app.agents.agent4_audio.services.tts import generate_audio
-from app.agents.agent4_audio.services.storage import save_audio
+from app.agents.agent4_audio.services.storage import audio_path, save_audio
 from app.agents.agent4_audio.services.whisper import transcribe
 from app.agents.agent4_audio.services.breakpoints import recalculate_breakpoints
 
@@ -79,18 +79,39 @@ def run_audio_generation(content_id: uuid.UUID, db: Session) -> bool:
 
         logger.info("Processing lang=%s voice_id=%s", lang, voice.voice_id)
 
+        # ── Step 1: TTS (skip if file already on disk) ───────────────────────
+        existing = audio_path(content_id, lang)
         try:
-            # ── Step 1: TTS ──────────────────────────────────────────────────
-            audio_bytes = generate_audio(script.voice_script, voice.voice_id, voice.emotion)
+            if existing.exists():
+                logger.info("Audio already on disk — skipping TTS for lang=%s", lang)
+                file_path   = str(existing)
+                from mutagen.mp3 import MP3
+                duration_ms = int(MP3(file_path).info.length * 1000)
+            else:
+                audio_bytes             = generate_audio(script.voice_script, voice.voice_id, voice.emotion)
+                file_path, duration_ms  = save_audio(content_id, lang, audio_bytes)
 
-            # ── Step 2: Save + measure duration ─────────────────────────────
-            file_path, duration_ms = save_audio(content_id, lang, audio_bytes)
+        except Exception as exc:
+            logger.error("TTS/storage failed lang=%s: %s", lang, exc)
+            db.rollback()
+            continue
 
-            # ── Step 3: Whisper transcription ────────────────────────────────
+        # ── Step 3: Whisper transcription (soft — failure uses equal splits) ──
+        transcript: list[dict] = []
+        try:
             transcript = transcribe(file_path, language=lang)
+        except Exception as exc:
+            logger.warning(
+                "Whisper failed lang=%s (%s) — continuing with equal-interval breakpoints",
+                lang, exc,
+            )
 
+        try:
             # ── Step 4: Recalculate Shorts breakpoints ───────────────────────
-            bp = recalculate_breakpoints(transcript, duration_ms, shorts_rule)
+            bp = recalculate_breakpoints(
+                transcript, duration_ms, shorts_rule,
+                voice_script=script.voice_script or "",
+            )
 
             # ── Step 5: Persist AudioFile ────────────────────────────────────
             _upsert_audio_file(db, content_id, lang, file_path, duration_ms, bp, transcript)
@@ -102,12 +123,12 @@ def run_audio_generation(content_id: uuid.UUID, db: Session) -> bool:
             db.commit()
             success_count += 1
             logger.info(
-                "Audio done lang=%s: %.1fs | %d breakpoint(s) | %d words",
+                "Audio done lang=%s: %.1fs | %d breakpoint(s) | %d whisper words",
                 lang, duration_ms / 1000, len(bp), len(transcript),
             )
 
         except Exception as exc:
-            logger.error("Audio generation failed lang=%s: %s", lang, exc)
+            logger.error("Breakpoints/persist failed lang=%s: %s", lang, exc)
             db.rollback()
             continue
 

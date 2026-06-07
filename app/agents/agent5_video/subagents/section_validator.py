@@ -1,7 +1,7 @@
 """Section Validator — validates and enriches sections for video production.
 
 For each section Claude checks:
-  - Duration fit (< 3s or > 60s = MAJOR)
+  - Duration fit (< 3s or > 25s = MAJOR)
   - Search query quality (too generic = MINOR)
   - Visual type correctness (b-roll / text_overlay / action)
   - Effect (slow_zoom / fade_in / cut / pan / zoom_out)

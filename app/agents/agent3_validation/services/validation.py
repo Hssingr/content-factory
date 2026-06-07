@@ -50,7 +50,8 @@ def run_validation(content_id: uuid.UUID, db: Session) -> bool:
         return False
 
     config: ChannelConfig | None = db.get(ChannelConfig, channel.id)
-    shorts_rule = config.shorts_rule if config else "auto"
+    shorts_rule   = config.shorts_rule if config else "auto"
+    script_format = config.script_format if config else "youtube_long"
 
     validation_rec: ContentValidation | None = (
         db.query(ContentValidation)
@@ -73,7 +74,7 @@ def run_validation(content_id: uuid.UUID, db: Session) -> bool:
     }
 
     # ── Initial validation ────────────────────────────────────────────────────
-    result = validate_scripts(scripts_by_lang, channel)
+    result = validate_scripts(scripts_by_lang, channel, script_format=script_format)
     logger.info(
         "Initial validation for content %s: %s (%d issues)",
         content_id, result["overall_status"], len(result["issues"]),
@@ -101,7 +102,9 @@ def run_validation(content_id: uuid.UUID, db: Session) -> bool:
                 continue
             logger.info("Correcting %s script for content %s", lang, content_id)
             try:
-                corrected = auto_correct_script(scripts_by_lang[lang], lang_issues, lang, channel)
+                corrected = auto_correct_script(
+                    scripts_by_lang[lang], lang_issues, lang, channel, script_format=script_format,
+                )
             except Exception as exc:
                 logger.error("auto_correct_script failed lang=%s: %s", lang, exc)
                 continue
@@ -126,7 +129,7 @@ def run_validation(content_id: uuid.UUID, db: Session) -> bool:
             }
 
         # Re-validate all languages after corrections
-        result = validate_scripts(scripts_by_lang, channel)
+        result = validate_scripts(scripts_by_lang, channel, script_format=script_format)
         accumulated_issues.extend(result["issues"])
         major_issues = [i for i in result["issues"] if i["severity"] == "MAJOR"]
         logger.info(

@@ -15,7 +15,7 @@ Python handles:
 
 import logging
 
-from app.agents.agent5_video.services.stock_fetcher import fetch_for_section
+from app.agents.agent5_video.services.stock_fetcher import fetch_for_beat, fetch_for_section
 from app.agents.agent5_video.system_prompt import validate_assembly_with_claude
 
 logger = logging.getLogger(__name__)
@@ -91,7 +91,10 @@ def validate_assembly(
 
         old_url = s.get("media_url", "")
         s["search_query"] = new_query
-        fetch_for_section(s)
+        if "visual_intent" in s:
+            fetch_for_beat(s)
+        else:
+            fetch_for_section(s)
         replaced += 1
         logger.info(
             "Section %d: replaced media — query=%r  old=%s  new=%s",

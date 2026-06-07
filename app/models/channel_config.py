@@ -28,5 +28,7 @@ class ChannelConfig(Base):
     video_color_grade: Mapped[str] = mapped_column(String(64), nullable=True)
     # Runway is the absolute last resort; disabled by default
     runway_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # 'youtube_long' | 'youtube_short' | 'tiktok' | 'reels'
+    script_format: Mapped[str] = mapped_column(String(32), nullable=False, server_default="youtube_long")
 
     channel: Mapped["Channel"] = relationship("Channel", back_populates="config")

@@ -99,7 +99,7 @@ def render_short(
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
 def _ensure_output_path(content_id: str, file_name: str) -> Path:
-    output_dir = Path(settings.media_path) / "video" / content_id
+    output_dir = Path(settings.media_path).resolve() / "video" / content_id
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir / file_name
 
@@ -107,9 +107,15 @@ def _ensure_output_path(content_id: str, file_name: str) -> Path:
 def _run_remotion(composition: str, output_path: Path, props_path: str) -> float:
     """Invoke the Remotion CLI and return wall-clock render time in seconds.
 
+    Remotion 4 CLI usage:
+      npx remotion render src/index.ts <CompositionId> <output.mp4> --props <props.json>
+
+    Both output_path and props_path must be absolute so they resolve correctly
+    when the subprocess cwd is the remotion project directory.
+
     Args:
         composition: Remotion composition ID (e.g. "MainVideo").
-        output_path: Destination MP4 path.
+        output_path: Absolute destination MP4 path.
         props_path:  Absolute path to the props JSON file.
 
     Returns:
@@ -118,13 +124,25 @@ def _run_remotion(composition: str, output_path: Path, props_path: str) -> float
     Raises:
         RuntimeError: If the subprocess exits with a non-zero return code.
     """
+    remotion_dir = Path(settings.remotion_path).resolve()
+
+    # Use the locally installed Remotion binary — avoids PATH/npx version issues.
+    remotion_bin = str(remotion_dir / "node_modules" / ".bin" / "remotion")
+
+    media_dir = Path(settings.media_path).resolve()
+
     cmd = [
-        "npx", "remotion", "render",
+        settings.node_bin,       # configurable path to Node ≥18 binary
+        remotion_bin,
+        "render",
+        "src/index.ts",          # Remotion 4 entry point
         composition,
-        str(output_path),
-        "--props", props_path,
-        "--concurrency", "2",
-        "--log", "verbose",
+        str(output_path.resolve()),
+        "--props",       str(Path(props_path).resolve()),
+        "--public-dir",  str(media_dir),   # audio_file in props is relative to this
+        "--concurrency", "6",       # use 6 of 8 available cores
+        "--timeout",     "300000", # 5 min — large video files need time to proxy
+        "--log",         "error",
     ]
 
     logger.info("Remotion render: %s → %s", composition, output_path)
@@ -133,14 +151,14 @@ def _run_remotion(composition: str, output_path: Path, props_path: str) -> float
     try:
         result = subprocess.run(
             cmd,
-            cwd=settings.remotion_path,
+            cwd=str(remotion_dir),
             capture_output=True,
             text=True,
             check=False,
         )
     except FileNotFoundError as exc:
         raise RuntimeError(
-            f"Remotion CLI not found — is Node.js installed and `npx` in PATH? ({exc})"
+            f"Remotion CLI not found — set NODE_BIN in .env to your Node ≥18 path. ({exc})"
         ) from exc
 
     elapsed = time.monotonic() - t0

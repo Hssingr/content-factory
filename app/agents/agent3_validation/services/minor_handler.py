@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.database import _get_session_factory
-from app.models import Channel, Content, ContentValidation, Script
+from app.models import Channel, ChannelConfig, Content, ContentValidation, Script
 from app.services import telegram_client
 
 logger = logging.getLogger(__name__)
@@ -305,6 +305,9 @@ def _apply_fix(
     """Run auto_correct_script on all languages that had MINOR issues."""
     from app.agents.agent3_validation.system_prompt import auto_correct_script
 
+    config: ChannelConfig | None = db.get(ChannelConfig, channel.id)
+    script_format = config.script_format if config else "youtube_long"
+
     minor_issues_by_lang: dict[str, list] = {}
     for entry in (validation.script_issues_log or []):
         if isinstance(entry, dict) and entry.get("severity") == "MINOR":
@@ -328,7 +331,7 @@ def _apply_fix(
         try:
             corrected = auto_correct_script(
                 {"video_script": script.video_script, "voice_script": script.voice_script},
-                issues, lang, channel,
+                issues, lang, channel, script_format=script_format,
             )
             new_script = Script(
                 content_id=content_id,

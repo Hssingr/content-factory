@@ -42,6 +42,16 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 
+def _audio_rel(audio_file_path: str) -> str:
+    """Return audio_file_path relative to media_path (for Remotion staticFile)."""
+    media_root = Path(settings.media_path).resolve()
+    try:
+        return str(Path(audio_file_path).resolve().relative_to(media_root))
+    except ValueError:
+        # Path outside media_root — return as-is and let Remotion handle it
+        return audio_file_path
+
+
 def build_main_props(
     content_id: str,
     language: str,
@@ -93,7 +103,7 @@ def build_main_props(
     props = {
         "content_id": content_id,
         "language":   language,
-        "audio_file": audio_file_path,
+        "audio_file": _audio_rel(audio_file_path),   # relative to media_path (Remotion --public-dir)
         "duration_ms": duration_ms,
         "sections": [_section_for_remotion(s) for s in sections],
         "subtitles": {"style": "standard", "captions": standard_subtitles},
@@ -147,7 +157,7 @@ def build_short_props(
     props = {
         "content_id":  content_id,
         "language":    language,
-        "audio_file":  audio_file_path,
+        "audio_file":  _audio_rel(audio_file_path),  # relative to media_path
         "short_index": short_index,
         "start_ms":    short_start,
         "end_ms":      short_end,
@@ -171,7 +181,7 @@ def build_short_props(
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _ensure_props_dir() -> Path:
-    path = Path(settings.media_path) / "remotion_props"
+    path = Path(settings.media_path).resolve() / "remotion_props"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -182,14 +192,47 @@ def _write_json(file_path: Path, data: dict) -> None:
 
 
 def _section_for_remotion(s: dict) -> dict:
-    """Return only the keys Remotion needs from a section dict."""
+    """Return only the keys Remotion needs from a section dict.
+
+    ``clips`` carries all fetched media items for this section (1-3 entries
+    depending on section duration). Remotion cycles through them with
+    crossfades. The legacy ``media_url`` / ``media_type`` fields are also
+    included for backward compatibility with older compositions.
+    """
+    raw_clips = s.get("clips") or []
+    clips = [
+        {
+            "url":   c.get("url", ""),
+            "thumb": c.get("thumb_url", ""),
+            "type":  c.get("media_type", "image"),
+        }
+        for c in raw_clips
+        if c.get("url")
+    ]
+    # Fallback: build a single-clip list from legacy fields when clips is empty
+    if not clips:
+        clips = [{
+            "url":   s.get("media_url", ""),
+            "thumb": s.get("media_thumb", ""),
+            "type":  s.get("media_type", "image"),
+        }]
+
     return {
-        "order":         s.get("section_order", 0),
-        "media_url":     s.get("media_url", ""),
-        "media_thumb":   s.get("media_thumb", ""),
-        "media_type":    s.get("media_type", "image"),
-        "effect":        s.get("effect", "slow_zoom"),
-        "color_grade":   s.get("color_grade", "desaturated"),
+        "order":          s.get("section_order", 0),
+        "clips":          clips,
+        "media_url":      clips[0]["url"],
+        "media_thumb":    clips[0]["thumb"],
+        "media_type":     clips[0]["type"],
+        "effect":         s.get("effect", "slow_zoom"),
+        "color_grade":    s.get("color_grade", "desaturated"),
         "audio_start_ms": s.get("audio_start_ms", 0),
         "audio_end_ms":   s.get("audio_end_ms", 0),
+        # Storyboard-beat fields — present when the storyboard pipeline ran;
+        # default to neutral values so legacy sections render exactly as before.
+        "visual_intent":      s.get("visual_intent", ""),
+        "visual_type":        s.get("visual_type", "b-roll"),
+        "transition_to_next": s.get("transition_to_next", "cut"),
+        "overlay_text":       s.get("overlay_text", ""),
+        "overlay_position":   s.get("overlay_position", "none"),
+        "priority":           s.get("priority", "essential"),
     }

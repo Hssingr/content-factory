@@ -1,7 +1,7 @@
 """Shorts Cutter — groups validated sections into Short-form video segments.
 
 Uses the ``shorts_breakpoints`` list from Agent 4 (audio_files table) as cut points.
-Each Short is ≤ 58 seconds of audio. The cutter:
+Each Short is between 61 and 91 seconds of audio. The cutter:
 
   1. Maps each breakpoint interval to the sections it covers.
   2. Assigns a language-specific part label (e.g. "Partie 1/8", "Part 1 of 8").

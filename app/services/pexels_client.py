@@ -7,6 +7,26 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 _BASE = "https://api.pexels.com"
+_MAX_VIDEO_WIDTH = 1920   # never return a UHD file — Remotion's proxy cannot handle them
+
+
+def _best_video_file(files: list[dict]) -> dict | None:
+    """Pick the best video file at or below FHD resolution.
+
+    Selection priority:
+      1. HD/FHD range: 1280–1920 px wide (highest width in range)
+      2. Any file ≤ 1920 px wide (highest width available)
+      3. None — skip this video entirely rather than return a UHD URL
+    """
+    if not files:
+        return None
+    fhd = [f for f in files if 1280 <= f.get("width", 0) <= _MAX_VIDEO_WIDTH]
+    if fhd:
+        return max(fhd, key=lambda f: f.get("width", 0))
+    capped = [f for f in files if 0 < f.get("width", 0) <= _MAX_VIDEO_WIDTH]
+    if capped:
+        return max(capped, key=lambda f: f.get("width", 0))
+    return None   # only UHD available — skip
 
 
 def _headers() -> dict:
@@ -91,11 +111,9 @@ def search_videos(query: str, per_page: int = 3) -> list[dict]:
         videos = resp.json().get("videos", [])
         results = []
         for v in videos:
-            # Pick highest-quality video file (prefer HD, then SD)
-            files = sorted(v.get("video_files", []), key=lambda f: f.get("width", 0), reverse=True)
-            if not files:
+            best = _best_video_file(v.get("video_files", []))
+            if not best:
                 continue
-            best = files[0]
             results.append({
                 "url":              best["link"],
                 "thumb_url":        v.get("image", ""),

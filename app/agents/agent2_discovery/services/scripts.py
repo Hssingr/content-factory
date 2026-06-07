@@ -2,7 +2,7 @@ import logging
 
 from sqlalchemy.orm import Session
 
-from app.models import Channel, ChannelLanguage, Content, Script
+from app.models import Channel, ChannelConfig, ChannelLanguage, Content, Script
 from app.agents.agent2_discovery.system_prompt import generate_native_script
 
 logger = logging.getLogger(__name__)
@@ -57,6 +57,14 @@ def generate_multilingual_scripts(
         content.status = "FAILED"
         db.commit()
         return []
+
+    # ── Load channel script format ────────────────────────────────────────────
+    config: ChannelConfig | None = (
+        db.query(ChannelConfig)
+        .filter(ChannelConfig.channel_id == channel.id)
+        .first()
+    )
+    script_format = config.script_format if config else "youtube_long"
 
     # ── Load channel target languages ─────────────────────────────────────────
     channel_langs: list[ChannelLanguage] = (
@@ -113,6 +121,7 @@ def generate_multilingual_scripts(
                 target_language=lang,
                 niche=channel.niche,
                 tone=channel.tone,
+                script_format=script_format,
             )
         except Exception as exc:
             logger.error(

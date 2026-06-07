@@ -18,6 +18,22 @@ def _audio_path(content_id: uuid.UUID, language: str) -> Path:
     return base / "audio" / str(content_id) / f"{language}.mp3"
 
 
+def audio_path(content_id: uuid.UUID, language: str) -> Path:
+    """Public accessor for the expected audio file path.
+
+    Use this to check whether a file already exists on disk before
+    deciding whether to re-call ElevenLabs TTS.
+
+    Args:
+        content_id: UUID of the content item.
+        language:   BCP-47 language code.
+
+    Returns:
+        Absolute ``Path`` — may or may not exist yet.
+    """
+    return _audio_path(content_id, language)
+
+
 def save_audio(content_id: uuid.UUID, language: str, audio_bytes: bytes) -> tuple[str, int]:
     """Write mp3 bytes to disk and measure exact duration.
 

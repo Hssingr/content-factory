@@ -1,10 +1,19 @@
 import logging
+import re
 
 from elevenlabs.types import VoiceSettings
 
 from app.services.elevenlabs_client import get_client
 
 logger = logging.getLogger(__name__)
+
+# Matches [INTRO], [OUTRO], [SECTION N], [SECTION N: Title] on their own line.
+# These markers are included in voice_script for timing alignment and must be
+# stripped before sending to ElevenLabs (otherwise they are read aloud).
+_MARKER_RE = re.compile(
+    r"^\s*\[(INTRO|OUTRO|SECTION[^\]]*)\]\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 # ElevenLabs multilingual model — supports all 6 channel languages (fr/en/de/es/it/pt)
 _MODEL_ID      = "eleven_multilingual_v2"
@@ -46,6 +55,8 @@ def generate_audio(voice_script: str, voice_id: str, emotion: str | None) -> byt
         RuntimeError: If ELEVENLABS_API_KEY is not configured.
         Exception:    On any ElevenLabs API error.
     """
+    voice_script = _MARKER_RE.sub("", voice_script).strip()
+
     resolved_emotion = emotion or _DEFAULT_EMOTION
     if resolved_emotion not in _EMOTION_SETTINGS:
         logger.warning("Unknown emotion %r — falling back to neutral", resolved_emotion)
