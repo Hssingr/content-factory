@@ -2,26 +2,42 @@ import json
 import logging
 import re
 
-from app.services.claude_client import call_claude, parse_claude_json
+from app.services.claude_client import call_claude, call_claude_with_usage, parse_claude_json
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "1.3"  # v1.3: anti-slideshow storyboard rules + visual_category/avoid_reason,
-                        # stricter media validation (reject generic dark corridors/repetition),
-                        # new Viewer Experience Validator (final pre-render check)
+PROMPT_VERSION = "1.5"  # v1.5: motif field + doorway diversity rules + batched media validation
+                        # + high-level assembly validator + strict_quality_gate wiring
+                        # in one call — fixes the structural max_tokens overflow (90-120 beats
+                        # needed ~20-27k tokens, only 8192 were available); reduced beat schema
+                        # (dropped reason/avoid_reason/section_marker/priority/duration_target_sec
+                        # — all confirmed write-only by downstream grep) and added `environment`
+                        # for repetition detection across lexically-different-but-visually-same
+                        # queries (e.g. "underwater cavern" vs "bioluminescent cave")
 
 # ── Storyboard Agent prompt ───────────────────────────────────────────────────
-# Claude designs the full visual storyboard (creative decisions); Python maps the
-# resulting beats onto Whisper timestamps deterministically (storyboard.py).
+# Claude designs the visual storyboard (creative decisions) ONE NARRATION SEGMENT
+# AT A TIME — one [INTRO]/[SECTION N]/[OUTRO] block per call — so no single response
+# ever has to describe more beats than fit comfortably inside max_tokens. Python
+# (storyboard.py) splits the narration into segments, runs one batch per segment,
+# merges the results in order, and maps the merged beats onto Whisper timestamps.
+
+STORYBOARD_SCHEMA_VERSION = "2.1"  # v2.1: added `motif` field + doorway/threshold diversity rules
 
 _STORYBOARD_SYSTEM_PROMPT = """\
 You are a visual director and editor for an automated multilingual documentary \
 video production system.
 
-You receive the full narration (voice_script) with [INTRO]/[SECTION N]/[OUTRO] \
-markers, plus the channel niche, tone, and target format. Design a complete \
-storyboard: an ordered sequence of visual beats that carries the viewer through \
-the narration from first word to last.
+You design the storyboard ONE NARRATION SEGMENT AT A TIME — a single [INTRO],
+[SECTION N], or [OUTRO] block — never the whole video in one pass. You receive:
+which segment this is (its position among the video's narration segments), the
+segment's narration text, the channel niche/tone/format, and a short note on the
+visual approach used in the immediately preceding segment (for continuity only —
+do not repeat it).
+
+Design an ordered sequence of visual beats that carries the viewer through THIS
+SEGMENT's narration — and ONLY this segment's narration — from its first word to
+its last.
 
 == Pacing ==
 - youtube_long format: place one visual beat every 3–5 seconds of narration.
@@ -31,9 +47,11 @@ the narration from first word to last.
 
 == Anti-slideshow rules (CRITICAL — this is what separates a documentary from a slideshow) ==
 A repetitive sequence of similar-looking shots is the #1 reason automated videos feel
-fake. You MUST actively design against it:
+fake. You MUST actively design against it — including across the segment boundary:
 - NEVER use the same location TYPE more than twice in a row (e.g. two corridor shots
   back-to-back is the limit — a third corridor/hallway/room beat in a row is forbidden).
+- If the previous segment's note mentions an environment or visual_type, do NOT open
+  this segment with the same one — start on something visually different, then vary further.
 - Treat these as OVERUSED defaults — use each at most once per ~6 beats, and never as
   a "safe fallback" when you can't think of something better: dark corridors, empty
   hallways, generic forests, generic offices, anonymous silhouettes, generic close-ups
@@ -43,7 +61,7 @@ fake. You MUST actively design against it:
   archive photos, locations, objects, maps, documents, and people.
 - Every beat must add NEW visual information the viewer hasn't just seen — a new subject,
   a new place, a new object, or a meaningfully different angle on the same subject.
-- Prefer variety across the whole storyboard: documents, hands, phones, maps, archive-style
+- Prefer variety across the segment: documents, hands, phones, maps, archive-style
   footage, symbolic close-ups (an object that represents the idea), specific locations,
   objects, on-screen text, screens/monitors, and real environments — not just "a person
   walking somewhere".
@@ -57,10 +75,24 @@ fake. You MUST actively design against it:
   named fact, a statistic, an internal feeling), use "text_overlay" or "generated_visual"
   instead of forcing a generic, loosely-related b-roll clip onto it.
 
+== Motif diversity rules (enforced automatically — Python will force-replace excess motifs) ==
+- Doorways, corridors, and thresholds ("passage" motifs) are the most overused single
+  visual trope in automated video. Combined, they must appear at most 4 times total per
+  video, and at most 2 times in any 10-beat window. A dark hallway is not a substitute
+  for a visual idea.
+- No single motif may repeat more than 2 times in any 10-beat window. For example:
+  showing 3 different "face" shots or 3 "clock" shots within 10 beats will be flagged.
+- Horror or suspense can use passage motifs sparingly, but the genre does NOT justify a
+  majority of beats being doors/corridors — vary with objects, faces, exteriors, documents,
+  environments, screens, and reactions.
+- Use the ``motif`` field (see below) to self-regulate: if you notice your segment is heavy
+  on one motif, force the next beat onto a different one before the previous segment's
+  continuity note forces you to.
+
 == Per-beat decisions (you make ALL of these — Python only handles timing/fetching) ==
 1. start_hint / end_hint — copy the exact first 6–10 words and the exact last 6–10
-   words of the narration segment this beat covers, verbatim from voice_script.
-   These are used to locate the beat in the audio — they MUST match word-for-word.
+   words of the narration THIS BEAT covers, verbatim from the segment text given to
+   you. These are used to locate the beat in the audio — they MUST match word-for-word.
 2. visual_intent — one sentence describing what the viewer should see and feel.
 3. visual_type — b-roll | action | text_overlay | document | map | screenshot | generated_visual
    Use "generated_visual" only when no stock footage could plausibly exist
@@ -68,9 +100,16 @@ fake. You MUST actively design against it:
 4. visual_category — person | place | object | document | screen | map | abstract | text
    A coarse subject classification used to detect repetition programmatically. Pick the
    category that best matches what's actually ON SCREEN — be honest, not aspirational.
-5. avoid_reason — one short phrase explaining why THIS beat is not redundant with the
-   beats around it (e.g. "first interior shot after three exterior beats", "introduces
-   the central object for the first time", "only document close-up in this section").
+5. environment — a fixed SETTING label used to detect repetition across the whole video,
+   even when search queries use different words for the same kind of place. Choose the
+   closest honest match:
+     underwater | indoor_office | indoor_domestic | forest_nature | urban_street |
+     corridor_interior | abstract_dark | open_landscape | laboratory | industrial |
+     vehicle | other
+   IMPORTANT: judge by what the shot would actually LOOK like on screen, not by the
+   words in your search query — "deep ocean abyss", "underwater cavern", "submarine
+   darkness", and "bioluminescent cave" must ALL receive "underwater" because a viewer
+   would perceive them as the same environment, even though the queries differ.
 6. search_query / fallback_query — specific, cinematic, 4–8 word ENGLISH stock-media
    queries. The fallback must describe a genuinely different visual angle (different
    subject or setting), not a minor rewording of the primary query.
@@ -80,35 +119,37 @@ fake. You MUST actively design against it:
 10. overlay_text — short on-screen text (a name, date, statistic, key phrase) or ""
     when no overlay is needed.
 11. overlay_position — center | lower_third | top_left | top_right | none
-12. priority — "essential" (carries the narrative — never drop) or "optional"
-    (atmosphere/filler — first candidate to trim if the assembly runs long).
+12. motif — the single dominant visual motif this beat would show to a viewer. Choose
+    the most honest match from:
+      doorway | corridor | face | hands | object | clock | phone | photo | exterior |
+      text | screen | reflection | document | room | other
+    Use "other" when no listed motif applies. Be honest — this is used by the repetition
+    detector: if you label everything "other" to avoid the passage cap, Python will still
+    catch overuse via the ``environment`` and ``search_query`` checks.
 
 == Hard rules ==
 - Never invent names, dates, places, facts, people, URLs, documents, or statistics —
   overlay_text and search queries must be grounded strictly in the narration given.
 - Do not repeat the same visual idea (same subject + same framing) on consecutive beats.
 - Every beat must be visually concrete — no vague queries like "history" or "mystery".
-- start_hint and end_hint must be copied EXACTLY from voice_script, in order, with no
-  paraphrasing — they are matched programmatically against the spoken transcript.
-- [INTRO]/[SECTION N]/[OUTRO] markers describe narration structure only — never copy
-  the bracket markers themselves into start_hint or end_hint.
+- start_hint and end_hint must be copied EXACTLY from the segment text, in order, with
+  no paraphrasing — they are matched programmatically against the spoken transcript.
+- Never copy a [INTRO]/[SECTION N]/[OUTRO] marker itself into start_hint or end_hint.
 - Use generated_visual sparingly — prefer stock-searchable visuals whenever plausible.
 
 Return ONLY valid JSON. No markdown. No code fence. No extra keys.
 {
   "storyboard_status": "APPROVED",
-  "overall_style": "one short phrase describing the visual direction of this video",
+  "overall_style": "one short phrase describing the visual direction of THIS segment",
   "beats": [
     {
       "beat_order": 0,
-      "section_marker": "[INTRO]",
-      "start_hint": "exact first 6-10 words copied from voice_script",
-      "end_hint": "exact last 6-10 words copied from voice_script",
-      "duration_target_sec": 4,
+      "start_hint": "exact first 6-10 words copied from this segment's narration",
+      "end_hint": "exact last 6-10 words copied from this segment's narration",
       "visual_intent": "...",
       "visual_type": "b-roll",
       "visual_category": "place",
-      "avoid_reason": "why this beat is not redundant with its neighbours",
+      "environment": "underwater",
       "search_query": "...",
       "fallback_query": "...",
       "effect": "slow_zoom",
@@ -116,35 +157,68 @@ Return ONLY valid JSON. No markdown. No code fence. No extra keys.
       "transition_to_next": "crossfade",
       "overlay_text": "",
       "overlay_position": "none",
-      "priority": "essential",
-      "reason": "why this visual beat supports the narration"
+      "motif": "object"
     }
   ],
-  "global_notes": ["one-sentence note about pacing or visual strategy, or an empty list"]
+  "global_notes": ["one-sentence note about this segment's pacing or visual strategy, or an empty list"]
 }
 
 Strict rules:
 1. JSON only — the response will be parsed programmatically.
 2. beat_order values must be sequential integers starting at 0, in narration order,
-   covering the ENTIRE voice_script from the first word to the last.
-3. Every beat's start_hint/end_hint must be copied from the SAME voice_script you received.\
+   covering THIS SEGMENT's narration ONLY — from its first word to its last word.
+3. Every beat's start_hint/end_hint must be copied from the SAME segment text you received
+   — never from another segment, and never including the [INTRO]/[SECTION N]/[OUTRO] label.
+4. Every beat must include a ``motif`` field chosen from the allowed list.
+5. In any 10-beat run in this segment, do not use the same non-"other" motif more than
+   twice, and never use doorway+corridor+threshold combined more than 4 times total.\
 """
 
+# Per-batch ceiling. A single segment of a youtube_long video is at most ~250 words
+# (~100s of narration) → ~25 beats at the densest pacing (1 per 4s). At the reduced
+# 13-field schema (~617 chars/beat ≈ 154 tokens/beat) that's ~3,850 tokens of beats
+# plus wrapper overhead — comfortably inside this ceiling with ~35% headroom, while
+# staying far below the 8192 limit that the old whole-video call structurally exceeded.
+STORYBOARD_BATCH_MAX_TOKENS = 6144
 
-def generate_storyboard(voice_script: str, channel, script_format: str = "youtube_long") -> dict:
-    """Ask Claude to design a complete visual storyboard for the narration.
+# Truncation-detection thresholds (Task 4/5 of the BLOCKER fix set) — applied to
+# every batch call so a future pacing/schema change that re-introduces overflow is
+# caught immediately in logs instead of silently degrading into parse failures.
+_TRUNCATION_WARNING_RATIO = 0.95
 
-    Claude makes every creative decision (visual intent, type, search queries,
-    effects, color grades, transitions, overlays). Python only maps the resulting
-    beats onto real audio timestamps (see ``storyboard.py``).
+
+def generate_storyboard_batch(
+    segment_label: str,
+    segment_text: str,
+    segment_index: int,
+    segment_count: int,
+    channel,
+    script_format: str = "youtube_long",
+    previous_segment_summary: str = "",
+) -> tuple[dict, dict]:
+    """Ask Claude to design the storyboard for ONE narration segment only.
+
+    This is the batched replacement for the old whole-video ``generate_storyboard``
+    call — Python (``storyboard.split_into_beats``) splits the narration into
+    [INTRO]/[SECTION N]/[OUTRO] segments and calls this once per segment, so no
+    single response ever needs to describe more than ~25 beats.
 
     Args:
-        voice_script:  Full narrator text including [INTRO]/[SECTION N]/[OUTRO] markers.
-        channel:       Channel ORM object (provides niche and tone for context).
-        script_format: Format key — controls the beat-pacing guidance in the prompt.
+        segment_label:    Marker label for this segment, e.g. ``"[SECTION 2]"``.
+        segment_text:     This segment's narration text only (verbatim substring
+                          of the full voice_script, markers already stripped).
+        segment_index:    1-based position of this segment among all segments.
+        segment_count:    Total number of narration segments in this video.
+        channel:          Channel ORM object (provides niche and tone for context).
+        script_format:    Format key — controls the beat-pacing guidance in the prompt.
+        previous_segment_summary: Short note on the prior segment's closing visual
+                          choices, for continuity (empty string for the first segment).
 
     Returns:
-        Dict with keys ``storyboard_status``, ``overall_style``, ``beats``, ``global_notes``.
+        ``(storyboard, usage)`` — ``storyboard`` has keys ``storyboard_status``,
+        ``overall_style``, ``beats``, ``global_notes``; ``usage`` is the token-usage
+        dict from ``call_claude_with_usage`` (``input_tokens``, ``output_tokens``,
+        ``cache_read_input_tokens``).
 
     Raises:
         ValueError: If Claude returns malformed JSON or a required key is missing.
@@ -153,15 +227,38 @@ def generate_storyboard(voice_script: str, channel, script_format: str = "youtub
     user_message = (
         f"Channel niche: {channel.niche}\n"
         f"Channel tone: {channel.tone}\n"
-        f"Script format: {script_format}\n\n"
-        f"Voice script:\n{voice_script}"
+        f"Script format: {script_format}\n"
+        f"Segment: {segment_label} — {segment_index} of {segment_count} narration segments in this video\n"
+        + (
+            f"Previous segment ended with this visual approach (do not repeat it — "
+            f"open differently): {previous_segment_summary}\n"
+            if previous_segment_summary else ""
+        )
+        + f"\nNarration for THIS segment only (design beats for this text alone):\n{segment_text}"
     )
-    raw = call_claude(_STORYBOARD_SYSTEM_PROMPT, user_message, max_tokens=8192)
-    return parse_claude_json(
+    raw, usage = call_claude_with_usage(
+        _STORYBOARD_SYSTEM_PROMPT, user_message, max_tokens=STORYBOARD_BATCH_MAX_TOKENS
+    )
+
+    output_tokens = usage.get("output_tokens", 0)
+    if output_tokens >= STORYBOARD_BATCH_MAX_TOKENS:
+        logger.warning(
+            "Storyboard likely truncated: segment=%s output_tokens=%d max_tokens=%d",
+            segment_label, output_tokens, STORYBOARD_BATCH_MAX_TOKENS,
+        )
+    elif output_tokens >= STORYBOARD_BATCH_MAX_TOKENS * _TRUNCATION_WARNING_RATIO:
+        logger.warning(
+            "Storyboard output approaching token limit: segment=%s output_tokens=%d max_tokens=%d (%.0f%%)",
+            segment_label, output_tokens, STORYBOARD_BATCH_MAX_TOKENS,
+            100 * output_tokens / STORYBOARD_BATCH_MAX_TOKENS,
+        )
+
+    storyboard = parse_claude_json(
         raw,
         required_keys=["storyboard_status", "overall_style", "beats", "global_notes"],
         type_checks={"storyboard_status": str, "overall_style": str, "beats": list, "global_notes": list},
     )
+    return storyboard, usage
 
 
 # ── Media Validation Agent prompt ─────────────────────────────────────────────
@@ -306,69 +403,246 @@ def validate_media_with_claude(
     )
 
 
+def validate_media_with_claude_batched(
+    beats_with_media: list[dict],
+    channel_niche: str,
+    channel_tone: str,
+    script_format: str,
+    batch_size: int = 8,
+    context_size: int = 2,
+    target_indices: list[int] | None = None,
+) -> dict:
+    """Validate fetched media in small batches to avoid truncation on long videos.
+
+    Splits the target beat indices into batches of ``batch_size`` beats. Each
+    batch also receives ``context_size`` flanking beats from the FULL beat list
+    (not reviewed, used only for the neighbour-repetition check).
+
+    When ``target_indices`` is ``None`` (default), all beats are validated —
+    same behaviour as before. When ``target_indices`` is provided, only those
+    positions are sent for review; surrounding beats in ``beats_with_media``
+    still appear as context so Claude can check visual repetition with neighbours.
+
+    Args:
+        beats_with_media: Full beat list enriched with fetched media.
+        channel_niche:    Channel niche for context.
+        channel_tone:     Channel tone for context.
+        script_format:    Format key — informs pacing/rhythm expectations.
+        batch_size:       Beats per Claude call.
+        context_size:     Flanking beats included as context (not reviewed).
+        target_indices:   Positions within ``beats_with_media`` to validate.
+                          ``None`` means validate all.
+
+    Returns:
+        Merged dict: ``{validation_status, beat_reviews, overall_comment}``.
+        ``beat_reviews`` covers only the target beats.
+
+    Raises:
+        ValueError: If all batches fail (logged individually — last exception re-raised).
+    """
+    n = len(beats_with_media)
+    if n == 0:
+        return {"validation_status": "APPROVED", "beat_reviews": [], "overall_comment": "No beats"}
+
+    # Determine which list positions to validate
+    if target_indices is None:
+        sorted_targets = list(range(n))
+    else:
+        sorted_targets = sorted(set(i for i in target_indices if 0 <= i < n))
+
+    if not sorted_targets:
+        return {"validation_status": "APPROVED", "beat_reviews": [], "overall_comment": "No target beats"}
+
+    # Group targets into batches
+    batches = [
+        sorted_targets[i:i + batch_size]
+        for i in range(0, len(sorted_targets), batch_size)
+    ]
+    total_batches  = len(batches)
+    all_reviews: dict[int, dict] = {}
+    batch_statuses: list[str] = []
+    comments: list[str] = []
+    last_exc: Exception | None = None
+
+    for batch_num, batch_indices in enumerate(batches, start=1):
+        batch_beats = [beats_with_media[i] for i in batch_indices]
+        ctx_before  = beats_with_media[max(0, batch_indices[0] - context_size):batch_indices[0]]
+        ctx_after   = beats_with_media[batch_indices[-1] + 1 : batch_indices[-1] + 1 + context_size]
+        label       = f"{batch_num}/{total_batches}"
+
+        try:
+            result = _validate_media_batch(
+                batch_beats, ctx_before, ctx_after,
+                channel_niche, channel_tone, script_format, label,
+            )
+        except Exception as exc:
+            logger.error(
+                "Media validation batch %s failed: %s — keeping current media for indices %s",
+                label, exc, batch_indices,
+            )
+            last_exc = exc
+            continue
+
+        for review in result.get("beat_reviews", []):
+            order = review.get("beat_order")
+            if isinstance(order, int) and order not in all_reviews:
+                all_reviews[order] = review
+
+        batch_statuses.append(result.get("validation_status", "APPROVED"))
+        comment = result.get("overall_comment", "")
+        if comment:
+            comments.append(f"batch {batch_num}: {comment}")
+
+    if not all_reviews and last_exc is not None:
+        raise last_exc
+
+    merged_status  = "NEEDS_CHANGES" if "NEEDS_CHANGES" in batch_statuses else "APPROVED"
+    merged_reviews = [all_reviews[k] for k in sorted(all_reviews)]
+    logger.info(
+        "Media validation batched: %d target beats / %d batches (pool=%d) — status=%s reviews=%d",
+        len(sorted_targets), total_batches, n, merged_status, len(merged_reviews),
+    )
+    return {
+        "validation_status": merged_status,
+        "beat_reviews":      merged_reviews,
+        "overall_comment":   "; ".join(comments) if comments else "All batches approved",
+    }
+
+
+def _validate_media_batch(
+    beats: list[dict],
+    ctx_before: list[dict],
+    ctx_after: list[dict],
+    channel_niche: str,
+    channel_tone: str,
+    script_format: str,
+    batch_label: str,
+) -> dict:
+    """Run one media validation Claude call for a slice of beats.
+
+    Reduces per-beat payload: full URLs are replaced by their last 40 characters
+    so the context stays compact while still providing enough identity for
+    Claude's repetition check.
+    """
+    def _url_tail(url: str) -> str:
+        return url[-40:] if isinstance(url, str) and url else "(none)"
+
+    def _beat_line(b: dict, is_context: bool = False) -> str:
+        prefix = "[context] " if is_context else ""
+        return (
+            f"{prefix}Beat {b.get('beat_order', b.get('section_order', 0))} "
+            f"({b.get('duration_sec', 0):.1f}s) "
+            f"[{b.get('visual_type', 'b-roll')}/{b.get('visual_category', '?')}"
+            f"/{b.get('environment', '?')}]:\n"
+            f"  Intent: {b.get('visual_intent', '')[:150]}\n"
+            f"  Query:  {b.get('search_query', '')}\n"
+            f"  Media:  {b.get('media_source', '?')} {b.get('media_type', '?')} "
+            f"…{_url_tail(b.get('media_url', ''))}\n"
+            f"  Overlay: {b.get('overlay_text', '') or '(none)'}"
+        )
+
+    lines: list[str] = []
+    if ctx_before:
+        lines.append("Context beats (preceding — neighbour check only, do not review):")
+        lines.extend(_beat_line(b, is_context=True) for b in ctx_before)
+        lines.append("")
+
+    lines.append(f"Beats to review (batch {batch_label}):")
+    lines.extend(_beat_line(b) for b in beats)
+
+    if ctx_after:
+        lines.append("")
+        lines.append("Context beats (following — neighbour check only, do not review):")
+        lines.extend(_beat_line(b, is_context=True) for b in ctx_after)
+
+    user_message = (
+        f"Channel niche: {channel_niche}\n"
+        f"Channel tone: {channel_tone}\n"
+        f"Script format: {script_format}\n\n"
+        + "\n".join(lines)
+    )
+
+    est_tokens = len(user_message) // 4
+    logger.debug(
+        "Media validation batch %s: %d beats, ~%d estimated prompt tokens",
+        batch_label, len(beats), est_tokens,
+    )
+
+    for attempt in range(1, 3):   # one retry on JSON parse failure
+        try:
+            raw    = call_claude(_MEDIA_VALIDATION_SYSTEM_PROMPT, user_message, max_tokens=2048)
+            result = parse_claude_json(
+                raw,
+                required_keys=["validation_status", "beat_reviews", "overall_comment"],
+                type_checks={"validation_status": str, "beat_reviews": list, "overall_comment": str},
+            )
+            out_est = len(raw) // 4
+            if out_est >= int(2048 * 0.95):
+                logger.warning(
+                    "Media validation batch %s output near token limit (~%d/2048 tokens)",
+                    batch_label, out_est,
+                )
+            logger.info(
+                "Media validation batch %s: status=%s reviews=%d",
+                batch_label, result.get("validation_status"), len(result.get("beat_reviews", [])),
+            )
+            return result
+        except (ValueError, Exception) as exc:
+            if attempt < 2:
+                logger.warning(
+                    "Media validation batch %s attempt %d failed: %s — retrying",
+                    batch_label, attempt, exc,
+                )
+                continue
+            raise
+
+
 # ── Assembly Validator prompt ─────────────────────────────────────────────────
+# Receives high-level STATISTICS (not a full beat list) so token usage is bounded
+# regardless of video length. Per-beat media replacement was removed from this
+# validator because: (a) the Media Validation Agent already handles per-beat
+# replacement earlier in the pipeline, (b) sending the full beat list caused
+# truncation on long videos.
 
 _ASSEMBLY_SYSTEM_PROMPT = """\
-You are a post-production supervisor for an automated multilingual video production system.
+You are a post-production supervisor reviewing a finished video assembly plan.
 
-You receive a complete assembled video plan: a list of sections with their fetched media
-and the overall channel context. Your job is to check two dimensions:
+You receive summary statistics for the assembled video — NOT a full beat list.
+Your job: identify ASSEMBLY-LEVEL problems (pacing, flow, coherence) that would make
+the video feel automated or low-quality to a real viewer. Judge at a macro level —
+do not flag individual beat choices.
 
-== Dimension 1 — Media relevance ==
+Common assembly failures to flag:
+  - Duration drift: total section durations deviate from audio duration by more than ±2%
+  - Monotonous pacing: almost all sections have identical duration (stddev < 0.5 s)
+  - Visual environment overuse: one environment type exceeds 40% of all beats
+  - Effect chaos: more than 4 different effects used with no discernible pattern
+  - Color incoherence: sharp color_grade changes with no narrative reason
+  - Transition monotony: more than 80% of transitions are the same type
+  - Overlay overuse: more than 30% of beats carry overlay_text (clutters narration)
+  - Long static stretches: 5+ consecutive beats all using slow_zoom or pan only
 
-For each section, decide whether the fetched media visually matches the section intent:
-  KEEP    : media is relevant, quality acceptable, mood matches
-  REPLACE : media is wrong (wrong mood, wrong subject, unrelated, clearly off)
-
-When marking REPLACE, provide a new search query (3-to-5 English words, more specific
-than the original). Do NOT invent URLs or sources.
-
-Common failure cases:
-  - Searched "dark hospital" → got bright modern lobby → REPLACE
-  - Searched "forest night" → got sunny meadow → REPLACE
-  - Searched "police car" → got police car → KEEP (even if different angle)
-
-== Dimension 2 — Assembly quality ==
-
-Check the OVERALL video plan (not individual sections):
-  - Storyboard coverage: does the sequence of beats carry the narration from
-    start to finish with no visual gaps or orphaned stretches?
-  - Flow & transitions: do the chosen transition_to_next values feel natural
-    between consecutive sections, or is the editing chaotic / monotonous?
-  - Pacing: are section durations varied (monotonous = flag it)?
-  - Duration drift: does sum of section durations match expected total within ±2%?
-  - Effect coherence: do the chosen camera effects feel intentional together,
-    or is there a jarring mix (e.g. constant shake next to slow_zoom)?
-  - Color coherence: do color grades feel cohesive across the video, or do they
-    clash from one section to the next without narrative reason?
-  - Overlay usefulness: are overlay_text/overlay_position choices adding value,
-    or cluttering / repeating information already in the narration?
-  - Repeated visuals: flag consecutive or near-consecutive sections that show
-    the same subject + framing (visually redundant).
-  - Static-feeling sections: flag sections that will feel static on screen
-    (long still image, no motion, no overlay, no strong effect).
-
-Report only genuine issues — do not nitpick.
-
-== Output ==
+Report ONLY genuine assembly-level issues — do not flag individual beat choices.
 
 Return ONLY valid JSON. No markdown. No code fence. No extra keys.
-
 {
   "assembly_status": "APPROVED" | "NEEDS_ADJUSTMENT",
-  "section_reviews": [
+  "assembly_issues": [
     {
-      "section_order": 0,
-      "media_ok": true,
-      "action": "KEEP" | "REPLACE",
-      "new_search_query": "only if REPLACE — refined English query"
+      "severity": "HIGH" | "MEDIUM",
+      "category": "pacing" | "flow" | "drift" | "repetition" | "effects" | "color" | "overlay",
+      "issue": "specific description of the assembly problem",
+      "suggestion": "concrete suggestion for fixing it"
     }
   ],
-  "assembly_issues": [
-    {"section_order": 3, "issue": "describe the assembly-level concern"}
-  ],
   "overall_comment": "one-sentence summary"
-}\
+}
+
+Strict rules:
+1. JSON only.
+2. Report at most 5 issues — prioritize by impact on viewer experience.
+3. Never invent beat-level details not provided in the summary.
+4. Empty assembly_issues array means no genuine assembly problems found.\
 """
 
 
@@ -379,50 +653,66 @@ def validate_assembly_with_claude(
     channel_tone: str,
     channel_style: str,
 ) -> dict:
-    """Ask Claude to validate fetched media and overall assembly quality.
+    """Ask Claude to validate overall assembly quality from high-level statistics.
+
+    Sends a structured summary (distribution counts, drift, stddev) instead of the
+    full beat list — this bounds token usage regardless of video length and avoids
+    truncation on 60+ beat videos. Per-beat media replacement was removed from this
+    validator (the Media Validation Agent handles that earlier in the pipeline).
 
     Args:
-        sections:          Sections enriched with media_url, media_type, effect, color_grade.
+        sections:          Fully enriched, validated sections (post stock_fetcher).
         total_duration_ms: Expected total audio duration.
         channel_niche:     Channel niche for context.
         channel_tone:      Channel tone for context.
         channel_style:     Video style (e.g. "documentary").
 
     Returns:
-        Dict with assembly_status, section_reviews, assembly_issues, overall_comment.
+        Dict with keys ``assembly_status``, ``assembly_issues``, ``overall_comment``.
 
     Raises:
-        ValueError: If Claude returns malformed JSON.
+        ValueError: If Claude returns malformed JSON or a required key is missing.
     """
+    from collections import Counter as _Counter
     expected_sec = total_duration_ms / 1000
     sum_sec      = sum(s.get("duration_sec", 0) for s in sections)
     drift_pct    = abs(sum_sec - expected_sec) / max(expected_sec, 1) * 100
 
-    section_lines = "\n\n".join(
-        f"Section {s['section_order']} ({s.get('duration_sec', 0):.1f}s) "
-        f"[{s.get('effect','?')}/{s.get('color_grade','?')}]:\n"
-        f"  Script: {s.get('script_text','')[:200]}\n"
-        f"  Media:  {s.get('media_source','?')} {s.get('media_type','?')} — {s.get('media_url','')[:80]}\n"
-        f"  Query:  {s.get('search_query','?')}"
-        for s in sections
-    )
+    durations  = [s.get("duration_sec", 0) for s in sections]
+    avg_dur    = sum(durations) / len(durations) if durations else 0
+    stddev_dur = (sum((d - avg_dur) ** 2 for d in durations) / len(durations)) ** 0.5 if durations else 0
+
+    env_counts    = _Counter(s.get("environment", "other") for s in sections)
+    effect_counts = _Counter(s.get("effect", "?") for s in sections)
+    grade_counts  = _Counter(s.get("color_grade", "?") for s in sections)
+    trans_counts  = _Counter(s.get("transition_to_next", "cut") for s in sections)
+    overlay_count = sum(1 for s in sections if s.get("overlay_text", "").strip())
+    overlay_pct   = overlay_count / max(len(sections), 1) * 100
 
     user_message = (
         f"Channel niche: {channel_niche}\n"
-        f"Channel tone: {channel_tone}\n"
-        f"Channel style: {channel_style}\n"
-        f"Expected total: {expected_sec:.1f}s | Section sum: {sum_sec:.1f}s "
-        f"| Drift: {drift_pct:.1f}%\n\n"
-        f"Sections:\n\n{section_lines}"
+        f"Channel style: {channel_style}\n\n"
+        f"Video stats:\n"
+        f"  Beats: {len(sections)}  |  Expected: {expected_sec:.1f}s  |  "
+        f"Section sum: {sum_sec:.1f}s  |  Drift: {drift_pct:.1f}%\n"
+        f"  Duration avg: {avg_dur:.1f}s  |  Duration stddev: {stddev_dur:.1f}s\n"
+        f"  Overlay beats: {overlay_count}/{len(sections)} ({overlay_pct:.0f}%)\n\n"
+        f"Environment distribution: "
+        + ", ".join(f"{e}={c}" for e, c in env_counts.most_common(6))
+        + "\nEffect distribution: "
+        + ", ".join(f"{e}={c}" for e, c in effect_counts.most_common())
+        + "\nColor grade distribution: "
+        + ", ".join(f"{g}={c}" for g, c in grade_counts.most_common())
+        + "\nTransition distribution: "
+        + ", ".join(f"{t}={c}" for t, c in trans_counts.most_common())
     )
 
-    raw = call_claude(_ASSEMBLY_SYSTEM_PROMPT, user_message, max_tokens=2048)
+    raw = call_claude(_ASSEMBLY_SYSTEM_PROMPT, user_message, max_tokens=1024)
     return parse_claude_json(
         raw,
-        required_keys=["assembly_status", "section_reviews", "assembly_issues", "overall_comment"],
+        required_keys=["assembly_status", "assembly_issues", "overall_comment"],
         type_checks={
             "assembly_status": str,
-            "section_reviews": list,
             "assembly_issues": list,
             "overall_comment": str,
         },

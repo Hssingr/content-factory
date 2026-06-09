@@ -1,21 +1,20 @@
-"""Assembly Validator — validates fetched media relevance and overall video assembly.
+"""Assembly Validator — checks overall video assembly quality at a macro level.
 
-Runs ONCE after the stock fetcher. For REPLACE sections the validator provides a
-new search_query and the orchestrator re-fetches using stock_fetcher.
+Runs ONCE after media validation. Sends high-level statistics (distribution counts,
+duration drift, stddev) instead of a full beat list so token usage is bounded
+regardless of video length.
 
-Two dimensions checked by Claude:
-  1. Media relevance: does the fetched image/video match the section's narrative intent?
-  2. Assembly quality: flow, pacing, duration drift, visual coherence across sections.
+This validator is purely advisory: it logs issues but never blocks the pipeline.
+It may return a set of beat list-indices whose media should be re-fetched if a
+CONCRETE technical issue is detected (currently always empty — the validator
+identifies macro-level structural patterns, not individual beat failures).
 
-Python handles:
-  - Duration drift computation (passed to Claude as context).
-  - Re-fetch of REPLACE sections via stock_fetcher.
-  - No validation loop (runs once — best effort).
+Per-beat media replacement is handled exclusively by the Media Validation Agent.
 """
 
 import logging
+from collections import Counter
 
-from app.agents.agent5_video.services.stock_fetcher import fetch_for_beat, fetch_for_section
 from app.agents.agent5_video.system_prompt import validate_assembly_with_claude
 
 logger = logging.getLogger(__name__)
@@ -27,24 +26,29 @@ def validate_assembly(
     channel_niche: str,
     channel_tone: str,
     channel_style: str = "documentary",
-) -> list[dict]:
-    """Validate the full assembled video plan and re-fetch any REPLACE sections.
+) -> tuple[list[dict], set[int]]:
+    """Validate overall video assembly quality from high-level statistics.
 
-    Steps:
-      1. Ask Claude to review media relevance + assembly quality.
-      2. For each section marked REPLACE: update search_query and re-fetch media.
-      3. Log any assembly-level issues (pacing, flow, drift) — no auto-fix.
+    Sends a structured summary (distribution counts, duration drift/stddev, overlay
+    percentage) to Claude rather than the full beat list — this prevents truncation
+    on long storyboard videos (60+ beats) and keeps each call under 1024 output tokens.
+
+    Assembly issues are logged as warnings and never block the pipeline on their own.
+    The second return value is a set of beat list-indices marked for incremental
+    media re-validation; currently always empty (assembly identifies macro issues,
+    not individual beat failures). The interface exists so the orchestrator can
+    optionally route specific beats back through media validation in future.
 
     Args:
-        sections:          Fully enriched sections (after stock_fetcher).
+        sections:          Fully enriched sections (after stock_fetcher + media validation).
         total_duration_ms: Expected audio duration from audio_files table.
         channel_niche:     Channel niche for context.
         channel_tone:      Channel tone for context.
         channel_style:     Video style type from channel_config.
 
     Returns:
-        Sections list with any REPLACE sections re-fetched. Assembly issues are
-        logged but do not block the pipeline.
+        ``(sections, dirty_beat_indices)`` — sections unchanged; dirty_beat_indices
+        is currently always an empty set.
     """
     try:
         review = validate_assembly_with_claude(
@@ -52,57 +56,32 @@ def validate_assembly(
         )
     except Exception as exc:
         logger.error("Assembly Validator Claude call failed: %s — skipping", exc)
-        return sections
+        return sections, set()
 
     assembly_status = review.get("assembly_status", "APPROVED")
-    section_reviews = review.get("section_reviews", [])
     assembly_issues = review.get("assembly_issues", [])
     overall_comment = review.get("overall_comment", "")
 
     logger.info("Assembly Validator: %s — %s", assembly_status, overall_comment)
 
-    # Log assembly-level issues (pacing, flow, drift)
     for issue in assembly_issues:
         logger.warning(
-            "Assembly issue (section %s): %s",
-            issue.get("section_order", "?"),
+            "Assembly issue [%s/%s]: %s — suggestion: %s",
+            issue.get("severity", "?"),
+            issue.get("category", "?"),
             issue.get("issue", ""),
+            issue.get("suggestion", ""),
         )
 
-    if assembly_status == "APPROVED":
-        return sections
-
-    # Build lookup from review list
-    reviews_by_order = {r["section_order"]: r for r in section_reviews if "section_order" in r}
-
-    replaced = 0
-    for s in sections:
-        order = s["section_order"]
-        review_entry = reviews_by_order.get(order)
-        if not review_entry:
-            continue
-        if review_entry.get("action") != "REPLACE":
-            continue
-
-        new_query = review_entry.get("new_search_query", "").strip()
-        if not new_query:
-            logger.warning("Section %d REPLACE but no new_search_query provided — skipping", order)
-            continue
-
-        old_url = s.get("media_url", "")
-        s["search_query"] = new_query
-        if "visual_intent" in s:
-            fetch_for_beat(s)
-        else:
-            fetch_for_section(s)
-        replaced += 1
-        logger.info(
-            "Section %d: replaced media — query=%r  old=%s  new=%s",
-            order, new_query, old_url[:60], s.get("media_url", "")[:60],
-        )
-
+    severity_dist = Counter(i.get("severity", "?") for i in assembly_issues)
+    category_dist = Counter(i.get("category", "?") for i in assembly_issues)
     logger.info(
-        "Assembly validation complete: status=%s replaced=%d assembly_issues=%d",
-        assembly_status, replaced, len(assembly_issues),
+        "Assembly validation complete: status=%s issues=%d "
+        "HIGH=%d MEDIUM=%d categories=%s",
+        assembly_status, len(assembly_issues),
+        severity_dist.get("HIGH", 0), severity_dist.get("MEDIUM", 0),
+        dict(category_dist),
     )
-    return sections
+
+    # Advisory only — no beats are currently marked for re-validation by assembly
+    return sections, set()

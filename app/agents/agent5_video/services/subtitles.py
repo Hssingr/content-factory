@@ -25,12 +25,12 @@ logger = logging.getLogger(__name__)
 # fire mid-phrase and produce broken-fragment captions.
 _MIN_WORDS_STANDARD      = 3
 _TARGET_WORDS_STANDARD   = 7
-_MAX_WORDS_STANDARD      = 12
+_MAX_WORDS_STANDARD      = 10     # hard cap; was 12 — tighter for readability
 _MAX_DURATION_MS         = 4500   # split chunk if it would exceed 4.5 s
 
 _MIN_WORDS_KARAOKE       = 2
 _TARGET_WORDS_KARAOKE    = 4
-_MAX_WORDS_KARAOKE       = 6      # smaller chunks for karaoke style (easier to follow)
+_MAX_WORDS_KARAOKE       = 8      # Shorts hard cap 8 for easy karaoke tracking; was 6
 _MAX_DURATION_MS_KARAOKE = 3000
 
 _DEFAULT_KARAOKE_COLOR = "#FFD700"
@@ -103,7 +103,10 @@ def _chunk_transcript(
     return chunks
 
 
-def build_standard_subtitles(whisper_transcript: list[dict]) -> list[dict]:
+def build_standard_subtitles(
+    whisper_transcript: list[dict],
+    max_words_override: int | None = None,
+) -> list[dict]:
     """Generate standard subtitle captions from Whisper word timestamps.
 
     Chunks split on natural sentence/clause boundaries (with minimum-size and
@@ -114,6 +117,9 @@ def build_standard_subtitles(whisper_transcript: list[dict]) -> list[dict]:
     Args:
         whisper_transcript: Word-level Whisper output.
                             Each word: {"word": str, "start": float, "end": float}
+        max_words_override: Override the hard word-count ceiling. Used by the Viewer
+                            Experience repair pass to rebuild with a stricter cap (e.g. 8)
+                            without changing the module-level constant.
 
     Returns:
         List of caption dicts: [{text, start_ms, end_ms}, ...]
@@ -122,11 +128,12 @@ def build_standard_subtitles(whisper_transcript: list[dict]) -> list[dict]:
     if not whisper_transcript:
         return []
 
+    max_words = max_words_override if max_words_override is not None else _MAX_WORDS_STANDARD
     chunks = _chunk_transcript(
         whisper_transcript,
         min_words=_MIN_WORDS_STANDARD,
         target_words=_TARGET_WORDS_STANDARD,
-        max_words=_MAX_WORDS_STANDARD,
+        max_words=max_words,
         max_duration_ms=_MAX_DURATION_MS,
     )
     captions = [
@@ -138,11 +145,13 @@ def build_standard_subtitles(whisper_transcript: list[dict]) -> list[dict]:
         for chunk in chunks
     ]
 
-    total_words = sum(len(c["text"].split()) for c in captions)
-    avg_words   = total_words / len(captions) if captions else 0.0
+    total_words       = sum(len(c["text"].split()) for c in captions)
+    avg_words         = total_words / len(captions) if captions else 0.0
+    max_caption_words = max((len(c["text"].split()) for c in captions), default=0)
+    over_cap          = sum(1 for c in captions if len(c["text"].split()) > max_words)
     logger.info(
-        "Standard subtitles: %d caption(s), avg %.1f words/caption",
-        len(captions), avg_words,
+        "Standard subtitles: %d captions, avg %.1f words, max %d words, %d over cap",
+        len(captions), avg_words, max_caption_words, over_cap,
     )
     return captions
 
@@ -186,5 +195,10 @@ def build_karaoke_subtitles(
         for chunk in raw_chunks
     ]
 
-    logger.info("Karaoke subtitles: %d chunk(s)", len(chunks))
+    avg_chunk_words = (sum(len(c["words"]) for c in chunks) / len(chunks)) if chunks else 0.0
+    over_cap        = sum(1 for c in chunks if len(c["words"]) > _MAX_WORDS_KARAOKE)
+    logger.info(
+        "Karaoke subtitles: %d chunks, avg %.1f words, %d over cap",
+        len(chunks), avg_chunk_words, over_cap,
+    )
     return chunks

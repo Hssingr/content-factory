@@ -94,6 +94,42 @@ def call_claude(system_prompt: str, user_message: str, max_tokens: int = 1024) -
         anthropic.APIConnectionError: On network or config errors (not retried).
         anthropic.APIError: On any other non-retryable API error.
     """
+    text, _usage = _call_claude_core(system_prompt, user_message, max_tokens)
+    return text
+
+
+def call_claude_with_usage(system_prompt: str, user_message: str, max_tokens: int = 1024) -> tuple[str, dict]:
+    """Make a single-turn Claude API call and also return token-usage diagnostics.
+
+    Identical to ``call_claude`` but additionally returns the usage dict so callers
+    that need to reason about output size (e.g. detecting truncation against
+    ``max_tokens``) don't have to re-implement the retry/caching plumbing.
+
+    Args:
+        system_prompt: The system prompt text for this call.
+        user_message: The user turn content.
+        max_tokens: Maximum tokens in the response (default 1024).
+
+    Returns:
+        ``(text, usage)`` — ``text`` is the stripped response content; ``usage`` is
+        ``{"input_tokens": int, "output_tokens": int, "cache_read_input_tokens": int}``
+        from the LAST successful attempt.
+
+    Raises:
+        ValueError: If the response block is not text or the response is empty.
+        anthropic.RateLimitError: If all retry attempts are exhausted.
+        anthropic.APIConnectionError: On network or config errors (not retried).
+        anthropic.APIError: On any other non-retryable API error.
+    """
+    return _call_claude_core(system_prompt, user_message, max_tokens)
+
+
+def _call_claude_core(system_prompt: str, user_message: str, max_tokens: int) -> tuple[str, dict]:
+    """Shared retry/caching/logging core for ``call_claude`` and ``call_claude_with_usage``.
+
+    Returns:
+        ``(text, usage)`` — see ``call_claude_with_usage``.
+    """
     if len(system_prompt) > 800:
         system: list | str = [
             {
@@ -122,13 +158,18 @@ def call_claude(system_prompt: str, user_message: str, max_tokens: int = 1024) -
                 messages=[{"role": "user", "content": user_message}],
             )
             elapsed_ms = int((_time.monotonic() - _t0) * 1000)
+            usage = {
+                "input_tokens": response.usage.input_tokens,
+                "output_tokens": response.usage.output_tokens,
+                "cache_read_input_tokens": getattr(response.usage, "cache_read_input_tokens", 0),
+            }
             logger.info(
                 "call_claude ok: attempt=%d elapsed_ms=%d input_tokens=%d output_tokens=%d cache_read=%d",
                 attempt + 1,
                 elapsed_ms,
-                response.usage.input_tokens,
-                response.usage.output_tokens,
-                getattr(response.usage, "cache_read_input_tokens", 0),
+                usage["input_tokens"],
+                usage["output_tokens"],
+                usage["cache_read_input_tokens"],
             )
             block = response.content[0]
             if not isinstance(block, anthropic.types.TextBlock):
@@ -136,7 +177,7 @@ def call_claude(system_prompt: str, user_message: str, max_tokens: int = 1024) -
             result = block.text.strip()
             if not result:
                 raise ValueError("Empty response from Claude")
-            return result
+            return result, usage
 
         except (anthropic.RateLimitError, anthropic.APITimeoutError) as exc:
             last_exc = exc

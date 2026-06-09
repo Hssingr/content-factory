@@ -30,5 +30,15 @@ class ChannelConfig(Base):
     runway_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     # 'youtube_long' | 'youtube_short' | 'tiktok' | 'reels'
     script_format: Mapped[str] = mapped_column(String(32), nullable=False, server_default="youtube_long")
+    # Storyboard failure policy. False (default): stop language generation with an
+    # explicit error when the Storyboard Agent fails — never silently fall back to
+    # the legacy section splitter (silent fallback was masking a 100% storyboard
+    # failure rate). True: restore the previous silent-fallback behavior.
+    allow_legacy_fallback: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    # Quality gate policy. False (default): block render only on HIGH-severity viewer
+    # experience issues (visuals category) that remain after the repair pass — non-blocking
+    # categories (intro, audio, captions, pacing) never block rendering.
+    # True: block on any NEEDS_FIXES verdict that survives the repair pass.
+    strict_quality_gate: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
 
     channel: Mapped["Channel"] = relationship("Channel", back_populates="config")

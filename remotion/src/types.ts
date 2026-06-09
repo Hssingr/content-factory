@@ -11,7 +11,6 @@ export type Transition = "cut" | "crossfade" | "dip_to_black" | "whip_pan"
 export type OverlayPosition = "center" | "lower_third" | "top_left" | "top_right" | "none";
 export type VisualType = "b-roll" | "action" | "text_overlay" | "document"
                        | "map" | "screenshot" | "generated_visual";
-export type Priority = "essential" | "optional";
 
 export interface ClipData {
   url:   string;
@@ -30,13 +29,12 @@ export interface SectionData {
   audio_start_ms: number;
   audio_end_ms:   number;
   // Storyboard-beat fields — populated by the Storyboard Agent flow; legacy
-  // sections carry neutral defaults ("", "b-roll", "cut", "none", "essential").
+  // sections carry neutral defaults ("", "b-roll", "cut", "none").
   visual_intent?:      string;
   visual_type?:        VisualType;
   transition_to_next?: Transition;
   overlay_text?:       string;
   overlay_position?:   OverlayPosition;
-  priority?:           Priority;
 }
 
 // ── Subtitles ─────────────────────────────────────────────────────────────────

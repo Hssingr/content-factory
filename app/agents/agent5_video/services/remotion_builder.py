@@ -234,5 +234,4 @@ def _section_for_remotion(s: dict) -> dict:
         "transition_to_next": s.get("transition_to_next", "cut"),
         "overlay_text":       s.get("overlay_text", ""),
         "overlay_position":   s.get("overlay_position", "none"),
-        "priority":           s.get("priority", "essential"),
     }

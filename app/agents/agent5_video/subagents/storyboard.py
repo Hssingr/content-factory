@@ -3,23 +3,56 @@
 Replaces the legacy ``section_splitter -> enrich_sections_with_visuals ->
 validate_sections`` flow when storyboard generation succeeds. Claude makes every
 creative decision (visual intent, visual type, search queries, effects, color
-grades, transitions, overlays); Python only does the deterministic work — locating
-each beat's narration span in the real Whisper transcript and converting it into
+grades, transitions, overlays); Python only does the deterministic work — splitting
+the narration into segments, batching the Claude calls, merging the results, locating
+each beat's narration span in the real Whisper transcript, and converting it into
 millisecond timestamps.
 
-Fallback chain (the pipeline never breaks):
-  storyboard generation fails / returns no beats → caller falls back to section_splitter
-  a beat's start_hint/end_hint can't be located    → proportional timing + logged warning
+Generation is BATCHED per narration segment ([INTRO] / [SECTION N] / [OUTRO]) rather
+than requested as one whole-video call — a 900-1200 word youtube_long script needs
+~90-120 beats at the prompt's own pacing rule (1 beat / 3-5s), which serializes to
+~20,000-27,000 tokens at the full schema and structurally cannot fit inside a single
+~8192-token response (this was the root cause of 100% storyboard failures: Claude hit
+max_tokens mid-beat, producing "Unterminated string" JSON errors). Splitting generation
+per segment keeps each call to ~5-25 beats — comfortably inside any reasonable ceiling.
+
+Fail-loud chain (per Recommended Fix BLOCKER #2 — no silent quality degradation):
+  any segment batch fails / returns no beats        → entire storyboard generation fails
+  storyboard generation fails                        → caller checks allow_legacy_fallback:
+                                                          True  → fall back to section_splitter
+                                                          False → stop language generation, explicit error
+  a beat's start_hint/end_hint can't be located      → proportional timing + logged warning
 """
 
 import logging
 import re
+import unicodedata
 
-from app.agents.agent5_video.system_prompt import generate_storyboard
+from app.agents.agent5_video.system_prompt import (
+    STORYBOARD_BATCH_MAX_TOKENS as _STORYBOARD_BATCH_MAX_TOKENS_LOG,
+    STORYBOARD_SCHEMA_VERSION as _STORYBOARD_SCHEMA_VERSION_LOG,
+    generate_storyboard_batch,
+)
 
 logger = logging.getLogger(__name__)
 
-_WORD_RE = re.compile(r"[a-zà-öø-ÿ0-9']+", re.IGNORECASE)
+# Apostrophes and typographic variants — all treated as word-boundary separators
+# so that French elisions (l'entreprise → ["l","entreprise"]) tokenize the same
+# way Whisper splits them, while English contractions (hadn't → ["hadn","t"])
+# also become consistent two-token forms on both hint and transcript sides.
+_APOSTROPHE_RE = re.compile(r"['’ʼʻ‘]")
+# Token pattern — apostrophe removed; we expand it to spaces before matching
+_WORD_RE = re.compile(r"[a-zÀ-ɏ0-9]+", re.IGNORECASE)
+
+# Minimum guaranteed duration per beat after timestamp mapping.
+# Prevents zero-width spans when consecutive beats anchor to the same Whisper
+# word (or when beat 0 anchors at ms=0 and beat 1 also anchors at ms=0).
+_MIN_BEAT_MS = 500
+
+# Fallback-rate acceptance thresholds for the mapping quality gate.
+# >30% → WARNING only; >50% → mapping failure (respects allow_legacy_fallback).
+_FALLBACK_WARN_RATIO  = 0.30
+_FALLBACK_FAIL_RATIO  = 0.50
 
 # Enum sets — Python enforces, never trusts Claude's strings blindly
 _VALID_EFFECTS           = {"slow_zoom", "zoom_out", "pan", "push_in", "shake", "cut", "fade_in", "parallax"}
@@ -27,19 +60,49 @@ _VALID_GRADES            = {"desaturated", "cold_blue", "warm_amber", "dark_cont
 _VALID_TRANSITIONS       = {"cut", "crossfade", "dip_to_black", "whip_pan", "zoom_blur", "match_cut", "none"}
 _VALID_OVERLAY_POSITIONS = {"center", "lower_third", "top_left", "top_right", "none"}
 _VALID_VISUAL_TYPES      = {"b-roll", "action", "text_overlay", "document", "map", "screenshot", "generated_visual"}
-_VALID_PRIORITIES        = {"essential", "optional"}
 _VALID_VISUAL_CATEGORIES = {"person", "place", "object", "document", "screen", "map", "abstract", "text"}
+_VALID_ENVIRONMENTS      = {
+    "underwater", "indoor_office", "indoor_domestic", "forest_nature", "urban_street",
+    "corridor_interior", "abstract_dark", "open_landscape", "laboratory", "industrial",
+    "vehicle", "other",
+}
+_VALID_MOTIFS            = {
+    "doorway", "corridor", "face", "hands", "object", "clock", "phone", "photo",
+    "exterior", "text", "screen", "reflection", "document", "room", "other",
+}
 
 _DEFAULT_EFFECT           = "slow_zoom"
 _DEFAULT_GRADE            = "desaturated"
 _DEFAULT_TRANSITION       = "cut"
 _DEFAULT_OVERLAY_POSITION = "none"
 _DEFAULT_VISUAL_TYPE      = "b-roll"
-_DEFAULT_PRIORITY         = "essential"
 _DEFAULT_VISUAL_CATEGORY  = "place"
+_DEFAULT_ENVIRONMENT      = "other"
+_DEFAULT_MOTIF            = "other"
 
 # Phrase-locating prefix lengths, longest first — tolerates Whisper transcription drift
 _PREFIX_LENGTHS = (None, 5, 3)
+
+# [INTRO] / [SECTION N] / [OUTRO] on their own line — same pattern used to strip
+# markers before TTS (agent4_audio/services/tts.py) and before quality prompts
+# (services/video.py _script_hook), kept in sync so segmentation matches exactly
+# what the narrator actually speaks.
+_SEGMENT_MARKER_RE = re.compile(
+    r"^\s*\[(INTRO|OUTRO|SECTION[^\]]*)\]\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# Rough pacing used ONLY for the diagnostic "estimated beat count" log line —
+# matches the rates stated in _STORYBOARD_SYSTEM_PROMPT ("== Pacing ==").
+_BEAT_SECONDS_BY_FORMAT: dict[str, float] = {"youtube_long": 4.0}
+_DEFAULT_BEAT_SECONDS = 3.0
+_WORDS_PER_MINUTE = 150
+
+# Diagnostic-only estimate of serialized size per beat at the reduced 13-field
+# schema (~617 chars/beat ≈ 154 tokens/beat at the project's chars/4 heuristic —
+# see Storyboard Size Analysis). Used solely to log an "estimated total output
+# tokens" figure alongside the real ``total_output_tokens`` for comparison.
+_STORYBOARD_TOKENS_PER_BEAT_LOG = 154
 
 
 def split_into_beats(
@@ -48,42 +111,184 @@ def split_into_beats(
     channel,
     script_format: str,
     whisper_transcript: list[dict],
+    allow_legacy_fallback: bool = False,
 ) -> list[dict] | None:
-    """Generate a storyboard with Claude and map its beats onto real audio timestamps.
+    """Generate a storyboard with Claude (batched per segment) and map it onto real audio timestamps.
+
+    Splits ``voice_script`` into [INTRO]/[SECTION N]/[OUTRO] segments, runs one
+    storyboard batch per segment (so no single Claude call has to describe the
+    whole video — see module docstring for why that was the root cause of the
+    prior 100% failure rate), merges the batches in order, and maps the merged
+    beats onto the real Whisper transcript.
 
     Args:
         voice_script:       Narrator text with [INTRO]/[SECTION N]/[OUTRO] markers.
         duration_ms:        Exact audio duration in milliseconds.
         channel:            Channel ORM object (provides niche/tone for the prompt).
         script_format:      Format key from ``channel_config.script_format``.
-        whisper_transcript: Word-level timestamps (``[{"word", "start", "end"}]``, seconds).
+        whisper_transcript:    Word-level timestamps (``[{"word", "start", "end"}]``, seconds).
+        allow_legacy_fallback: Forwarded to ``map_storyboard_beats_to_timestamps`` to control
+            what happens when > 50 % of beats use proportional fallback timing —
+            ``False`` (default) treats that as a mapping failure and returns ``None``;
+            ``True`` accepts the result regardless.
 
     Returns:
         List of renderable beat-section dicts, or ``None`` if storyboard generation
-        failed or returned no usable beats — signalling the caller to fall back to
-        the legacy section splitter.
+        failed or returned no usable beats — signalling the caller to apply its
+        ``allow_legacy_fallback`` policy (fall back to the legacy section splitter,
+        or stop language generation with an explicit error).
     """
     if not whisper_transcript:
         logger.warning("No Whisper transcript available — cannot build a storyboard")
         return None
 
-    try:
-        storyboard = generate_storyboard(voice_script, channel, script_format=script_format)
-    except Exception as exc:
-        logger.error("Storyboard generation failed: %s", exc)
+    segments = _split_voice_script_into_segments(voice_script)
+    if not segments:
+        logger.warning("Storyboard: voice_script has no narration content — cannot build a storyboard")
         return None
 
-    beats = storyboard.get("beats") or []
-    if not beats:
-        logger.warning("Storyboard returned no beats — falling back to legacy section splitter")
-        return None
-
-    mapped = map_storyboard_beats_to_timestamps(beats, whisper_transcript, duration_ms)
+    estimated_beats = _estimate_beat_count(voice_script, script_format)
     logger.info(
-        "Storyboard generated: %d beat(s), style=%r",
-        len(mapped), storyboard.get("overall_style", ""),
+        "Storyboard generation start: schema_version=%s segments=%d estimated_beat_count=%d "
+        "(estimated from %d words at ~%.0fs/beat)",
+        _STORYBOARD_SCHEMA_VERSION_LOG, len(segments), estimated_beats,
+        len(voice_script.split()), _BEAT_SECONDS_BY_FORMAT.get(script_format, _DEFAULT_BEAT_SECONDS),
+    )
+
+    raw_batches: list[list[dict]] = []
+    overall_style = ""
+    previous_summary = ""
+    total_output_tokens = 0
+
+    for index, (label, text) in enumerate(segments, start=1):
+        try:
+            storyboard, usage = generate_storyboard_batch(
+                segment_label=label,
+                segment_text=text,
+                segment_index=index,
+                segment_count=len(segments),
+                channel=channel,
+                script_format=script_format,
+                previous_segment_summary=previous_summary,
+            )
+        except Exception as exc:
+            logger.error(
+                "Storyboard batch failed for segment %s (%d/%d) — aborting storyboard "
+                "generation entirely (fail-loud: a partial storyboard would leave gaps "
+                "in the narration with no designed visuals): %s",
+                label, index, len(segments), exc,
+            )
+            return None
+
+        total_output_tokens += usage.get("output_tokens", 0)
+        beats = storyboard.get("beats") or []
+        if not beats:
+            logger.warning(
+                "Storyboard batch for segment %s (%d/%d) returned no beats — aborting "
+                "storyboard generation entirely",
+                label, index, len(segments),
+            )
+            return None
+
+        logger.info(
+            "Storyboard batch ok: segment=%s (%d/%d) beats=%d output_tokens=%d/%d",
+            label, index, len(segments), len(beats),
+            usage.get("output_tokens", 0), _STORYBOARD_BATCH_MAX_TOKENS_LOG,
+        )
+
+        raw_batches.append(beats)
+        overall_style = overall_style or storyboard.get("overall_style", "")
+        previous_summary = _summarize_batch_for_continuity(label, beats)
+
+    beats = _merge_batches(raw_batches)
+
+    logger.info(
+        "Storyboard generation complete: schema_version=%s batch_count=%d estimated_beat_count=%d "
+        "actual_beat_count=%d estimated_output_tokens=%d actual_output_tokens=%d style=%r",
+        _STORYBOARD_SCHEMA_VERSION_LOG, len(raw_batches), estimated_beats, len(beats),
+        estimated_beats * _STORYBOARD_TOKENS_PER_BEAT_LOG, total_output_tokens, overall_style,
+    )
+
+    mapped = map_storyboard_beats_to_timestamps(
+        beats, whisper_transcript, duration_ms, allow_legacy_fallback=allow_legacy_fallback
     )
     return mapped
+
+
+def _split_voice_script_into_segments(voice_script: str) -> list[tuple[str, str]]:
+    """Split narration into ``([INTRO]/[SECTION N]/[OUTRO], text)`` segments for batched generation.
+
+    Each segment's text is a verbatim contiguous substring of ``voice_script`` (markers
+    stripped, whitespace trimmed) — so every beat's start_hint/end_hint, generated from
+    segment text, remains a valid forward-search target against the full Whisper
+    transcript, exactly as it was when generated from the whole script at once.
+
+    Returns:
+        Ordered list of ``(marker_label, segment_text)`` tuples, one per non-empty
+        segment. If no markers are found, returns a single ``("[FULL]", voice_script)``
+        segment so batching degrades gracefully to one call instead of failing outright.
+    """
+    matches = list(_SEGMENT_MARKER_RE.finditer(voice_script))
+    if not matches:
+        text = voice_script.strip()
+        return [("[FULL]", text)] if text else []
+
+    segments: list[tuple[str, str]] = []
+    for i, match in enumerate(matches):
+        label = f"[{match.group(1).strip().upper()}]"
+        start = match.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(voice_script)
+        text = voice_script[start:end].strip()
+        if text:
+            segments.append((label, text))
+    return segments
+
+
+def _estimate_beat_count(voice_script: str, script_format: str) -> int:
+    """Estimate the expected total beat count from word count and the prompt's pacing rule.
+
+    Diagnostic-only (Storyboard Failure Analysis, Task 1) — a rough sanity figure
+    logged alongside the actual merged beat count so a future pacing or schema
+    change that risks reintroducing the token-overflow failure is visible immediately.
+    """
+    words = len(voice_script.split())
+    narration_seconds = (words / _WORDS_PER_MINUTE) * 60
+    beat_seconds = _BEAT_SECONDS_BY_FORMAT.get(script_format, _DEFAULT_BEAT_SECONDS)
+    return max(int(narration_seconds / beat_seconds), 1)
+
+
+def _summarize_batch_for_continuity(label: str, beats: list[dict]) -> str:
+    """Build a short note on a batch's closing visual choices for the next segment's prompt.
+
+    Keeps cross-segment continuity (varied environments/transitions at segment
+    boundaries) without re-sending the full previous segment's narration or beats.
+    """
+    if not beats:
+        return ""
+    tail = beats[-3:]
+    descriptors = [
+        f"{b.get('environment', 'other')}/{b.get('visual_type', 'b-roll')}/{b.get('motif', 'other')}"
+        for b in tail
+    ]
+    return f"{label} closed on: " + ", ".join(descriptors)
+
+
+def _merge_batches(raw_batches: list[list[dict]]) -> list[dict]:
+    """Concatenate per-segment beat batches into one globally-ordered, sequentially-numbered list.
+
+    Each batch is locally normalized first (``_normalize_beat_order`` — Claude's
+    per-batch ``beat_order`` is untrusted, exactly as in the legacy single-call path),
+    sorting and de-duplicating within the segment. Batches are then concatenated in
+    segment order and renumbered ``0..N-1`` globally, so beat ordering, transitions,
+    and the forward-cursor timestamp mapping all stay consistent across segment
+    boundaries — downstream consumers see one continuous storyboard, unaware it was
+    assembled from several Claude calls.
+    """
+    merged: list[dict] = []
+    for batch in raw_batches:
+        merged.extend(_normalize_beat_order(batch))
+
+    return [{**beat, "beat_order": global_order} for global_order, beat in enumerate(merged)]
 
 
 # ── Beat → timestamp mapping ──────────────────────────────────────────────────
@@ -92,7 +297,8 @@ def map_storyboard_beats_to_timestamps(
     beats: list[dict],
     whisper_transcript: list[dict],
     duration_ms: int,
-) -> list[dict]:
+    allow_legacy_fallback: bool = False,
+) -> list[dict] | None:
     """Map each storyboard beat onto real audio timestamps using Whisper words.
 
     Locates each beat's ``start_hint``/``end_hint`` phrase in the Whisper word
@@ -100,40 +306,91 @@ def map_storyboard_beats_to_timestamps(
     drift). Beats whose hints cannot be located fall back to proportional timing,
     interpolated between their nearest successfully matched neighbours.
 
+    Cursor advancement moves only to the END of the START_HINT match (not to
+    the end of the full beat span including end_hint) — this prevents greedy
+    end_hint matching from consuming subsequent beats' territory and causing a
+    cascade of proportional fallbacks.
+
     Args:
-        beats:              Raw beat dicts from ``generate_storyboard``.
-        whisper_transcript: Word-level timestamps (``[{"word", "start", "end"}]``, seconds).
-        duration_ms:        Exact audio duration in milliseconds.
+        beats:                Raw beat dicts from ``generate_storyboard``.
+        whisper_transcript:   Word-level timestamps (``[{"word", "start", "end"}]``, seconds).
+        duration_ms:          Exact audio duration in milliseconds.
+        allow_legacy_fallback: When ``True``, accept the result even if > 50 % of beats
+            used proportional fallback; when ``False`` (default), return ``None``
+            instead so the caller can apply its fallback policy.
 
     Returns:
-        List of renderable beat-section dicts (one per input beat, in order), each
-        with: beat_order, section_order, section_marker, audio_start_ms, audio_end_ms,
-        duration_sec, script_text, visual_intent, visual_type, visual_category,
-        avoid_reason, search_query, fallback_query, effect, color_grade,
-        transition_to_next, overlay_text, overlay_position, priority.
+        List of renderable beat-section dicts, or ``None`` if the fallback rate
+        exceeded ``_FALLBACK_FAIL_RATIO`` and ``allow_legacy_fallback`` is False.
     """
     flat = _flatten_transcript(whisper_transcript)
     beats = _normalize_beat_order(beats)
     n = len(beats)
 
+    # match[i] = (full_start_idx, full_end_idx) for exact/fuzzy hits, None for misses
     matches: list[tuple[int, int] | None] = [None] * n
-    failed_orders: list = []
+    # match_type[i] = "exact" | "fuzzy" | "fallback"
+    match_type: list[str] = ["fallback"] * n
     cursor = 0
 
     for i, beat in enumerate(beats):
-        located = _locate_beat_span(
+        located, start_hint_end_idx = _locate_beat_span(
             flat, cursor, str(beat.get("start_hint", "")), str(beat.get("end_hint", ""))
         )
         if located is None:
-            failed_orders.append(beat.get("beat_order", i))
             continue
         matches[i] = located
-        cursor = located[1] + 1
+        # Classify: exact = full start_hint token sequence matched; fuzzy = prefix matched
+        sh_tokens = _normalize_phrase(str(beat.get("start_hint", "")))
+        span_len = located[1] - located[0] + 1
+        if len(sh_tokens) > 0 and span_len >= len(sh_tokens):
+            match_type[i] = "exact"
+        else:
+            match_type[i] = "fuzzy"
+        # Advance cursor past the start_hint match ONLY — not past end_hint.
+        # This prevents greedy end_hint matching from consuming subsequent beats'
+        # narration territory, which was the primary cause of cascading fallbacks.
+        cursor = start_hint_end_idx + 1
 
-    if failed_orders:
+    n_exact    = sum(1 for t in match_type if t == "exact")
+    n_fuzzy    = sum(1 for t in match_type if t == "fuzzy")
+    n_fallback = sum(1 for t in match_type if t == "fallback")
+    fallback_orders = [beats[i].get("beat_order", i) for i, t in enumerate(match_type) if t == "fallback"]
+
+    avg_beat_ms = duration_ms / n if n > 0 else 0
+    logger.info(
+        "Storyboard timestamp mapping: total=%d exact=%d fuzzy=%d fallback=%d "
+        "avg_beat_duration=%.0fms",
+        n, n_exact, n_fuzzy, n_fallback, avg_beat_ms,
+    )
+    if fallback_orders:
         logger.warning(
-            "Storyboard timestamp mapping: %d beat(s) used proportional fallback — orders=%s",
-            len(failed_orders), failed_orders,
+            "Storyboard timestamp mapping: %d beat(s) used proportional fallback "
+            "(%.0f%%) — beat_orders=%s",
+            n_fallback, 100 * n_fallback / n, fallback_orders,
+        )
+
+    fallback_ratio = n_fallback / n if n > 0 else 0
+    if fallback_ratio > _FALLBACK_FAIL_RATIO:
+        if allow_legacy_fallback:
+            logger.warning(
+                "Storyboard timestamp mapping: fallback rate %.0f%% > %.0f%% threshold — "
+                "accepting result because allow_legacy_fallback=True",
+                100 * fallback_ratio, 100 * _FALLBACK_FAIL_RATIO,
+            )
+        else:
+            logger.error(
+                "Storyboard timestamp mapping: fallback rate %.0f%% > %.0f%% threshold — "
+                "returning None so caller can apply allow_legacy_fallback policy "
+                "(fallback_reason=mapping_quality_below_threshold)",
+                100 * fallback_ratio, 100 * _FALLBACK_FAIL_RATIO,
+            )
+            return None
+    elif fallback_ratio > _FALLBACK_WARN_RATIO:
+        logger.warning(
+            "Storyboard timestamp mapping: fallback rate %.0f%% > %.0f%% warn threshold — "
+            "check hint quality or normalization",
+            100 * fallback_ratio, 100 * _FALLBACK_WARN_RATIO,
         )
 
     boundaries = _resolve_boundaries(matches, beats, flat, duration_ms)
@@ -153,30 +410,49 @@ def map_storyboard_beats_to_timestamps(
 
 
 def _flatten_transcript(whisper_transcript: list[dict]) -> list[tuple[str, str, int, int]]:
-    """Normalize whisper words into ``(norm_token, original_word, start_ms, end_ms)`` tuples."""
+    """Normalize Whisper words into ``(norm_token, original_word, start_ms, end_ms)`` tuples.
+
+    Apostrophes are expanded to spaces so French elisions that Whisper splits
+    into separate tokens (``d'argent`` → ``["d", "argent"]``) match the same
+    two-token form produced by ``_normalize_phrase`` on the hint side.  Each
+    sub-token inherits the parent word's start/end timestamps.
+    """
     flat = []
     for w in whisper_transcript:
         word = str(w.get("word", ""))
-        norm = _normalize_word(word)
-        if not norm:
-            continue
-        flat.append((
-            norm,
-            word,
-            int(float(w.get("start", 0)) * 1000),
-            int(float(w.get("end", 0)) * 1000),
-        ))
+        start_ms = int(float(w.get("start", 0)) * 1000)
+        end_ms   = int(float(w.get("end",   0)) * 1000)
+        for part in _APOSTROPHE_RE.split(word):
+            norm = _normalize_word(part)
+            if norm:
+                flat.append((norm, part, start_ms, end_ms))
     return flat
 
 
 def _normalize_word(word: str) -> str:
-    """Collapse a word to a single lowercase alphanumeric token for matching."""
-    return "".join(_WORD_RE.findall(word.lower()))
+    """Lowercase, strip accents (NFD), and keep only alphanumeric characters.
+
+    Accent normalization (NFD → strip combining marks) makes matching robust to
+    encoding differences between Claude hints and Whisper transcriptions (e.g.
+    precomposed ``é`` vs decomposed ``e`` + combining accent).
+    """
+    nfd = unicodedata.normalize("NFD", word.lower())
+    stripped = "".join(c for c in nfd if unicodedata.category(c) != "Mn")
+    return "".join(_WORD_RE.findall(stripped))
 
 
 def _normalize_phrase(phrase: str) -> list[str]:
-    """Split a phrase into normalized tokens, dropping punctuation-only words."""
-    return [t for t in (_normalize_word(w) for w in phrase.split()) if t]
+    """Split a hint phrase into normalized tokens, expanding apostrophes to spaces.
+
+    Expanding apostrophes before splitting ensures French elisions in Claude-
+    generated hints (``l'entreprise``, ``d'argent``) produce the same two-token
+    sequence as the expanded Whisper transcript: ``["l","entreprise"]``,
+    ``["d","argent"]``.  English contractions follow the same rule (``hadn't``
+    → ``["hadn","t"]``) and the transcript side applies the same split, so both
+    sides stay consistent.
+    """
+    expanded = _APOSTROPHE_RE.sub(" ", phrase)
+    return [t for t in (_normalize_word(w) for w in expanded.split()) if t]
 
 
 def _locate_beat_span(
@@ -184,18 +460,27 @@ def _locate_beat_span(
     cursor: int,
     start_hint: str,
     end_hint: str,
-) -> tuple[int, int] | None:
-    """Locate a beat's inclusive ``[start_idx, end_idx]`` token span in the transcript."""
+) -> tuple[tuple[int, int] | None, int]:
+    """Locate a beat's inclusive ``[start_idx, end_idx]`` token span in the transcript.
+
+    Returns:
+        ``(span, start_hint_end_idx)`` where ``span`` is ``(start_idx, end_idx)``
+        or ``None`` on failure, and ``start_hint_end_idx`` is the last token index
+        of the start_hint match (used by the caller to advance the cursor without
+        overshooting into subsequent beats' territory).
+    """
     start_match = _locate_phrase(flat, cursor, start_hint)
     if start_match is None:
-        return None
-    start_idx = start_match[0]
+        return None, cursor          # unchanged cursor on failure
+
+    start_idx       = start_match[0]
+    start_hint_end  = start_match[1]   # cursor advances HERE, not to end_hint end
 
     end_match = _locate_phrase(flat, start_idx, end_hint)
     if end_match is None:
-        return (start_idx, start_match[1])   # minimal span — just the start phrase
+        return (start_idx, start_hint_end), start_hint_end
 
-    return (start_idx, max(end_match[1], start_idx))
+    return (start_idx, max(end_match[1], start_idx)), start_hint_end
 
 
 def _locate_phrase(
@@ -254,10 +539,14 @@ def _resolve_boundaries(
     """Turn matched/unmatched beat spans into a monotonic, bounds-clean ms timeline.
 
     Matched beats anchor their start to the matched phrase's start_ms. Unmatched
-    runs are filled proportionally — by ``duration_target_sec`` weight — between
-    their matched neighbours (or the timeline edges). A final pass enforces
-    monotonic, non-overlapping boundaries within ``[0, duration_ms]`` and snaps
-    the last beat to end exactly at ``duration_ms``.
+    runs are filled with equal-weight proportional spacing between their matched
+    neighbours (or the timeline edges).
+
+    Guarantees (enforced by ``_enforce_minimum_durations`` after boundary assembly):
+    - ``audio_end_ms > audio_start_ms`` for every beat (minimum ``_MIN_BEAT_MS``)
+    - strictly monotonic: each beat's start >= previous beat's end
+    - first beat starts at 0, last beat ends exactly at ``duration_ms``
+    - zero-width spans are corrected and logged
     """
     n = len(beats)
     anchors: list[int | None] = [
@@ -277,21 +566,65 @@ def _resolve_boundaries(
     boundaries: list[tuple[int, int]] = []
     for i in range(n):
         end_ms = starts[i + 1] if i + 1 < n else duration_ms
-        boundaries.append((starts[i], max(end_ms, starts[i])))
+        boundaries.append((starts[i], end_ms))
 
     if boundaries:
         last_start, _ = boundaries[-1]
         boundaries[-1] = (last_start, max(duration_ms, last_start))
 
+    _enforce_minimum_durations(boundaries, duration_ms)
     return boundaries
+
+
+def _enforce_minimum_durations(
+    boundaries: list[tuple[int, int]],
+    duration_ms: int,
+) -> None:
+    """Mutate ``boundaries`` in place so every beat has duration >= ``_MIN_BEAT_MS``.
+
+    Propagates end_ms forward through the list so that extending one beat does
+    not collapse the next; the last beat is always clamped to ``duration_ms``.
+    Zero-width corrections are counted and logged.
+    """
+    n = len(boundaries)
+    if n == 0:
+        return
+
+    zero_width_corrected = 0
+    for i in range(n):
+        start_ms, end_ms = boundaries[i]
+        # Guarantee start >= 0
+        start_ms = max(start_ms, 0)
+        min_end  = start_ms + _MIN_BEAT_MS
+        if end_ms < min_end:
+            zero_width_corrected += 1
+            end_ms = min_end
+        boundaries[i] = (start_ms, end_ms)
+        # Propagate: next beat must start >= this beat's end
+        if i + 1 < n:
+            next_start, next_end = boundaries[i + 1]
+            if next_start < end_ms:
+                boundaries[i + 1] = (end_ms, max(next_end, end_ms))
+
+    # Clamp last beat to duration_ms (never overshoot)
+    last_start, last_end = boundaries[-1]
+    boundaries[-1] = (min(last_start, duration_ms), duration_ms)
+
+    if zero_width_corrected:
+        logger.warning(
+            "Storyboard timestamp mapping: %d zero-width beat(s) corrected "
+            "(extended to minimum %dms)",
+            zero_width_corrected, _MIN_BEAT_MS,
+        )
 
 
 def _fill_gaps(anchors: list[int | None], beats: list[dict], duration_ms: int) -> None:
     """Interpolate start_ms for unmatched beats between their matched neighbours.
 
-    Distributes the span between two known anchors proportionally to each
-    unmatched beat's ``duration_target_sec`` weight. Edge runs fall back to
-    ``0`` / ``duration_ms`` as their bounding anchors.
+    Distributes the span between two known anchors with equal weight across each
+    unmatched beat in the run (the per-beat ``duration_target_sec`` weight this used
+    was a write-only schema field, removed in schema v2.0 — see Storyboard Schema
+    Reduction). Edge runs fall back to ``0`` / ``duration_ms`` as their bounding anchors.
     """
     n = len(anchors)
     i = 0
@@ -309,13 +642,9 @@ def _fill_gaps(anchors: list[int | None], beats: list[dict], duration_ms: int) -
         span = max(right_ms - left_ms, 0)
 
         run = list(range(i, j))
-        weights = [max(float(beats[k].get("duration_target_sec") or 3), 0.5) for k in run]
-        total_weight = sum(weights) or float(len(run))
-
-        cumulative = 0.0
+        step = span / len(run)
         for offset, k in enumerate(run):
-            anchors[k] = int(left_ms + span * (cumulative / total_weight))
-            cumulative += weights[offset]
+            anchors[k] = int(left_ms + step * offset)
 
         i = j
 
@@ -331,7 +660,6 @@ def _build_beat_section(beat: dict, index: int, start_ms: int, end_ms: int, scri
     return {
         "beat_order": beat_order,
         "section_order": beat_order,
-        "section_marker": str(beat.get("section_marker", "")),
         "audio_start_ms": start_ms,
         "audio_end_ms": end_ms,
         "duration_sec": max(end_ms - start_ms, 0) / 1000,
@@ -339,7 +667,7 @@ def _build_beat_section(beat: dict, index: int, start_ms: int, end_ms: int, scri
         "visual_intent": str(beat.get("visual_intent", "")),
         "visual_type": _safe_enum(beat.get("visual_type"), _VALID_VISUAL_TYPES, _DEFAULT_VISUAL_TYPE),
         "visual_category": _safe_enum(beat.get("visual_category"), _VALID_VISUAL_CATEGORIES, _DEFAULT_VISUAL_CATEGORY),
-        "avoid_reason": str(beat.get("avoid_reason", "") or ""),
+        "environment": _safe_enum(beat.get("environment"), _VALID_ENVIRONMENTS, _DEFAULT_ENVIRONMENT),
         "search_query": str(beat.get("search_query", "")),
         "fallback_query": str(beat.get("fallback_query", "")),
         "effect": _safe_enum(beat.get("effect"), _VALID_EFFECTS, _DEFAULT_EFFECT),
@@ -347,7 +675,7 @@ def _build_beat_section(beat: dict, index: int, start_ms: int, end_ms: int, scri
         "transition_to_next": _safe_enum(beat.get("transition_to_next"), _VALID_TRANSITIONS, _DEFAULT_TRANSITION),
         "overlay_text": str(beat.get("overlay_text", "") or ""),
         "overlay_position": _safe_enum(beat.get("overlay_position"), _VALID_OVERLAY_POSITIONS, _DEFAULT_OVERLAY_POSITION),
-        "priority": _safe_enum(beat.get("priority"), _VALID_PRIORITIES, _DEFAULT_PRIORITY),
+        "motif": _safe_enum(beat.get("motif"), _VALID_MOTIFS, _DEFAULT_MOTIF),
     }
 
 

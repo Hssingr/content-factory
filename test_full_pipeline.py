@@ -152,6 +152,52 @@ def _print_audio_summary(content_id: uuid.UUID, audio_ok: bool) -> None:
             print(f"             Whisper sample: {sample}")
 
 
+def _print_agent5_failure_diagnostic(content_id: uuid.UUID) -> None:
+    """Query DB and print per-language diagnostic when Agent 5 fails."""
+    from app.models import AudioFile, Script, VideoRender, VideoSection, Content
+    db = _db()
+    content   = db.get(Content, content_id)
+    scripts   = db.query(Script).filter(Script.content_id == content_id, Script.validated.is_(True)).all()
+    audios    = db.query(AudioFile).filter(AudioFile.content_id == content_id).all()
+    sections  = db.query(VideoSection).filter(VideoSection.content_id == content_id).all()
+    renders   = db.query(VideoRender).filter(VideoRender.content_id == content_id).all()
+    db.close()
+
+    print(f"\n  Agent 5 failure diagnostic for content {content_id}:")
+    print(f"  Status: {content.status if content else 'NOT FOUND'}")
+
+    expected_langs = {s.language for s in scripts}
+    audio_langs    = {a.language for a in audios}
+    section_langs  = {}
+    for s in sections:
+        section_langs.setdefault(s.language, 0)
+        section_langs[s.language] += 1
+    render_langs   = {}
+    for r in renders:
+        render_langs.setdefault(r.language, 0)
+        render_langs[r.language] += 1
+
+    print(f"\n  {'Lang':<6}  {'Audio':>6}  {'Sections':>9}  {'Renders':>7}  Inferred failure stage")
+    for lang in sorted(expected_langs):
+        has_audio  = lang in audio_langs
+        n_sections = section_langs.get(lang, 0)
+        n_renders  = render_langs.get(lang, 0)
+        if n_renders > 0:
+            stage = "SUCCESS"
+        elif n_sections > 0:
+            stage = "FAILED after storyboard — quality gate or render error"
+        elif has_audio:
+            stage = "FAILED before storyboard — storyboard generation failed"
+        else:
+            stage = "SKIPPED — no audio file"
+        print(f"  {lang:<6}  {'yes' if has_audio else 'NO':>6}  {n_sections:>9}  {n_renders:>7}  {stage}")
+
+    missing_audio = expected_langs - audio_langs
+    if missing_audio:
+        print(f"\n  Missing audio for: {sorted(missing_audio)}")
+        print("  → Check Agent 4 output or run --from-audio")
+
+
 def _print_video_summary(content_id: uuid.UUID, video_ok: bool) -> None:
     from app.models import VideoRender, VideoSection
     db = _db()
@@ -252,8 +298,10 @@ def _print_final_summary(
     if video_ok:
         print(f"  ✅  COMPLETE — content is {content.status} → ready for Agent 6")
     elif audio_ok:
-        print(f"  ❌  AGENT 5 FAILED — check Remotion setup (Node.js + npx in PATH)")
-        print(f"      Re-run:  python test_full_pipeline.py --from-video {content_id}")
+        print(f"  ❌  AGENT 5 FAILED")
+        _print_agent5_failure_diagnostic(content_id)
+        print(f"\n      Re-run:  python test_full_pipeline.py --from-video {content_id}")
+        print(f"      If Node.js / Remotion missing: check that npx is in PATH")
     elif passed:
         print(f"  ❌  AGENT 4 FAILED — check ELEVENLABS_API_KEY and OPENAI_API_KEY in .env")
         print(f"      Re-run:  python test_full_pipeline.py --from-audio {content_id}")
@@ -374,8 +422,10 @@ def run(
         if video_ok:
             print(f"  ✅  COMPLETE — ready for Agent 6")
         else:
-            print(f"  ❌  AGENT 5 FAILED — check Remotion setup")
-            print(f"      Re-run:  python test_full_pipeline.py --from-video {content_id}")
+            print(f"  ❌  AGENT 5 FAILED")
+            _print_agent5_failure_diagnostic(content_id)
+            print(f"\n      Re-run:  python test_full_pipeline.py --from-video {content_id}")
+            print(f"      If Node.js / Remotion missing: check that npx is in PATH")
         print(SEP)
         return
 
