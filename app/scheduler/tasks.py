@@ -1,4 +1,4 @@
-"""Celery task definitions for Agent 2 — Content Discovery pipeline.
+"""Celery task definitions for the content pipeline.
 
 All tasks use lazy imports inside their function bodies to:
   - Avoid circular imports (tasks → scheduler → tasks)
@@ -23,6 +23,8 @@ from app.config import settings
 from app.scheduler import celery_app
 
 logger = logging.getLogger(__name__)
+
+_MAX_CORRECTIONS = 3   # auto-correct rounds before escalating to quality rewrite
 
 
 # ── Periodic: dispatch discovery ─────────────────────────────────────────────
@@ -102,9 +104,9 @@ def check_validation_timeouts() -> int:
 
 @celery_app.task(name="app.scheduler.tasks.pickup_approved_content")
 def pickup_approved_content() -> int:
-    """Trigger multilingual generation for every content still in APPROVED status.
+    """Trigger script generation for every content still in APPROVED status.
 
-    ``run_multilingual_generation`` sets status → GENERATING_SCRIPTS atomically
+    ``run_agent2_scripts_for_content`` sets status → GENERATING_SCRIPTS atomically
     at its start, so concurrent workers won't double-process the same content.
 
     Returns:
@@ -122,7 +124,7 @@ def pickup_approved_content() -> int:
             .all()
         )
         for content in approved:
-            run_multilingual_generation.delay(str(content.id))
+            run_agent2_scripts_for_content.delay(str(content.id))
             dispatched += 1
     finally:
         db.close()
@@ -132,7 +134,7 @@ def pickup_approved_content() -> int:
     return dispatched
 
 
-# ── On-demand: full Agent 2 pipeline for one channel ─────────────────────────
+# ── On-demand: Agent 2 Phase A — discovery + Telegram ────────────────────────
 
 @celery_app.task(
     name="app.scheduler.tasks.run_agent2_for_channel",
@@ -141,23 +143,21 @@ def pickup_approved_content() -> int:
     default_retry_delay=300,   # 5 minutes between retries
 )
 def run_agent2_for_channel(self, channel_id: str) -> None:
-    """Run the full Agent 2 discovery pipeline for a single channel.
+    """Run Agent 2 discovery phase for one channel.
 
     Steps:
-      1. Discover the best new story (fetch → score → deduplicate → save Content)
-      2. Generate source-language scripts via Claude
-      3. Save the Script record and update Content.title
-      4. Send for Telegram validation
+      1. Fetch the best new story (fetch → dedup → score → save Content)
+      2. Send to Telegram for user approval (deterministic Python message, no Claude)
+
+    Script generation happens in run_agent2_scripts_for_content after user approval.
 
     Args:
         channel_id: UUID string of the target channel.
     """
     from app.database import _get_session_factory
-    from app.models import Channel, ChannelConfig, Script
+    from app.models import Channel, ChannelLanguage
     from app.agents.agent2_discovery.services.discovery import run_discovery
-    from app.agents.agent2_discovery.services.scripts import run_script_quality_gate
     from app.agents.agent2_discovery.services.validation import send_for_validation
-    from app.agents.agent2_discovery.system_prompt import generate_scripts
 
     cid = uuid.UUID(channel_id)
     db = _get_session_factory()()
@@ -167,45 +167,26 @@ def run_agent2_for_channel(self, channel_id: str) -> None:
             logger.info("Channel %s not found or inactive — skipping", channel_id)
             return
 
-        # ── 1. Discover ───────────────────────────────────────────────────────
+        # ── 1. Discover (fetch → dedup → score → persist) ────────────────────
         result = run_discovery(cid, db)
         if result is None:
             logger.info("No new story found for channel %s", channel_id)
             return
 
-        content, story = result
+        content, story, story_assessment = result
 
-        # ── 2. Generate source-language scripts (Claude) ─────────────────────
-        config: ChannelConfig | None = (
-            db.query(ChannelConfig)
-            .filter(ChannelConfig.channel_id == channel.id)
-            .first()
+        # ── 2. Send to Telegram — no scripts generated yet ───────────────────
+        target_languages = [
+            cl.language
+            for cl in db.query(ChannelLanguage)
+            .filter(ChannelLanguage.channel_id == channel.id)
+            .all()
+        ]
+        send_for_validation(
+            content, channel, db,
+            assessment=story_assessment,
+            target_languages=target_languages,
         )
-        script_format = config.script_format if config else "youtube_long"
-
-        logger.info("Generating scripts for content %s… (format=%s)", content.id, script_format)
-        scripts = generate_scripts(story, channel, script_format=script_format)
-
-        # ── 2b. Script Quality Gate — retention review, rewrite if needed ─────
-        scripts = run_script_quality_gate(scripts, channel, script_format=script_format)
-        hook_excerpt = scripts.get("voice_script", "").strip()[:300].replace("\n", " ")
-        logger.info("Final script hook (first 300 chars) for content %s: %r", content.id, hook_excerpt)
-
-        # ── 3. Persist Script + update Content title ──────────────────────────
-        content.title = scripts.get("title", content.title)
-        script_record = Script(
-            content_id=content.id,
-            language=content.source_language,
-            video_script=scripts["video_script"],
-            voice_script=scripts["voice_script"],
-            version=1,
-            validated=False,
-        )
-        db.add(script_record)
-        db.commit()
-
-        # ── 4. Send to Telegram for user validation ───────────────────────────
-        send_for_validation(content, channel, scripts, db)
 
     except Exception as exc:
         logger.error("run_agent2_for_channel error for %s: %s", channel_id, exc)
@@ -218,37 +199,59 @@ def run_agent2_for_channel(self, channel_id: str) -> None:
         db.close()
 
 
-# ── On-demand: multilingual script generation ─────────────────────────────────
+# ── On-demand: Agent 2 Phase B — script generation + validation ───────────────
 
 @celery_app.task(
-    name="app.scheduler.tasks.run_multilingual_generation",
+    name="app.scheduler.tasks.run_agent2_scripts_for_content",
     bind=True,
     max_retries=2,
     default_retry_delay=300,
 )
-def run_multilingual_generation(self, content_id: str) -> None:
-    """Generate culturally adapted scripts for all channel languages.
+def run_agent2_scripts_for_content(self, content_id: str) -> None:
+    """Generate, validate, and adapt scripts for approved content.
 
-    Only processes content with ``status="APPROVED"``. Atomically sets
-    ``status="GENERATING_SCRIPTS"`` at the start to prevent double-processing
-    when the pickup beat task fires multiple times.
+    Only processes content with ``status="APPROVED"``. Steps:
+      1. Reconstruct story proxy from Content.source_excerpt
+      2. Generate source-language scripts (Claude)
+      3. Script Quality Gate (retention review + optional rewrite)
+      4. Intro Optimizer (best hook)
+      5. Deterministic checks + auto-correct loop (up to 3 rounds, Sonnet)
+      6. If still MAJOR after 3 rounds: one final quality rewrite
+      7. Persist source Script (with estimated duration, breakpoints, validated=True)
+      8. Generate multilingual scripts for all target languages
+      9. Set duration + breakpoints + validated=True on all language scripts
+      10. content.status = "SCRIPTS_VALIDATED"
 
     Args:
-        content_id: UUID string of the approved Content record.
+        content_id: UUID string of content with status ``"APPROVED"``.
     """
     from app.database import _get_session_factory
-    from app.models import Channel, Content
-    from app.agents.agent2_discovery.services.scripts import generate_multilingual_scripts
+    from app.models import Channel, ChannelConfig, ChannelVoice, Content, Script
+    from app.agents.agent2_discovery.services.scripts import (
+        run_script_quality_gate,
+        generate_multilingual_scripts,
+    )
+    from app.agents.agent2_discovery.services.story import Story
+    from app.agents.agent2_discovery.system_prompt import (
+        generate_scripts,
+        optimize_intro,
+        auto_correct_script,
+    )
+    from app.services.script_checks import run_deterministic_checks
+    from app.services.script_estimator import estimate_duration_sec, compute_shorts_breakpoints
 
     cid = uuid.UUID(content_id)
     db = _get_session_factory()()
     try:
         content: Content | None = db.get(Content, cid)
         if not content:
-            logger.warning("Content %s not found", content_id)
+            logger.warning("Content %s not found — skipping", content_id)
             return
         if content.status != "APPROVED":
-            logger.debug("Content %s status=%s — skipping multilingual", content_id, content.status)
+            logger.debug(
+                "Content %s status=%s — skipping script generation",
+                content_id, content.status,
+            )
             return
 
         channel: Channel | None = db.get(Channel, content.channel_id)
@@ -256,15 +259,214 @@ def run_multilingual_generation(self, content_id: str) -> None:
             logger.error("Channel not found for content %s", content_id)
             return
 
-        generate_multilingual_scripts(content, channel, db)
+        config: ChannelConfig | None = db.get(ChannelConfig, channel.id)
+        script_format = config.script_format if config else "youtube_long"
+        audio_tags_enabled = config.audio_tags_enabled if config else False
+        shorts_rule = config.shorts_rule if config else "auto"
+
+        # ── Resolve source-language voice ─────────────────────────────────────
+        src_voice: ChannelVoice | None = (
+            db.query(ChannelVoice)
+            .filter(
+                ChannelVoice.channel_id == channel.id,
+                ChannelVoice.language == content.source_language,
+            )
+            .first()
+        )
+        if not src_voice:
+            src_voice = (
+                db.query(ChannelVoice)
+                .filter(ChannelVoice.channel_id == channel.id)
+                .first()
+            )
+            if src_voice:
+                logger.info(
+                    "No voice for source lang=%s — using %s voice for TTS block",
+                    content.source_language, src_voice.language,
+                )
+
+        tts_model    = src_voice.tts_model if src_voice else "sonic-2"
+        tts_provider = src_voice.provider if src_voice else "cartesia"
+
+        # ── Build voice map for multilingual duration estimates ───────────────
+        voice_map: dict[str, ChannelVoice] = {
+            v.language: v
+            for v in db.query(ChannelVoice).filter(ChannelVoice.channel_id == channel.id).all()
+        }
+
+        # ── Reconstruct story proxy from Content fields ───────────────────────
+        story = Story(
+            title=content.title,
+            url=content.source_url,
+            language=content.source_language,
+            body=content.source_excerpt or "",
+            source_type="db",
+            source_value="content_record",
+            published_at=datetime.now(timezone.utc),
+            upvotes=0,
+            comments=0,
+        )
+
+        # ── Distributed lock: mark as in-progress ────────────────────────────
+        content.status = "GENERATING_SCRIPTS"
+        db.commit()
+
+        logger.info(
+            "Generating scripts for content %s… (format=%s provider=%s model=%s)",
+            content.id, script_format, tts_provider, tts_model,
+        )
+
+        # ── Step 1: Generate source-language scripts ──────────────────────────
+        scripts = generate_scripts(
+            story, channel,
+            script_format=script_format,
+            audio_tags_enabled=audio_tags_enabled,
+            tts_model=tts_model,
+            tts_provider=tts_provider,
+        )
+
+        # ── Step 2: Script Quality Gate (retention review) ────────────────────
+        scripts = run_script_quality_gate(
+            scripts, channel,
+            script_format=script_format,
+            language=content.source_language,
+            tts_model=tts_model,
+            tts_provider=tts_provider,
+        )
+
+        # ── Step 3: Intro Optimizer ───────────────────────────────────────────
+        scripts = optimize_intro(scripts, channel, script_format=script_format)
+
+        hook_excerpt = scripts.get("voice_script", "").strip()[:300].replace("\n", " ")
+        logger.info("Final script hook (first 300 chars) for content %s: %r", content.id, hook_excerpt)
+
+        # ── Step 4: Deterministic checks + auto-correct loop ─────────────────
+        scripts_by_lang = {
+            content.source_language: {
+                "video_script": scripts["video_script"],
+                "voice_script": scripts["voice_script"],
+            }
+        }
+
+        all_clear = False
+        for round_n in range(1, _MAX_CORRECTIONS + 1):
+            issues_by_lang = run_deterministic_checks(scripts_by_lang, script_format)
+            lang_issues = issues_by_lang.get(content.source_language, [])
+            major = [i for i in lang_issues if i["severity"] == "MAJOR"]
+
+            if not major:
+                logger.info(
+                    "Det checks: PASSED on round %d for content %s", round_n, content.id
+                )
+                all_clear = True
+                break
+
+            logger.info(
+                "Det checks: %d MAJOR issue(s) on round %d for content %s — auto-correcting",
+                len(major), round_n, content.id,
+            )
+            try:
+                corrected = auto_correct_script(
+                    current_scripts=scripts_by_lang[content.source_language],
+                    issues=major,
+                    language=content.source_language,
+                    channel=channel,
+                    script_format=script_format,
+                    source_excerpt=content.source_excerpt,
+                    tts_model=tts_model,
+                    tts_provider=tts_provider,
+                )
+                scripts_by_lang[content.source_language] = corrected
+                scripts = {**scripts, **corrected}
+            except Exception as exc:
+                logger.error(
+                    "Auto-correct round %d failed for content %s: %s — stopping correction loop",
+                    round_n, content.id, exc,
+                )
+                break
+
+        if not all_clear:
+            # Still MAJOR after all rounds — one final quality rewrite
+            logger.warning(
+                "Still MAJOR after %d correction rounds for content %s — running quality rewrite",
+                _MAX_CORRECTIONS, content.id,
+            )
+            try:
+                scripts = run_script_quality_gate(
+                    scripts, channel,
+                    script_format=script_format,
+                    language=content.source_language,
+                    tts_model=tts_model,
+                    tts_provider=tts_provider,
+                )
+                scripts_by_lang[content.source_language] = {
+                    "video_script": scripts["video_script"],
+                    "voice_script": scripts["voice_script"],
+                }
+            except Exception as exc:
+                logger.error(
+                    "Final quality rewrite failed for content %s: %s — proceeding with latest",
+                    content.id, exc,
+                )
+
+        # ── Step 5: Persist source Script ─────────────────────────────────────
+        content.title = scripts.get("title", content.title)
+        src_voice_script = scripts.get("voice_script", "")
+        src_dur_sec = estimate_duration_sec(src_voice_script, content.source_language)
+        src_breakpoints = compute_shorts_breakpoints(src_voice_script, src_dur_sec, shorts_rule)
+
+        script_record = Script(
+            content_id=content.id,
+            language=content.source_language,
+            video_script=scripts["video_script"],
+            voice_script=src_voice_script,
+            version=1,
+            validated=True,
+            estimated_duration_sec=src_dur_sec,
+            shorts_breakpoints=src_breakpoints,
+        )
+        db.add(script_record)
+        db.commit()
+        logger.info(
+            "Source script saved for content %s — lang=%s dur=%.1fs",
+            content.id, content.source_language, src_dur_sec,
+        )
+
+        # ── Step 6: Generate multilingual scripts ─────────────────────────────
+        generate_multilingual_scripts(content, channel, db, audio_tags_enabled=audio_tags_enabled)
+
+        # ── Step 7: Duration + breakpoints for all multilingual scripts ────────
+        db.refresh(content)
+        all_scripts: list[Script] = (
+            db.query(Script).filter(Script.content_id == content.id).all()
+        )
+        for s in all_scripts:
+            if s.language == content.source_language:
+                continue   # already set above
+            lang_voice = voice_map.get(s.language)
+            dur = estimate_duration_sec(s.voice_script, s.language)
+            bp  = compute_shorts_breakpoints(s.voice_script, dur, shorts_rule)
+            s.estimated_duration_sec = dur
+            s.shorts_breakpoints = bp
+            s.validated = True
+            logger.info(
+                "Duration set for lang=%s content %s: %.1fs",
+                s.language, content.id, dur,
+            )
+        db.commit()
+
+        # ── Step 8: Set final status ──────────────────────────────────────────
+        content.status = "SCRIPTS_VALIDATED"
+        db.commit()
+        logger.info("Content %s — SCRIPTS_VALIDATED", content.id)
 
     except Exception as exc:
-        logger.error("run_multilingual_generation error for %s: %s", content_id, exc)
+        logger.error("run_agent2_scripts_for_content error for %s: %s", content_id, exc)
         db.rollback()
         try:
             raise self.retry(exc=exc)
         except self.MaxRetriesExceededError:
-            logger.error("Max retries reached for content %s — giving up", content_id)
+            logger.error("Max retries reached for content %s scripts — giving up", content_id)
     finally:
         db.close()
 
@@ -327,9 +529,6 @@ def schedule_content_creation() -> int:
       3. Check whether the next publish slot falls on tomorrow (local date).
       4. If both: fire ``run_agent2_for_channel`` and create a ``PublishSchedule`` placeholder.
 
-    This ensures story generation starts at exactly the user-configured time,
-    and the Telegram validation message arrives at a predictable hour each D-1.
-
     Returns:
         Number of discovery tasks dispatched.
     """
@@ -353,9 +552,8 @@ def schedule_content_creation() -> int:
         for timing in timings:
             channel_id = timing.channel_id
             if channel_id in seen_channels:
-                continue   # already dispatched for this channel this run
+                continue
 
-            # ── Load channel owner's pipeline schedule preferences ────────────
             channel: Channel | None = db.get(Channel, channel_id)
             if not channel:
                 continue
@@ -370,11 +568,9 @@ def schedule_content_creation() -> int:
 
             local_now = now.astimezone(user_tz)
 
-            # ── Condition 1: is it the user's pipeline run hour right now? ────
             if local_now.hour != user.pipeline_run_hour:
                 continue
 
-            # ── Condition 2: does the next publish fall on tomorrow locally? ──
             next_dt = next_publish_datetime(timing, now)
             local_tomorrow = (local_now + timedelta(days=1)).date()
             next_dt_local  = next_dt.astimezone(user_tz)
@@ -388,14 +584,13 @@ def schedule_content_creation() -> int:
                 user.pipeline_timezone, next_dt_local.strftime("%A %Y-%m-%d %H:%M"),
             )
 
-            # Check if content is already being created for this channel
             in_progress = (
                 db.query(Content)
                 .filter(
                     Content.channel_id == channel_id,
                     Content.status.in_([
                         "PENDING_APPROVAL", "APPROVED",
-                        "GENERATING_SCRIPTS", "SCRIPTS_READY",
+                        "GENERATING_SCRIPTS", "SCRIPTS_VALIDATED",
                     ]),
                 )
                 .first()
@@ -404,10 +599,8 @@ def schedule_content_creation() -> int:
                 logger.debug("Channel %s already has content in progress — skipping D-1", channel_id)
                 continue
 
-            # Fire discovery
             run_agent2_for_channel.delay(str(channel_id))
 
-            # Create placeholder publish_schedule rows for all platforms in this timing's language
             from app.models import ChannelPlatform
             platforms = (
                 db.query(ChannelPlatform)
@@ -419,11 +612,10 @@ def schedule_content_creation() -> int:
                 .all()
             )
             for plat in platforms:
-                # Avoid creating duplicate schedule rows
                 existing = (
                     db.query(PublishSchedule)
                     .filter(
-                        PublishSchedule.content_id == None,  # noqa: E711 — placeholder
+                        PublishSchedule.content_id == None,  # noqa: E711
                         PublishSchedule.platform == plat.platform,
                         PublishSchedule.language == timing.language,
                         PublishSchedule.scheduled_at == next_dt,
@@ -432,7 +624,7 @@ def schedule_content_creation() -> int:
                 )
                 if not existing:
                     db.add(PublishSchedule(
-                        content_id=None,    # filled in when content is ready
+                        content_id=None,
                         platform=plat.platform,
                         language=timing.language,
                         scheduled_at=next_dt,
@@ -459,7 +651,6 @@ def dispatch_publishing() -> int:
     """Log publish_schedule rows due in the next 30 minutes.
 
     Placeholder for Agent 7 — actual platform uploads are not yet implemented.
-    This task ensures the scheduling infrastructure is wired and testable.
 
     Returns:
         Number of rows found due for publishing.
@@ -476,7 +667,7 @@ def dispatch_publishing() -> int:
             .filter(
                 PublishSchedule.status == "SCHEDULED",
                 PublishSchedule.scheduled_at <= soon,
-                PublishSchedule.content_id.is_not(None),  # only real content
+                PublishSchedule.content_id.is_not(None),
             )
             .all()
         )
@@ -490,126 +681,6 @@ def dispatch_publishing() -> int:
         db.close()
 
     return count
-
-
-# ── Agent 3 — Script Validation tasks ────────────────────────────────────────
-
-@celery_app.task(name="app.scheduler.tasks.pickup_scripts_ready")
-def pickup_scripts_ready() -> int:
-    """Trigger Agent 3 validation for every content with status SCRIPTS_READY.
-
-    Runs every 15 minutes. Atomically transitions each content item to
-    VALIDATING_SCRIPTS inside ``run_agent3_validation`` so concurrent beats
-    cannot double-process the same item.
-
-    Returns:
-        Number of validation tasks dispatched.
-    """
-    from app.database import _get_session_factory
-    from app.models import Content
-
-    db = _get_session_factory()()
-    dispatched = 0
-    try:
-        ready = db.query(Content).filter(Content.status == "SCRIPTS_READY").all()
-        for content in ready:
-            run_agent3_validation.delay(str(content.id))
-            dispatched += 1
-    finally:
-        db.close()
-
-    if dispatched:
-        logger.info("pickup_scripts_ready: %d task(s) dispatched", dispatched)
-    return dispatched
-
-
-@celery_app.task(
-    name="app.scheduler.tasks.run_agent3_validation",
-    bind=True,
-    max_retries=2,
-    default_retry_delay=120,
-)
-def run_agent3_validation(self, content_id: str) -> None:
-    """Run the full Agent 3 script validation pipeline for one content item.
-
-    Steps:
-      1. Run validation (MAJOR auto-correct loop + duration/breakpoints estimation)
-      2. If NEEDS_REVIEW: send Telegram alert to channel owner
-      3. If passed: check for MINOR issues → send notification + schedule 5-min timeout
-
-    Args:
-        content_id: UUID string of content with status SCRIPTS_READY.
-    """
-    from app.database import _get_session_factory
-    from app.models import Channel, Content, ContentValidation, User
-    from app.services import telegram_client
-    from app.agents.agent3_validation.services.validation import run_validation
-    from app.agents.agent3_validation.services.minor_handler import send_minor_notification
-
-    cid = uuid.UUID(content_id)
-    db = _get_session_factory()()
-    try:
-        passed = run_validation(cid, db)
-
-        content: Content | None = db.get(Content, cid)
-        channel: Channel | None = db.get(Channel, content.channel_id) if content else None
-
-        if not passed:
-            # MAJOR issues persist after 3 auto-corrections — block pipeline and ask user
-            if content and channel:
-                from app.agents.agent3_validation.services.minor_handler import (
-                    send_major_blocked_notification,
-                )
-                send_major_blocked_notification(content, channel, db)
-            return
-
-        # Passed — check for MINOR issues and send Telegram notification + countdown
-        validation: ContentValidation | None = (
-            db.query(ContentValidation)
-            .filter(ContentValidation.content_id == cid)
-            .first()
-        )
-        minor_issues = [
-            i for i in (validation.script_issues_log or [])
-            if isinstance(i, dict) and i.get("severity") == "MINOR"
-        ]
-        timeout_sec = settings.agent3_minor_timeout_minutes * 60
-        if minor_issues and content and channel:
-            send_minor_notification(content, channel, minor_issues, db)
-            handle_minor_timeout.apply_async(args=[content_id], countdown=timeout_sec)
-
-    except Exception as exc:
-        logger.error("run_agent3_validation error for %s: %s", content_id, exc)
-        db.rollback()
-        try:
-            raise self.retry(exc=exc)
-        except self.MaxRetriesExceededError:
-            logger.error("Max retries reached for Agent 3 validation of %s", content_id)
-    finally:
-        db.close()
-
-
-@celery_app.task(name="app.scheduler.tasks.handle_minor_timeout")
-def handle_minor_timeout(content_id: str) -> None:
-    """Apply the user's FIX correction (if requested) 5 minutes after MINOR notification.
-
-    Called with ``countdown=300`` from ``run_agent3_validation`` after a minor
-    issue Telegram notification is sent. Reads the fix_requested flag from
-    script_issues_log and either auto-corrects or logs and continues.
-
-    Args:
-        content_id: UUID string of the content whose minor notification timed out.
-    """
-    from app.database import _get_session_factory
-    from app.agents.agent3_validation.services.minor_handler import apply_minor_fix_or_continue
-
-    db = _get_session_factory()()
-    try:
-        apply_minor_fix_or_continue(uuid.UUID(content_id), db)
-    except Exception as exc:
-        logger.error("handle_minor_timeout error for %s: %s", content_id, exc)
-    finally:
-        db.close()
 
 
 # ── Agent 4 — Audio Generation tasks ─────────────────────────────────────────
@@ -729,7 +800,7 @@ def pickup_audio_done() -> int:
     name="app.scheduler.tasks.run_agent5_for_content",
     bind=True,
     max_retries=2,
-    default_retry_delay=300,   # 5 minutes — renders can take a while
+    default_retry_delay=300,
 )
 def run_agent5_for_content(self, content_id: str) -> None:
     """Run the full Agent 5 video generation pipeline for one content item.

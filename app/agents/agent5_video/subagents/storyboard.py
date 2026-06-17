@@ -33,6 +33,7 @@ from app.agents.agent5_video.system_prompt import (
     STORYBOARD_SCHEMA_VERSION as _STORYBOARD_SCHEMA_VERSION_LOG,
     generate_storyboard_batch,
 )
+from app.shared.text_normalize import normalize_for_matching as _normalize_for_matching
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +113,7 @@ def split_into_beats(
     script_format: str,
     whisper_transcript: list[dict],
     allow_legacy_fallback: bool = False,
+    language: str = "en",
 ) -> list[dict] | None:
     """Generate a storyboard with Claude (batched per segment) and map it onto real audio timestamps.
 
@@ -126,11 +128,13 @@ def split_into_beats(
         duration_ms:        Exact audio duration in milliseconds.
         channel:            Channel ORM object (provides niche/tone for the prompt).
         script_format:      Format key from ``channel_config.script_format``.
-        whisper_transcript:    Word-level timestamps (``[{"word", "start", "end"}]``, seconds).
+        whisper_transcript: Word-level timestamps (``[{"word", "start", "end"}]``, seconds).
         allow_legacy_fallback: Forwarded to ``map_storyboard_beats_to_timestamps`` to control
             what happens when > 50 % of beats use proportional fallback timing —
             ``False`` (default) treats that as a mapping failure and returns ``None``;
             ``True`` accepts the result regardless.
+        language:           BCP-47 language code (e.g. "fr", "en") — used by
+            ``normalize_for_matching`` for digit-to-word expansion in hint matching.
 
     Returns:
         List of renderable beat-section dicts, or ``None`` if storyboard generation
@@ -147,12 +151,14 @@ def split_into_beats(
         logger.warning("Storyboard: voice_script has no narration content — cannot build a storyboard")
         return None
 
+    total_words = max(len(voice_script.split()), 1)
+    beat_seconds = _BEAT_SECONDS_BY_FORMAT.get(script_format, _DEFAULT_BEAT_SECONDS)
     estimated_beats = _estimate_beat_count(voice_script, script_format)
     logger.info(
-        "Storyboard generation start: schema_version=%s segments=%d estimated_beat_count=%d "
-        "(estimated from %d words at ~%.0fs/beat)",
-        _STORYBOARD_SCHEMA_VERSION_LOG, len(segments), estimated_beats,
-        len(voice_script.split()), _BEAT_SECONDS_BY_FORMAT.get(script_format, _DEFAULT_BEAT_SECONDS),
+        "Storyboard generation start: schema_version=%s language=%s segments=%d "
+        "estimated_beat_count=%d (estimated from %d words at ~%.0fs/beat)",
+        _STORYBOARD_SCHEMA_VERSION_LOG, language, len(segments), estimated_beats,
+        total_words, beat_seconds,
     )
 
     raw_batches: list[list[dict]] = []
@@ -160,7 +166,16 @@ def split_into_beats(
     previous_summary = ""
     total_output_tokens = 0
 
+    # Cross-segment continuity ledger: tracks cumulative environment counts and
+    # recent visual_types across all batches to give Claude global repetition context.
+    ledger: dict = {"env_counts": {}, "recent_envs": [], "recent_visual_types": [], "total_beats": 0}
+
     for index, (label, text) in enumerate(segments, start=1):
+        # Per-segment target beat count from proportional audio duration
+        seg_words = max(len(text.split()), 1)
+        seg_duration_sec = (seg_words / total_words) * (duration_ms / 1000)
+        target_beat_count = max(1, round(seg_duration_sec / beat_seconds))
+
         try:
             storyboard, usage = generate_storyboard_batch(
                 segment_label=label,
@@ -170,6 +185,7 @@ def split_into_beats(
                 channel=channel,
                 script_format=script_format,
                 previous_segment_summary=previous_summary,
+                target_beat_count=target_beat_count,
             )
         except Exception as exc:
             logger.error(
@@ -190,27 +206,37 @@ def split_into_beats(
             )
             return None
 
+        # Hint hardening: fix any hints that are out-of-range or contain digits
+        beats = _harden_hints(beats, text)
+
         logger.info(
-            "Storyboard batch ok: segment=%s (%d/%d) beats=%d output_tokens=%d/%d",
-            label, index, len(segments), len(beats),
+            "Storyboard batch ok: segment=%s (%d/%d) target_beats=%d actual_beats=%d output_tokens=%d/%d",
+            label, index, len(segments), target_beat_count, len(beats),
             usage.get("output_tokens", 0), _STORYBOARD_BATCH_MAX_TOKENS_LOG,
         )
 
         raw_batches.append(beats)
         overall_style = overall_style or storyboard.get("overall_style", "")
-        previous_summary = _summarize_batch_for_continuity(label, beats)
+
+        # Update ledger then build the next segment's continuity summary
+        _update_ledger(ledger, beats)
+        previous_summary = _summarize_batch_for_continuity(label, beats, ledger)
 
     beats = _merge_batches(raw_batches)
 
     logger.info(
-        "Storyboard generation complete: schema_version=%s batch_count=%d estimated_beat_count=%d "
-        "actual_beat_count=%d estimated_output_tokens=%d actual_output_tokens=%d style=%r",
-        _STORYBOARD_SCHEMA_VERSION_LOG, len(raw_batches), estimated_beats, len(beats),
+        "Storyboard generation complete: schema_version=%s language=%s batch_count=%d "
+        "estimated_beat_count=%d actual_beat_count=%d estimated_output_tokens=%d "
+        "actual_output_tokens=%d style=%r top_envs=%s",
+        _STORYBOARD_SCHEMA_VERSION_LOG, language, len(raw_batches), estimated_beats, len(beats),
         estimated_beats * _STORYBOARD_TOKENS_PER_BEAT_LOG, total_output_tokens, overall_style,
+        sorted(ledger["env_counts"].items(), key=lambda x: -x[1])[:3],
     )
 
     mapped = map_storyboard_beats_to_timestamps(
-        beats, whisper_transcript, duration_ms, allow_legacy_fallback=allow_legacy_fallback
+        beats, whisper_transcript, duration_ms,
+        allow_legacy_fallback=allow_legacy_fallback,
+        language=language,
     )
     return mapped
 
@@ -257,11 +283,26 @@ def _estimate_beat_count(voice_script: str, script_format: str) -> int:
     return max(int(narration_seconds / beat_seconds), 1)
 
 
-def _summarize_batch_for_continuity(label: str, beats: list[dict]) -> str:
-    """Build a short note on a batch's closing visual choices for the next segment's prompt.
+def _update_ledger(ledger: dict, beats: list[dict]) -> None:
+    """Update the cross-segment continuity ledger with the beats from one batch."""
+    for b in beats:
+        env = b.get("environment", "other")
+        vt  = b.get("visual_type", "b-roll")
+        ledger["env_counts"][env] = ledger["env_counts"].get(env, 0) + 1
+        ledger["recent_envs"].append(env)
+        ledger["recent_visual_types"].append(vt)
+        ledger["total_beats"] += 1
+    # Keep only the last 10 for the "recent" window
+    ledger["recent_envs"] = ledger["recent_envs"][-10:]
+    ledger["recent_visual_types"] = ledger["recent_visual_types"][-10:]
 
-    Keeps cross-segment continuity (varied environments/transitions at segment
-    boundaries) without re-sending the full previous segment's narration or beats.
+
+def _summarize_batch_for_continuity(label: str, beats: list[dict], ledger: dict) -> str:
+    """Build a continuity note for the next segment's prompt.
+
+    Includes the closing 3 beats' descriptors AND the cumulative environment
+    distribution from the ledger so Claude can self-avoid the most overused
+    environments across segment boundaries.
     """
     if not beats:
         return ""
@@ -270,7 +311,56 @@ def _summarize_batch_for_continuity(label: str, beats: list[dict]) -> str:
         f"{b.get('environment', 'other')}/{b.get('visual_type', 'b-roll')}/{b.get('motif', 'other')}"
         for b in tail
     ]
-    return f"{label} closed on: " + ", ".join(descriptors)
+    closing = f"{label} closed on: " + ", ".join(descriptors)
+
+    if ledger["total_beats"] > 0:
+        top_envs = sorted(ledger["env_counts"].items(), key=lambda x: -x[1])[:4]
+        env_str = ", ".join(f"{e}×{c}" for e, c in top_envs)
+        recent_vt = ", ".join(ledger["recent_visual_types"][-6:])
+        closing += (
+            f". Video-wide env totals (avoid most-used): {env_str}. "
+            f"Last 6 visual_types: {recent_vt}"
+        )
+    return closing
+
+
+def _harden_hints(beats: list[dict], segment_text: str) -> list[dict]:
+    """Log quality warnings for start_hint/end_hint that violate verbatim-word rules.
+
+    Rules Claude is required to follow (enforced in the schema prompt):
+      - 6–10 verbatim words copied from the narration
+      - no digit characters
+      - no marker text (INTRO/OUTRO/SECTION)
+
+    When a hint violates these rules we log a WARNING and leave it unchanged.
+    The matching pipeline (_locate_phrase / _fill_gaps) handles unmatched beats
+    via real anchor timestamps from adjacent matched beats — proportional text
+    substitution here inflated the fallback rate by replacing valid short phrases
+    with wrong-position text that couldn't match the Whisper transcript.
+    """
+    _DIGIT_IN_HINT_RE = re.compile(r"\d")
+    _MARKER_IN_HINT_RE = re.compile(r"\[(INTRO|OUTRO|SECTION)", re.IGNORECASE)
+
+    for beat in beats:
+        for hint_key in ("start_hint", "end_hint"):
+            raw = str(beat.get(hint_key, "") or "").strip()
+            hint_words = raw.split()
+            valid = (
+                6 <= len(hint_words) <= 10
+                and not _DIGIT_IN_HINT_RE.search(raw)
+                and not _MARKER_IN_HINT_RE.search(raw)
+            )
+            if not valid:
+                logger.warning(
+                    "Hint quality: beat=%s %s %r is invalid "
+                    "(words=%d has_digit=%s has_marker=%s) — kept as-is for matching",
+                    beat.get("beat_order"), hint_key, raw[:60],
+                    len(hint_words),
+                    bool(_DIGIT_IN_HINT_RE.search(raw)),
+                    bool(_MARKER_IN_HINT_RE.search(raw)),
+                )
+
+    return beats
 
 
 def _merge_batches(raw_batches: list[list[dict]]) -> list[dict]:
@@ -298,6 +388,7 @@ def map_storyboard_beats_to_timestamps(
     whisper_transcript: list[dict],
     duration_ms: int,
     allow_legacy_fallback: bool = False,
+    language: str = "en",
 ) -> list[dict] | None:
     """Map each storyboard beat onto real audio timestamps using Whisper words.
 
@@ -318,6 +409,8 @@ def map_storyboard_beats_to_timestamps(
         allow_legacy_fallback: When ``True``, accept the result even if > 50 % of beats
             used proportional fallback; when ``False`` (default), return ``None``
             instead so the caller can apply its fallback policy.
+        language:             BCP-47 language code — passed to ``_normalize_phrase``
+            for digit-to-word expansion when matching hint phrases.
 
     Returns:
         List of renderable beat-section dicts, or ``None`` if the fallback rate
@@ -335,13 +428,14 @@ def map_storyboard_beats_to_timestamps(
 
     for i, beat in enumerate(beats):
         located, start_hint_end_idx = _locate_beat_span(
-            flat, cursor, str(beat.get("start_hint", "")), str(beat.get("end_hint", ""))
+            flat, cursor, str(beat.get("start_hint", "")), str(beat.get("end_hint", "")),
+            language=language,
         )
         if located is None:
             continue
         matches[i] = located
         # Classify: exact = full start_hint token sequence matched; fuzzy = prefix matched
-        sh_tokens = _normalize_phrase(str(beat.get("start_hint", "")))
+        sh_tokens = _normalize_phrase(str(beat.get("start_hint", "")), language)
         span_len = located[1] - located[0] + 1
         if len(sh_tokens) > 0 and span_len >= len(sh_tokens):
             match_type[i] = "exact"
@@ -441,18 +535,22 @@ def _normalize_word(word: str) -> str:
     return "".join(_WORD_RE.findall(stripped))
 
 
-def _normalize_phrase(phrase: str) -> list[str]:
-    """Split a hint phrase into normalized tokens, expanding apostrophes to spaces.
+def _normalize_phrase(phrase: str, language: str = "en") -> list[str]:
+    """Split a hint phrase into normalized tokens with digit expansion.
 
-    Expanding apostrophes before splitting ensures French elisions in Claude-
-    generated hints (``l'entreprise``, ``d'argent``) produce the same two-token
-    sequence as the expanded Whisper transcript: ``["l","entreprise"]``,
-    ``["d","argent"]``.  English contractions follow the same rule (``hadn't``
-    → ``["hadn","t"]``) and the transcript side applies the same split, so both
-    sides stay consistent.
+    Uses ``normalize_for_matching`` for full normalization including digit expansion
+    so that a hint containing "1984" matches Whisper's spoken form "nineteen eighty
+    four". Apostrophes are handled by ``normalize_for_matching``'s punctuation
+    stripping, which aligns with ``_flatten_transcript``'s apostrophe expansion.
+
+    Args:
+        phrase:   Raw hint string from Claude (may contain digits or accented chars).
+        language: BCP-47 language code for digit-to-word expansion (e.g. "fr", "en").
+
+    Returns:
+        List of normalized, lowercase, punctuation-free tokens.
     """
-    expanded = _APOSTROPHE_RE.sub(" ", phrase)
-    return [t for t in (_normalize_word(w) for w in expanded.split()) if t]
+    return _normalize_for_matching(phrase, language)
 
 
 def _locate_beat_span(
@@ -460,6 +558,7 @@ def _locate_beat_span(
     cursor: int,
     start_hint: str,
     end_hint: str,
+    language: str = "en",
 ) -> tuple[tuple[int, int] | None, int]:
     """Locate a beat's inclusive ``[start_idx, end_idx]`` token span in the transcript.
 
@@ -469,14 +568,14 @@ def _locate_beat_span(
         of the start_hint match (used by the caller to advance the cursor without
         overshooting into subsequent beats' territory).
     """
-    start_match = _locate_phrase(flat, cursor, start_hint)
+    start_match = _locate_phrase(flat, cursor, start_hint, language=language)
     if start_match is None:
         return None, cursor          # unchanged cursor on failure
 
     start_idx       = start_match[0]
     start_hint_end  = start_match[1]   # cursor advances HERE, not to end_hint end
 
-    end_match = _locate_phrase(flat, start_idx, end_hint)
+    end_match = _locate_phrase(flat, start_idx, end_hint, language=language)
     if end_match is None:
         return (start_idx, start_hint_end), start_hint_end
 
@@ -487,13 +586,14 @@ def _locate_phrase(
     flat: list[tuple[str, str, int, int]],
     from_idx: int,
     phrase: str,
+    language: str = "en",
 ) -> tuple[int, int] | None:
     """Find a phrase forward from ``from_idx``, trying shrinking prefixes for fuzzy tolerance.
 
     Returns:
         Inclusive ``(start_idx, end_idx)`` token-index span, or ``None`` if not found.
     """
-    tokens = _normalize_phrase(phrase)
+    tokens = _normalize_phrase(phrase, language)
     if not tokens:
         return None
 
@@ -539,8 +639,11 @@ def _resolve_boundaries(
     """Turn matched/unmatched beat spans into a monotonic, bounds-clean ms timeline.
 
     Matched beats anchor their start to the matched phrase's start_ms. Unmatched
-    runs are filled with equal-weight proportional spacing between their matched
-    neighbours (or the timeline edges).
+    beats inherit the previous matched beat's timestamp (adjacent-boundary fallback)
+    rather than proportional interpolation — proportional text substitution in
+    _harden_hints inflated the fallback rate by producing wrong-position hints that
+    couldn't match the transcript. _enforce_minimum_durations then pushes each
+    unmatched beat forward by _MIN_BEAT_MS, giving it a real time slice.
 
     Guarantees (enforced by ``_enforce_minimum_durations`` after boundary assembly):
     - ``audio_end_ms > audio_start_ms`` for every beat (minimum ``_MIN_BEAT_MS``)
@@ -554,7 +657,9 @@ def _resolve_boundaries(
         for match in matches
     ]
 
-    _fill_gaps(anchors, beats, duration_ms)
+    # _fill_gaps is intentionally not called here. None anchors fall through to
+    # the `prev` path in the loop below, anchoring unmatched beats to the nearest
+    # prior real timestamp instead of a proportional guess.
 
     starts = [0] * n
     prev = 0
@@ -652,31 +757,33 @@ def _fill_gaps(anchors: list[int | None], beats: list[dict], duration_ms: int) -
 def _build_beat_section(beat: dict, index: int, start_ms: int, end_ms: int, script_text: str) -> dict:
     """Build a renderable beat-section dict from a raw beat + resolved timestamps.
 
-    ``section_order`` mirrors ``beat_order`` so the existing pipeline stages
-    (persistence, stock fetcher, assembly validator, shorts cutter, Remotion
-    builder) keep working unchanged on storyboard beats.
+    ``section_order`` mirrors ``beat_order`` so downstream pipeline stages
+    (persistence, shorts cutter, Remotion builder) work unchanged on storyboard beats.
+    ``flux_prompt`` is passed through unchanged — Flux Schnell will use it to
+    generate the image for this beat.
     """
     beat_order = beat.get("beat_order", index)
+
     return {
-        "beat_order": beat_order,
-        "section_order": beat_order,
-        "audio_start_ms": start_ms,
-        "audio_end_ms": end_ms,
-        "duration_sec": max(end_ms - start_ms, 0) / 1000,
-        "script_text": script_text,
-        "visual_intent": str(beat.get("visual_intent", "")),
-        "visual_type": _safe_enum(beat.get("visual_type"), _VALID_VISUAL_TYPES, _DEFAULT_VISUAL_TYPE),
+        "beat_order":      beat_order,
+        "section_order":   beat_order,
+        "audio_start_ms":  start_ms,
+        "audio_end_ms":    end_ms,
+        "duration_sec":    max(end_ms - start_ms, 0) / 1000,
+        "script_text":     script_text,
+        "visual_intent":   str(beat.get("visual_intent", "")),
+        "visual_type":     _safe_enum(beat.get("visual_type"), _VALID_VISUAL_TYPES, _DEFAULT_VISUAL_TYPE),
         "visual_category": _safe_enum(beat.get("visual_category"), _VALID_VISUAL_CATEGORIES, _DEFAULT_VISUAL_CATEGORY),
-        "environment": _safe_enum(beat.get("environment"), _VALID_ENVIRONMENTS, _DEFAULT_ENVIRONMENT),
-        "search_query": str(beat.get("search_query", "")),
-        "fallback_query": str(beat.get("fallback_query", "")),
-        "effect": _safe_enum(beat.get("effect"), _VALID_EFFECTS, _DEFAULT_EFFECT),
-        "color_grade": _safe_enum(beat.get("color_grade"), _VALID_GRADES, _DEFAULT_GRADE),
+        "environment":     _safe_enum(beat.get("environment"), _VALID_ENVIRONMENTS, _DEFAULT_ENVIRONMENT),
+        "flux_prompt":     str(beat.get("flux_prompt", "") or ""),
+        "effect":          _safe_enum(beat.get("effect"), _VALID_EFFECTS, _DEFAULT_EFFECT),
+        "color_grade":     _safe_enum(beat.get("color_grade"), _VALID_GRADES, _DEFAULT_GRADE),
         "transition_to_next": _safe_enum(beat.get("transition_to_next"), _VALID_TRANSITIONS, _DEFAULT_TRANSITION),
-        "overlay_text": str(beat.get("overlay_text", "") or ""),
+        "overlay_text":    str(beat.get("overlay_text", "") or ""),
         "overlay_position": _safe_enum(beat.get("overlay_position"), _VALID_OVERLAY_POSITIONS, _DEFAULT_OVERLAY_POSITION),
-        "motif": _safe_enum(beat.get("motif"), _VALID_MOTIFS, _DEFAULT_MOTIF),
+        "motif":           _safe_enum(beat.get("motif"), _VALID_MOTIFS, _DEFAULT_MOTIF),
     }
+
 
 
 def _normalize_beat_order(beats: list[dict]) -> list[dict]:

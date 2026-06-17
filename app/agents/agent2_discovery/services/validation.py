@@ -9,12 +9,8 @@ from app.database import _get_session_factory
 from app.models import Channel, ChannelConfig, Content, ContentValidation, Script, User
 from app.services import telegram_client
 from app.agents.agent2_discovery.system_prompt import (
+    build_telegram_message,
     generate_revised_scripts,
-    generate_telegram_summary,
-)
-from app.agents.agent3_validation.services.minor_handler import (
-    check_fix_reply,
-    check_major_decision_reply,
 )
 
 logger = logging.getLogger(__name__)
@@ -25,19 +21,24 @@ logger = logging.getLogger(__name__)
 def send_for_validation(
     content: Content,
     channel: Channel,
-    scripts: dict,
     db: Session,
+    assessment: dict | None = None,
+    target_languages: list[str] | None = None,
 ) -> None:
     """Send discovered content to the channel owner on Telegram for approval.
 
-    Generates a Telegram summary via Claude, sends it, and stores the returned
-    ``message_id`` in the ``content_validations`` record.
+    Builds a deterministic Telegram summary (no Claude call) and stores the
+    returned ``message_id`` in the ``content_validations`` record. Scripts are
+    generated AFTER the user approves — not before.
 
     Args:
-        content:  Content ORM object (source_url, title, id).
-        channel:  Channel ORM object (name, niche, user_id).
-        scripts:  Output of ``generate_scripts()`` — provides generated title + excerpt.
-        db:       SQLAlchemy session managed by the caller.
+        content:          Content ORM object (source_url, title, id).
+        channel:          Channel ORM object (name, niche, user_id).
+        db:               SQLAlchemy session managed by the caller.
+        assessment:       Optional story scoring assessment dict — used to surface
+                          top-2 scoring dimensions in the Telegram message.
+        target_languages: Optional list of BCP-47 target language codes from
+                          ``ChannelLanguage`` — displayed as "FR · EN · ES".
     """
     user: User | None = db.get(User, channel.user_id)
     if not user:
@@ -49,12 +50,14 @@ def send_for_validation(
         logger.error("User %s has no telegram_chat_id", user.id)
         return
 
-    # Generate the Telegram summary (Claude, user's primary language)
-    try:
-        message = generate_telegram_summary(content, channel, scripts, user.primary_language)
-    except Exception as exc:
-        logger.error("generate_telegram_summary failed for content %s: %s", content.id, exc)
-        return
+    # Build the Telegram message — deterministic Python, no Claude call
+    message = build_telegram_message(
+        title=content.title,
+        url=content.source_url,
+        assessment=assessment,
+        target_languages=target_languages,
+        user_language=user.primary_language,
+    )
 
     # Send — sync HTTP call, safe for Celery prefork workers
     message_id = telegram_client.send_message_sync(chat_id, message)
@@ -132,11 +135,7 @@ async def handle_telegram_update(update: Update, context: ContextTypes.DEFAULT_T
     try:
         result = _find_validation(replied_to_id, db)
         if result is None:
-            # Not an Agent 2 story validation — try Agent 3 handlers in order:
-            # 1. Minor FIX reply  2. Major PROCEED / REVALIDATE decision
-            if not check_fix_reply(replied_to_id, message_text, db):
-                check_major_decision_reply(replied_to_id, message_text, db)
-            return
+            return   # not a story validation reply — ignore
 
         validation, content, channel = result
 
@@ -252,6 +251,22 @@ def _handle_change(
         db.commit()
         return None
 
+    # Persist revision changes to script_issues_log
+    changes: list[dict] = revised.get("changes") or []
+    if changes:
+        log_entry = {
+            "revision":  validation.revision_count,
+            "feedback":  feedback,
+            "changes":   changes,
+        }
+        # Replace the plain feedback entry we already added above with the enriched one
+        current_log = list(validation.script_issues_log or [])
+        if current_log and current_log[-1].get("revision") == validation.revision_count:
+            current_log[-1] = log_entry
+        else:
+            current_log.append(log_entry)
+        validation.script_issues_log = current_log
+
     # Save new script version
     new_script = Script(
         content_id=content.id,
@@ -274,12 +289,21 @@ def _handle_change(
         db.commit()
         return None
 
-    try:
-        message = generate_telegram_summary(content, channel, revised, user.primary_language)
-    except Exception as exc:
-        logger.error("generate_telegram_summary failed during revision: %s", exc)
-        db.commit()
-        return None
+    message = build_telegram_message(
+        title=content.title,
+        url=content.source_url,
+        assessment=None,
+        target_languages=None,
+        user_language=user.primary_language,
+    )
+
+    # Append compact changes summary to the Telegram message
+    if changes:
+        change_lines = "\n".join(
+            f"• *{c.get('section', '?')}*: {c.get('before_summary', '')} → {c.get('after_summary', '')}"
+            for c in changes[:5]
+        )
+        message += f"\n\n*Changes made:*\n{change_lines}"
 
     db.commit()
     logger.info("Content %s revised (v%d) — re-queued for Telegram send", content.id, new_script.version)

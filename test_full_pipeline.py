@@ -3,14 +3,14 @@
 Full Agent 2 → Agent 3 → Agent 4 → Agent 5 end-to-end test script.
 
 Steps:
-  1. Discovery    — Claude browses your sources, picks the best story
-  2. Scripts      — Claude generates video + voice scripts in source language
-  3. Telegram     — sends summary to your phone, waits for APPROVE / CHANGE
+  1. Discovery    — Claude browses your sources, picks the best story (fetch → dedup → score)
+  2. Telegram     — sends title + URL + score to your phone, waits for APPROVE
+  3. Scripts      — Claude generates video + voice scripts in source language (after APPROVE)
   4. Multilingual — generates culturally adapted scripts for every channel language
-  5. Agent 3      — validates all scripts, auto-corrects MAJOR issues
+  5. Validation   — deterministic checks + auto-correction, sets SCRIPTS_VALIDATED
   6. Agent 4      — ElevenLabs TTS + Whisper transcription + breakpoints
-  7. Agent 5      — Section Splitter → Validator → Stock Fetch → Assembly Validator
-                    → Shorts Cutter → Subtitles → Remotion render
+  7. Agent 5      — Storyboard (1×) → Flux Schnell image generation (1×)
+                    → Per-language: Shorts Cutter → Subtitles → Remotion render
   8. Summary      — prints final DB state (scripts + audio + video renders)
 
 Usage:
@@ -19,7 +19,7 @@ Usage:
     # Full run (discovery → Agent 5):
     python test_full_pipeline.py [channel_id]
 
-    # Skip discovery — use an existing content_id (has source scripts, no Telegram yet):
+    # Skip discovery + Telegram — content exists and is already approved, restart scripts:
     python test_full_pipeline.py --from-content <content_id>
 
     # Skip Telegram — content already approved, restart multilingual generation:
@@ -163,19 +163,23 @@ def _print_agent5_failure_diagnostic(content_id: uuid.UUID) -> None:
     renders   = db.query(VideoRender).filter(VideoRender.content_id == content_id).all()
     db.close()
 
-    print(f"\n  Agent 5 failure diagnostic for content {content_id}:")
-    print(f"  Status: {content.status if content else 'NOT FOUND'}")
-
+    # "__visual__" rows = shared visual-pass beats (storyboard + Flux, run once)
+    visual_beats  = sum(1 for s in sections if s.language == "__visual__")
     expected_langs = {s.language for s in scripts}
     audio_langs    = {a.language for a in audios}
     section_langs  = {}
     for s in sections:
-        section_langs.setdefault(s.language, 0)
-        section_langs[s.language] += 1
+        if s.language != "__visual__":
+            section_langs.setdefault(s.language, 0)
+            section_langs[s.language] += 1
     render_langs   = {}
     for r in renders:
         render_langs.setdefault(r.language, 0)
         render_langs[r.language] += 1
+
+    print(f"\n  Agent 5 failure diagnostic for content {content_id}:")
+    print(f"  Status: {content.status if content else 'NOT FOUND'}")
+    print(f"  Shared visual-pass beats (Storyboard+Flux, once): {visual_beats}")
 
     print(f"\n  {'Lang':<6}  {'Audio':>6}  {'Sections':>9}  {'Renders':>7}  Inferred failure stage")
     for lang in sorted(expected_langs):
@@ -185,9 +189,18 @@ def _print_agent5_failure_diagnostic(content_id: uuid.UUID) -> None:
         if n_renders > 0:
             stage = "SUCCESS"
         elif n_sections > 0:
-            stage = "FAILED after storyboard — quality gate or render error"
+            # Sections saved but no render — check logs for Agent5 [FAIL] status=...
+            stage = (
+                "FAILED after sections saved — check logs for Agent5 [FAIL] status=... "
+                "(RENDER_BLOCKED=too many text_card beats | "
+                "REMOTION_FAILED=Page crashed or render error | "
+                "INVALID_PROPS=props sanity check | "
+                "VERIFY_FAILED=post-render black/silence check)"
+            )
+        elif visual_beats > 0:
+            stage = "FAILED during render setup — visual pass ran but sections not saved for this lang"
         elif has_audio:
-            stage = "FAILED before storyboard — storyboard generation failed"
+            stage = "FAILED in visual pass — storyboard or Flux generation failed (0 shared beats)"
         else:
             stage = "SKIPPED — no audio file"
         print(f"  {lang:<6}  {'yes' if has_audio else 'NO':>6}  {n_sections:>9}  {n_renders:>7}  {stage}")
@@ -220,11 +233,22 @@ def _print_video_summary(content_id: uuid.UUID, video_ok: bool) -> None:
         return
 
     langs       = sorted({r.language for r in renders})
-    sec_by_lang = {}
+    # Separate shared visual-pass beats (language="__visual__") from per-lang sections
+    visual_beats = [s for s in sections if s.language == "__visual__"]
+    sec_by_lang  = {}
     for s in sections:
-        sec_by_lang.setdefault(s.language, []).append(s)
+        if s.language != "__visual__":
+            sec_by_lang.setdefault(s.language, []).append(s)
 
-    print(f"\n  Video renders ({len(renders)} total across {len(langs)} language(s)):")
+    flux_ok = sum(
+        1 for s in visual_beats
+        if (getattr(s, "generation_prompt", None) or "").find('"media_url": "cache/') >= 0
+    )
+    print(
+        f"\n  Visual pass: {len(visual_beats)} shared beats"
+        + (f"  (~{flux_ok} with Flux images)" if visual_beats else "")
+    )
+    print(f"  Video renders ({len(renders)} total across {len(langs)} language(s)):")
     for lang in langs:
         lang_renders  = [r for r in renders if r.language == lang]
         lang_sections = sec_by_lang.get(lang, [])
@@ -253,7 +277,7 @@ def _print_final_summary(
     multilingual_ok: bool,
 ) -> None:
     from app.models import Content, ContentValidation, Script
-    from app.agents.agent3_validation.services.estimator import estimate_duration_sec
+    from app.services.script_estimator import estimate_duration_sec
 
     db = _db()
     content     = db.get(Content, content_id)
@@ -318,22 +342,117 @@ def _print_final_summary(
 # ── Step runners (reused by multiple entry points) ────────────────────────────
 
 def _run_agent3(content_id: uuid.UUID) -> bool:
-    """Run Agent 3 script validation. Returns True if scripts passed."""
-    from app.models import Content
-    from app.agents.agent3_validation.services.validation import run_validation
+    """Run deterministic script validation + auto-correction.
 
-    print(STEP("STEP 5: Agent 3 — Script validation"))
+    Validation is now embedded in run_agent2_scripts_for_content (Celery flow),
+    but the test pipeline calls it separately because scripts were generated
+    manually step-by-step.  Returns True if all languages are MAJOR-issue-free
+    after up to 3 auto-correction rounds.
+    """
+    from app.models import Channel, ChannelConfig, ChannelVoice, Content, Script
+    from app.agents.agent2_discovery.system_prompt import auto_correct_script
+    from app.services.script_checks import run_deterministic_checks
+    from app.services.script_estimator import estimate_duration_sec, compute_shorts_breakpoints
+
+    _MAX_ROUNDS = 3
+
+    print(STEP("STEP 5: Script validation (det checks + auto-correction)"))
     db = _db()
-    content = db.get(Content, content_id)
-    if content.status != "SCRIPTS_READY":
-        content.status = "SCRIPTS_READY"
+    try:
+        content = db.get(Content, content_id)
+        channel = db.get(Channel, content.channel_id)
+        config  = db.get(ChannelConfig, channel.id)
+        script_format = config.script_format if config else "youtube_long"
+        shorts_rule   = config.shorts_rule   if config else "auto"
+
+        scripts_qs = (
+            db.query(Script)
+            .filter(Script.content_id == content_id)
+            .order_by(Script.language, Script.version.desc())
+            .all()
+        )
+        # Keep only the latest version per language
+        seen: dict[str, Script] = {}
+        for s in scripts_qs:
+            if s.language not in seen:
+                seen[s.language] = s
+        scripts_rows = list(seen.values())
+
+        if not scripts_rows:
+            print("  No scripts found — skipping validation")
+            return False
+
+        scripts_by_lang = {
+            s.language: {"video_script": s.video_script, "voice_script": s.voice_script}
+            for s in scripts_rows
+        }
+
+        # ── Deterministic checks + auto-correct loop (per language) ──────────
+        all_passed = True
+        for lang, row in zip(scripts_by_lang, scripts_rows):
+            voice_map_entry = (
+                db.query(ChannelVoice)
+                .filter(ChannelVoice.channel_id == channel.id, ChannelVoice.language == lang)
+                .first()
+            )
+            tts_model    = voice_map_entry.tts_model if voice_map_entry else "sonic-2"
+            tts_provider = voice_map_entry.provider if voice_map_entry else "cartesia"
+
+            lang_passed = False
+            for round_n in range(1, _MAX_ROUNDS + 1):
+                issues_by_lang = run_deterministic_checks(scripts_by_lang, script_format)
+                major = [i for i in issues_by_lang.get(lang, []) if i["severity"] == "MAJOR"]
+                minor = [i for i in issues_by_lang.get(lang, []) if i["severity"] == "MINOR"]
+
+                if not major:
+                    lang_passed = True
+                    if minor:
+                        print(f"  [{lang}] PASS ({len(minor)} MINOR issues logged)")
+                    else:
+                        print(f"  [{lang}] PASS (clean)")
+                    break
+
+                print(f"  [{lang}] round={round_n} MAJOR={len(major)} — auto-correcting")
+                try:
+                    corrected = auto_correct_script(
+                        current_scripts=scripts_by_lang[lang],
+                        issues=major,
+                        language=lang,
+                        channel=channel,
+                        script_format=script_format,
+                        source_excerpt=content.source_excerpt,
+                        tts_model=tts_model,
+                        tts_provider=tts_provider,
+                    )
+                    scripts_by_lang[lang] = corrected
+                except Exception as exc:
+                    print(f"  [{lang}] auto-correct round {round_n} failed: {exc} — stopping")
+                    break
+
+            if not lang_passed:
+                print(f"  [{lang}] FAIL — MAJOR issues remain after {_MAX_ROUNDS} rounds")
+                all_passed = False
+
+        # ── Persist corrected scripts + set validated=True ────────────────────
+        for s in scripts_rows:
+            updated = scripts_by_lang.get(s.language, {})
+            if updated.get("video_script"):
+                s.video_script = updated["video_script"]
+            if updated.get("voice_script"):
+                s.voice_script = updated["voice_script"]
+            dur = estimate_duration_sec(s.voice_script, s.language)
+            bp  = compute_shorts_breakpoints(s.voice_script, dur, shorts_rule)
+            s.estimated_duration_sec = dur
+            s.shorts_breakpoints     = bp
+            s.validated              = True
+
+        content.status = "SCRIPTS_VALIDATED"
         db.commit()
-    db.close()
+        print(f"  {'PASS' if all_passed else 'PARTIAL'} — {len(scripts_rows)} language(s) validated; status=SCRIPTS_VALIDATED")
+        return all_passed
 
-    db = _db()
-    passed = run_validation(content_id, db)
-    db.close()
-    return passed
+    finally:
+        db.close()
 
 
 def _run_agent4(content_id: uuid.UUID) -> bool:
@@ -390,14 +509,15 @@ def run(
 ) -> None:
     from app.config import settings
     from app.models import (
-        Channel, ChannelConfig, ChannelSource, Content,
-        ContentValidation, Script,
+        Channel, ChannelConfig, ChannelLanguage, ChannelSource, ChannelVoice,
+        Content, ContentValidation, Script,
     )
     from app.agents.agent2_discovery.services.discovery import run_discovery
     from app.agents.agent2_discovery.services.scripts import generate_multilingual_scripts
-    from app.agents.agent2_discovery.services.validation import send_for_validation, _handle_change
+    from app.agents.agent2_discovery.services.story import Story
+    from app.agents.agent2_discovery.services.validation import send_for_validation
     from app.agents.agent2_discovery.system_prompt import generate_scripts
-    from app.agents.agent3_validation.services.estimator import estimate_duration_sec
+    from app.services.script_estimator import estimate_duration_sec
 
     print(SEP)
     print("  FULL PIPELINE TEST  —  Agent 2 → Agent 3 → Agent 4 → Agent 5")
@@ -530,12 +650,14 @@ def run(
     # ── Find channel ──────────────────────────────────────────────────────────
     db = _db()
 
-    content_id                  = None
-    scripts                     = None
-    story                       = None
-    skip_discovery_and_scripts  = False
+    content_id    = None
+    story: Story | None = None
+    _assessment   = None
+    skip_to_scripts = False  # True when jumping in after Telegram approval
 
     if from_content_id_str:
+        # Content already exists and is approved — skip discovery + Telegram,
+        # jump straight to script generation.
         content_id = uuid.UUID(from_content_id_str)
         content    = db.get(Content, content_id)
 
@@ -544,26 +666,18 @@ def run(
             db.close()
             return
 
-        channel = db.get(Channel, content.channel_id)
-        existing_script = (
-            db.query(Script)
-            .filter(Script.content_id == content_id)
-            .order_by(Script.version.desc())
-            .first()
-        )
+        channel    = db.get(Channel, content.channel_id)
+        channel_id = channel.id
 
-        if not existing_script:
-            print(f"\nERROR: Content {content_id} has no scripts in DB.")
-            db.close()
-            return
+        # Ensure status allows script generation
+        if content.status not in (
+            "APPROVED", "GENERATING_SCRIPTS", "SCRIPTS_READY",
+            "SCRIPTS_VALIDATED", "AUDIO_DONE",
+        ):
+            content.status = "APPROVED"
+            db.commit()
 
-        scripts = {
-            "title":        content.title,
-            "video_script": existing_script.video_script,
-            "voice_script": existing_script.voice_script,
-        }
-        channel_id                 = channel.id
-        skip_discovery_and_scripts = True
+        skip_to_scripts = True
 
     elif channel_id_str:
         channel = db.get(Channel, uuid.UUID(channel_id_str))
@@ -575,9 +689,8 @@ def run(
         db.close()
         return
 
-    config   = db.get(ChannelConfig, channel.id)
-    sources  = db.query(ChannelSource).filter(ChannelSource.channel_id == channel.id).all()
-    max_rev  = config.validation_max_revisions if config else 3
+    config  = db.get(ChannelConfig, channel.id)
+    sources = db.query(ChannelSource).filter(ChannelSource.channel_id == channel.id).all()
 
     print(f"\n  Channel : {channel.name}")
     print(f"  Niche   : {channel.niche}")
@@ -587,11 +700,11 @@ def run(
     channel_id = channel.id
     db.close()
 
-    if not skip_discovery_and_scripts:
+    if not skip_to_scripts:
         # ── STEP 1: Discovery ────────────────────────────────────────────────
-        print(STEP("STEP 1: Discovery — Claude browsing sources (30-60s)"))
+        print(STEP("STEP 1: Discovery — fetch → dedup → score (30-60s)"))
 
-        db    = _db()
+        db     = _db()
         result = run_discovery(channel_id, db)
         db.close()
 
@@ -600,26 +713,119 @@ def run(
             print("     Check: is the channel active? Are sources configured?")
             return
 
-        content, story = result
-        content_id     = content.id
+        content, story, _assessment = result
+        content_id = content.id
 
         print(f"  Story   : {story.title[:70]}")
         print(f"  URL     : {story.url}")
         print(f"  Language: {story.language}")
-        print(f"  Body    : {len(story.body.split())} words")
+        print(f"  Score   : {_assessment.get('overall_score', '?') if _assessment else '?'}")
 
-        # ── STEP 2: Generate source-language scripts ─────────────────────────
-        print(STEP("STEP 2: Generating scripts (Claude)"))
+        # ── STEP 2: Telegram — title + URL + score, no scripts ───────────────
+        print(STEP("STEP 2: Telegram approval (title + URL + score)"))
 
         db      = _db()
+        content = db.get(Content, content_id)
         channel = db.get(Channel, channel_id)
-        config  = db.get(ChannelConfig, channel_id)
-        script_format = config.script_format if config else "youtube_long"
-        scripts = generate_scripts(story, channel, script_format=script_format)
+        target_languages = [
+            cl.language
+            for cl in db.query(ChannelLanguage)
+            .filter(ChannelLanguage.channel_id == channel_id)
+            .all()
+        ]
+        send_for_validation(
+            content, channel, db,
+            assessment=_assessment,
+            target_languages=target_languages,
+        )
+        val    = db.query(ContentValidation).filter(ContentValidation.content_id == content_id).first()
+        msg_id = val.telegram_message_id if val else None
+        db.close()
 
-        content       = db.get(Content, content_id)
+        if not msg_id:
+            print("  ❌ Telegram send failed — check TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID in .env")
+            print(f"     When fixed, re-run: python test_full_pipeline.py --from-content {content_id}")
+            return
+
+        print(f"  ✅ Sent (message_id={msg_id})")
+        print("  Reply APPROVE in Telegram (or wait 5 min for auto-approve)…\n")
+
+        decision, from_user = poll_telegram(settings.telegram_bot_token, msg_id, timeout_sec=300)
+        reason = f"approved by @{from_user}" if from_user != "timeout" else "auto-approved (timeout)"
+
+        db      = _db()
+        content = db.get(Content, content_id)
+        val     = db.query(ContentValidation).filter(ContentValidation.content_id == content_id).first()
+        if val:
+            val.status      = "APPROVED"
+            val.approved_at = datetime.now(timezone.utc)
+        content.status = "APPROVED"
+        db.commit()
+        db.close()
+        print(f"  ✅ Content {reason}")
+
+    # ── STEP 3: Generate source-language scripts (after APPROVE) ──────────────
+    print(STEP("STEP 3: Generating source scripts (Claude)"))
+
+    db      = _db()
+    content = db.get(Content, content_id)
+    channel = db.get(Channel, channel_id)
+    config  = db.get(ChannelConfig, channel_id)
+    script_format      = config.script_format      if config else "youtube_long"
+    audio_tags_enabled = config.audio_tags_enabled if config else False
+    shorts_rule        = config.shorts_rule        if config else "auto"
+
+    # Re-use existing source script if this is a re-run (--from-content path)
+    existing_src = (
+        db.query(Script)
+        .filter(
+            Script.content_id == content_id,
+            Script.language   == content.source_language,
+        )
+        .order_by(Script.version.desc())
+        .first()
+    )
+
+    if existing_src:
+        print(f"  Existing source script found for lang={content.source_language} — skipping generation")
+        wc = len(existing_src.voice_script.split())
+        print(f"  Voice: {wc} words")
+    else:
+        # Reconstruct story proxy from content record when skipping discovery
+        if story is None:
+            story = Story(
+                title=content.title,
+                url=content.source_url,
+                language=content.source_language,
+                body=content.source_excerpt or "",
+                source_type="db",
+                source_value="content_record",
+                published_at=datetime.now(timezone.utc),
+                upvotes=0,
+                comments=0,
+            )
+
+        src_voice = (
+            db.query(ChannelVoice)
+            .filter(
+                ChannelVoice.channel_id == channel_id,
+                ChannelVoice.language   == content.source_language,
+            )
+            .first()
+        ) or db.query(ChannelVoice).filter(ChannelVoice.channel_id == channel_id).first()
+
+        tts_model    = src_voice.tts_model if src_voice else "sonic-2"
+        tts_provider = src_voice.provider if src_voice else "cartesia"
+
+        scripts = generate_scripts(
+            story, channel,
+            script_format=script_format,
+            audio_tags_enabled=audio_tags_enabled,
+            tts_model=tts_model,
+            tts_provider=tts_provider,
+        )
+
         content.title = scripts.get("title", content.title)
-
         db.add(Script(
             content_id=content_id,
             language=story.language,
@@ -629,89 +835,15 @@ def run(
             validated=False,
         ))
         db.commit()
-        db.close()
 
         wc        = len(scripts["voice_script"].split())
         dur       = estimate_duration_sec(scripts["voice_script"], story.language)
         sec_count = scripts["video_script"].count("[SECTION")
-
         print(f"  Title   : {scripts['title'][:70]}")
         print(f"  Voice   : {wc} words → ~{dur:.0f}s ({dur / 60:.1f} min)")
         print(f"  Sections: {sec_count}")
 
-    else:
-        print(STEP("SKIP STEP 1 & 2: Using existing content/scripts"))
-
-        wc        = len(scripts["voice_script"].split())
-        sec_count = scripts["video_script"].count("[SECTION")
-
-        print(f"  Content : {content_id}")
-        print(f"  Title   : {scripts.get('title', '')[:70] or '(no title)'}")
-        print(f"  Voice   : {wc} words")
-        print(f"  Sections: {sec_count}")
-
-    # ── STEP 3: Telegram validation loop ──────────────────────────────────────
-    print(STEP("STEP 3: Sending to Telegram for approval"))
-
-    db      = _db()
-    content = db.get(Content, content_id)
-    channel = db.get(Channel, channel_id)
-    send_for_validation(content, channel, scripts, db)
-
-    val    = db.query(ContentValidation).filter(ContentValidation.content_id == content_id).first()
-    msg_id = val.telegram_message_id if val else None
     db.close()
-
-    if not msg_id:
-        print("  ❌ Telegram send failed — check TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID in .env")
-        print(f"     When fixed, re-run: python test_full_pipeline.py --from-content {content_id}")
-        return
-
-    print(f"  ✅ Sent (message_id={msg_id})")
-
-    for attempt in range(1, max_rev + 2):
-        decision, from_user = poll_telegram(settings.telegram_bot_token, msg_id, timeout_sec=300)
-
-        if decision.upper().startswith("APPROVE") or from_user == "timeout":
-            db      = _db()
-            content = db.get(Content, content_id)
-            val     = db.query(ContentValidation).filter(ContentValidation.content_id == content_id).first()
-            if val:
-                val.status      = "APPROVED"
-                val.approved_at = datetime.now(timezone.utc)
-            content.status = "APPROVED"
-            db.commit()
-            db.close()
-            reason = f"approved by @{from_user}" if from_user != "timeout" else "auto-approved (timeout)"
-            print(f"  ✅ Content {reason}")
-            break
-
-        print(f"  CHANGE ({attempt}/{max_rev}): {decision!r} — regenerating…")
-
-        db      = _db()
-        content = db.get(Content, content_id)
-        channel = db.get(Channel, channel_id)
-        val     = db.query(ContentValidation).filter(ContentValidation.content_id == content_id).first()
-
-        pending = _handle_change(val, content, channel, decision, db)
-
-        if pending:
-            chat_id, new_message = pending
-            new_msg_id = _tg_send(settings.telegram_bot_token, chat_id, new_message)
-            if new_msg_id:
-                val.telegram_message_id = new_msg_id
-                db.commit()
-                msg_id = new_msg_id
-                print(f"  ✅ Revised script sent (message_id={msg_id})")
-        db.close()
-
-        if attempt >= max_rev:
-            print(f"  ⚠ Max revisions ({max_rev}) reached — auto-approving")
-            db      = _db()
-            content = db.get(Content, content_id)
-            content.status = "APPROVED"
-            db.commit()
-            db.close()
 
     # ── STEP 4: Multilingual scripts ──────────────────────────────────────────
     print(STEP("STEP 4: Generating multilingual scripts"))
@@ -770,7 +902,7 @@ if __name__ == "__main__":
         "--from-content",
         dest="from_content_id",
         metavar="CONTENT_ID",
-        help="Skip discovery + script generation. Restart from Telegram validation (Step 3).",
+        help="Skip discovery + Telegram. Content must exist in DB (already approved). Restarts from script generation (Step 3).",
     )
     parser.add_argument(
         "--from-multilingual",

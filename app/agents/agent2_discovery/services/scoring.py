@@ -4,7 +4,7 @@ Replaces the old "relevance + engagement + substance" selection (which never
 checked narrative tension, visual potential, or retention potential, and had
 no reject path) with a deterministic scoring gate:
 
-  Claude scores nine fixed dimensions of a candidate story (with justifications).
+  Claude scores eighteen fixed dimensions of a candidate story (with justifications).
   Python computes the weighted overall score and makes the accept/reject call —
   Claude never decides ACCEPTED/REJECTED directly (CLAUDE.md determinism rules:
   business rules belong in Python, prompts only generate/classify content).
@@ -16,36 +16,55 @@ Telegram — only a story that clears every gate proceeds to script generation.
 
 import logging
 
-from app.agents.agent2_discovery.services.fetcher import fetch as claude_fetch
+from app.agents.agent2_discovery.services.fetcher import fetch_batch
 from app.agents.agent2_discovery.services.story import Story
-from app.agents.agent2_discovery.system_prompt import assess_story_quality
+from app.agents.agent2_discovery.system_prompt import score_story_for_gate
 
 logger = logging.getLogger(__name__)
 
-# Weighted dimensions — must sum to 1.0. visual_potential and narrative_tension/
-# youtube_retention are weighted heaviest because they are the named non-negotiable
-# axes (see _MIN_* floors below); the rest round out overall documentary quality.
+# Weighted dimensions — must sum to 1.0.
+# opening_scene_strength, social_media_clickability, thumbnail_strength,
+# visual_storytelling_potential, and viral_clip_count are the highest-priority
+# dimensions: they gate YouTube retention and platform performance directly.
+# central_mystery and conflict_or_contradiction are the primary narrative-quality
+# gates: a story with no mystery, conflict, or contradiction cannot hold a viewer.
 _DIMENSION_WEIGHTS: dict[str, float] = {
-    "visual_potential": 0.20,
-    "narrative_tension": 0.15,
-    "youtube_retention": 0.15,
-    "emotional_impact": 0.10,
-    "curiosity_gap": 0.10,
-    "documentary_potential": 0.10,
-    "stock_media_availability": 0.10,
-    "shorts_potential": 0.05,
-    "visual_diversity": 0.05,
+    "visual_storytelling_potential":   0.14,
+    "social_media_clickability":       0.12,
+    "opening_scene_strength":          0.10,
+    "thumbnail_strength":              0.09,
+    "scroll_stopper_potential":        0.08,
+    "emotional_stakes":                0.08,
+    "viral_clip_count":                0.07,
+    "central_mystery":                 0.06,
+    "curiosity_gap":                   0.05,
+    "conflict_or_contradiction":       0.05,
+    "emotional_specificity":           0.04,
+    "title_thumbnail_potential":       0.03,
+    "visual_range":                    0.03,
+    "stock_media_feasibility":         0.02,
+    "short_form_clip_potential":       0.01,
+    "comment_section_potential":       0.01,
+    "series_potential":                0.01,
+    "episode_two_potential":           0.01,
 }
 
 # Hard floors — a story can have a high weighted average and still be rejected
-# if any one of these named dimensions is weak ("strong narrative tension, strong
-# visual potential, and high viewer-retention potential" are non-negotiable).
-_MIN_OVERALL_SCORE = 65
-_MIN_NARRATIVE_TENSION = 60
-_MIN_VISUAL_POTENTIAL = 60
-_MIN_YOUTUBE_RETENTION = 60
+# if any of these named dimensions falls below its individual floor.
+# Dimension floors:
+_MIN_OVERALL_SCORE           = 65
+_MIN_VISUAL_STORYTELLING     = 55
+_MIN_EMOTIONAL_STAKES        = 55
+_MIN_SCROLL_STOPPER          = 55
+_MIN_CENTRAL_MYSTERY         = 45
+_MIN_CONFLICT_CONTRADICTION  = 45
+_MIN_SOCIAL_CLICKABILITY     = 50
+_MIN_TITLE_THUMBNAIL         = 50
+_MIN_OPENING_SCENE           = 50
+_MIN_THUMBNAIL_STRENGTH      = 50
+_MIN_VISUAL_RANGE            = 35
+_MIN_STOCK_FEASIBILITY       = 40
 
-_MAX_CANDIDATES_PER_RUN = 3
 
 
 def _clamp_score(value) -> int:
@@ -65,9 +84,9 @@ def score_story_assessment(assessment: dict) -> dict:
     same assessment always yields the same score and the same gate result.
 
     Args:
-        assessment: Raw dict from ``assess_story_quality()`` — must contain a
-                    ``scores`` mapping of dimension name to
-                    ``{"score": <0-100>, "justification": "..."}``.
+        assessment: Raw dict from ``score_stories_comparatively()`` — must contain a
+                    ``scores`` mapping of dimension name to either a plain integer
+                    0–100 (new batch schema) or ``{"score": <0-100>}`` (legacy).
 
     Returns:
         Dict with:
@@ -77,8 +96,22 @@ def score_story_assessment(assessment: dict) -> dict:
                                 hard-floor check that failed (empty if all passed)
     """
     raw_scores = assessment.get("scores") or {}
+    # Support legacy key aliases from older single-candidate Claude responses
+    if "emotional_tension" in raw_scores and "emotional_stakes" not in raw_scores:
+        raw_scores["emotional_stakes"] = raw_scores["emotional_tension"]
+    if "controversy_or_debate_potential" in raw_scores and "conflict_or_contradiction" not in raw_scores:
+        raw_scores["conflict_or_contradiction"] = raw_scores["controversy_or_debate_potential"]
+
+    def _extract(val) -> int:
+        """Accept either plain int (new batch schema) or {"score": int} (legacy)."""
+        if isinstance(val, (int, float)):
+            return _clamp_score(val)
+        if isinstance(val, dict):
+            return _clamp_score(val.get("score"))
+        return 0
+
     dimension_scores: dict[str, int] = {
-        dimension: _clamp_score((raw_scores.get(dimension) or {}).get("score"))
+        dimension: _extract(raw_scores.get(dimension))
         for dimension in _DIMENSION_WEIGHTS
     }
 
@@ -90,18 +123,23 @@ def score_story_assessment(assessment: dict) -> dict:
     failed_gates: list[str] = []
     if overall_score < _MIN_OVERALL_SCORE:
         failed_gates.append(f"overall_score {overall_score} < {_MIN_OVERALL_SCORE}")
-    if dimension_scores["narrative_tension"] < _MIN_NARRATIVE_TENSION:
-        failed_gates.append(
-            f"narrative_tension {dimension_scores['narrative_tension']} < {_MIN_NARRATIVE_TENSION}"
-        )
-    if dimension_scores["visual_potential"] < _MIN_VISUAL_POTENTIAL:
-        failed_gates.append(
-            f"visual_potential {dimension_scores['visual_potential']} < {_MIN_VISUAL_POTENTIAL}"
-        )
-    if dimension_scores["youtube_retention"] < _MIN_YOUTUBE_RETENTION:
-        failed_gates.append(
-            f"youtube_retention {dimension_scores['youtube_retention']} < {_MIN_YOUTUBE_RETENTION}"
-        )
+
+    def _check(dim: str, floor: int) -> None:
+        val = dimension_scores.get(dim, 0)
+        if val < floor:
+            failed_gates.append(f"{dim} {val} < {floor}")
+
+    _check("visual_storytelling_potential", _MIN_VISUAL_STORYTELLING)
+    _check("emotional_stakes",              _MIN_EMOTIONAL_STAKES)
+    _check("scroll_stopper_potential",      _MIN_SCROLL_STOPPER)
+    _check("central_mystery",              _MIN_CENTRAL_MYSTERY)
+    _check("conflict_or_contradiction",    _MIN_CONFLICT_CONTRADICTION)
+    _check("social_media_clickability",    _MIN_SOCIAL_CLICKABILITY)
+    _check("title_thumbnail_potential",    _MIN_TITLE_THUMBNAIL)
+    _check("opening_scene_strength",       _MIN_OPENING_SCENE)
+    _check("thumbnail_strength",           _MIN_THUMBNAIL_STRENGTH)
+    _check("visual_range",                 _MIN_VISUAL_RANGE)
+    _check("stock_media_feasibility",      _MIN_STOCK_FEASIBILITY)
 
     return {
         "overall_score": overall_score,
@@ -137,22 +175,20 @@ def run_story_scoring_gate(
     niche: str,
     channel,
     script_format: str = "youtube_long",
-) -> Story | None:
-    """Fetch and score candidate stories; return the first one that clears every gate.
+) -> tuple[Story, dict] | None:
+    """Fetch the highest-engagement story then score and gate it in two Claude calls.
 
-    Flow per attempt (up to ``_MAX_CANDIDATES_PER_RUN``):
-      1. Ask Claude to fetch a candidate story (excluding already-rejected ones).
-      2. Ask Claude to score it across nine fixed dimensions
-         (``assess_story_quality``).
-      3. Compute the deterministic weighted score (``score_story_assessment``).
-      4. Apply the fixed accept/reject gates (``decide_story_acceptance``).
+    Phase 1 — Fetch: ``fetch_batch`` runs one web_search pass (story_research / Sonnet)
+    and returns the single most engaged, highest-signal story from the configured sources.
 
-    If a candidate is accepted, it is returned immediately — no further
-    candidates are fetched. If scoring itself fails (Claude error, malformed
-    JSON), that candidate is rejected and the loop continues — the gate fails
-    closed (an unscored story never proceeds). If no candidate clears the bar
-    after ``_MAX_CANDIDATES_PER_RUN`` attempts, ``None`` is returned and the
-    caller exits cleanly: nothing is persisted, no Telegram message is sent.
+    Phase 2 — Score: ``score_story_for_gate`` calls Claude once (story_gate_scoring /
+    Sonnet, structured schema) to produce 18 dimension scores. No comparative scoring —
+    there is only one candidate.
+
+    Phase 3 — Gate: Python applies the weighted threshold and all hard floors.
+
+    The gate fails closed: if either the fetch or the scoring call fails, ``None`` is
+    returned and nothing is persisted.
 
     Args:
         sources:       List of ``(source_value, source_type, trust_score)`` tuples.
@@ -161,59 +197,65 @@ def run_story_scoring_gate(
         script_format: Format key from ``channel_config.script_format``.
 
     Returns:
-        The first ``Story`` that is ACCEPTED, or ``None`` if no candidate
-        cleared the bar (or the fetcher produced nothing) within the attempt limit.
+        ``(story, assessment)`` where ``story`` is the accepted ``Story`` and
+        ``assessment`` is its scoring dict (for downstream Telegram message).
+        Returns ``None`` if the story didn't clear the gate or no story was fetched.
     """
-    rejected: list[dict] = []
-
-    for attempt in range(1, _MAX_CANDIDATES_PER_RUN + 1):
-        story = claude_fetch(sources, niche=niche, exclude=rejected or None)
-        if story is None:
-            logger.info(
-                "Story Scoring Gate: fetcher returned no candidate on attempt %d/%d",
-                attempt, _MAX_CANDIDATES_PER_RUN,
-            )
-            break
-
-        try:
-            assessment = assess_story_quality(
-                story, channel, script_format=script_format, rejected_candidates=rejected or None,
-            )
-            story_score = score_story_assessment(assessment)
-        except Exception as exc:
-            logger.error(
-                "Story Scoring Gate: scoring failed for candidate %d/%d "
-                "(title=%r url=%s) — rejecting and trying next: %s",
-                attempt, _MAX_CANDIDATES_PER_RUN, story.title[:80], story.url, exc,
-            )
-            rejected.append({"title": story.title, "url": story.url})
-            continue
-
-        accepted, reason = decide_story_acceptance(story_score)
-        decision = "ACCEPTED" if accepted else "REJECTED"
-
+    # Phase 1: fetch single highest-engagement story
+    stories: list[Story] = fetch_batch(sources, niche=niche)
+    if not stories:
         logger.info(
-            "Story Scoring Gate candidate %d/%d: title=%r url=%s overall_score=%.1f "
-            "dimension_scores=%s decision=%s reason=%s",
-            attempt, _MAX_CANDIDATES_PER_RUN, story.title[:80], story.url,
-            story_score["overall_score"], story_score["dimension_scores"], decision, reason,
+            "Story Scoring Gate: fetch returned no story — exiting cleanly, "
+            "no Content created, no Telegram message sent"
         )
-        logger.info(
-            "Story Scoring Gate candidate %d/%d details: central_tension=%r "
-            "best_possible_hook=%r concrete_visual_elements=%s",
-            attempt, _MAX_CANDIDATES_PER_RUN,
-            assessment.get("central_tension", ""), assessment.get("best_possible_hook", ""),
-            assessment.get("concrete_visual_elements", []),
+        return None
+    story = stories[0]
+    logger.info(
+        "Story Scoring Gate: fetched story (title=%r url=%s)", story.title[:80], story.url
+    )
+
+    # Phase 2: score the single story
+    try:
+        assessment = score_story_for_gate(
+            story=story,
+            channel=channel,
+            script_format=script_format,
         )
+    except Exception as exc:
+        logger.error(
+            "Story Scoring Gate: scoring failed for %r: %s — "
+            "exiting cleanly, no Content created",
+            story.title[:80], exc,
+        )
+        return None
 
-        if accepted:
-            return story
+    # Phase 3: apply gate
+    try:
+        story_score = score_story_assessment(assessment)
+    except Exception as exc:
+        logger.error(
+            "Story Scoring Gate: score_story_assessment failed for %r — skipping: %s",
+            story.title[:80], exc,
+        )
+        return None
 
-        rejected.append({"title": story.title, "url": story.url})
+    accepted, reason = decide_story_acceptance(story_score)
+    decision = "ACCEPTED" if accepted else "REJECTED"
 
     logger.info(
-        "Story Scoring Gate: no candidate cleared the bar after %d attempt(s) — "
-        "exiting cleanly, no Content created, no Telegram message sent",
-        len(rejected) if rejected else _MAX_CANDIDATES_PER_RUN,
+        "Story Scoring Gate: title=%r url=%s overall_score=%.1f decision=%s reason=%s",
+        story.title[:80], story.url, story_score["overall_score"], decision, reason,
+    )
+    top5 = dict(
+        sorted(story_score["dimension_scores"].items(), key=lambda x: x[1], reverse=True)[:5]
+    )
+    logger.info("Story Scoring Gate top-5 dimensions: %s", top5)
+
+    if accepted:
+        return story, assessment
+
+    logger.info(
+        "Story Scoring Gate: story rejected (title=%r) — exiting cleanly, no Content created",
+        story.title[:80],
     )
     return None

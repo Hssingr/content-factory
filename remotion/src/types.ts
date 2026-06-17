@@ -10,7 +10,7 @@ export type Transition = "cut" | "crossfade" | "dip_to_black" | "whip_pan"
                        | "zoom_blur" | "match_cut" | "none";
 export type OverlayPosition = "center" | "lower_third" | "top_left" | "top_right" | "none";
 export type VisualType = "b-roll" | "action" | "text_overlay" | "document"
-                       | "map" | "screenshot" | "generated_visual";
+                       | "map" | "screenshot" | "generated_visual" | "text_card";
 
 export interface ClipData {
   url:   string;
@@ -101,5 +101,10 @@ export interface ShortProps extends RemotionProps {
   part_label:   string;
   total_parts:  number;
   hook_modified: boolean;
+  rehook_file?:        string | null;  // plays at frame 0, layered over narration intro
+  bridge_file?:        string | null;  // plays after main audio ends
+  rehook_duration_ms?: number | null;  // actual rehook audio duration (from mutagen); null → legacy path
+  bridge_duration_ms?: number | null;  // actual bridge audio duration (from mutagen); null → 2s fallback
+  rehook_text?:        string | null;  // text overlay shown during rehook audio
   config:       VideoConfig;
 }

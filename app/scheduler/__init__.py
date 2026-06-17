@@ -47,11 +47,6 @@ celery_app.conf.beat_schedule = {
         "task": "app.scheduler.tasks.dispatch_publishing",
         "schedule": crontab(minute="0,30"),            # every 30 minutes
     },
-    # Agent 3: validate all scripts ready for quality checking
-    "pickup-scripts-ready": {
-        "task": "app.scheduler.tasks.pickup_scripts_ready",
-        "schedule": crontab(minute="*/15"),            # every 15 minutes
-    },
     # Agent 4: generate audio for all validated scripts
     "pickup-scripts-validated": {
         "task": "app.scheduler.tasks.pickup_scripts_validated",

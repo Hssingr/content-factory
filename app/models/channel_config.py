@@ -41,4 +41,9 @@ class ChannelConfig(Base):
     # True: block on any NEEDS_FIXES verdict that survives the repair pass.
     strict_quality_gate: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
 
+    # ElevenLabs v3 audio tags (e.g. [dramatic pause], [whispers]).
+    # Only meaningful when provider="elevenlabs" AND tts_model="eleven_v3".
+    # False for all existing channels — safe default.
+    audio_tags_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+
     channel: Mapped["Channel"] = relationship("Channel", back_populates="config")

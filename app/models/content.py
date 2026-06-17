@@ -20,6 +20,9 @@ class Content(Base):
     title: Mapped[str] = mapped_column(Text, nullable=False)
     # pipeline state machine — see CLAUDE.md §Agent descriptions for full list
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="DRAFT")
+    # raw source body stored at discovery time (≤8 000 chars) — used by Agent 3
+    # auto_correct_script() to expand minimum_length corrections from source facts
+    source_excerpt: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 

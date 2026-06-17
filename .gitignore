@@ -1,9 +1,13 @@
+# ── Secrets ──────────────────────────────────────────────────────────────────
 .env
-.vscode/
-.idea/
+.env.*
+!.env.example
+
+# ── Python ────────────────────────────────────────────────────────────────────
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
 .venv/
 venv/
 *.egg-info/
@@ -11,8 +15,36 @@ dist/
 build/
 .pytest_cache/
 .mypy_cache/
-node_modules/
-remotion/node_modules/
-*.log
+*.db          # mypy cache sqlite files
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── Media — generated files, never committed ──────────────────────────────────
 media/
-media/**
+
+# ── Remotion runtime artifacts ────────────────────────────────────────────────
+remotion/node_modules/
+remotion/bundles/
+remotion_tmp/
+remotion-webpack-bundle-*/
+remotion-v*/
+puppeteer_dev_chrome_profile-*/
+
+# ── Node ──────────────────────────────────────────────────────────────────────
+node_modules/
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+*.log
+celerybeat-schedule
+celerybeat.pid
+
+# ── One-off scripts ───────────────────────────────────────────────────────────
+scripts/migrate_flux_cache.py
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db

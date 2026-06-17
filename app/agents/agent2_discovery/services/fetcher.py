@@ -10,119 +10,108 @@ logger = logging.getLogger(__name__)
 
 _WEB_SEARCH_TOOL: dict = {"type": "web_search_20250305", "name": "web_search"}
 
-_SYSTEM_PROMPT = """\
+_SINGLE_STORY_SYSTEM_PROMPT = """\
 You are a content discovery agent for an automated multilingual video channel system.
 
-Your task: browse the provided sources and find the SINGLE most relevant and engaging
-story for the channel's niche.
+Your task: browse the provided sources and find the SINGLE most engaged, highest-signal story
+for the channel's niche — not just the most recent, but the one with the most genuine audience
+response: highest comments, reactions, upvotes, or shares when visible.
 
 Discovery criteria:
-1. Relevance   — the story must clearly and strongly match the channel niche
-2. Engagement  — prefer stories with high upvotes, comments, or shares when visible
-3. Substance   — the story must have enough depth for a 6–12 minute video script
+1. Engagement — prefer stories with the most comments, reactions, or shares over recency
+2. Relevance  — the story must clearly and strongly match the channel niche
+3. Substance  — the story must have enough depth for a 6–12 minute video script
 
 Rules:
-- Use the web_search tool to browse the sources provided by the user
-- Skip: promotional content, ads, stickied posts, meta announcements, duplicate stories
-- Check multiple sources if needed before deciding on the best story
+- Use web_search to browse all provided sources before deciding
+- Compare multiple stories across sources before picking the highest-engagement one
+- Skip: promotional content, ads, stickied posts, meta announcements
+- Never invent facts, URLs, titles, or statistics — only include what you actually found
 
-CRITICAL — Return ONLY valid JSON. No markdown. No code fence. No extra keys.
-Start immediately with { and end with }. Never invent facts, URLs, titles, or statistics.
-Only include information you actually found by browsing.
+Return ONLY a valid JSON object. No markdown. No code fence.
+Start immediately with { and end with }.
 
 Required format:
-{"title":"...","body":"200-500 word summary","url":"...","language":"en","published_at":"ISO8601 or null","upvotes":0,"comments":0}\
+{"title":"...","body":"200-500 word factual summary","url":"...","language":"en","published_at":"ISO8601 or null","upvotes":0,"comments":0}\
 """
 
-_REFORMAT_SYSTEM_PROMPT = """\
-Convert the story information below into a single JSON object.
-Return ONLY valid JSON. No markdown. No code fence. No extra keys. Start with {.
+_SINGLE_STORY_REFORMAT_PROMPT = """\
+Extract the story information from the text below and convert it into a single JSON object.
+Return ONLY valid JSON. No markdown. No code fence. Start with {.
 Required keys: title, body, url, language, published_at (ISO8601 or null), upvotes, comments.
 Never invent facts, URLs, or details not present in the input.\
 """
 
 
-def fetch(
+def fetch_batch(
     sources: list[tuple[str, str, float]],
     niche: str,
-    exclude: list[dict] | None = None,
-) -> Story | None:
-    """Ask Claude to autonomously browse all sources and return the best story.
+    count: int = 1,  # kept for call-site compatibility; always fetches exactly 1 story
+) -> list[Story]:
+    """Browse sources and return the single highest-engagement story in one Claude call.
 
-    Uses a two-pass approach:
-    1. Claude browses the web with web_search_20250305 and identifies the best story.
-    2. If the response is not valid JSON (Claude explained in prose), a second
-       single-turn call reformats it into the required JSON structure.
+    Runs one ``call_claude_with_tools`` pass (story_research / Sonnet + web_search).
+    Falls back to a reformat pass if Claude returns prose, then to an empty list on failure.
 
     Args:
-        sources: List of (source_value, source_type, trust_score) tuples.
+        sources: List of ``(source_value, source_type, trust_score)`` tuples.
         niche:   Channel niche description.
-        exclude: Optional list of ``{"title", "url"}`` dicts for stories already
-                 rejected this run (by the Story Scoring Gate) — Claude is told
-                 not to propose any of them again, so retries surface a genuinely
-                 different candidate instead of looping on the same story.
+        count:   Ignored — always returns at most 1 story.
 
     Returns:
-        The best Story found, or None on error.
+        List containing 0 or 1 Story objects.
     """
     if not sources:
-        logger.warning("fetch() called with empty sources list")
-        return None
+        logger.warning("fetch_batch() called with empty sources list")
+        return []
 
     source_lines = "\n".join(
         f"  - [{stype}] {svalue}  (trust={trust:.1f})"
         for svalue, stype, trust in sources
     )
-    exclude_block = ""
-    if exclude:
-        exclude_lines = "\n".join(
-            f"  - {c.get('title', '')!r} ({c.get('url', '')})" for c in exclude
-        )
-        exclude_block = (
-            "\n\nDo NOT propose any of these stories again — they were already "
-            f"rejected this run, find a genuinely different one:\n{exclude_lines}"
-        )
     user_message = (
         f"Channel niche: {niche}\n\n"
-        f"Sources to explore:\n{source_lines}"
-        f"{exclude_block}\n\n"
-        "Browse the sources, find the best story, then output ONLY the JSON object."
+        f"Sources to explore:\n{source_lines}\n\n"
+        "Browse the sources, find the highest-engagement story, then output ONLY the JSON object."
     )
 
     try:
         raw = call_claude_with_tools(
-            _SYSTEM_PROMPT,
+            _SINGLE_STORY_SYSTEM_PROMPT,
             user_message,
             tools=[_WEB_SEARCH_TOOL],
-            max_tokens=2048,
-            max_rounds=15,
+            max_tokens=4096,
+            max_rounds=20,
+            task="story_research",
         )
     except Exception as exc:
-        logger.error("Claude web search failed: %s", exc)
-        return None
+        logger.error("Story fetch web search failed: %s", exc)
+        return []
 
     # Pass 1: try to parse directly
     story = _parse_story(raw)
     if story:
-        return story
+        logger.info("fetch_batch: parsed story directly (title=%r)", story.title[:80])
+        return [story]
 
-    # Pass 2: Claude gave prose — extract the JSON by asking Claude to reformat
+    # Pass 2: Claude gave prose — reformat to JSON object
     logger.info("Response was not JSON — sending reformat pass...")
     try:
         reformatted = call_claude(
-            _REFORMAT_SYSTEM_PROMPT,
-            f"Story information:\n{raw[:3000]}",
-            max_tokens=2048,   # body can be 200-500 words; 512 was too small
+            _SINGLE_STORY_REFORMAT_PROMPT,
+            f"Story information:\n{raw[:6000]}",
+            max_tokens=2048,
+            task="content_reformat",
         )
         story = _parse_story(reformatted)
         if story:
-            logger.info("Reformat pass succeeded")
-            return story
+            logger.info("Reformat pass succeeded (title=%r)", story.title[:80])
+            return [story]
     except Exception as exc:
         logger.error("Reformat pass failed: %s", exc)
 
-    logger.error("Could not extract a valid story from Claude's response")
-    return None
+    logger.error("Could not extract a story from fetch response")
+    return []
 
 
 def _safe_int(value) -> int:
@@ -133,35 +122,12 @@ def _safe_int(value) -> int:
         return 0
 
 
-def _parse_story(text: str) -> Story | None:
-    """Parse Claude's JSON response into a Story. Returns None on parse failure."""
-    # Strip code fences if present
-    cleaned = re.sub(r"```(?:json)?\s*([\s\S]*?)```", r"\1", text).strip()
-
-    # Try to extract a JSON object if there's prose around it
-    if not cleaned.startswith("{"):
-        match = re.search(r"\{[\s\S]*\}", cleaned)
-        if match:
-            cleaned = match.group(0)
-
-    try:
-        # Use raw_decode so we stop at the end of the first valid JSON object
-        # and silently ignore any trailing text Claude added after the closing }.
-        decoder = json.JSONDecoder()
-        data, end_idx = decoder.raw_decode(cleaned)
-        if end_idx < len(cleaned.rstrip()):
-            logger.debug(
-                "Ignored extra content after JSON (first 60 chars): %.60s",
-                cleaned[end_idx:].strip(),
-            )
-    except json.JSONDecodeError as exc:
-        logger.error("Fetcher JSON parse error: %s | Raw (first 300): %.300s", exc, text)
-        return None
-
+def _story_from_dict(data: dict) -> Story | None:
+    """Build a Story from a parsed dict. Returns None if required fields are missing."""
     url   = (data.get("url") or "").strip()
     title = (data.get("title") or "").strip()
     if not url or not title:
-        logger.error("Fetcher response missing url or title: %.200s", text)
+        logger.debug("Fetcher entry missing url or title — skipping")
         return None
 
     language = (data.get("language") or "en").strip()
@@ -186,3 +152,30 @@ def _parse_story(text: str) -> Story | None:
         upvotes=_safe_int(data.get("upvotes")),
         comments=_safe_int(data.get("comments")),
     )
+
+
+def _parse_story(text: str) -> Story | None:
+    """Parse Claude's single-object JSON response into a Story."""
+    cleaned = re.sub(r"```(?:json)?\s*([\s\S]*?)```", r"\1", text).strip()
+
+    if not cleaned.startswith("{"):
+        match = re.search(r"\{[\s\S]*\}", cleaned)
+        if match:
+            cleaned = match.group(0)
+
+    try:
+        decoder = json.JSONDecoder()
+        data, end_idx = decoder.raw_decode(cleaned)
+        if end_idx < len(cleaned.rstrip()):
+            logger.debug(
+                "Ignored extra content after JSON (first 60 chars): %.60s",
+                cleaned[end_idx:].strip(),
+            )
+    except json.JSONDecodeError as exc:
+        logger.error("Fetcher JSON parse error: %s | Raw (first 300): %.300s", exc, text)
+        return None
+
+    story = _story_from_dict(data)
+    if story is None:
+        logger.error("Fetcher response missing url or title: %.200s", text)
+    return story

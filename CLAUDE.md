@@ -12,16 +12,15 @@ Système automatisé de création et publication de vidéos multilingues sur You
 | Langage | Python 3.11+ |
 | Framework API | FastAPI |
 | Queue / Workers | Celery + Redis |
-| Scheduler | APScheduler |
-| Base de données | PostgreSQL |
-| ORM | SQLAlchemy |
-| Containerisation | Docker + Docker Compose |
+| Scheduler | Celery Beat |
+| Base de données | PostgreSQL (local, pas Docker) |
+| ORM | SQLAlchemy 2.0 |
 | IA / Agents | Claude API — modèle : claude-sonnet-4-6 |
 | Voix | ElevenLabs API |
 | Sous-titres | OpenAI Whisper API (word-level timestamps) |
 | Vidéo | Remotion (Node.js, appelé depuis Python via subprocess) |
 | Vidéo IA | Runway API (max 5s, dernier recours uniquement) |
-| Images stock | Pexels API + Unsplash API (gratuits) |
+| Images stock | Pexels API + Unsplash API + Pixabay API |
 | Thumbnails | Pillow (Python) + DALL-E fallback |
 | Notifications | Telegram Bot API (gratuit) |
 | Publication | YouTube Data API v3, Meta Graph API, TikTok API |
@@ -59,36 +58,61 @@ Le pipeline est composé de 8 agents qui s'exécutent en séquence pour chaque v
 - Tous les scripts sauvegardés en DB → passe à Agent 3
 
 ### Agent 3 — Script Validation
-- Reçoit tous les scripts de toutes les langues simultanément
-- Vérifications : cohérence de longueur entre langues (>30% = majeur), ton, complétude, breakpoints Shorts, conformité politique contenu, naturalité linguistique
-- Problème MAJEUR → auto-correction (max 3 tentatives) → si échec : NEEDS_REVIEW + notification Telegram
-- Problème MINEUR → notification Telegram "Reply FIX ou ignoré dans 5 min" → FIX : corrige et continue → pas de réponse : log + continue
+- **Step A — Deterministic Python checks** (`app/services/script_checks.py`) — run first on ALL languages, no Claude call:
+  - `check_completeness`: [INTRO]/[OUTRO]/[SECTION N] markers present, consecutive numbering, no empty bodies, terminal punctuation — MAJOR
+  - `check_minimum_length`: voice_script ≥ 900 words (youtube_long) or ≥ 420 words (short-form) — MAJOR
+  - `check_length_coherence`: cross-language — any lang >30% from median word count — MAJOR
+  - `check_hook_quality`: first sentence after [INTRO] ≤15 words and no forbidden opener — MAJOR
+  - `check_tts_compliance`: no sentence >18 words, no digit-runs, no forbidden chars `()/%&`, no abbreviations (Dr./vs./etc.), no ALL-CAPS words 3+ letters — MAJOR (NEW)
+  - `check_retention_structure`: short-form sections ≤130 words or contain `?`; youtube_long non-last sections must not end with summary-pattern sentences — MINOR (NEW)
+- **Step B — Claude validation** (`PROMPT_VERSION = "2.0"`) — only for languages with NO deterministic MAJOR:
+  - TONE (MINOR), LINGUISTIC_NATURALNESS (MINOR), CONTENT_POLICY (MAJOR)
+  - Claude never re-checks structural/length/hook/TTS issues — those are done in Python
+- Auto-correction loop (max 3 rounds): corrects MAJOR issues per language; re-runs det checks on ALL langs after each round (length_coherence is cross-lang); re-runs Claude only on corrected languages that cleared det MAJOR; carries forward prior verdicts for untouched languages
+- `source_excerpt` (≤8000 chars of original source body) injected into the correction prompt when `minimum_length` is among the issues — Claude expands from source facts, not filler
+- MINOR issues logged to `script_issues_log`; Celery task passes to minor_handler for Telegram notification
 - Output : scripts validés + durées estimées + breakpoints Shorts → Agent 4
 
 ### Agent 4 — Audio Generation
 - Envoie chaque script voix à ElevenLabs (voice_id + emotion depuis channel_voices)
+- **Sélection du modèle ElevenLabs** : piloté par `channel_voices.elevenlabs_model`
+  - `eleven_v3` : audio tags (`<laugh>`, `<sigh>`, `<break time="0.5s" />`) + `speed_profile` (`slow`/`normal`/`fast`) + presets de stabilité (`v3_stability_preset`) — `audio_tags_enabled` (channel_config) doit être `true` pour qu'Agent 2 les injecte dans le script voix
+  - `eleven_multilingual_v2` (défaut) : VoiceSettings classiques (`stability_override`, `similarity_override`, `style_override`, `speed_override`, `use_speaker_boost`)
 - Reçoit fichier audio par langue → stocké sur serveur
 - Mesure durée exacte en millisecondes
 - Recalcule breakpoints Shorts basés sur durée audio réelle
 - Appelle Whisper sur le fichier audio → timestamps mot par mot (pour sous-titres karaoké)
-- Output : fichiers audio + durées exactes + breakpoints + transcriptions Whisper → Agent 5
+- **Bookend audio Shorts** : génère via Claude un re-hook audio et un bridge audio par Short — textes écrits par Claude depuis le contexte Whisper autour du breakpoint, synthétisés via ElevenLabs — stockés dans `audio_files.short_rehook_paths` et `short_bridge_paths` (JSONB lists indexées par short_index, `null` si inutile)
+- Output : fichiers audio + durées exactes + breakpoints + transcriptions Whisper + bookends Shorts → Agent 5
 
 ### Agent 5 — Video Generation
 - Agent autonome avec sous-agents internes
-- Base : Remotion + Pexels/Unsplash stock
-- Runway : uniquement si (1) pas de stock pertinent ET (2) scène critique ET (3) max 5s ET (4) activé dans config — meilleur de ne pas utiliser
+- Base : Remotion + stock Pexels/Unsplash/Pixabay téléchargé localement avant le rendu
+- Runway : uniquement si (1) pas de stock pertinent ET (2) scène critique ET (3) max 5s ET (4) activé dans config — à éviter
 - **Sous-agents :**
-  - Section Splitter : découpe le script en sections selon changements naturels de scène
-  - Section Validator : valide chaque section (ton, durée, flow, impact visuel, source) — max 3 rounds, meilleure tentative si limite atteinte
-  - Runway Decision : spawné uniquement si Runway envisagé, valide les 4 conditions
-  - Assembly Validator : vérifie l'ensemble avant rendu (flow, pacing, durée totale vs audio)
-  - Shorts Cutter : regroupe sections en Shorts, reframe 16:9→9:16, optimise les 3 premières secondes (hook), ajoute numéro de partie
+  - Storyboard Agent : génère les beats visuels depuis le script Whisper — chaque beat porte `visual_intent`, `visual_type`, `search_query`, `stock_query`, `broad_query`, `fallback_query`, `query_style` (`textural`|`environmental`|`action`), `environment`, `motif`, `transition_to_next`, `overlay_text`
+  - Section Splitter : fallback si le Storyboard échoue — découpe le script en sections à intervalles égaux
+  - Section Validator : valide chaque section (ton, durée, flow, impact visuel) — max 3 rounds, meilleure tentative si limite atteinte
+  - Assembly Validator : vérifie l'ensemble avant rendu (répétitions d'environnement, URLs dupliquées, dérive de durée, saturation des overlays)
+  - Shorts Cutter : regroupe les beats en segments Shorts, reframe 16:9→9:16, optimise les 3 premières secondes (hook), ajoute numéro de partie
+- **Media fetch — architecture immediate-download :**
+  - Pour chaque beat : Claude score des candidats de 3 providers (Pexels, Unsplash, Pixabay) sur 0–100
+  - Boucle scorée : ≥72 au 1er essai → accepté immédiatement ; ≥70 au 2e → stop ; score < 55 après tous les essais → candidat rejeté + dark fallback ; sinon 3e essai avec rotation de requêtes (stock_query → search_query → broad_query → fallback_query → refetch_query Claude)
+  - Déduplication cross-beats : une URL distante appliquée à un beat est exclue de tous les beats suivants du même run — évite les clips identiques dans la vidéo
+  - **Invariant absolu** : le candidat sélectionné est téléchargé immédiatement via `asset_manager.py` avant d'être appliqué au beat — `beat["media_url"]` est toujours un chemin local (`cache/abc123.mp4`), jamais une URL http
+  - Si le téléchargement échoue : candidat suivant dans la réponse scorée — jamais de repli sur l'URL distante
+  - Provider disable-per-run : une erreur 403 Unsplash désactive Unsplash pour tous les beats restants du run
+  - `asset_manager.py` : cache thread-safe SHA-256(url)[:24] + extension, déduplication par `threading.Event`
+- **Rendu Remotion :**
+  - Vidéo principale (16:9) : rendu chunked si durée > 90s (`chunk_duration_sec`) — chaque chunk est rendu séparément puis concaténé via ffmpeg
+  - Shorts (9:16) : rendus individuellement
+  - `PRE_RENDER_ASSET_AUDIT` : audit avant rendu — FAIL FAST si une URL http survit dans les props (ne télécharge pas, bloque le rendu)
+  - `remotion_builder.py` : lève `ValueError` si une URL http est détectée lors de la construction des props
 - **Sous-titres :**
   - Vidéo principale : style standard
   - Shorts : style karaoké (mot courant surligné en #FFD700)
   - Générés depuis timestamps Whisper (pas depuis le script)
 - **Numéro de partie Shorts :** "Partie {n}/{total}" (FR), "Part {n} of {total}" (EN), "Parte {n}/{total}" (ES/IT), style et position depuis config canal
-- Remotion rend : vidéo principale (16:9) + tous les Shorts (9:16) en un seul pass
 - Output : fichiers vidéo + Shorts → Agent 6
 
 ### Agent 6 — Thumbnails & Metadata
@@ -134,9 +158,12 @@ channel_config         — channel_id, videos_per_week, shorts_rule,
                          validation_on_limit_reached, subtitle_style_main,
                          subtitle_style_shorts, subtitle_karaoke_active_color,
                          shorts_part_label_style, video_style_type,
-                         video_color_grade, runway_enabled
+                         video_color_grade, runway_enabled, audio_tags_enabled
 channel_languages      — id, channel_id, language, channel_name
-channel_voices         — id, channel_id, language, provider, voice_id, emotion, music_style
+channel_voices         — id, channel_id, language, provider, voice_id, emotion, music_style,
+                         elevenlabs_model, stability_override, similarity_override,
+                         style_override, speed_override, use_speaker_boost,
+                         v3_stability_preset, speed_profile
 channel_sources        — id, channel_id, source_type, source_value, language, trust_score
 channel_platforms      — id, channel_id, language, platform, platform_channel_id,
                          credentials_encrypted, verified, active
@@ -156,7 +183,8 @@ content_validations    — id, content_id, telegram_message_id, status,
                          self_correction_attempts
 
 audio_files            — id, content_id, language, file_path, duration_ms,
-                         shorts_breakpoints (JSON), whisper_transcript (JSON)
+                         shorts_breakpoints (JSONB), whisper_transcript (JSONB),
+                         short_rehook_paths (JSONB), short_bridge_paths (JSONB)
 video_sections         — id, content_id, language, section_order, script_text,
                          audio_start_ms, audio_end_ms, visual_source,
                          search_query, generation_prompt, effect, color_grade,
@@ -188,6 +216,10 @@ analytics_anomalies    — id, content_id, detected_at, type, metric,
 - **Sous-titres karaoké** : depuis timestamps Whisper sur fichier audio réel (pas le script)
 - **Publication** : proxies résidentiels Brightdata par région linguistique
 - **Shorts** : publiés en décalé, pas tous en même temps
+- **Media assets (Agent 5)** : téléchargés immédiatement à la sélection du candidat — `media_url` est toujours un chemin local (`cache/`), jamais une URL http. Remotion et Chromium n'ouvrent aucune connexion réseau pendant le rendu
+- **Rendu chunked (Agent 5)** : vidéos > 90s découpées en chunks de 90s, rendues séparément, concaténées via ffmpeg — élimine les crashes mémoire Chromium sur les vidéos longues
+- **Banned query patterns (Agent 5)** : 14 patterns de requêtes interdits (clichés stock : couloirs sombres, silhouettes, brouillard, etc.) — si `stock_query` matche, `broad_query` est promu à sa place (Python enforce, jamais juste un warning). `query_style` (`textural`|`environmental`|`action`) catégorise le type visuel ciblé pour détecter et éviter les slideshows
+- **Bookend audio Shorts (Agent 4)** : chaque Short reçoit un re-hook audio (clause d'accroche, joué en début) et un bridge audio (transition "suite au prochain épisode", joué après la narration principale) — générés par Claude + ElevenLabs, stockés en JSONB indexé par short_index
 
 ---
 
@@ -211,7 +243,21 @@ content-factory/
 │   │   ├── agent3_validation/
 │   │   ├── agent4_audio/
 │   │   ├── agent5_video/
-│   │   │   └── subagents/
+│   │   │   ├── system_prompt.py        # Storyboard + scoring + validation prompts
+│   │   │   ├── subagents/
+│   │   │   │   ├── storyboard.py       # Génère les beats visuels depuis Whisper
+│   │   │   │   ├── section_splitter.py # Fallback : découpe égale par section
+│   │   │   │   ├── section_validator.py
+│   │   │   │   ├── assembly_validator.py
+│   │   │   │   └── shorts_cutter.py
+│   │   │   └── services/
+│   │   │       ├── video.py            # Orchestrateur principal
+│   │   │       ├── stock_fetcher.py    # Boucle scorée + sélection candidats
+│   │   │       ├── asset_manager.py    # Téléchargement immédiat + cache local thread-safe
+│   │   │       ├── media_localizer.py  # Audit de sécurité (plus de téléchargement)
+│   │   │       ├── remotion_builder.py # Assemblage props JSON (valide l'absence d'URL http)
+│   │   │       ├── renderer.py         # CLI Remotion + rendu chunked
+│   │   │       └── subtitles.py        # Captions standard + karaoké Whisper
 │   │   ├── agent6_metadata/
 │   │   ├── agent7_publishing/
 │   │   └── agent8_analytics/
@@ -221,6 +267,8 @@ content-factory/
 │   │   ├── elevenlabs_client.py
 │   │   ├── whisper_client.py
 │   │   ├── pexels_client.py
+│   │   ├── pixabay_client.py
+│   │   ├── unsplash_client.py
 │   │   ├── runway_client.py
 │   │   └── proxy_manager.py
 │   ├── publishers/
@@ -229,7 +277,7 @@ content-factory/
 │   │   ├── instagram.py
 │   │   └── facebook.py
 │   ├── scheduler/
-│   │   └── scheduler.py        # APScheduler + Celery tasks
+│   │   └── tasks.py            # Celery Beat + tâches périodiques
 │   └── ui/                     # Frontend Agent 1 + Analytics
 ├── remotion/                   # projet Remotion séparé (Node.js)
 │   ├── src/
@@ -314,6 +362,12 @@ REMOTION_PATH=./remotion
 - Local PostgreSQL — no Docker needed
 - DATABASE_URL set in .env
 
+## Testing — HARD RULE
+**NEVER run `test_full_pipeline.py` or any command that triggers real API calls.**
+This includes: Claude API, ElevenLabs, web_search, Pexels/Unsplash/Pixabay, Runway, Telegram, YouTube, Meta.
+Validate with static checks only: `ast.parse`, `importlib.import_module`, `inspect.getsource`, pure-Python unit tests with mocked/stubbed externals.
+If a live run log is needed, tell the user to run it and paste the output here.
+
 ## Coding Standards
 - Python 3.11+
 - SQLAlchemy 2.0 style — Mapped / mapped_column only
@@ -370,6 +424,123 @@ Rules:
 - One-liners are allowed only if the function name is self-explanatory
 
 
+## Prompt Assembly Architecture (Block 2)
+
+Agent 2's `system_prompt.py` uses a composed assembly model instead of monolithic prompt strings:
+
+- `BASE_SCRIPT_PROMPT: dict[str, str]` — keyed by `script_format` — structural core (role, structure, word targets, forbidden openers, JSON schema)
+- `RETENTION_BLOCK: dict[str, str]` — keyed by `script_format` — platform-specific retention mechanics (mini-hook placement, re-hook cadence, loop endings)
+- `TTS_BLOCK: dict[str, str]` — keyed by `elevenlabs_model` — writing constraints baked in at generation time (shared core: ≤18 words, numbers as words, no abbreviations/ALL-CAPS; per-model pacing rules)
+- `build_script_system_prompt(script_format, elevenlabs_model, audio_tags_enabled, niche, tone) -> str` — assembles the full generation prompt; block order is fixed for cache-friendliness per (format, model) pair
+- `build_native_system_prompt(script_format, elevenlabs_model, audio_tags_enabled) -> str` — same assembly for native adaptation prompts
+- `with_tts_block(prompt: str, model: str) -> str` — appends TTS_BLOCK to any existing prompt; used by rewrite, correction, and revision prompts
+
+**Invariants:**
+- TTS constraints are present in ALL script-producing prompts (generation, native adaptation, rewrite, correction, revision). Violations that reach Agent 3 are residual sentence-length overflow, not character-class failures.
+- `generate_revised_scripts()` now returns `{"title", "video_script", "voice_script", "changes"}` — callers must handle the `changes` array (persisted to `ContentValidation.script_issues_log`; appended to the next Telegram message).
+- `generate_native_script()` always receives a `hook_context` string (extracted from the optimised source script's first sentence if not provided by the caller) — native adaptations must preserve the opening hook's concrete specificity.
+- `optimize_intro()` scores across 6 dimensions (honesty removed; fabrication is a hard disqualifier in the prompt). Python max total = 60.
+- Source-language voice model is resolved in `tasks.py` before `generate_scripts()` is called. Target-language voice models are resolved in `generate_multilingual_scripts()` per language from `ChannelVoice`.
+- `optimize_intro()` is now wired in `tasks.py` (called after the Script Quality Gate, before persistence and Telegram send).
+
+**Over-cap Shorts fix (implemented in Block 4, folded):**
+`_enforce_duration_bounds()` in `agent4_audio/services/breakpoints.py` now runs two passes:
+Pass 1 (floor): drops cuts that would produce segments < 61s (unchanged). Pass 2 (ceiling):
+scans resulting segments; for any segment > 91s, computes `n_pieces = ceil(seg_dur / 91s)`
+and inserts `n_pieces - 1` equal-interval bisection cuts. If `piece_ms < 61s` the segment
+cannot be split without violating the floor — it is logged as WARNING and left unchanged
+(e.g. a ~115s segment that would split into two ~58s pieces is kept as-is). For the observed
+FR 139.9s case: 2 pieces of ~69.95s — splits cleanly. The EN 115.7s case cannot be split
+cleanly and logs a WARNING.
+
+**Block 5 — Stock fetcher rewrite (implemented in Block 5):**
+`score_media_candidates_with_claude()` in `agent5_video/system_prompt.py` migrated to
+`call_claude_structured(task="media_scoring")` with `_MEDIA_RANKING_SCHEMA` + vision image
+blocks (thumbnail URL-based). Old `_MEDIA_CANDIDATE_SCORING_SYSTEM_PROMPT`, `_parse_scoring_response`,
+`_extract_json_object` removed. `_MEDIA_RANKING_SYSTEM_PROMPT` + `_MEDIA_RANKING_SCHEMA` added.
+Prescreening (`_prescreen`: resolution ≥ 1280×720, landscape only, video ≥ beat_duration_sec) runs
+before every Claude call via `_verified_candidates` (concurrent HEAD checks). `fetch_all_beats()`
+now processes beats in parallel via `ThreadPoolExecutor(max_workers=6)` with thread-safe
+`_ProviderStatus` (Lock), `used_urls_lock` (atomic URL claim-before-download), `env_best_lock`.
+Dark fallback replaced with `_apply_env_reuse_or_text_card()`: (a) reuse highest-scored local clip
+from same `environment` in this run; (b) if none → `visual_source="text_card"`, `media_url="__dark_fallback__"`.
+`validate_beats_for_render` updated to allow `text_card` beats through the render gate.
+Pixabay video `thumb_url` fixed (was `userImageURL` — an avatar, not a preview; now `""`).
+Video-first implemented: for `query_style in ("action","environmental")` only video candidates sent
+to Claude; images added as fallback if no videos pass prescreen.
+`text_card` TextCard.tsx Remotion composition deferred to Block 6 (currently renders as dark frame;
+`visual_source="text_card"` set in props so Block 6 can wire the composition).
+
+**CDN access note (Block 5):**
+URL-based vision image blocks (`source.type="url"`) fail for many stock CDN URLs (Pixabay,
+Unsplash) because Anthropic's API servers cannot reach them (HTTP 400 "Unable to download").
+Pexels photo URLs typically work. When vision fails, `_verified_candidates` HEAD-check passes
+(CDN is reachable) but Claude API subsequently 400s — `score_media_candidates_with_claude` falls
+back to `_deterministic_best_candidate`. This is a CDN access restriction in Anthropic's datacenter,
+not a code bug. If vision hit rate needs to improve: switch to base64-encoded thumbnails (download
+→ encode → pass as `source.type="base64"`). Not implemented in Block 5 — too expensive per beat.
+
+**Block 6 — Render: pre-bundling, parallel chunks, bridge fps fix, TextCard beat, post-render verification (implemented in Block 6):**
+
+`verify.py` (`agent5_video/services/verify.py`) — `verify_render(mp4_path, expected_duration_ms, fmt)` runs after every
+Remotion render (gated by `VERIFY_RENDERS=true`): ffprobe checks duration ±2%, exactly one audio stream, correct
+resolution (1920×1080 main / 1080×1920 short); `blackdetect` catches any black interval ≥3 s;
+`silencedetect` catches any interior silence ≥4 s (ignoring first/last 1 s edge). Failure → `VerifyFailedError`
+raised in `_run_renders()` → VideoRender row NOT saved → `content.status = "NEEDS_REVIEW"` → error log
+(mp4 kept on disk for inspection). Shorts skip duration check (`expected_duration_ms=None`) because
+bookend padding is variable.
+
+`ensure_bundle()` in `renderer.py` — SHA-256 of `remotion/src/` tree + `package.json`/`package-lock.json`
+determines bundle identity. Bundle stored under `remotion/bundles/{hash}/`. Reused on cache hit;
+`npx remotion bundle` run on miss. Old bundles pruned to keep last 2. Gated by `REMOTION_PRE_BUNDLE=true`
+(default `false`). `render_*` functions all accept `bundle_dir=` and pass it as the Remotion CLI entry point.
+
+Parallel chunk rendering — `CHUNK_PARALLEL_WORKERS=N` (default 1). Set to 2 only after measuring
+single-chunk peak RSS on the VPS (`/usr/bin/time -v npx remotion render ...`) and confirming
+2× peak < 80% of total RAM. `render_main_video_chunked` uses `ThreadPoolExecutor(max_workers=N)`
+for the render phase; audio-slice + props-write phases remain sequential (no thread-safety issues).
+
+Bridge fps fix in `Short.tsx` — `shortCalculateMetadata` now computes `bridgeExtraFrames = Math.ceil(bridge_duration_ms / 1000 * 30)` using the stored `bridge_duration_ms` from props
+instead of the old fixed 60-frame (2 s) buffer. Legacy rows without `bridge_duration_ms` fall back to 60 frames.
+`rehook_duration_ms` likewise used to scope the rehook text overlay sequence.
+
+Rehook text overlay — when `rehook_text` is non-null in Short props, a `RehookOverlay` component
+displays it in gold (#FFD700) during the rehook audio window (fades in/out). This requires Block 3's
+bookend dict shape `{"path", "duration_ms", "text"}` — `_bookend_text()` shim returns `""` for legacy str entries.
+
+`TextCard.tsx` — `remotion/src/components/TextCard.tsx`: dark radial gradient + centred text + accent bar
++ subtle slow-zoom (1.0→1.05). Wired in `MediaSection.tsx` when `section.visual_type === "text_card"`.
+Python side: `_section_for_remotion()` in `remotion_builder.py` overrides `visual_type = "text_card"`
+when the beat dict has `visual_source == "text_card"` (set by stock_fetcher's env-reuse fallback cascade).
+
+Bookend shims in `remotion_builder.py` — `_bookend_path()` / `_bookend_duration()` / `_bookend_text()`
+handle both old bare-string and new dict JSONB shapes. `build_short_props()` now writes
+`rehook_duration_ms`, `bridge_duration_ms`, `rehook_text` into the props JSON.
+
+New settings in `config.py`:
+- `CHUNK_PARALLEL_WORKERS` (int, default 1)
+- `REMOTION_PRE_BUNDLE` (bool, default false)
+- `VERIFY_RENDERS` (bool, default true)
+
+**Block 7 — Telegram summary wiring + existing-props verify (implemented in Block 7):**
+
+`run_story_scoring_gate()` now returns `tuple[Story, dict] | None` (was `Story | None`) — the second
+element is the full Claude `assessment` dict from `assess_story_quality()`. `run_discovery()` unpacks
+it and returns `(content, story, assessment)`. `run_agent2_for_channel` in `tasks.py` unpacks the
+3-tuple, loads `target_languages` from `ChannelLanguage`, and passes both to `send_for_validation()`.
+`send_for_validation()` now accepts `assessment` and `target_languages` and passes them to
+`generate_telegram_summary()` — top-2 scoring dimensions and language list now appear in the Telegram
+message. `estimated_duration_sec` still uses the word-count fallback (post-Agent 3 estimate requires
+Agent 3 to have run; not yet wired because Telegram is sent before Agent 3 runs).
+
+`_render_from_existing_props()` in `video.py` now calls `ensure_bundle()` and passes `bundle_dir` to
+every render call; calls `verify_render()` after the main render and each short; raises
+`VerifyFailedError` on failure. `_process_language` wraps the `_render_from_existing_props` call in a
+`try/except VerifyFailedError` block that sets `content.status = "NEEDS_REVIEW"` and returns `False`,
+matching the behavior of the `_run_renders` path.
+
+---
+
 ## Claude Client Architecture
 
 Shared infrastructure lives in app/services/claude_client.py:
@@ -378,7 +549,19 @@ Shared infrastructure lives in app/services/claude_client.py:
 - Rate limit + timeout error handling
 - Empty response guard
 - Constants: _MAX_RETRIES, _BACKOFF_BASE
-- One base function: call_claude(system_prompt, user_message, max_tokens) -> str
+- Entry points: call_claude(), call_claude_with_usage(), call_claude_structured(), call_claude_with_tools()
+
+Model routing lives in app/services/model_routing.py:
+- MODEL_ROUTING dict: task key → model ID
+- resolve_model(task, model_override=None) — resolution order: override → CLAUDE_TIER=dev → MODEL_ROUTING[task]
+- Unknown task → ValueError (fail-loud, no default)
+- CLAUDE_TIER=dev in .env forces Haiku globally for cheap dev iterations
+
+All call_claude* functions require `task=` as a keyword-only argument. The task key is used for model
+routing and appears in every log line for cost attribution.
+
+call_claude_structured() uses forced tool-use (tool_choice={"type":"tool","name":schema_name}) to
+guarantee structured JSON output without text parsing. Use for Block 4+ storyboard and scoring calls.
 
 Each agent that uses Claude has its own system_prompt.py inside its folder:
 - agent1_setup/system_prompt.py     — field suggestion prompt
@@ -389,12 +572,14 @@ Each agent that uses Claude has its own system_prompt.py inside its folder:
 - agent6_metadata/system_prompt.py  — titles, descriptions, thumbnails
 - agent8_analytics/system_prompt.py — pattern analysis + recommendations
 
-Agents 4 and 7 do not use Claude (ElevenLabs and platform APIs only).
+Agent 7 does not use Claude (platform APIs only).
+Agent 4 uses Claude only for Short bookend generation (`_BOOKEND_SYSTEM_PROMPT` in `agent4_audio/services/audio.py` — prompt is short, no separate system_prompt.py needed).
 
 max_tokens per agent:
 - Agent 1: 256   (short field values)
-- Agent 2: 4096  (full scripts)
-- Agent 3: 1024  (validation output)
+- Agent 2: 4096  (full scripts); generate_native_script uses a higher limit for multilingual adaptation
+- Agent 3: 1024  (subjective validation — 3 checks only: tone, linguistic_naturalness, content_policy); 4096 for auto_correction
+- Agent 4: 512   (bookend text per Short — short Claude call)
 - Agent 5: 2048  (scene descriptions)
 - Agent 6: 1024  (titles + descriptions)
 - Agent 8: 2048  (weekly analysis report)
@@ -402,14 +587,22 @@ max_tokens per agent:
 Rules:
 - Never put a system prompt inside app/services/claude_client.py
 - Never call the Anthropic client directly from an agent — always go through call_claude()
-- Prompt caching (cache_control ephemeral) applied in call_claude() automatically
-  when prompt exceeds 1024 tokens
+- Every call_claude* call must pass task= (keyword-only). Adding a new task requires adding it to MODEL_ROUTING first
+- Prompt caching (cache_control ephemeral) applied automatically when system prompt exceeds 800 chars
+- Every call logs: task, resolved model, cached(yes/no), input/output token counts
 
-## Model Strategy
-- Development / testing: claude-haiku-4-5-20251001 (fast, cheap)
-- Production: claude-sonnet-4-6 (full quality)
-- Model is set via CLAUDE_MODEL in .env — never hardcoded
-- Switch to Sonnet only when testing output quality, not pipeline logic
+## Model Strategy (Block 0 — task routing)
+- Model routing is per-task, not per-agent (app/services/model_routing.py)
+- Dev and prod resolve models identically from MODEL_ROUTING — no env-based override exists.
+  Testing in dev uses the same model as production; there is no Haiku dev-override.
+- Sonnet tasks (high quality or tool-use): script_generation, native_adaptation, quality_rewrite,
+  intro_optimization, auto_correction, storyboard, story_scoring, revision, story_research
+  (web_search — Haiku does not support it), channel_suggestion (onboarding quality)
+- Haiku tasks (fast/cheap): script_quality_check, script_validation, media_scoring, semantic_splits,
+  bookends, telegram_summary, content_reformat, section_validation, section_splitting,
+  visual_reinterpretation
+- CLAUDE_TIER in .env is an inert ops label — it has no effect on model selection
+- model_override= on individual calls bypasses routing (highest precedence; discouraged in production)
 
 ## Prompt Engineering Rules for Claude API Calls
 
@@ -484,11 +677,16 @@ Prompts must NOT:
 
 # Every system prompt must expose:
 
-PROMPT_VERSION = "1.0"
+PROMPT_VERSION = "x.y"
 
 When behavior changes:
 - increment version
 - document reason
+
+Current versions:
+- Agent 2 system_prompt.py: PROMPT_VERSION = "3.0"
+- Agent 3 system_prompt.py: PROMPT_VERSION = "2.0"
+- Agent 5 system_prompt.py: PROMPT_VERSION = "2.2", STORYBOARD_SCHEMA_VERSION = "2.5"
 
 # Hallucination Prevention
 

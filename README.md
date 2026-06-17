@@ -47,7 +47,8 @@ content-factory/
 │       ├── 0002_video_metadata_and_schema_fixes.py
 │       ├── 0003_add_channel_description.py
 │       ├── 0004_add_voice_use_case.py
-│       └── 0005_add_user_pipeline_schedule.py
+│       ├── 0005_add_user_pipeline_schedule.py
+│       └── 0006_add_audio_and_quality_config.py
 └── app/
     ├── main.py                    # FastAPI entry point + Telegram polling/webhook + dev bootstrap
     ├── config.py                  # pydantic-settings from .env
@@ -72,19 +73,22 @@ content-factory/
     │   │   └── services/          # discovery, fetcher (Claude web_search), story,
     │   │                          # scripts (multilingual), validation (Telegram loop)
     │   └── agent5_video/          # Video Generation agent
-    │       ├── system_prompt.py   # enrich_sections_with_visuals(), validate_sections_with_claude(),
-    │       │                      # validate_assembly_with_claude() — PROMPT_VERSION 1.0
+    │       ├── system_prompt.py   # Storyboard generation, candidate scoring, section validation
+    │       │                      # PROMPT_VERSION 2.1 / STORYBOARD_SCHEMA_VERSION 2.4
     │       ├── subagents/
-    │       │   ├── section_splitter.py   # Parses [INTRO]/[SECTION N]/[OUTRO] → timed sections
+    │       │   ├── storyboard.py         # Visual beats from Whisper timestamps + script
+    │       │   ├── section_splitter.py   # Fallback: equal-interval section split
     │       │   ├── section_validator.py  # Claude validation loop (max 3 rounds, best-attempt fallback)
-    │       │   ├── assembly_validator.py # Media relevance check + re-fetch REPLACE sections
-    │       │   └── shorts_cutter.py      # Groups sections into Shorts segments with part labels
+    │       │   ├── assembly_validator.py # Macro checks: env repetition, duplicate URLs, duration drift
+    │       │   └── shorts_cutter.py      # Groups beats into Shorts segments with part labels
     │       └── services/
-    │           ├── stock_fetcher.py      # Fetches media from Pexels/Unsplash per section
-    │           ├── subtitles.py          # Standard captions + karaoke chunks from Whisper
-    │           ├── remotion_builder.py   # Assembles JSON props for Remotion compositions
-    │           ├── renderer.py           # Calls Remotion CLI via subprocess
-    │           └── video.py              # Orchestrator: runs steps 1-9 per language
+    │           ├── video.py              # Orchestrator: steps 1-9 per language
+    │           ├── stock_fetcher.py      # Scored candidate loop (Pexels/Unsplash/Pixabay + Claude scoring)
+    │           ├── asset_manager.py      # Thread-safe immediate download cache (SHA-256 filename)
+    │           ├── media_localizer.py    # Safety audit — FAIL FAST on any remote URL in props
+    │           ├── remotion_builder.py   # JSON props builder — raises ValueError on http URL
+    │           ├── renderer.py           # Remotion CLI + chunked render (90s chunks, ffmpeg concat)
+    │           └── subtitles.py          # Standard captions + karaoke chunks from Whisper
     ├── scheduler/
     │   ├── __init__.py            # Celery app + 8 beat tasks
     │   └── tasks.py               # 10 Celery tasks (6 periodic + 4 on-demand)
@@ -148,7 +152,7 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 ```bash
 sudo -u postgres psql -c "CREATE USER cf_postgres WITH PASSWORD 'postgres';"
 sudo -u postgres psql -c "CREATE DATABASE content_factory OWNER cf_postgres;"
-alembic upgrade head   # applies all 5 migrations
+alembic upgrade head   # applies all 6 migrations
 ```
 
 ### 4. Start the API server

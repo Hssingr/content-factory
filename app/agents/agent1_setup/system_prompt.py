@@ -126,7 +126,7 @@ def suggest_field(field: str, context: dict, max_tokens: int = 256) -> str:
         raise ValueError(f"Invalid context for field '{field}'") from exc
 
     user_message = f"Field: {field}\nContext:\n{context_str}"
-    return call_claude(_SYSTEM_PROMPT, user_message, max_tokens=max_tokens)
+    return call_claude(_SYSTEM_PROMPT, user_message, max_tokens=max_tokens, task="channel_suggestion")
 
 
 # ── Publish timing suggestion ─────────────────────────────────────────────────
@@ -181,7 +181,7 @@ def suggest_publish_timing(
         f"Videos per week: {videos_per_week}\n\n"
         "Return the optimal publish schedule JSON."
     )
-    raw = call_claude(_TIMING_SYSTEM_PROMPT, user_message, max_tokens=256)
+    raw = call_claude(_TIMING_SYSTEM_PROMPT, user_message, max_tokens=256, task="channel_suggestion")
 
     data = parse_claude_json(
         raw,

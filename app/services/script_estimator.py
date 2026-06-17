@@ -1,8 +1,8 @@
-"""Duration estimation and Shorts breakpoints calculation for Agent 3.
+"""Duration estimation and Shorts breakpoints calculation.
 
 All functions are pure Python — no Claude or external API calls.
 Agent 4 will RECALCULATE breakpoints using real audio duration from ElevenLabs;
-these estimates exist so Agent 3 can flag structurally thin scripts before audio is generated.
+these estimates exist so Agent 2 can flag structurally thin scripts before audio is generated.
 """
 
 # Average narration speed in words per minute per language (conservative estimates)
@@ -19,7 +19,7 @@ _DEFAULT_RATE = 140.0   # used when language is unknown
 # A Short must be ≤ 60 s; we target ≤ 58 s to leave a safe margin
 _MAX_SHORT_SEC = 58.0
 
-# Minimum video length threshold (MAJOR validation check)
+# Minimum video length threshold
 MIN_VIDEO_DURATION_SEC = 300.0   # 5 minutes
 
 
@@ -27,7 +27,6 @@ def estimate_duration_sec(voice_script: str, language: str) -> float:
     """Estimate narration duration from a voice script's word count.
 
     Uses language-specific average speech rates. The result feeds:
-    - The minimum_length check (< 5 min = MAJOR issue flagged by Claude)
     - The Shorts breakpoints calculator below
     - ``scripts.estimated_duration_sec`` stored in the DB
 

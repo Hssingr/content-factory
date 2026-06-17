@@ -5,6 +5,7 @@ import {
   OffthreadVideo,
   Sequence,
   interpolate,
+  staticFile,
   useCurrentFrame,
   useVideoConfig,
 } from "remotion";
@@ -16,6 +17,7 @@ import {
   SectionData,
   Transition,
 } from "../types";
+import { TextCard } from "./TextCard";
 
 interface Props {
   section:      SectionData;
@@ -116,16 +118,6 @@ export const MediaSection: React.FC<Props> = ({ section, crossfadeIn = 0, incomi
   const transitionStyle = getTransitionStyle(incomingTransition, frame, crossfadeIn);
   const overlayPosition = section.overlay_position ?? "none";
 
-  // text_overlay beats need no stock media — Storyboard Agent decided to render
-  // the narration as on-screen text over a dark background.
-  if (section.visual_type === "text_overlay") {
-    return (
-      <AbsoluteFill style={{ ...DARK_FALLBACK_STYLE, ...transitionStyle }}>
-        <TextOverlay text={section.overlay_text ?? ""} position={overlayPosition === "none" ? "center" : overlayPosition} />
-      </AbsoluteFill>
-    );
-  }
-
   // Resolve clips — fall back to legacy single-media fields when clips array is absent
   const clips: ClipData[] =
     section.clips?.length
@@ -134,9 +126,32 @@ export const MediaSection: React.FC<Props> = ({ section, crossfadeIn = 0, incomi
 
   const validClips = clips.filter((c) => !isFallback(c.url));
 
-  // generated_visual beats (or any beat whose media fetch never produced a usable
-  // clip) render a neutral placeholder rather than a plain dark fallback.
-  if (section.visual_type === "generated_visual" || validClips.length === 0) {
+  // No usable stock media — render a background placeholder + any overlay text.
+  //
+  // Differentiation by visual_type:
+  //   text_card         → TextCard.tsx (dark gradient + overlay_text, Block 5 fallback)
+  //   generated_visual  → GeneratedPlaceholder (AI generation pending in MODE A,
+  //                        or a hard MEDIA_FAILED beat that slipped through in MODE B)
+  //   text_overlay      → dark background (MODE A design choice; in MODE B this beat
+  //                        should always carry a real media_url from stock_fetcher)
+  //   anything else     → GeneratedPlaceholder (shouldn't happen in a healthy pipeline)
+  if (validClips.length === 0) {
+    const effectiveOverlayPos = overlayPosition === "none" ? "center" : overlayPosition;
+    if (section.visual_type === "text_card") {
+      return (
+        <TextCard
+          text={section.overlay_text ?? ""}
+          style={transitionStyle}
+        />
+      );
+    }
+    if (section.visual_type === "text_overlay") {
+      return (
+        <AbsoluteFill style={{ ...DARK_FALLBACK_STYLE, ...transitionStyle }}>
+          <TextOverlay text={section.overlay_text ?? ""} position={effectiveOverlayPos} />
+        </AbsoluteFill>
+      );
+    }
     return (
       <AbsoluteFill style={transitionStyle}>
         <GeneratedPlaceholder />
@@ -212,9 +227,9 @@ const SingleClip: React.FC<ClipProps> = ({
   return (
     <AbsoluteFill style={{ overflow: "hidden" }}>
       {clip.type === "video" ? (
-        <OffthreadVideo src={clip.url} style={mediaStyle} muted />
+        <OffthreadVideo src={staticFile(clip.url)} style={mediaStyle} muted />
       ) : (
-        <Img src={clip.url} style={mediaStyle} />
+        <Img src={staticFile(clip.url)} style={mediaStyle} />
       )}
     </AbsoluteFill>
   );
