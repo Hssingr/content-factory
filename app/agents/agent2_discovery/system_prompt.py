@@ -5,7 +5,11 @@ from app.services.claude_client import call_claude, call_claude_structured, pars
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "3.1"  # v3.1: auto_correct_script moved from agent3 — Agent 2 now owns
+PROMPT_VERSION = "4.0"  # v4.0: blueprint-first section generation.
+                        # generate_scripts() → generate_story_blueprint() + generate_section().
+                        # optimize_intro() removed — INTRO is a dedicated section with
+                        # built-in quality constraints. global_validation added (Haiku).
+                        # v3.1: auto_correct_script moved from agent3 — Agent 2 now owns
                         # the full script correction loop (det checks + correction prompt).
                         # v3.0: prompt assembly architecture — BASE_SCRIPT_PROMPT /
                         # RETENTION_BLOCK / TTS_BLOCK dicts replace monolithic prompts.
@@ -536,6 +540,394 @@ def _extract_hook_context(voice_script: str, script_format: str) -> str:
     )
 
 
+# ── Story Blueprint ──────────────────────────────────────────────────────────
+
+_STORY_BLUEPRINT_SYSTEM_PROMPT = """\
+You are a documentary story architect. Your task: read a news story and extract its
+narrative skeleton.
+
+You are NOT writing the script yet. You are identifying the structural elements
+that every section of the script must serve. This is a constraint document,
+not a creative exercise.
+
+Rules:
+- hook: the single most gripping, CONCRETE fact from the story. ≤15 words. A named
+  person, a specific number, a physical action — not a theme or a summary.
+- central_question: the one question the viewer must have answered before leaving.
+- major_turns: 2–5 narrative turns — contradictions, discoveries, reversals, or
+  escalations — each one advancing toward the final_payoff. Minimum 2 required.
+- final_payoff: what is revealed or resolved at the end of the story.
+- comment_trigger: ≤20 words, ends with a question mark, forces a strong viewer opinion.
+- suggested_section_count: number of BODY sections (not counting INTRO and OUTRO).
+  Between 2 and 5. Python may override.
+- suggested_title: YouTube title derived from hook. 60–70 chars. SEO-optimized.
+
+Never invent facts not present in the story body.\
+"""
+
+_STORY_BLUEPRINT_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "hook":                   {"type": "string"},
+        "central_question":       {"type": "string"},
+        "major_turns":            {"type": "array", "items": {"type": "string"}, "minItems": 2},
+        "final_payoff":           {"type": "string"},
+        "comment_trigger":        {"type": "string"},
+        "suggested_section_count": {"type": "integer", "minimum": 2, "maximum": 5},
+        "suggested_title":        {"type": "string"},
+    },
+    "required": [
+        "hook", "central_question", "major_turns", "final_payoff",
+        "comment_trigger", "suggested_section_count", "suggested_title",
+    ],
+}
+
+
+def generate_story_blueprint(story, channel, script_format: str = "youtube_long") -> dict:
+    """Extract the narrative skeleton from a story before any script writing.
+
+    Generates a constraint document — hook, central question, major turns, final payoff,
+    comment trigger, suggested title and section count. Every section generated afterward
+    must advance toward the payoff and end with the comment trigger.
+
+    Args:
+        story:         Story object (title, url, body, language).
+        channel:       Channel ORM object (niche, tone).
+        script_format: Format key — affects suggested_section_count recommendation.
+
+    Returns:
+        Dict with keys: hook, central_question, major_turns, final_payoff,
+        comment_trigger, suggested_section_count, suggested_title.
+
+    Raises:
+        ValueError: If major_turns has fewer than 2 entries or required keys missing.
+        anthropic.APIError: On non-retryable Claude API errors.
+    """
+    user_message = (
+        f"Channel niche: {channel.niche}\n"
+        f"Channel tone: {channel.tone}\n"
+        f"Script format: {script_format}\n\n"
+        f"Story title: {story.title}\n"
+        f"Story URL: {story.url}\n\n"
+        f"Story body:\n{story.body[:8000]}"
+    )
+    result = call_claude_structured(
+        task="story_blueprint",
+        system_prompt=_STORY_BLUEPRINT_SYSTEM_PROMPT,
+        user_message=user_message,
+        schema_name="story_blueprint",
+        input_schema=_STORY_BLUEPRINT_SCHEMA,
+        max_tokens=512,
+    )
+    major_turns = result.get("major_turns") or []
+    if len(major_turns) < 2:
+        raise ValueError(
+            f"generate_story_blueprint: major_turns must have ≥2 entries, got {len(major_turns)}"
+        )
+    # Clamp suggested_section_count to valid range
+    count = result.get("suggested_section_count", 3)
+    result["suggested_section_count"] = max(2, min(5, int(count)))
+    return result
+
+
+# ── Section Generation ───────────────────────────────────────────────────────
+
+_SECTION_GENERATION_SYSTEM_PROMPT = """\
+You are a YouTube documentary scriptwriter generating ONE narration section at a time.
+
+Your output is a single narration block — not a complete script. Every word will be read
+aloud by a TTS voice directly to the viewer.
+
+Blueprint constraint: every section must advance the story toward the final_payoff and
+comment_trigger provided in the blueprint. Do not veer off-story.
+
+Each BODY section must do EXACTLY ONE of these narrative functions:
+  - Introduce new information the viewer has not seen yet
+  - Reveal a contradiction between two things stated as true
+  - Escalate the stakes (make things worse or more urgent)
+  - Deliver a concrete piece of evidence or named fact
+  - Create a new open question the viewer needs answered
+Never summarize prior sections — the viewer just heard them. Never repeat a fact.
+
+Content quality rules — driven by channel configuration, not hardcoded genre:
+  - Every body section must contain at least one concrete moment: a named person doing
+    something specific, a physical object, a number with context, a direct consequence,
+    or an observable action. Abstract interpretation is not a substitute.
+  - Do not turn body sections into thematic essays unless the channel tone explicitly
+    requires analysis (e.g., "educational", "documentary", "analytical"). For narrative
+    channels (thriller, horror, mystery, drama, true crime), reserve thematic explanation
+    for the OUTRO. Body sections advance plot and deliver concrete facts.
+  - Match the section's register to the channel configuration:
+    • horror / thriller / mystery → show the event, not the meaning. Let the fact speak.
+    • educational / documentary / analytical → interpret, contextualize, connect.
+    • drama / true crime → alternate between event and emotional reaction.
+    Never impose a register that contradicts the channel's configured tone and niche.
+  - Banned generic phrases — if any of the following appear, rewrite the sentence:
+    "this is not just", "something far worse", "what happened next", "the answer is worse",
+    "but here's the thing", "but that's not all", "little did they know", "it gets worse",
+    "you won't believe", "the truth is", "believe it or not", "here's where it gets",
+    "things took a turn", "what nobody knew", "and that's when everything changed",
+    "in ways nobody could have imagined", "a shocking revelation", "brace yourself".
+
+Narrative progression rules — apply to every section:
+  - Prior summaries and reveals listed in the user message are FORBIDDEN MATERIAL.
+    Do not restate, rephrase, or echo them. The ONLY exception: referencing a prior fact
+    to add a direct new consequence ("X happened — which meant Y was now inevitable").
+  - Never write meta-commentary of any kind: "all major turns have been covered",
+    "as we established", "as mentioned earlier", "to recap", "in summary", "in conclusion",
+    "this brings us to", "building on what we know", "having covered X".
+  - Never produce filler: generic moral reflections, thematic observations, or transitional
+    sentences that add no new fact and advance no story turn.
+  - Reveal meaning through events, not commentary. If an event carries meaning, state
+    the event with precision — the viewer infers its significance. Never precede or
+    follow a concrete fact with a sentence explaining its symbolic importance.
+  - Interpretation must not exceed one sentence per body section. After stating what
+    something means, the very next sentence must deliver a new fact, action, or consequence.
+  - Do not write consecutive sentences of analysis, reflection, or thematic explanation.
+    Each successive sentence must introduce new narrative information: a new person,
+    action, object, or consequence not yet mentioned in this section.
+  - One section = one narrative job. When the user message names a single primary turn,
+    focus entirely on that turn. Do not attempt to resolve all remaining turns at once.
+  - Future turns listed in the user message as "do not resolve yet" may be foreshadowed
+    but must not be answered or fully explained. Leave them for later sections.
+  - End body sections with a bridge or an open question toward the next uncovered turn.
+
+[INTRO] specific rules — apply ONLY when label = INTRO:
+  - The first sentence must be the blueprint's hook verbatim or a direct derivation
+    preserving its exact concrete specificity, named fact, and sense of urgency. ≤15 words.
+  - Must open a curiosity gap — the viewer must wonder "how did this happen?"
+  - Forbidden openers (NEVER start with): In, Today, Have you, Welcome, What if,
+    Did you, Imagine, This is, This was, I want, Let me, This story
+
+[OUTRO] specific rules — apply ONLY when label = OUTRO:
+  - Must directly reference blueprint.final_payoff — the answer the viewer came for.
+  - Resolve the story emotionally before explaining it. Let the consequence land before
+    the interpretation. Do not open OUTRO with a fact dump or a list of events.
+  - Do not repeat body facts unless you are adding a final consequence that was not
+    previously stated. The viewer already heard the facts — give them the meaning.
+  - The final 2–3 sentences must build directly into the comment trigger. The emotional
+    temperature should rise toward the question, not fall away from it.
+  - The LAST non-empty sentence must be EXACTLY blueprint.comment_trigger (or a minimal
+    grammatical adaptation preserving its meaning and question mark).
+  - Must not introduce any new unresolved question.
+
+Output format — return ONLY the tool schema. No prose, no code fence, no extra keys.
+
+Rules:
+1. Never fabricate facts not in the story body or blueprint.
+2. script_text must NOT contain [INTRO], [SECTION N], or [OUTRO] markers inside it.
+3. Every sentence in script_text must be ≤18 words. Count them.
+4. suggests_outro: true ONLY when all major_turns from the blueprint have been covered in
+   prior sections. This is a recommendation only — Python decides whether to end generation.\
+"""
+
+_SECTION_GENERATION_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "script_text": {
+            "type": "string",
+            "description": "Narration text for this section only — no [LABEL] marker inside",
+        },
+        "summary": {
+            "type": "string",
+            "description": "Two sentences: what this section revealed and how it advances the story",
+        },
+        "reveals": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Exact facts or revelations stated in this section",
+        },
+        "open_questions": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Unresolved questions this section raises for the viewer",
+        },
+        "suggests_outro": {
+            "type": "boolean",
+            "description": "True only when all major_turns from the blueprint have been covered",
+        },
+        "visual_intent": {
+            "type": "object",
+            "properties": {
+                "section_goal":        {"type": "string"},
+                "primary_visual_focus": {"type": "string"},
+                "avoid_repeating": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Visual concepts used here that future sections should not repeat",
+                },
+            },
+            "required": ["section_goal", "primary_visual_focus", "avoid_repeating"],
+        },
+    },
+    "required": ["script_text", "summary", "reveals", "open_questions", "suggests_outro", "visual_intent"],
+}
+
+
+def generate_section(
+    label: str,
+    story,
+    blueprint: dict,
+    prior_sections_summary: list[dict],
+    visual_intent_accumulator: dict,
+    channel,
+    script_format: str = "youtube_long",
+    tts_model: str = "sonic-2",
+    tts_provider: str = "cartesia",
+    audio_tags_enabled: bool = False,
+    override_instruction: str = "",
+    primary_required_turn: str | None = None,
+    future_uncovered_turns: list[str] | None = None,
+) -> dict:
+    """Generate a single narration section guided by the story blueprint.
+
+    Args:
+        label:                   Section label: "INTRO", "SECTION 1", "OUTRO", etc.
+        story:                   Story object (body used for source grounding).
+        blueprint:               Blueprint dict from generate_story_blueprint().
+        prior_sections_summary:  List of {label, summary, reveals, open_questions} from
+                                 all previously generated sections (empty for INTRO).
+        visual_intent_accumulator: Accumulated avoid_repeating list across all sections.
+        channel:                 Channel ORM object (niche, tone).
+        script_format:           Format key for TTS_BLOCK selection.
+        tts_model:               TTS model ID.
+        tts_provider:            TTS provider ("cartesia" | "elevenlabs").
+        audio_tags_enabled:      ElevenLabs v3 audio tag opt-in.
+        override_instruction:    Optional extra constraint appended to user message
+                                 (used for targeted retry after completeness check failure).
+        primary_required_turn:   The single earliest uncovered major_turn this section must
+                                 primarily advance. Injected as "MUST primarily advance this
+                                 one turn". None for INTRO and OUTRO (no constraint).
+        future_uncovered_turns:  Remaining uncovered turns after the primary. Injected as
+                                 "do NOT fully resolve these yet". None if ≤1 turn remains.
+
+    Returns:
+        Dict with script_text, summary, reveals, open_questions, suggests_outro, visual_intent.
+
+    Raises:
+        ValueError: If Claude returns malformed JSON or missing required keys.
+        anthropic.APIError: On non-retryable Claude API errors.
+    """
+    import json
+    system_prompt = with_tts_block(
+        _SECTION_GENERATION_SYSTEM_PROMPT, tts_provider, tts_model
+    )
+    if audio_tags_enabled and tts_provider == "elevenlabs" and tts_model == "eleven_v3":
+        system_prompt += AUDIO_TAGS_INSTRUCTION
+
+    prior_json = json.dumps(prior_sections_summary, ensure_ascii=False)
+    avoid_json = json.dumps(visual_intent_accumulator.get("avoid_repeating", []), ensure_ascii=False)
+    blueprint_json = json.dumps(blueprint, ensure_ascii=False)
+
+    user_message = (
+        f"Channel niche: {channel.niche}\n"
+        f"Channel tone: {channel.tone}\n"
+        f"Script format: {script_format}\n\n"
+        f"Blueprint:\n{blueprint_json}\n\n"
+        f"Prior sections summary:\n{prior_json}\n\n"
+        f"Visual concepts already used (do not repeat):\n{avoid_json}\n\n"
+        f"Story source (for fact-grounding):\n{story.body[:4000]}\n\n"
+        f"Now generate: {label}"
+    )
+    if primary_required_turn:
+        user_message += (
+            f"\n\nThis section MUST primarily advance this one story turn:\n{primary_required_turn}"
+        )
+    if future_uncovered_turns:
+        future_json = json.dumps(future_uncovered_turns, ensure_ascii=False)
+        user_message += (
+            f"\n\nFuture turns (do NOT fully resolve these yet — they belong in later sections):\n{future_json}"
+        )
+    if override_instruction:
+        user_message += f"\n\nIMPORTANT: {override_instruction}"
+
+    return call_claude_structured(
+        task="section_generation",
+        system_prompt=system_prompt,
+        user_message=user_message,
+        schema_name="section_output",
+        input_schema=_SECTION_GENERATION_SCHEMA,
+        max_tokens=3072,
+    )
+
+
+# ── Global Validation ────────────────────────────────────────────────────────
+
+_GLOBAL_VALIDATION_SYSTEM_PROMPT = """\
+You check ONLY narrative coherence of a fully assembled video script.
+
+Do NOT re-check:
+  - Sentence length or TTS compliance  (already checked per section)
+  - Hook quality or forbidden openers  (already checked per section)
+  - Word count or minimum length       (already checked per section)
+
+Check ONLY:
+  1. Section flow: does each section transition naturally from the previous?
+     Flag abrupt topic jumps where the connection is unclear.
+  2. Fact repetition: is any specific fact, name, or statistic stated more than once?
+  3. Outro resolution: does the outro answer the question the intro raised?
+  4. Open loops: are there questions raised mid-script that the outro never closes?
+
+Use FIXED criteria — identical script must always return identical result.
+Output ONLY the tool schema. No prose, no extra keys.\
+"""
+
+_GLOBAL_VALIDATION_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "status": {"type": "string", "enum": ["PASS", "NEEDS_FIX"]},
+        "issues": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "section":     {"type": "string"},
+                    "description": {"type": "string"},
+                    "suggestion":  {"type": "string"},
+                },
+                "required": ["section", "description", "suggestion"],
+            },
+        },
+    },
+    "required": ["status", "issues"],
+}
+
+
+def validate_script_globally(voice_script: str, blueprint: dict) -> dict:
+    """Run a Haiku narrative coherence check on the fully assembled voice script.
+
+    Checks transitions, repetition, intro/outro resolution, and open loops.
+    Does NOT re-check TTS compliance, hook quality, or word count.
+
+    Args:
+        voice_script: Fully assembled script with [INTRO]/[SECTION N]/[OUTRO] markers.
+        blueprint:    Blueprint dict — used to contextualise intro/outro resolution check.
+
+    Returns:
+        Dict with status ("PASS" | "NEEDS_FIX") and issues list.
+
+    Raises:
+        ValueError: If Claude returns malformed JSON.
+        anthropic.APIError: On non-retryable Claude API errors.
+    """
+    import json
+    user_message = (
+        f"Blueprint (for context):\n{json.dumps(blueprint, ensure_ascii=False)}\n\n"
+        f"Voice script:\n{voice_script}"
+    )
+    result = call_claude_structured(
+        task="global_validation",
+        system_prompt=_GLOBAL_VALIDATION_SYSTEM_PROMPT,
+        user_message=user_message,
+        schema_name="global_validation",
+        input_schema=_GLOBAL_VALIDATION_SCHEMA,
+        max_tokens=1024,
+    )
+    if result.get("status") not in {"PASS", "NEEDS_FIX"}:
+        raise ValueError(f"validate_script_globally: unexpected status {result.get('status')!r}")
+    return result
+
+
 # ── Telegram message builder (deterministic — no Claude call) ─────────────────
 
 _TELEGRAM_TEMPLATES: dict[str, dict[str, str]] = {
@@ -644,6 +1036,17 @@ Strict rules:
 3. Be specific — quote the actual sentence and say why it fails.\
 """
 
+_QUALITY_REWRITE_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "title":        {"type": "string"},
+        "video_script": {"type": "string"},
+        "voice_script": {"type": "string"},
+    },
+    "required": ["title", "video_script", "voice_script"],
+    "additionalProperties": False,
+}
+
 _SCRIPT_QUALITY_REWRITE_BASE = """\
 You are a YouTube documentary scriptwriter rewriting a script to fix specific retention
 problems identified by an editorial review — WITHOUT losing any facts, structure, or language.
@@ -652,126 +1055,20 @@ You will receive the current title/video_script/voice_script and a list of issue
 concrete fixes. Apply EVERY fix precisely. Do not introduce new problems while fixing old ones.
 
 Rules:
-1. Return ONLY valid JSON. No markdown. No code fence. No extra keys.
-2. Preserve the source language, factual content, and overall story unless an issue
+1. Preserve the source language, factual content, and overall story unless an issue
    explicitly requires changing it.
-3. Apply the requested fixes fully — especially HIGH severity ones (hook, generic
+2. Apply the requested fixes fully — especially HIGH severity ones (hook, generic
    language, narrative arc) — these are non-negotiable.
-4. Never invent facts, names, dates, statistics, or events not present in the
+3. Never invent facts, names, dates, statistics, or events not present in the
    current scripts.
-5. Never send partial scripts — always return the FULL title, video_script, and voice_script.
-6. Preserve [INTRO], [SECTION N], [OUTRO] markers in voice_script, in the same positions
+4. Never send partial scripts — always return the FULL title, video_script, and voice_script.
+5. Preserve [INTRO], [SECTION N], [OUTRO] markers in voice_script, in the same positions
    unless restructuring is explicitly required by an issue.
-7. The rewritten opening must satisfy: first sentence concrete and self-contained, central
+6. The rewritten opening must satisfy: first sentence concrete and self-contained, central
    tension clear within the first three sentences, no generic AI-documentary phrasing
    ("This is a story about…", "Everything changed…", "But one question remains…") unless
    immediately grounded in a specific fact.
-8. Output schema: {"title": "...", "video_script": "...", "voice_script": "..."}\
-"""
-
-# ── Intro Optimizer prompt (6 dimensions — honesty removed) ────────────────────
-
-_INTRO_OPTIMIZER_SYSTEM_PROMPT = """\
-You are a hook-writing specialist for YouTube documentary content.
-
-You receive a full voice_script for a YouTube documentary. Your task:
-  1. Extract what the current [INTRO] block is trying to say and what facts it contains.
-  2. Write SEVEN alternative intro paragraphs (just the text — no [INTRO] marker inside them).
-  3. Score ALL seven against the criteria below.
-  4. Select the highest-scoring one and return it alongside all seven alternatives.
-
-Each alternative must:
-  - Cover the same core facts as the original intro — every claim must come directly from
-    the source material. Fabrication of any detail disqualifies the entire response.
-  - Sound completely natural when read aloud by a TTS voice (no stage directions,
-    no brackets, no parentheses)
-  - Drop the viewer into the MIDDLE OF SOMETHING — danger, contradiction, mystery,
-    or emotional shock. They must feel they arrived late to something already happening.
-  - Open with a specific, concrete, named fact or moment — NOT a preview or tease
-  - Be short: 3–6 sentences maximum (must fit comfortably in 15–25 spoken seconds)
-  - First sentence must be concrete and self-contained: a stranger should understand
-    SOMETHING has happened from that sentence alone, without any context
-
-FORBIDDEN openers for ALL alternatives:
-  "This is a story about…", "Today", "In this video", "Have you ever wondered",
-  "Welcome", "Imagine", "Let me tell you about", "What happened next", "It all started when"
-
-Hook types to produce (exactly one of each, in this order):
-  shock_hook                — opens with the single most surprising or high-stakes fact
-  mystery_hook              — opens with a specific counterintuitive or unexplained fact
-  emotional_hook            — opens by placing a NAMED person in a concrete high-stakes moment
-  contradiction_hook        — opens with two factual statements that directly contradict
-  cold_open_scene_hook      — opens in the middle of a concrete scene, sensory and immediate
-  revelation_hook           — opens with a fact that reframes everything about this story type
-  uncomfortable_question_hook — opens with a question that forces confrontation; story answers it
-
-Scoring criteria — evaluate each alternative against ALL SIX (score 0–10 each):
-  first_3_seconds:    Would a viewer stop scrolling in the first 3 seconds?
-  first_8_seconds:    Would they still be watching after 8 seconds?
-  curiosity_gap:      Does it create a genuine, answerable open question?
-  clarity:            Is the first sentence immediately clear to a stranger with zero context?
-                      Score 0 if it requires prior knowledge, 10 if it stands alone.
-  spoken_naturalness: Does it sound warm and human when read aloud by a TTS voice?
-  retention:          Overall: how strongly does this drive watch time through the full video?
-
-Return ONLY valid JSON. No markdown. No code fence. No extra keys.
-{
-  "alternatives": [
-    {
-      "type": "shock_hook",
-      "text": "...",
-      "scores": {"first_3_seconds": 0, "first_8_seconds": 0, "curiosity_gap": 0, "clarity": 0, "spoken_naturalness": 0, "retention": 0},
-      "total_score": 0
-    },
-    {
-      "type": "mystery_hook",
-      "text": "...",
-      "scores": {"first_3_seconds": 0, "first_8_seconds": 0, "curiosity_gap": 0, "clarity": 0, "spoken_naturalness": 0, "retention": 0},
-      "total_score": 0
-    },
-    {
-      "type": "emotional_hook",
-      "text": "...",
-      "scores": {"first_3_seconds": 0, "first_8_seconds": 0, "curiosity_gap": 0, "clarity": 0, "spoken_naturalness": 0, "retention": 0},
-      "total_score": 0
-    },
-    {
-      "type": "contradiction_hook",
-      "text": "...",
-      "scores": {"first_3_seconds": 0, "first_8_seconds": 0, "curiosity_gap": 0, "clarity": 0, "spoken_naturalness": 0, "retention": 0},
-      "total_score": 0
-    },
-    {
-      "type": "cold_open_scene_hook",
-      "text": "...",
-      "scores": {"first_3_seconds": 0, "first_8_seconds": 0, "curiosity_gap": 0, "clarity": 0, "spoken_naturalness": 0, "retention": 0},
-      "total_score": 0
-    },
-    {
-      "type": "revelation_hook",
-      "text": "...",
-      "scores": {"first_3_seconds": 0, "first_8_seconds": 0, "curiosity_gap": 0, "clarity": 0, "spoken_naturalness": 0, "retention": 0},
-      "total_score": 0
-    },
-    {
-      "type": "uncomfortable_question_hook",
-      "text": "...",
-      "scores": {"first_3_seconds": 0, "first_8_seconds": 0, "curiosity_gap": 0, "clarity": 0, "spoken_naturalness": 0, "retention": 0},
-      "total_score": 0
-    }
-  ],
-  "selected": "shock_hook | mystery_hook | emotional_hook | contradiction_hook | cold_open_scene_hook | revelation_hook | uncomfortable_question_hook",
-  "selected_text": "...",
-  "reason": "one sentence explaining why this alternative outscored the others"
-}
-
-Strict rules:
-1. JSON only — response will be parsed programmatically.
-2. Every claim in every alternative must come directly from the story body. Any invented
-   detail (name, date, statistic, event) disqualifies the entire response.
-3. Each alternative text must be a plain prose paragraph — no [INTRO] marker inside it.
-4. selected_text must be identical to the text of the selected alternative.
-5. total_score for each alternative must equal the sum of its six dimension scores.\
+7. Fill the title, video_script, and voice_script fields of the provided tool schema exactly.\
 """
 
 # ── Public functions ───────────────────────────────────────────────────────────
@@ -819,11 +1116,14 @@ def generate_scripts(
         f"Source URL: {story.url}\n\n"
         f"Story content:\n{story.body[:8000]}"
     )
+    # Intentional free-form JSON path: long-form script output can exceed practical
+    # tool-schema limits. parse_claude_json validates required and allowed keys.
     response = call_claude(prompt, user_message, max_tokens=8192, task="script_generation")
     return parse_claude_json(
         response,
         required_keys=["title", "video_script", "voice_script"],
         type_checks={"title": str, "video_script": str, "voice_script": str},
+        allowed_keys=["title", "video_script", "voice_script"],
     )
 
 
@@ -937,11 +1237,14 @@ def generate_native_script(
         f"\nSource video script:\n{video_script}\n\n"
         f"Source voice script:\n{voice_script}"
     )
+    # Intentional free-form JSON path: native script adaptation is a large text payload.
+    # parse_claude_json validates required and allowed keys.
     response = call_claude(prompt, user_message, max_tokens=8192, task="native_adaptation")
     return parse_claude_json(
         response,
         required_keys=["video_script", "voice_script"],
         type_checks={"video_script": str, "voice_script": str},
+        allowed_keys=["video_script", "voice_script"],
     )
 
 
@@ -981,11 +1284,14 @@ def generate_revised_scripts(
         f"Current voice script:\n{current_scripts.get('voice_script', '')}\n\n"
         f"User feedback:\n{feedback}"
     )
+    # Intentional free-form JSON path: user-driven revisions may return large scripts.
+    # parse_claude_json validates required and allowed keys.
     response = call_claude(prompt, user_message, max_tokens=8192, task="revision")
     return parse_claude_json(
         response,
         required_keys=["title", "video_script", "voice_script", "changes"],
         type_checks={"title": str, "video_script": str, "voice_script": str, "changes": list},
+        allowed_keys=["title", "video_script", "voice_script", "changes"],
     )
 
 
@@ -1010,6 +1316,8 @@ def assess_script_quality(scripts: dict, channel, script_format: str = "youtube_
         f"Title: {scripts.get('title', '')}\n\n"
         f"Voice script:\n{scripts.get('voice_script', '')}"
     )
+    # Intentional free-form JSON path: retained to avoid changing quality-gate
+    # prompt behavior in this rule-cleanup pass. parse_claude_json validates keys.
     response = call_claude(
         _SCRIPT_QUALITY_SYSTEM_PROMPT, user_message, max_tokens=1536, task="script_quality_check"
     )
@@ -1017,6 +1325,7 @@ def assess_script_quality(scripts: dict, channel, script_format: str = "youtube_
         response,
         required_keys=["status", "issues"],
         type_checks={"status": str, "issues": list},
+        allowed_keys=["status", "issues"],
     )
     if result["status"] not in {"PASSED", "NEEDS_REWRITE"}:
         raise ValueError(f"assess_script_quality: unexpected status {result['status']!r}")
@@ -1065,137 +1374,18 @@ def rewrite_script_for_quality(
         f"Current voice script:\n{scripts.get('voice_script', '')}\n\n"
         f"Issues to fix:\n{issue_lines}"
     )
-    response = call_claude(prompt, user_message, max_tokens=8192, task="quality_rewrite")
-    return parse_claude_json(
-        response,
-        required_keys=["title", "video_script", "voice_script"],
-        type_checks={"title": str, "video_script": str, "voice_script": str},
+    result = call_claude_structured(
+        task="quality_rewrite",
+        system_prompt=prompt,
+        user_message=user_message,
+        schema_name="quality_rewrite",
+        input_schema=_QUALITY_REWRITE_SCHEMA,
+        max_tokens=8192,
     )
-
-
-_VALID_HOOK_TYPES = frozenset({
-    "shock_hook", "mystery_hook", "emotional_hook",
-    "contradiction_hook", "cold_open_scene_hook",
-    "revelation_hook", "uncomfortable_question_hook",
-})
-
-
-def optimize_intro(scripts: dict, channel, script_format: str = "youtube_long") -> dict:
-    """Generate 7 hook alternatives for the intro and replace the best one in voice_script.
-
-    Scores across SIX dimensions (honesty removed — fabrication is now a hard
-    disqualifier stated in the prompt, not a scored dimension). Max total score is 60.
-
-    Fails gracefully: if Claude fails or returns a malformed response, the original
-    scripts are returned unmodified.
-
-    Args:
-        scripts:       Dict with ``title``, ``video_script``, ``voice_script``.
-        channel:       Channel ORM object (provides niche and tone as context).
-        script_format: Intro optimization only runs for ``youtube_long``; other
-                       formats return ``scripts`` unchanged.
-
-    Returns:
-        Scripts dict with potentially optimized intro in ``voice_script``.
-        Always has ``title``, ``video_script``, ``voice_script``.
-    """
-    if script_format != "youtube_long":
-        return scripts
-
-    voice_script = scripts.get("voice_script", "")
-    if not voice_script:
-        return scripts
-
-    user_message = (
-        f"Channel niche: {channel.niche}\n"
-        f"Channel tone: {channel.tone}\n\n"
-        f"Current title: {scripts.get('title', '')}\n\n"
-        f"Full voice script:\n{voice_script}"
-    )
-
-    try:
-        raw = call_claude(
-            _INTRO_OPTIMIZER_SYSTEM_PROMPT, user_message, max_tokens=2560, task="intro_optimization"
-        )
-        result = parse_claude_json(
-            raw,
-            required_keys=["alternatives", "selected", "selected_text", "reason"],
-            type_checks={
-                "alternatives": list,
-                "selected": str,
-                "selected_text": str,
-                "reason": str,
-            },
-        )
-    except Exception as exc:
-        logger.warning("Intro optimizer failed — keeping original intro: %s", exc)
-        return scripts
-
-    alternatives = result.get("alternatives") or []
-
-    # Log all alternatives and their scores (6 dimensions, max 60)
-    for alt in alternatives:
-        h_type   = alt.get("type", "?")
-        h_scores = alt.get("scores") or {}
-        h_total  = alt.get("total_score") or sum(
-            int(v) for v in h_scores.values() if isinstance(v, (int, float))
-        )
-        logger.info(
-            "Intro optimizer hook: type=%s total=%d/60 scores=%s",
-            h_type, h_total, {k: v for k, v in h_scores.items()},
-        )
-
-    # Python picks the winner by total across all six dimensions
-    best_alt   = None
-    best_total = -1
-    for alt in alternatives:
-        hook_scores = alt.get("scores") or {}
-        total = sum(int(v) for v in hook_scores.values() if isinstance(v, (int, float)))
-        if total > best_total:
-            best_total = total
-            best_alt   = alt
-
-    claude_text = result.get("selected_text", "").strip()
-    claude_type = result.get("selected", "unknown")
-    if best_alt and best_alt.get("text", "").strip():
-        selected_text = best_alt["text"].strip()
-        selected_type = best_alt.get("type", "unknown")
-        if selected_text != claude_text:
-            logger.info(
-                "Intro optimizer: Python picked %s (total=%d/60) over Claude's pick %s",
-                selected_type, best_total, claude_type,
-            )
-    else:
-        selected_text = claude_text
-        selected_type = claude_type
-
-    reason = result.get("reason", "")
-
-    if not selected_text:
-        logger.warning("Intro optimizer returned empty selected_text — keeping original")
-        return scripts
-
-    intro_re = re.compile(
-        r"(\[INTRO\]\s*\n)(.+?)(\n\s*\[(?:SECTION|OUTRO))",
-        re.IGNORECASE | re.DOTALL,
-    )
-    new_voice_script, subs = intro_re.subn(
-        lambda m: m.group(1) + selected_text + "\n" + m.group(3),
-        voice_script,
-        count=1,
-    )
-
-    if subs == 0:
-        logger.warning(
-            "Intro optimizer: could not locate [INTRO] block in voice_script — keeping original"
-        )
-        return scripts
-
-    logger.info(
-        "Intro optimizer: selected=%s total_score=%d/60 reason=%r new_intro_len=%d",
-        selected_type, best_total, reason, len(selected_text),
-    )
-    return {**scripts, "voice_script": new_voice_script}
+    for _key in ("title", "video_script", "voice_script"):
+        if not isinstance(result.get(_key), str):
+            raise ValueError(f"rewrite_script_for_quality: missing or non-string key '{_key}'")
+    return result
 
 
 # ── Story Scoring Gate (single story) ─────────────────────────────────────────
@@ -1585,4 +1775,207 @@ def auto_correct_script(
 
     return result
 
-    return {"scores": raw_scores}
+
+# ── Standalone short planning: Shorts Planner ──────────────────────────────────────────────────
+
+_SHORTS_PLANNER_SYSTEM_PROMPT = """\
+You are a Short-form content strategist planning how to split a long-form story into
+3–5 standalone TikTok episodes.
+
+Your task: read the source story (voice script + blueprint) and produce a part plan.
+
+Rules:
+- total_parts must be between 3 and 5 (inclusive). Never fewer than 3 or more than 5.
+- Split at narrative boundaries: reveals, discoveries, reversals, or escalations.
+  Never split primarily by time — narrative logic is paramount.
+- Each part covers 60–90 seconds of spoken narration (≈160–250 words at Cartesia sonic-2 speed).
+- Every part must be independently watchable: a viewer who starts on Part 3 must
+  understand the situation from the first 5 seconds without having seen prior parts.
+- opening_hook: 1–2 sentences, each ≤15 words, drops the viewer mid-story. No recap.
+  Must reference something SPECIFIC from the story — not a generic "wait for it" tease.
+- Part N's cliffhanger must be directly answered by Part N+1's main_reveal.
+  The final part's cliffhanger is replaced by a comment trigger question (ends with "?").
+- Never invent facts not present in the voice script or blueprint.
+- goal, main_content_summary, and main_reveal: one concise sentence each.
+
+Output ONLY the tool schema. No prose, no extra keys.\
+"""
+
+_SHORTS_PLAN_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "total_parts": {
+            "type": "integer",
+            "minimum": 3,
+            "maximum": 5,
+            "description": "Total number of Short episodes. Must be 3, 4, or 5.",
+        },
+        "parts": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "part":                 {"type": "integer"},
+                    "goal":                 {"type": "string"},
+                    "opening_hook":         {"type": "string"},
+                    "main_content_summary": {"type": "string"},
+                    "main_reveal":          {"type": "string"},
+                    "cliffhanger":          {"type": "string"},
+                },
+                "required": [
+                    "part", "goal", "opening_hook",
+                    "main_content_summary", "main_reveal", "cliffhanger",
+                ],
+            },
+            "minItems": 3,
+            "maxItems": 5,
+        },
+    },
+    "required": ["total_parts", "parts"],
+}
+
+
+def generate_shorts_plan(voice_script: str, blueprint: dict, channel) -> dict:
+    """Plan 3–5 standalone TikTok episodes from a long-form voice script.
+
+    Uses a Haiku structured call — the output is validated by Python for the
+    total_parts range constraint (3 ≤ n ≤ 5). Callers should retry once if the
+    constraint fails before giving up.
+
+    Args:
+        voice_script: Fully assembled long-form voice script (with markers).
+        blueprint:    Blueprint dict from generate_story_blueprint().
+        channel:      Channel ORM object (provides niche and tone).
+
+    Returns:
+        Dict with ``total_parts`` (int) and ``parts`` (list of part plan dicts).
+
+    Raises:
+        ValueError: If Claude returns malformed JSON, missing keys, or total_parts
+                    outside [3, 5].
+        anthropic.APIError: On non-retryable Claude API errors.
+    """
+    import json
+    user_message = (
+        f"Channel niche: {channel.niche}\n"
+        f"Channel tone: {channel.tone}\n\n"
+        f"Blueprint:\n{json.dumps(blueprint, ensure_ascii=False)}\n\n"
+        f"Long-form voice script:\n{voice_script[:8000]}"
+    )
+    result = call_claude_structured(
+        task="shorts_planner",
+        system_prompt=_SHORTS_PLANNER_SYSTEM_PROMPT,
+        user_message=user_message,
+        schema_name="shorts_plan",
+        input_schema=_SHORTS_PLAN_SCHEMA,
+        max_tokens=1024,
+    )
+    total = result.get("total_parts")
+    if not isinstance(total, int) or not (3 <= total <= 5):
+        raise ValueError(
+            f"generate_shorts_plan: total_parts must be 3–5, got {total!r}"
+        )
+    parts = result.get("parts") or []
+    if len(parts) != total:
+        raise ValueError(
+            f"generate_shorts_plan: parts list length {len(parts)} != total_parts {total}"
+        )
+    required_part_keys = {"part", "goal", "opening_hook", "main_content_summary", "main_reveal", "cliffhanger"}
+    for i, part in enumerate(parts):
+        missing = required_part_keys - set(part.keys())
+        if missing:
+            raise ValueError(f"generate_shorts_plan: part[{i}] missing keys: {missing}")
+    return result
+
+
+# ── Standalone short planning: Short Episode Script ────────────────────────────────────────────
+
+_SHORT_EPISODE_SYSTEM_PROMPT = """\
+You are writing a TikTok episode script — one standalone part of a multi-part story.
+
+This is NOT a cut of a longer video. It is purpose-built for TikTok.
+
+Rules:
+- Hard limit: 160–250 words. Count every word in voice_script before returning.
+  If voice_script exceeds 250 words, cut it — remove the least essential sentences
+  until the count is at or below 250. Do not return until the word count is ≤250.
+  (250 words ≈ 83 seconds at Cartesia sonic-2 speed.)
+- First sentence = the opening_hook from the plan, ≤15 words, drops viewer mid-story
+- Re-hook every 7–10 seconds of narration: a new curiosity gap, question, or micro-reveal
+  that prevents the viewer from scrolling away. These are not summaries — they are new angles.
+- Never recap prior parts — assume this viewer has never seen any other part
+- One clear main_reveal per part — this is the payoff for watching this part
+- End on the exact cliffhanger from the plan — this is what drives the viewer to Part N+1
+- Sentence rhythm: short sentences (3–7 words) for tension, longer (8–15 words) for buildup.
+  Never 3+ consecutive sentences of the same length.
+- No filler, no recap, no "as I mentioned", no "in Part 1"
+- No [SECTION N] markers — Short scripts are flat narration only
+
+Return ONLY valid JSON. No markdown. No code fence. No extra keys.
+{"title": "Part N title (≤60 chars, TikTok-optimized)", "voice_script": "Full flat narration text"}\
+"""
+
+
+def generate_short_episode_script(
+    part_plan: dict,
+    long_voice_script: str,
+    blueprint: dict,
+    channel,
+    channel_voice,
+    override_instruction: str = "",
+) -> dict:
+    """Generate a single TikTok episode script from a part plan.
+
+    The user message includes the part plan, the relevant excerpt of the long
+    voice_script, and the blueprint — Claude writes purpose-built TikTok narration,
+    NOT a cut of the long video.
+
+    Args:
+        part_plan:          Single part dict from generate_shorts_plan().
+        long_voice_script:  Full long-form voice script (for story grounding).
+        blueprint:          Blueprint dict from generate_story_blueprint().
+        channel:            Channel ORM object (provides niche and tone).
+        channel_voice:      ChannelVoice ORM object (provides tts_model for TTS_BLOCK).
+        override_instruction: Optional correction instruction appended to user message
+                              (used by the 2-round auto-correction loop in run_shorts_planner).
+
+    Returns:
+        Dict with keys ``title`` (str) and ``voice_script`` (str).
+
+    Raises:
+        ValueError: If Claude returns malformed JSON or missing required keys.
+        anthropic.APIError: On non-retryable Claude API errors.
+    """
+    import json
+    tts_model    = channel_voice.tts_model if channel_voice else "sonic-2"
+    tts_provider = channel_voice.provider  if channel_voice else "cartesia"
+    system_prompt = with_tts_block(_SHORT_EPISODE_SYSTEM_PROMPT, tts_provider, tts_model)
+
+    part_n     = part_plan.get("part", "?")
+    total_parts = part_plan.get("_total_parts", "?")   # injected by caller
+    part_json  = json.dumps(part_plan, ensure_ascii=False)
+    bp_json    = json.dumps(blueprint, ensure_ascii=False)
+
+    user_message = (
+        f"Channel niche: {channel.niche}\n"
+        f"Channel tone: {channel.tone}\n"
+        f"Part: {part_n} of {total_parts}\n\n"
+        f"Part plan:\n{part_json}\n\n"
+        f"Blueprint:\n{bp_json}\n\n"
+        f"Long-form voice script (for story grounding — do NOT lift sentences directly):\n"
+        f"{long_voice_script[:6000]}"
+    )
+    if override_instruction:
+        user_message += f"\n\nIMPORTANT: {override_instruction}"
+
+    # Intentional free-form JSON path: retained to avoid changing short-script
+    # generation behavior in this rule-cleanup pass. parse_claude_json validates keys.
+    response = call_claude(
+        system_prompt, user_message, max_tokens=1024, task="short_script"
+    )
+    return parse_claude_json(
+        response,
+        required_keys=["title", "voice_script"],
+        type_checks={"title": str, "voice_script": str},
+        allowed_keys=["title", "voice_script"],
+    )

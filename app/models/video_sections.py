@@ -1,5 +1,5 @@
 import uuid
-from sqlalchemy import String, Integer, Text, ForeignKey
+from sqlalchemy import Float, String, Integer, Text, ForeignKey
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.dialects.postgresql import UUID
 
@@ -24,5 +24,9 @@ class VideoSection(Base):
     # JSON blob: visual_intent, visual_type, environment, motif, transition_to_next,
     # overlay_text, overlay_position, media_url (local cache path after Flux generation)
     generation_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    beat_intensity: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    suggested_duration_sec: Mapped[float | None] = mapped_column(Float, nullable=True)
+    media_strategy: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    text_card_style: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     content: Mapped["Content"] = relationship("Content", back_populates="video_sections")

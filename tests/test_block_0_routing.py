@@ -41,7 +41,7 @@ class TestResolveModel(unittest.TestCase):
         from app.services.model_routing import HAIKU
         for task in (
             "script_quality_check", "script_validation", "media_scoring",
-            "semantic_splits", "bookends", "telegram_summary",
+            "telegram_summary",
             "content_reformat", "section_validation", "section_splitting",
             "visual_reinterpretation",
         ):

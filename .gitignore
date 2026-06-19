@@ -42,6 +42,10 @@ node_modules/
 celerybeat-schedule
 celerybeat.pid
 
+
+# ── Generated code reports ────────────────────────────────────────────────────
+code_report/
+
 # ── One-off scripts ───────────────────────────────────────────────────────────
 scripts/migrate_flux_cache.py
 

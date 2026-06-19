@@ -1,7 +1,7 @@
 """Text normalization utilities shared across agents.
 
-Provides ``normalize_for_matching`` — used by Agent 4 (Shorts split phrase
-matching) and Agent 5 (storyboard narration-hint matching) to make fuzzy
+Provides ``normalize_for_matching`` — used by Agent 3 audio normalization and Agent 4 visual
+matching to make fuzzy
 string comparison numeral-proof and language-aware.
 """
 

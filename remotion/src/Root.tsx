@@ -58,7 +58,6 @@ export const RemotionRoot: React.FC = () => {
             subtitles:     { style: "karaoke", captions: [] },
             part_label:    "",
             total_parts:   1,
-            hook_modified: true,
             config:        { style: "documentary", color_grade: "desaturated" },
           } satisfies ShortProps
         }

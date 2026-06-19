@@ -1,705 +1,2271 @@
-# CLAUDE.md — Content Factory
+# CLAUDE.md — Content Factory Engineering Guide
 
-## Vue d'ensemble du projet
-Système automatisé de création et publication de vidéos multilingues sur YouTube, TikTok, Instagram et Facebook. Le système fonctionne 24h/24 sans intervention humaine quotidienne. L'utilisateur interagit uniquement via Telegram pour valider les contenus.
+This file is the **single source of truth** for Content Factory architecture, coding rules, prompting rules, and operational constraints.
+
+It has two major parts:
+
+1. **Platform architecture** — what exists today, how the pipeline flows, which modules own which responsibility, and what invariants must hold.
+2. **Rules** — mandatory engineering, database, testing, naming, prompting, Claude Code/Codex, logging, reliability, and safety rules.
+
+When architecture changes, update this file in the same change set.  
+When a rule becomes obsolete, remove or replace it.  
+Do not append temporary phase notes. This file describes the current product, not the development history.
 
 ---
 
-## Stack technique
+# Part 1 — Platform Architecture
 
-| Composant | Technologie |
+## 1. Product Overview
+
+Content Factory is an automated media pipeline for generating multilingual long-form videos and standalone short episodes for YouTube, TikTok, Instagram, and Facebook.
+
+The system:
+
+- Discovers source stories from configured sources.
+- Scores and deduplicates stories.
+- Sends selected stories to the operator through Telegram for approval.
+- Generates long-form scripts.
+- Generates standalone short episode scripts linked to the long-form parent.
+- Generates audio with TTS.
+- Generates word-level timestamps with Whisper.
+- Generates visual storyboards.
+- Generates Flux images.
+- Renders videos through Remotion.
+- Stores all outputs in PostgreSQL and the local media filesystem.
+- Runs through Celery workers and Celery Beat scheduling.
+
+The current production-relevant pipeline covers:
+
+- Agent 1 — Channel Setup
+- Agent 2 — Story discovery, validation, long script generation, short episode planning
+- Agent 3 — Audio and Whisper
+- Agent 4 — Visual planning and media generation
+- Agent 5 — Rendering
+- Agent 6+ — not part of the current media-generation core yet
+
+Deterministic script checks and script correction run inside Agent 2.
+
+---
+
+## 2. Core Technology Stack
+
+| Area | Technology |
 |---|---|
-| Langage | Python 3.11+ |
-| Framework API | FastAPI |
-| Queue / Workers | Celery + Redis |
+| Language | Python 3.11+ |
+| API | FastAPI |
+| Workers | Celery |
 | Scheduler | Celery Beat |
-| Base de données | PostgreSQL (local, pas Docker) |
+| Queue/Broker | Redis |
+| Database | PostgreSQL |
 | ORM | SQLAlchemy 2.0 |
-| IA / Agents | Claude API — modèle : claude-sonnet-4-6 |
-| Voix | ElevenLabs API |
-| Sous-titres | OpenAI Whisper API (word-level timestamps) |
-| Vidéo | Remotion (Node.js, appelé depuis Python via subprocess) |
-| Vidéo IA | Runway API (max 5s, dernier recours uniquement) |
-| Images stock | Pexels API + Unsplash API + Pixabay API |
-| Thumbnails | Pillow (Python) + DALL-E fallback |
-| Notifications | Telegram Bot API (gratuit) |
-| Publication | YouTube Data API v3, Meta Graph API, TikTok API |
-| Proxies | Brightdata résidentiel (1 profil par langue/région) |
-| Chiffrement | Python Fernet (AES-256) pour les credentials |
-| Serveur | Hetzner VPS Ubuntu 22.04 |
+| Migrations | Alembic |
+| AI text/reasoning | Claude API |
+| TTS | Cartesia by default; ElevenLabs supported as legacy/provider option |
+| Transcription | OpenAI Whisper API with word-level timestamps |
+| Image generation | fal.ai Flux Schnell |
+| Video rendering | Remotion, called from Python through subprocess |
+| Notifications | Telegram Bot API |
+| Credential encryption | Fernet |
+| Frontend | React/Vite for Agent 1 UI |
+| Media storage | Local filesystem under configured media path |
 
 ---
 
-## Architecture des agents
+## 3. High-Level Pipeline
 
-Le pipeline est composé de 8 agents qui s'exécutent en séquence pour chaque vidéo.
-
-### Agent 1 — Channel Setup
-- UI web avec champs assistés par IA
-- Tab 1 : configuration du canal (description, langues, noms, niche, voix, fréquence, shorts, sources, plateformes)
-- Tab 2 : credentials par plateforme × langue avec vérification live
-- Chaque champ se déverrouille quand le précédent est rempli
-- Claude propose des suggestions, l'utilisateur valide ou modifie
-- Sauvegarde en DRAFT jusqu'à validation des credentials
-- Pipeline activé par ligne de credential vérifiée (activation partielle possible)
-  > **Décision d'implémentation :** toutes les credentials doivent être vérifiées avant activation (choix UX pour fiabilité)
-
-### Agent 2 — Content Discovery
-- Déclenchement : schedule (cron) ou manuel via POST /run/{channel_id}
-- Source la meilleure histoire dans la langue la plus riche pour la niche (pas forcément la langue de l'utilisateur)
-- Scoring des histoires : pertinence + engagement (upvotes, commentaires) + fraîcheur
-- Déduplication via SHA-256 hash (URL + titre) dans PostgreSQL
-- Génère : titre + script vidéo + script voix dans la langue source
-- Envoie résumé à l'utilisateur via Telegram (dans sa langue primaire)
-- Boucle de validation : APPROVE ou CHANGE + feedback (limite configurable, défaut 3, max 5)
-- Timeout configurable (défaut 24h) → auto-approve
-- Sur limite atteinte : auto_approve ou needs_review (configurable par canal)
-- Après validation : génère script natif par langue (pas traduction — adaptation culturelle)
-- Tous les scripts sauvegardés en DB → passe à Agent 3
-
-### Agent 3 — Script Validation
-- **Step A — Deterministic Python checks** (`app/services/script_checks.py`) — run first on ALL languages, no Claude call:
-  - `check_completeness`: [INTRO]/[OUTRO]/[SECTION N] markers present, consecutive numbering, no empty bodies, terminal punctuation — MAJOR
-  - `check_minimum_length`: voice_script ≥ 900 words (youtube_long) or ≥ 420 words (short-form) — MAJOR
-  - `check_length_coherence`: cross-language — any lang >30% from median word count — MAJOR
-  - `check_hook_quality`: first sentence after [INTRO] ≤15 words and no forbidden opener — MAJOR
-  - `check_tts_compliance`: no sentence >18 words, no digit-runs, no forbidden chars `()/%&`, no abbreviations (Dr./vs./etc.), no ALL-CAPS words 3+ letters — MAJOR (NEW)
-  - `check_retention_structure`: short-form sections ≤130 words or contain `?`; youtube_long non-last sections must not end with summary-pattern sentences — MINOR (NEW)
-- **Step B — Claude validation** (`PROMPT_VERSION = "2.0"`) — only for languages with NO deterministic MAJOR:
-  - TONE (MINOR), LINGUISTIC_NATURALNESS (MINOR), CONTENT_POLICY (MAJOR)
-  - Claude never re-checks structural/length/hook/TTS issues — those are done in Python
-- Auto-correction loop (max 3 rounds): corrects MAJOR issues per language; re-runs det checks on ALL langs after each round (length_coherence is cross-lang); re-runs Claude only on corrected languages that cleared det MAJOR; carries forward prior verdicts for untouched languages
-- `source_excerpt` (≤8000 chars of original source body) injected into the correction prompt when `minimum_length` is among the issues — Claude expands from source facts, not filler
-- MINOR issues logged to `script_issues_log`; Celery task passes to minor_handler for Telegram notification
-- Output : scripts validés + durées estimées + breakpoints Shorts → Agent 4
-
-### Agent 4 — Audio Generation
-- Envoie chaque script voix à ElevenLabs (voice_id + emotion depuis channel_voices)
-- **Sélection du modèle ElevenLabs** : piloté par `channel_voices.elevenlabs_model`
-  - `eleven_v3` : audio tags (`<laugh>`, `<sigh>`, `<break time="0.5s" />`) + `speed_profile` (`slow`/`normal`/`fast`) + presets de stabilité (`v3_stability_preset`) — `audio_tags_enabled` (channel_config) doit être `true` pour qu'Agent 2 les injecte dans le script voix
-  - `eleven_multilingual_v2` (défaut) : VoiceSettings classiques (`stability_override`, `similarity_override`, `style_override`, `speed_override`, `use_speaker_boost`)
-- Reçoit fichier audio par langue → stocké sur serveur
-- Mesure durée exacte en millisecondes
-- Recalcule breakpoints Shorts basés sur durée audio réelle
-- Appelle Whisper sur le fichier audio → timestamps mot par mot (pour sous-titres karaoké)
-- **Bookend audio Shorts** : génère via Claude un re-hook audio et un bridge audio par Short — textes écrits par Claude depuis le contexte Whisper autour du breakpoint, synthétisés via ElevenLabs — stockés dans `audio_files.short_rehook_paths` et `short_bridge_paths` (JSONB lists indexées par short_index, `null` si inutile)
-- Output : fichiers audio + durées exactes + breakpoints + transcriptions Whisper + bookends Shorts → Agent 5
-
-### Agent 5 — Video Generation
-- Agent autonome avec sous-agents internes
-- Base : Remotion + stock Pexels/Unsplash/Pixabay téléchargé localement avant le rendu
-- Runway : uniquement si (1) pas de stock pertinent ET (2) scène critique ET (3) max 5s ET (4) activé dans config — à éviter
-- **Sous-agents :**
-  - Storyboard Agent : génère les beats visuels depuis le script Whisper — chaque beat porte `visual_intent`, `visual_type`, `search_query`, `stock_query`, `broad_query`, `fallback_query`, `query_style` (`textural`|`environmental`|`action`), `environment`, `motif`, `transition_to_next`, `overlay_text`
-  - Section Splitter : fallback si le Storyboard échoue — découpe le script en sections à intervalles égaux
-  - Section Validator : valide chaque section (ton, durée, flow, impact visuel) — max 3 rounds, meilleure tentative si limite atteinte
-  - Assembly Validator : vérifie l'ensemble avant rendu (répétitions d'environnement, URLs dupliquées, dérive de durée, saturation des overlays)
-  - Shorts Cutter : regroupe les beats en segments Shorts, reframe 16:9→9:16, optimise les 3 premières secondes (hook), ajoute numéro de partie
-- **Media fetch — architecture immediate-download :**
-  - Pour chaque beat : Claude score des candidats de 3 providers (Pexels, Unsplash, Pixabay) sur 0–100
-  - Boucle scorée : ≥72 au 1er essai → accepté immédiatement ; ≥70 au 2e → stop ; score < 55 après tous les essais → candidat rejeté + dark fallback ; sinon 3e essai avec rotation de requêtes (stock_query → search_query → broad_query → fallback_query → refetch_query Claude)
-  - Déduplication cross-beats : une URL distante appliquée à un beat est exclue de tous les beats suivants du même run — évite les clips identiques dans la vidéo
-  - **Invariant absolu** : le candidat sélectionné est téléchargé immédiatement via `asset_manager.py` avant d'être appliqué au beat — `beat["media_url"]` est toujours un chemin local (`cache/abc123.mp4`), jamais une URL http
-  - Si le téléchargement échoue : candidat suivant dans la réponse scorée — jamais de repli sur l'URL distante
-  - Provider disable-per-run : une erreur 403 Unsplash désactive Unsplash pour tous les beats restants du run
-  - `asset_manager.py` : cache thread-safe SHA-256(url)[:24] + extension, déduplication par `threading.Event`
-- **Rendu Remotion :**
-  - Vidéo principale (16:9) : rendu chunked si durée > 90s (`chunk_duration_sec`) — chaque chunk est rendu séparément puis concaténé via ffmpeg
-  - Shorts (9:16) : rendus individuellement
-  - `PRE_RENDER_ASSET_AUDIT` : audit avant rendu — FAIL FAST si une URL http survit dans les props (ne télécharge pas, bloque le rendu)
-  - `remotion_builder.py` : lève `ValueError` si une URL http est détectée lors de la construction des props
-- **Sous-titres :**
-  - Vidéo principale : style standard
-  - Shorts : style karaoké (mot courant surligné en #FFD700)
-  - Générés depuis timestamps Whisper (pas depuis le script)
-- **Numéro de partie Shorts :** "Partie {n}/{total}" (FR), "Part {n} of {total}" (EN), "Parte {n}/{total}" (ES/IT), style et position depuis config canal
-- Output : fichiers vidéo + Shorts → Agent 6
-
-### Agent 6 — Thumbnails & Metadata
-- Extrait la frame la plus impactante de la vidéo (scoring: contraste, action, impact visuel)
-- Améliore avec Pillow : color grade, texte teaser, branding canal
-- Fallback DALL-E si aucune frame satisfaisante
-- Formats : 16:9 (YouTube/Facebook), 1:1 (Instagram), 9:16 (TikTok/Shorts)
-- Génère titres + descriptions optimisés par plateforme par langue :
-  - YouTube : titre SEO + description complète + timestamps + hashtags
-  - TikTok : titre court + 3-5 hashtags
-  - Instagram : hook émotionnel + hashtags
-  - Facebook : titre conversationnel + description longue
-- Envoie thumbnail + titre + description YouTube à l'utilisateur via Telegram (sa langue)
-- Validation : APPROVE ou CHANGE, limite depuis config (défaut 3), auto-approve après 1h
-- Output : thumbnails + métadonnées → Agent 7
-
-### Agent 7 — Publishing
-- Calcule le créneau de publication optimal par plateforme × langue × timezone
-- Shorts publiés en décalé (shorts_spread_hours, défaut 6h entre chaque)
-- Publie via proxy résidentiel régional (FR→IP française, EN/US→IP américaine, etc.)
-- Vérifie credentials avant publication
-- 3 tentatives par plateforme → PUBLISH_FAILED + notification Telegram si échec
-- Stocke platform_video_id retourné par chaque API
-- Update statut → PUBLISHED
-
-### Agent 8 — Analytics (développé en dernier)
-- Polling : 1h, 24h, 7j, 30j, 90j après publication
-- Métriques : vues, likes, commentaires, partages, watch time, CTR, revenus
-- Anomalie si déviation >50% de la moyenne du canal → notification Telegram
-- Rapport hebdomadaire (chaque lundi) : max 5 recommandations actionnables
-- Si pattern constant sur 3+ semaines → propose mise à jour config canal → approuvé via Telegram
-- Dashboard UI : KPIs, tableau performance par canal, heatmap horaire, comparaison Shorts vs vidéo longue
-
----
-
-## Schéma base de données — tables principales
-
-```
-users                  — id, name, telegram_chat_id, primary_language
-channels               — id, user_id, name, niche, tone, active
-channel_config         — channel_id, videos_per_week, shorts_rule,
-                         validation_timeout_hours, validation_max_revisions,
-                         validation_on_limit_reached, subtitle_style_main,
-                         subtitle_style_shorts, subtitle_karaoke_active_color,
-                         shorts_part_label_style, video_style_type,
-                         video_color_grade, runway_enabled, audio_tags_enabled
-channel_languages      — id, channel_id, language, channel_name
-channel_voices         — id, channel_id, language, provider, voice_id, emotion, music_style,
-                         elevenlabs_model, stability_override, similarity_override,
-                         style_override, speed_override, use_speaker_boost,
-                         v3_stability_preset, speed_profile
-channel_sources        — id, channel_id, source_type, source_value, language, trust_score
-channel_platforms      — id, channel_id, language, platform, platform_channel_id,
-                         credentials_encrypted, verified, active
-channel_publish_timing — id, channel_id, platform, language, timezone,
-                         optimal_days (JSON), optimal_hour_start, optimal_hour_end,
-                         shorts_spread_hours
-proxy_config           — id, language, region, provider, proxy_url_encrypted, active
-
-content                — id, channel_id, source_url, source_language, content_hash,
-                         title, status, created_at, published_at
-scripts                — id, content_id, language, video_script, voice_script,
-                         estimated_duration_sec, shorts_breakpoints (JSON),
-                         validated, version
-content_validations    — id, content_id, telegram_message_id, status,
-                         revision_count, sent_at, approved_at, timeout_at,
-                         script_validation_status, script_issues_log,
-                         self_correction_attempts
-
-audio_files            — id, content_id, language, file_path, duration_ms,
-                         shorts_breakpoints (JSONB), whisper_transcript (JSONB),
-                         short_rehook_paths (JSONB), short_bridge_paths (JSONB)
-video_sections         — id, content_id, language, section_order, script_text,
-                         audio_start_ms, audio_end_ms, visual_source,
-                         search_query, generation_prompt, effect, color_grade,
-                         runway_used, subagent_rounds, best_attempt_used
-video_renders          — id, content_id, language, format, short_order,
-                         file_path, duration_seconds, hook_modified, render_time_seconds
-
-publish_schedule       — id, content_id, platform, language, scheduled_at,
-                         published_at, proxy_region, platform_video_id,
-                         status, retry_count, failure_reason
-video_analytics        — id, content_id, platform, language, polled_at,
-                         poll_type, views, likes, watch_time_seconds,
-                         avg_view_duration_pct, ctr, revenue_usd
-analytics_anomalies    — id, content_id, detected_at, type, metric,
-                         expected_value, actual_value, notified_user
+```mermaid
+flowchart TD
+    A[Agent 2 discovery] --> B[Content PENDING_APPROVAL]
+    B --> C[Telegram approval]
+    C --> D[Content APPROVED]
+    D --> E[Long script generation]
+    E --> F[Scripts validated]
+    F --> G[Standalone short planner]
+    G --> H[Child short Content rows]
+    F --> I[Parent Agent 3 audio + Whisper]
+    I --> J[Parent AUDIO_DONE]
+    J --> K[Release/enqueue child short audio]
+    K --> L[Child Agent 3 audio + Whisper]
+    L --> M[Child AUDIO_DONE]
+    J --> N[Parent Agent 4 visual pass]
+    N --> O[Parent main render]
+    O --> P[Parent VIDEO_DONE]
+    M --> Q[Child Agent 4 visual remap]
+    N --> Q
+    Q --> R[Agent 5 child vertical short render]
+    R --> S[Child VIDEO_DONE]
 ```
 
+Arrow explanation:
+
+Discovery  
+→ creates parent `Content` row  
+→ sends Telegram validation  
+→ approval marks parent as `APPROVED`  
+→ Agent 2 generates long scripts  
+→ scripts reach `SCRIPTS_VALIDATED`  
+→ short planner creates child short contents  
+→ parent Agent 3 generates parent audio and Whisper  
+→ parent reaches `AUDIO_DONE`  
+→ child short episodes are released and enqueued for audio  
+→ each child generates its own audio and Whisper  
+→ parent Agent 4 generates shared visual beats and Agent 5 renders the long video  
+→ child Agent 4 remaps parent visual beats to its own short narration  
+→ each child renders as vertical `Short.tsx`  
+→ parent and children reach `VIDEO_DONE` independently
+
+Important ordering rule:
+
+- Child short videos require child audio and parent visual beats.
+- Child short videos do **not** require the parent MP4 to be fully rendered.
+- Child short videos must never use parent audio.
+- Parent content must never render cut-down parent shorts.
+
 ---
 
-## Décisions clés
+## 4. Runtime Status Model
 
-- **Notifications** : Telegram Bot API (gratuit, pas Twilio)
-- **Langue source** : meilleure pour la niche, pas forcément celle de l'utilisateur
-- **Scripts multilingues** : génération native par langue, pas traduction
-- **Validation utilisateur** : toujours dans la langue primaire de l'utilisateur
-- **Déduplication** : SHA-256(URL + titre) stocké dans content.content_hash
-- **Credentials** : chiffrés Fernet avant INSERT, déchiffrés uniquement à l'exécution
-- **Runway** : dernier recours absolu, max 5s, désactivable par canal
-- **Sous-titres karaoké** : depuis timestamps Whisper sur fichier audio réel (pas le script)
-- **Publication** : proxies résidentiels Brightdata par région linguistique
-- **Shorts** : publiés en décalé, pas tous en même temps
-- **Media assets (Agent 5)** : téléchargés immédiatement à la sélection du candidat — `media_url` est toujours un chemin local (`cache/`), jamais une URL http. Remotion et Chromium n'ouvrent aucune connexion réseau pendant le rendu
-- **Rendu chunked (Agent 5)** : vidéos > 90s découpées en chunks de 90s, rendues séparément, concaténées via ffmpeg — élimine les crashes mémoire Chromium sur les vidéos longues
-- **Banned query patterns (Agent 5)** : 14 patterns de requêtes interdits (clichés stock : couloirs sombres, silhouettes, brouillard, etc.) — si `stock_query` matche, `broad_query` est promu à sa place (Python enforce, jamais juste un warning). `query_style` (`textural`|`environmental`|`action`) catégorise le type visuel ciblé pour détecter et éviter les slideshows
-- **Bookend audio Shorts (Agent 4)** : chaque Short reçoit un re-hook audio (clause d'accroche, joué en début) et un bridge audio (transition "suite au prochain épisode", joué après la narration principale) — générés par Claude + ElevenLabs, stockés en JSONB indexé par short_index
+### 4.1 Parent Long Content
 
----
-
-## Structure du projet
-
+```text
+PENDING_APPROVAL
+→ APPROVED
+→ GENERATING_SCRIPTS
+→ SCRIPTS_VALIDATED
+→ GENERATING_AUDIO
+→ AUDIO_DONE
+→ GENERATING_VIDEO
+→ VIDEO_DONE
 ```
+
+Optional/problem statuses:
+
+```text
+AWAITING_MANUAL_STORY
+NEEDS_REVIEW
+FAILED
+```
+
+### 4.2 Child Short Episodes
+
+```text
+GENERATING_SCRIPTS
+→ SCRIPTS_VALIDATED_AWAITING_PARENT
+→ SCRIPTS_VALIDATED
+→ GENERATING_AUDIO
+→ AUDIO_DONE
+→ GENERATING_VIDEO
+→ VIDEO_DONE
+```
+
+Child short release rule:
+
+- Child short contents wait in `SCRIPTS_VALIDATED_AWAITING_PARENT`.
+- Once the parent reaches `AUDIO_DONE`, children are flipped to `SCRIPTS_VALIDATED`.
+- After release, each child must generate its own audio and Whisper.
+
+---
+
+## 5. Core Database Tables
+
+### 5.1 Configuration Tables
+
+```text
+users
+channels
+channel_config
+channel_languages
+channel_voices
+channel_sources
+channel_platforms
+channel_publish_timing
+proxy_config
+```
+
+### 5.2 Pipeline Tables
+
+```text
+content
+scripts
+content_validations
+audio_files
+video_sections
+video_renders
+publish_schedule
+video_analytics
+analytics_anomalies
+```
+
+### 5.3 Key Model Invariants
+
+#### `content`
+
+Parent content:
+
+```text
+is_short_episode = False
+parent_content_id = NULL
+short_part_number = NULL
+short_total_parts = NULL
+```
+
+Child short content:
+
+```text
+is_short_episode = True
+parent_content_id = parent Content.id
+short_part_number = 1-based part index
+short_total_parts = total number of parts
+```
+
+#### `scripts`
+
+- Parent rows contain long-form `video_script` and `voice_script`.
+- Child short rows contain standalone short narration.
+- Child short scripts are flat narration, not `[SECTION N]` structured long-form scripts.
+- `video_script` and `voice_script` may be identical when visuals are storyboard-driven.
+
+#### `audio_files`
+
+- Parent `AudioFile` contains parent audio and parent Whisper transcript.
+- Child `AudioFile` contains child short audio and child Whisper transcript.
+- `shorts_breakpoints`, `short_rehook_paths`, and `short_bridge_paths` are not part of the V2 schema.
+- Parent and child audio rows store only their own audio metadata and Whisper transcript.
+
+#### `video_sections`
+
+- Parent shared visual pass writes rows using `language="__visual__"`.
+- Parent per-language render can also write/load language-specific rows.
+- Child short episodes do not generate a full visual pass.
+- Child short episodes write remapped, timed beats under their actual language.
+
+#### `video_renders`
+
+Parent long render:
+
+```text
+content_id = parent id
+format = "main"
+short_order = NULL
+```
+
+Child short render:
+
+```text
+content_id = child id
+format = "short"
+short_order = child.short_part_number - 1
+```
+
+No parent content may create `VideoRender(format="short")`.
+
+---
+
+## 6. Project Structure
+
+```text
 content-factory/
 ├── CLAUDE.md
-├── docker-compose.yml
-├── .env                        # variables d'environnement (jamais en git)
-├── alembic/                    # migrations DB
+├── .env
+├── alembic/
 ├── app/
-│   ├── main.py                 # FastAPI entry point
-│   ├── config.py               # settings depuis .env
-│   ├── database.py             # SQLAlchemy session
-│   ├── models/                 # modèles SQLAlchemy (1 fichier par table)
-│   ├── schemas/                # Pydantic schemas
-│   ├── agents/
-│   │   ├── agent1_setup/
-│   │   ├── agent2_discovery/
-│   │   ├── agent3_validation/
-│   │   ├── agent4_audio/
-│   │   ├── agent5_video/
-│   │   │   ├── system_prompt.py        # Storyboard + scoring + validation prompts
-│   │   │   ├── subagents/
-│   │   │   │   ├── storyboard.py       # Génère les beats visuels depuis Whisper
-│   │   │   │   ├── section_splitter.py # Fallback : découpe égale par section
-│   │   │   │   ├── section_validator.py
-│   │   │   │   ├── assembly_validator.py
-│   │   │   │   └── shorts_cutter.py
-│   │   │   └── services/
-│   │   │       ├── video.py            # Orchestrateur principal
-│   │   │       ├── stock_fetcher.py    # Boucle scorée + sélection candidats
-│   │   │       ├── asset_manager.py    # Téléchargement immédiat + cache local thread-safe
-│   │   │       ├── media_localizer.py  # Audit de sécurité (plus de téléchargement)
-│   │   │       ├── remotion_builder.py # Assemblage props JSON (valide l'absence d'URL http)
-│   │   │       ├── renderer.py         # CLI Remotion + rendu chunked
-│   │   │       └── subtitles.py        # Captions standard + karaoké Whisper
-│   │   ├── agent6_metadata/
-│   │   ├── agent7_publishing/
-│   │   └── agent8_analytics/
+│   ├── main.py
+│   ├── config.py
+│   ├── database.py
+│   ├── models/
+│   ├── schemas/
 │   ├── services/
-│   │   ├── claude_client.py    # wrapper Claude API
-│   │   ├── telegram_client.py  # wrapper Telegram Bot API
-│   │   ├── elevenlabs_client.py
-│   │   ├── whisper_client.py
-│   │   ├── pexels_client.py
-│   │   ├── pixabay_client.py
-│   │   ├── unsplash_client.py
-│   │   ├── runway_client.py
-│   │   └── proxy_manager.py
-│   ├── publishers/
-│   │   ├── youtube.py
-│   │   ├── tiktok.py
-│   │   ├── instagram.py
-│   │   └── facebook.py
+│   │   ├── claude_client.py
+│   │   ├── model_routing.py
+│   │   ├── script_checks.py
+│   │   ├── telegram_client.py
+│   │   └── ...
 │   ├── scheduler/
-│   │   └── tasks.py            # Celery Beat + tâches périodiques
-│   └── ui/                     # Frontend Agent 1 + Analytics
-├── remotion/                   # projet Remotion séparé (Node.js)
-│   ├── src/
-│   │   ├── compositions/
-│   │   │   ├── MainVideo.tsx
-│   │   │   ├── Short.tsx
-│   │   │   └── Subtitles.tsx
-│   └── package.json
-└── tests/
+│   │   └── tasks.py
+│   └── agents/
+│       ├── agent1_setup/
+│       ├── agent2_discovery/
+│       ├── agent3_audio/
+│       ├── agent4_visuals/
+│       └── agent5_render/
+├── remotion/
+│   └── src/
+│       ├── compositions/
+│       │   ├── MainVideo.tsx
+│       │   └── Short.tsx
+│       └── components/
+└── scripts/
 ```
 
 ---
 
-## Variables d'environnement (.env)
+## 7. Shared Services Architecture
 
+### 7.1 Claude Client
+
+File:
+
+```text
+app/services/claude_client.py
 ```
-# Base de données
-DATABASE_URL=postgresql://user:password@localhost:5432/content_factory
 
-# Redis
-REDIS_URL=redis://localhost:6379
+Responsibilities:
 
-# Claude API
-ANTHROPIC_API_KEY=
+- Own the Anthropic client singleton.
+- Apply retries/backoff.
+- Log every Claude call.
+- Support structured tool-use responses.
+- Support tool/web-search calls where intentionally used.
+- Enforce empty-response guards.
+- Keep prompt transport separate from prompt content.
 
-# ElevenLabs
-ELEVENLABS_API_KEY=
+Public call helpers:
 
-# OpenAI (Whisper)
-OPENAI_API_KEY=
-
-# Telegram
-TELEGRAM_BOT_TOKEN=
-TELEGRAM_CHAT_ID=
-
-# Pexels
-PEXELS_API_KEY=
-
-# Runway
-RUNWAY_API_KEY=
-
-# Brightdata
-BRIGHTDATA_USERNAME=
-BRIGHTDATA_PASSWORD=
-
-# Chiffrement credentials
-FERNET_KEY=
-
-# Remotion
-REMOTION_PATH=./remotion
+```text
+call_claude()
+call_claude_with_usage()
+call_claude_structured()
+call_claude_with_tools()
 ```
+
+Rules:
+
+- Agents must never instantiate Anthropic clients directly.
+- Agents must never bypass `claude_client.py`.
+- Every Claude call must include a `task=` key.
+- Every new task key must be added to `app/services/model_routing.py`.
+- Use `call_claude_structured()` when code needs JSON or schema-like output.
+- Use `call_claude_with_tools()` only when tool use is required.
+- Do not put system prompts inside `claude_client.py`.
+
+### 7.2 Model Routing
+
+File:
+
+```text
+app/services/model_routing.py
+```
+
+Responsibilities:
+
+- Map `task` keys to model IDs.
+- Fail loudly on unknown task keys.
+- Centralize model selection.
+
+Rules:
+
+- No ad-hoc model strings inside agents unless explicitly passed through a documented override.
+- Unknown task → `ValueError`.
+- Model choice is an architecture decision, not a random call-site detail.
+- Cheap/fast tasks should use smaller models only when quality is not degraded.
+- High-quality creative generation, source research, and complex visual storyboard tasks use the configured high-quality model.
+
+### 7.3 Deterministic Script Checks
+
+File:
+
+```text
+app/services/script_checks.py
+```
+
+Responsibilities:
+
+- TTS compliance checks.
+- Hook checks.
+- Section transition checks.
+- Completeness checks.
+- Length checks.
+- Deterministic cleanup utilities.
+
+Rules:
+
+- Any issue that can be checked deterministically must be checked in Python, not by prompt.
+- Claude may generate or revise, but Python decides pass/fail.
+- TTS cleanup should run before expensive retries whenever possible.
+- No script with remaining MAJOR deterministic issues should be silently marked validated.
 
 ---
 
-## Ordre de développement
+## 8. Agent 1 — Channel Setup
 
-1. Schema DB + migrations Alembic
-2. Agent 1 — Channel Setup UI
-3. Agent 2 — Content Discovery + Telegram loop
-4. Agent 3 — Script Validation
-5. Agent 4 — Audio ElevenLabs + Whisper
-6. Agent 5 — Video Remotion + sous-agents
-7. Agent 6 — Thumbnails + Metadata
-8. Agent 7 — Publishing + proxies
-9. Agent 8 — Analytics (en dernier)
+Agent 1 owns channel configuration and credential entry.
+
+Current responsibilities:
+
+- Conversational/dynamic setup UI.
+- Field suggestions through Claude.
+- Channel configuration persistence.
+- Language setup.
+- Voice ID entry.
+- Platform credential entry and verification.
+- Fernet encryption before credential storage.
+- Channel activation after required credentials are verified.
+
+Key API area:
+
+```text
+app/agents/agent1_setup/
+```
+
+Rules:
+
+- Credential handling is structured, not AI-driven.
+- Raw credentials must never be logged.
+- Credentials must be encrypted before storage.
+- Credential verification must be explicit and logged without secrets.
+- Claude may suggest channel fields, but not validate credentials.
+- Voice IDs are operator-provided hard inputs unless a future voice browser is explicitly implemented.
 
 ---
 
-## Coût mensuel
+## 9. Agent 2 — Discovery, Scripts, and Standalone Short Planning
 
-| Service | Coût |
+### 9.1 Agent 2 Responsibilities
+
+Agent 2 owns:
+
+- Story discovery.
+- Deduplication.
+- Story scoring.
+- Telegram validation.
+- Manual fallback story handling.
+- Long-form script blueprinting.
+- Section-by-section script generation.
+- Script quality gate.
+- Multilingual script generation.
+- Standalone short episode planning and script creation.
+
+Agent 2 must not:
+
+- Generate audio.
+- Generate images.
+- Render videos.
+- Decide publishing.
+- Cut parent videos into shorts.
+
+### 9.2 Agent 2 Flow
+
+```mermaid
+flowchart TD
+    A[run_discovery] --> B[fetch_batch]
+    B --> C[dedup check]
+    C --> D[story gate scoring]
+    D --> E[Content PENDING_APPROVAL]
+    E --> F[send_for_validation]
+    F --> G[Telegram APPROVE]
+    G --> H[Content APPROVED]
+    H --> I[run_agent2_scripts_for_content]
+    I --> J[generate_story_blueprint]
+    J --> K[generate_script_sections]
+    K --> L[run_script_quality_gate]
+    L --> M[persist source Script]
+    M --> N[generate_multilingual_scripts]
+    N --> O[Content SCRIPTS_VALIDATED]
+    O --> P[run_shorts_planner]
+    P --> Q[child Content rows]
+    Q --> R[child short Scripts]
+    R --> S[SCRIPTS_VALIDATED_AWAITING_PARENT]
+```
+
+### 9.3 Important Agent 2 Functions
+
+#### `run_discovery`
+
+File:
+
+```text
+app/agents/agent2_discovery/services/discovery.py
+```
+
+Input:
+
+- Channel ID
+- Database session
+- Optional rejected stories list
+
+Output:
+
+- Parent `Content` row
+- Story object
+- Gate assessment
+
+Responsibilities:
+
+- Load channel and sources.
+- Fetch a candidate story.
+- Deduplicate.
+- Score story.
+- Persist parent content if accepted.
+- Trigger manual fallback if discovery fails.
+
+#### `fetch_batch`
+
+File:
+
+```text
+app/agents/agent2_discovery/services/fetcher.py
+```
+
+Input:
+
+- Source config
+- Channel/niche context
+- Rejected story exclusions
+
+Output:
+
+- Candidate `Story`
+
+Rules:
+
+- Must return direct story candidates when possible.
+- Must accept rejected story exclusions.
+- Must not block the whole pipeline on one duplicate candidate.
+- Must not invent URLs.
+- Must not validate business decisions by prompt alone.
+
+#### `send_for_validation`
+
+File:
+
+```text
+app/agents/agent2_discovery/services/validation.py
+```
+
+Input:
+
+- Parent content
+- Channel
+- Assessment
+
+Output:
+
+- Telegram validation message
+
+Rules:
+
+- Telegram failures must log clearly.
+- Markdown formatting failures may retry as plain text.
+- Approval marks content `APPROVED`.
+- Change flow before script generation must be handled explicitly; do not pretend script revision exists when no script exists.
+
+#### `run_agent2_scripts_for_content`
+
+File:
+
+```text
+app/scheduler/tasks.py
+```
+
+Input:
+
+- Parent content ID
+
+Output:
+
+- Validated long scripts
+- Child short content rows/scripts
+
+Responsibilities:
+
+- Load parent content.
+- Move status to `GENERATING_SCRIPTS`.
+- Generate story blueprint.
+- Generate section scripts.
+- Run quality gate.
+- Persist scripts.
+- Generate multilingual scripts.
+- Mark parent `SCRIPTS_VALIDATED`.
+- Call `run_shorts_planner`.
+
+#### `generate_story_blueprint`
+
+File:
+
+```text
+app/agents/agent2_discovery/system_prompt.py
+```
+
+Output fields:
+
+- hook
+- major_turns
+- final_payoff
+- comment_trigger
+- suggested_section_count
+- suggested_title
+
+Rules:
+
+- Use structured Claude call.
+- Python validates required fields.
+- Major turns drive section progression.
+- Business logic remains in Python.
+
+#### `generate_script_sections`
+
+File:
+
+```text
+app/agents/agent2_discovery/services/scripts.py
+```
+
+Responsibilities:
+
+- Generate INTRO.
+- Generate body sections one primary turn at a time.
+- Generate OUTRO.
+- Enforce TTS cleanup.
+- Track coverage.
+- Avoid collapsing multiple major turns into one section.
+- Retry only when required.
+- Preserve section progression.
+
+Rules:
+
+- One body section should primarily advance one major turn.
+- Future turns may be foreshadowed, not resolved.
+- TTS checks are deterministic.
+- Major business decisions live in Python.
+- Narrative completeness retry must not create infinite loops.
+
+#### `run_script_quality_gate`
+
+File:
+
+```text
+app/agents/agent2_discovery/services/scripts.py
+```
+
+Responsibilities:
+
+- Run final deterministic cleanup.
+- Run quality assessment.
+- Skip expensive rewrite when issues are TTS-only and fixable in Python.
+- Log cost estimates.
+
+Rules:
+
+- Do not call expensive rewrite for cheap deterministic issues.
+- Clean before assessment and before final return.
+- Log hash/trace when scripts move across stages.
+
+#### `generate_multilingual_scripts`
+
+File:
+
+```text
+app/agents/agent2_discovery/services/scripts.py
+```
+
+Responsibilities:
+
+- Generate/adapt scripts into configured languages.
+- Persist `Script` rows.
+- Validate language outputs.
+
+Rules:
+
+- Native adaptation, not literal translation.
+- Maintain factual consistency.
+- Do not silently shorten content across languages.
+
+### 9.4 Standalone Short Planning
+
+#### `run_shorts_planner`
+
+File:
+
+```text
+app/agents/agent2_discovery/services/scripts.py
+```
+
+Input:
+
+- Parent content ID
+- Channel
+- Config
+- Database session
+
+Output:
+
+- Child `Content` rows
+- Child short `Script` rows
+
+Current standalone short flow:
+
+```text
+Parent SCRIPTS_VALIDATED
+→ shorts planner
+→ child Content rows
+→ child short scripts
+→ SCRIPTS_VALIDATED_AWAITING_PARENT
+→ released after parent AUDIO_DONE
+```
+
+Rules:
+
+- Child short scripts are standalone.
+- Child short scripts are not parent cuts.
+- Child short scripts must be validated before release.
+- If child short rows already exist, do not create duplicates.
+- Existing child rows must still be released/enqueued when the parent reaches audio completion.
+- No child with MAJOR deterministic script issues may be marked ready.
+
+Naming rule:
+
+- Use product names such as `short_episode`, `standalone_short`, or `child_short`.
+- Do not name functions, files, constants, classes, logs, or DB concepts after development phase labels such as `phase4`.
+- Log messages may mention the current product concept, for example:
+  - `STANDALONE_SHORTS_ALREADY_EXIST`
+  - `CHILD_SHORT_AUDIO_ENQUEUED`
+  - `SHORT_EPISODE_RENDER_DONE`
+- Existing phase-labeled logs should be renamed when touched.
+
+---
+
+## 10. Agent 3 — Audio and Whisper
+
+### 10.1 Agent 3 Responsibilities
+
+Agent 3 owns:
+
+- TTS generation.
+- Audio file persistence.
+- Duration measurement.
+- Whisper transcription.
+- AudioFile upsert.
+- Child short audio orchestration after parent audio completion.
+
+Agent 3 must not:
+
+- Generate parent short cuts.
+- Generate parent short breakpoints.
+- Generate parent rehooks/bridges under standalone-short architecture.
+- Render video.
+- Generate visual beats.
+
+### 10.2 Agent 3 Flow
+
+Parent:
+
+```mermaid
+flowchart TD
+    A[Parent SCRIPTS_VALIDATED] --> B[run_agent3_audio_for_content]
+    B --> C[run_audio_generation]
+    C --> D[TTS]
+    D --> E[save parent audio]
+    E --> F[Whisper]
+    F --> G[AudioFile upsert]
+    G --> H[Parent AUDIO_DONE]
+    H --> I[ensure child short audio enqueued]
+```
+
+Child short:
+
+```mermaid
+flowchart TD
+    A[Child SCRIPTS_VALIDATED] --> B[run_agent3_audio_for_content]
+    B --> C[run_audio_generation]
+    C --> D[short TTS with short pacing]
+    D --> E[save child audio]
+    E --> F[child Whisper]
+    F --> G[child AudioFile upsert]
+    G --> H[Child AUDIO_DONE]
+```
+
+### 10.3 Important Agent 3 Functions
+
+#### `pickup_scripts_validated`
+
+File:
+
+```text
+app/scheduler/tasks.py
+```
+
+Responsibilities:
+
+- Find content rows in `SCRIPTS_VALIDATED`.
+- Enqueue `run_agent3_audio_for_content`.
+
+Rules:
+
+- May pick parent and child content.
+- Worker-side guards must prevent duplicate processing.
+- It should not rely on parent/child timing assumptions.
+
+#### `run_agent3_audio_for_content`
+
+File:
+
+```text
+app/scheduler/tasks.py
+```
+
+Responsibilities:
+
+- Run audio generation for one content ID.
+- After parent reaches `AUDIO_DONE`, call child audio enqueue helper using the same DB session.
+
+Rules:
+
+- Parent success must trigger child audio enqueue immediately.
+- Do not rely only on Beat timing.
+- Do not open unnecessary second sessions for critical orchestration if the current session has the needed state.
+
+Temporary compatibility:
+
+- `run_agent4_for_content` remains as a Celery task alias for old queued messages only.
+- New code must call `run_agent3_audio_for_content`.
+
+#### `ensure_child_short_audio_enqueued`
+
+File:
+
+```text
+app/scheduler/tasks.py
+```
+
+Responsibilities:
+
+- Query all child short rows for a parent.
+- Release awaiting children if parent audio is done.
+- Enqueue child audio if child status is `SCRIPTS_VALIDATED` and no `AudioFile` exists.
+- Skip children that already have audio or are in progress.
+
+Required logs:
+
+```text
+CHILD_SHORT_AUDIO_SCAN
+CHILD_SHORT_RELEASED
+CHILD_SHORT_AUDIO_ENQUEUED
+CHILD_SHORT_AUDIO_ALREADY_EXISTS
+CHILD_SHORT_AUDIO_SKIP
+```
+
+Rules:
+
+- Must query by `parent_content_id`.
+- Must check `AudioFile` existence.
+- Must not enqueue children with audio already present.
+- Must not enqueue parent content.
+- Must be idempotent.
+
+#### `run_audio_generation`
+
+File:
+
+```text
+app/agents/agent3_audio/services/audio.py
+```
+
+Responsibilities:
+
+- Load content and validated scripts.
+- Set status to `GENERATING_AUDIO`.
+- Generate TTS per language.
+- Save audio file.
+- Run Whisper.
+- Upsert `AudioFile`.
+- Mark content `AUDIO_DONE`.
+
+Rules:
+
+- Parent content does not generate breakpoints, bookends, rehooks, bridges, or semantic short splits.
+- Child content does not generate breakpoints, bookends, rehooks, or bridges.
+- Child content uses its own script, audio, and Whisper.
+- TTS skip-on-disk must still update/confirm `AudioFile` consistency.
+
+#### `generate_audio`
+
+File:
+
+```text
+app/agents/agent3_audio/services/tts.py
+```
+
+Responsibilities:
+
+- Prepare text.
+- Select provider path.
+- Generate audio bytes.
+- Handle chunking and concatenation.
+
+Rules:
+
+- Provider-specific behavior must be behind a clear provider abstraction.
+- Cartesia default model is `sonic-2`.
+- ElevenLabs remains supported only as configured provider/legacy path.
+- Voice and model choices come from `channel_voices`.
+
+#### `prepare_script_for_tts`
+
+File:
+
+```text
+app/agents/agent3_audio/services/tts.py
+```
+
+Rules:
+
+- Strip unsupported markers.
+- Normalize TTS text.
+- Add pacing markers deterministically.
+- Short episodes may use different pacing caps.
+- Never insert pauses that corrupt meaning.
+
+#### `transcribe`
+
+File:
+
+```text
+app/agents/agent3_audio/services/whisper.py
+```
+
+Rules:
+
+- Use actual generated audio.
+- Store word-level timestamps.
+- Captions must derive from Whisper, not script text.
+
+---
+
+## 11. Agent 4 — Visual Planning and Media Generation
+
+### 11.1 Agent 4 Responsibilities
+
+Agent 4 owns:
+
+- Parent visual pass.
+- Storyboard generation.
+- Storyboard validation.
+- Timestamp mapping.
+- Parent `__visual__` `VideoSection` rows.
+- Flux prompt generation.
+- Flux image/media generation.
+- Media cache/reuse.
+- Standalone child-short visual remapping.
+- Visual quality diagnostics.
+
+Agent 4 must not:
+
+- Generate audio.
+- Recreate scripts.
+- Render videos.
+- Persist `VideoRender` rows.
+- Cut parent videos into shorts.
+- Use network assets during Remotion rendering.
+
+### 11.2 Parent Agent 4 Visual Flow
+
+```mermaid
+flowchart TD
+    A[Parent AUDIO_DONE] --> B[Agent 5 render orchestration]
+    B --> C[Agent 4 parent visual pass]
+    C --> D[split_into_beats]
+    D --> E[generate_storyboard_batch]
+    E --> F[map beats to Whisper timestamps]
+    F --> G[generate_all_beat_images]
+    G --> H[save __visual__ VideoSection rows]
+```
+
+### 11.3 Child Short Agent 4 Visual Flow
+
+```mermaid
+flowchart TD
+    A[Child AUDIO_DONE] --> B[Agent 5 render orchestration]
+    B --> C[check parent __visual__ rows]
+    C -->|missing| D[defer back to AUDIO_DONE]
+    C -->|exists| E[remap_beats_for_short]
+    E --> F[reuse parent images or generate new]
+    F --> G[map to child Whisper timestamps]
+    G --> H[save child VideoSection rows]
+```
+
+### 11.4 Important Agent 4 Functions
+
+#### `split_into_beats`
+
+File:
+
+```text
+app/agents/agent4_visuals/subagents/storyboard.py
+```
+
+Responsibilities:
+
+- Split long script into storyboard segments.
+- Call storyboard generation per segment.
+- Merge batches.
+- Map beats to timestamps.
+- Log estimate accuracy and cost.
+
+Rules:
+
+- Track estimated vs actual beats.
+- Log token/cost diagnostics.
+- Avoid unnecessary full-storyboard retries.
+- Use deterministic validation when possible.
+
+#### `generate_storyboard_batch`
+
+File:
+
+```text
+app/agents/agent4_visuals/system_prompt.py
+```
+
+Responsibilities:
+
+- Ask Claude for structured visual beats.
+- Return schema-validated storyboard batch.
+
+Rules:
+
+- Use `call_claude_structured()`.
+- Use forced tool output.
+- Keep schema strict.
+- Storyboard prompt must produce physical, camera-pointable visuals.
+- Prompt must not rely on vague mood words.
+- Prompt must support visual continuity and identity consistency.
+
+#### `map_storyboard_beats_to_timestamps`
+
+File:
+
+```text
+app/agents/agent4_visuals/subagents/storyboard.py
+```
+
+Responsibilities:
+
+- Align storyboard beats to Whisper transcript.
+- Produce timed visual sections.
+
+Rules:
+
+- Use actual Whisper timings.
+- Allow fallback only when explicitly intended.
+- Log fallback rate.
+
+#### `generate_all_beat_images`
+
+File:
+
+```text
+app/agents/agent4_visuals/services/flux_generator.py
+```
+
+Responsibilities:
+
+- Generate or reuse Flux images.
+- Save local cache images.
+- Attach local `media_url`.
+
+Rules:
+
+- `media_url` must always be local, usually `cache/...`.
+- Never pass HTTP URLs to Remotion props.
+- Cache reuse must not create obvious visual repetition.
+- If cache reuse is controlled by prompt hash, log enough to debug repeated frames.
+
+#### `remap_beats_for_short`
+
+File:
+
+```text
+app/agents/agent4_visuals/subagents/storyboard.py
+```
+
+Responsibilities:
+
+- Load parent visual beats.
+- Ask Claude to map short narration phrases to parent beats.
+- Reuse parent images when relevant.
+- Generate new images when needed.
+- Map beats to child Whisper timestamps.
+- Return child short beats.
+
+Rules:
+
+- Use child short voice script.
+- Use child short audio and Whisper.
+- Use parent visual beats only as a visual source pool.
+- Reuse parent images only when match score threshold passes.
+- Threshold is enforced in Python, not prompt.
+- Log reuse stats.
+
+Preferred log names when touched:
+
+```text
+SHORT_EPISODE_REUSE_STATS
+SHORT_EPISODE_RENDER
+SHORT_EPISODE_RENDER_DONE
+```
+
+Avoid phase-labeled names in new code.
+
+---
+
+## 11A. Agent 5 — Rendering
+
+### 11A.1 Agent 5 Responsibilities
+
+Agent 5 owns:
+
+- Render orchestration for content in `AUDIO_DONE`.
+- Parent/child render routing.
+- Subtitle chunk generation.
+- Remotion props generation.
+- Main video rendering.
+- Vertical short rendering.
+- Render verification.
+- `VideoRender` persistence.
+
+Agent 5 must not:
+
+- Generate audio.
+- Recreate scripts.
+- Cut parent videos into shorts.
+- Own storyboard or Flux generation logic.
+- Store remote media URLs in props.
+
+Current Phase 3A boundary note:
+
+- `app/agents/agent5_render/services/video.py` still orchestrates calls into Agent 4 visual services and Agent 5 render services in one worker task to preserve runtime sequencing.
+- Visual generation logic lives under `app/agents/agent4_visuals/`.
+- Rendering logic lives under `app/agents/agent5_render/`.
+- Phase 3B may split the orchestration further if explicitly requested.
+
+### 11A.2 Parent Agent 5 Render Flow
+
+```mermaid
+flowchart TD
+    A[Parent AUDIO_DONE] --> B[run_agent5_render_for_content]
+    B --> C[ensure Agent 4 visual rows exist]
+    C --> D[build_main_props]
+    D --> E[render_main_video or chunked render]
+    E --> F[verify_render]
+    F --> G[VideoRender format=main]
+    G --> H[Parent VIDEO_DONE]
+```
+
+### 11A.3 Child Short Agent 5 Render Flow
+
+```mermaid
+flowchart TD
+    A[Child AUDIO_DONE] --> B[run_agent5_render_for_content]
+    B --> C[ensure child visual remap exists]
+    C --> D[build_short_props]
+    D --> E[render_short Short.tsx]
+    E --> F[verify_render]
+    F --> G[VideoRender format=short]
+    G --> H[Child VIDEO_DONE]
+```
+
+### 11A.4 Important Agent 5 Functions
+
+#### `pickup_audio_done`
+
+File:
+
+```text
+app/scheduler/tasks.py
+```
+
+Responsibilities:
+
+- Find `AUDIO_DONE` content.
+- Enqueue `run_agent5_render_for_content`.
+
+Rules:
+
+- Can pick parent and child content.
+- Child content may defer until parent visual beats exist.
+
+#### `run_agent5_render_for_content`
+
+File:
+
+```text
+app/scheduler/tasks.py
+```
+
+Responsibilities:
+
+- Run rendering orchestration for one content ID.
+- Preserve current Agent 2 → Agent 3 → Agent 5 sequencing.
+
+Temporary compatibility:
+
+- `run_agent5_for_content` remains as a Celery task alias for old queued messages only.
+- New code must call `run_agent5_render_for_content`.
+
+#### `run_video_generation`
+
+File:
+
+```text
+app/agents/agent5_render/services/video.py
+```
+
+Responsibilities:
+
+- Route parent vs child rendering.
+- Manage status transitions.
+- Call Agent 4 visual services when visual rows/remaps are needed.
+- Persist video outputs.
+
+Rules:
+
+- Parent generates shared `__visual__` rows through Agent 4 visual services.
+- Child requires parent `__visual__` rows.
+- Child deferral to `AUDIO_DONE` is allowed while waiting.
+- Parent renders only `format="main"`.
+- Child renders only `format="short"`.
+- Parent must not create short props or short renders.
+
+#### `build_main_props`
+
+File:
+
+```text
+app/agents/agent5_render/services/remotion_builder.py
+```
+
+Rules:
+
+- Parent main props only.
+- Validate media paths.
+- Fail fast if remote URLs are present.
+
+#### `build_short_props`
+
+File:
+
+```text
+app/agents/agent5_render/services/remotion_builder.py
+```
+
+Rules:
+
+- Child short props only.
+- Use vertical layout.
+- Use child audio.
+- Use child timed beats.
+- Do not add rehook/bridge audio unless a future architecture explicitly reintroduces standalone short bookends.
+
+#### `render_main_video`
+
+File:
+
+```text
+app/agents/agent5_render/services/renderer.py
+```
+
+Rules:
+
+- Use `MainVideo.tsx`.
+- Render 1920×1080.
+- Use chunked render for long durations.
+- Verify final output.
+
+#### `render_short`
+
+File:
+
+```text
+app/agents/agent5_render/services/renderer.py
+```
+
+Rules:
+
+- Use `Short.tsx`.
+- Render 1080×1920.
+- Store as `VideoRender(format="short")`.
+- Output belongs to the child content ID.
+
+---
+
+## 12. Parent vs Child Short Comparison
+
+| Dimension | Parent long content | Child short episode |
+|---|---|---|
+| `content.is_short_episode` | `False` | `True` |
+| Parent link | none | `parent_content_id` |
+| Script | long structured script | standalone flat short narration |
+| Audio | own full audio | own short audio |
+| Whisper | parent transcript | child transcript |
+| Breakpoints | empty | empty |
+| Bookends/rehooks/bridges | disabled | disabled |
+| Visual pass | full storyboard + Flux | remap parent visual beats |
+| Images | parent Flux cache | reuse parent images or generate child cache |
+| Remotion composition | `MainVideo.tsx` | `Short.tsx` |
+| Resolution | 1920×1080 | 1080×1920 |
+| `VideoRender.format` | `"main"` | `"short"` |
+| Render content ID | parent ID | child ID |
+| Status flow | parent flow | child flow |
+
+---
+
+## 13. Artifact Map
+
+### Parent audio
+
+```text
+{media_path}/audio/{parent_content_id}/{language}.mp3
+```
+
+### Child short audio
+
+```text
+{media_path}/audio/{child_content_id}/{language}.mp3
+```
+
+### Parent Remotion props
+
+```text
+{media_path}/remotion_props/{parent_content_id}_{language}_main.json
+```
+
+### Child short Remotion props
+
+```text
+{media_path}/remotion_props/{child_content_id}_{language}_short_{short_order}.json
+```
+
+### Parent main video
+
+```text
+{media_path}/video/{parent_content_id}/{language}_main.mp4
+```
+
+### Child short video
+
+```text
+{media_path}/video/{child_content_id}/{language}_short_{short_order}.mp4
+```
+
+### Flux cache
+
+Parent:
+
+```text
+{media_path}/cache/{parent_content_id}/{prompt_hash}.jpg
+```
+
+Child new images:
+
+```text
+{media_path}/cache/{child_content_id}/{prompt_hash}.jpg
+```
+
+Child reused images:
+
+```text
+cache/{parent_content_id}/{prompt_hash}.jpg
+```
+
+### Whisper transcripts
+
+Stored in database:
+
+```text
+audio_files.whisper_transcript
+```
+
+No separate transcript file is required.
+
+---
+
+## 14. Celery and Beat Tasks
+
+Primary task file:
+
+```text
+app/scheduler/tasks.py
+```
+
+Important tasks:
+
+| Task | Responsibility |
 |---|---|
-| Hetzner VPS | ~6€ |
-| Claude API | ~20–50€ |
-| ElevenLabs | ~22€ |
-| Brightdata | ~10€ |
-| Telegram | 0€ |
-| Pexels/RSS | 0€ |
-| **Total** | **~58–88€/mois** |
-## Setup
-- Always activate venv before any command: source venv/bin/activate
-- Local PostgreSQL — no Docker needed
-- DATABASE_URL set in .env
-
-## Testing — HARD RULE
-**NEVER run `test_full_pipeline.py` or any command that triggers real API calls.**
-This includes: Claude API, ElevenLabs, web_search, Pexels/Unsplash/Pixabay, Runway, Telegram, YouTube, Meta.
-Validate with static checks only: `ast.parse`, `importlib.import_module`, `inspect.getsource`, pure-Python unit tests with mocked/stubbed externals.
-If a live run log is needed, tell the user to run it and paste the output here.
-
-## Coding Standards
-- Python 3.11+
-- SQLAlchemy 2.0 style — Mapped / mapped_column only
-- Type hints on all functions
-- Pydantic for all data validation
-- One responsibility per function
-- All API calls wrapped in try/except with proper logging
-- Environment variables via config.py only, never hardcoded
-- Tests with pytest for all business logic
-- Docstrings on all public functions
-- No multi-line comment blocks inside model files
-- JSONB (not JSON) for all JSON columns in PostgreSQL
-- Mapped[list] for list columns, Mapped[dict] for object columns
-- make README.md changes every time you see we need it 
-
-## Schema decisions
-- Videos are NOT stored locally after publishing
-  — video_renders has no file_path
-  — platform_title stored in publish_schedule after upload
-- video_metadata table stores Agent 6 output
-  (titles, descriptions, hashtags, thumbnail_file_path per platform/language)
-- thumbnail_file_path is temporary — deleted after upload to platform
-- created_at added to users and content_validations (useful, keep it)
-## Authentication
-Not implemented yet — to be added as the VERY LAST step before deployment.
-For now all routes are unprotected.
-When the time comes: JWT tokens + bcrypt password hashing.
-The users table is already in the schema, ready for auth fields to be added.
-
-## Docstring Standard
-All public functions and classes must have a docstring using this exact format:
-
-    def my_function(param1: str, param2: int = 0) -> str:
-        """One-line summary of what it does.
-
-        Args:
-            param1: Description.
-            param2: Description. Defaults to 0.
-
-        Returns:
-            Description of return value.
-
-        Raises:
-            ValueError: When and why this is raised.
-            anthropic.APIError: On API failure.
-        """
+| `dispatch_discovery` | start scheduled discovery |
+| `run_agent2_for_channel` | discovery for one channel |
+| `pickup_approved_content` | enqueue script generation |
+| `run_agent2_scripts_for_content` | generate scripts and child short plans |
+| `pickup_scripts_validated` | enqueue Agent 3 audio |
+| `run_agent3_audio_for_content` | generate audio/Whisper |
+| `pickup_short_episodes_awaiting_parent` | safety net for child short release |
+| `ensure_child_short_audio_enqueued` | immediate child audio enqueue after parent audio |
+| `pickup_audio_done` | enqueue Agent 5 render |
+| `run_agent5_render_for_content` | render video |
 
 Rules:
-- First line: one sentence, no period at end
-- Args section: only if function has parameters
-- Returns section: only if function returns something meaningful (not None)
-- Raises section: only if function raises exceptions explicitly
-- Private functions (prefixed with _) do not need docstrings
-- One-liners are allowed only if the function name is self-explanatory
 
-
-## Prompt Assembly Architecture (Block 2)
-
-Agent 2's `system_prompt.py` uses a composed assembly model instead of monolithic prompt strings:
-
-- `BASE_SCRIPT_PROMPT: dict[str, str]` — keyed by `script_format` — structural core (role, structure, word targets, forbidden openers, JSON schema)
-- `RETENTION_BLOCK: dict[str, str]` — keyed by `script_format` — platform-specific retention mechanics (mini-hook placement, re-hook cadence, loop endings)
-- `TTS_BLOCK: dict[str, str]` — keyed by `elevenlabs_model` — writing constraints baked in at generation time (shared core: ≤18 words, numbers as words, no abbreviations/ALL-CAPS; per-model pacing rules)
-- `build_script_system_prompt(script_format, elevenlabs_model, audio_tags_enabled, niche, tone) -> str` — assembles the full generation prompt; block order is fixed for cache-friendliness per (format, model) pair
-- `build_native_system_prompt(script_format, elevenlabs_model, audio_tags_enabled) -> str` — same assembly for native adaptation prompts
-- `with_tts_block(prompt: str, model: str) -> str` — appends TTS_BLOCK to any existing prompt; used by rewrite, correction, and revision prompts
-
-**Invariants:**
-- TTS constraints are present in ALL script-producing prompts (generation, native adaptation, rewrite, correction, revision). Violations that reach Agent 3 are residual sentence-length overflow, not character-class failures.
-- `generate_revised_scripts()` now returns `{"title", "video_script", "voice_script", "changes"}` — callers must handle the `changes` array (persisted to `ContentValidation.script_issues_log`; appended to the next Telegram message).
-- `generate_native_script()` always receives a `hook_context` string (extracted from the optimised source script's first sentence if not provided by the caller) — native adaptations must preserve the opening hook's concrete specificity.
-- `optimize_intro()` scores across 6 dimensions (honesty removed; fabrication is a hard disqualifier in the prompt). Python max total = 60.
-- Source-language voice model is resolved in `tasks.py` before `generate_scripts()` is called. Target-language voice models are resolved in `generate_multilingual_scripts()` per language from `ChannelVoice`.
-- `optimize_intro()` is now wired in `tasks.py` (called after the Script Quality Gate, before persistence and Telegram send).
-
-**Over-cap Shorts fix (implemented in Block 4, folded):**
-`_enforce_duration_bounds()` in `agent4_audio/services/breakpoints.py` now runs two passes:
-Pass 1 (floor): drops cuts that would produce segments < 61s (unchanged). Pass 2 (ceiling):
-scans resulting segments; for any segment > 91s, computes `n_pieces = ceil(seg_dur / 91s)`
-and inserts `n_pieces - 1` equal-interval bisection cuts. If `piece_ms < 61s` the segment
-cannot be split without violating the floor — it is logged as WARNING and left unchanged
-(e.g. a ~115s segment that would split into two ~58s pieces is kept as-is). For the observed
-FR 139.9s case: 2 pieces of ~69.95s — splits cleanly. The EN 115.7s case cannot be split
-cleanly and logs a WARNING.
-
-**Block 5 — Stock fetcher rewrite (implemented in Block 5):**
-`score_media_candidates_with_claude()` in `agent5_video/system_prompt.py` migrated to
-`call_claude_structured(task="media_scoring")` with `_MEDIA_RANKING_SCHEMA` + vision image
-blocks (thumbnail URL-based). Old `_MEDIA_CANDIDATE_SCORING_SYSTEM_PROMPT`, `_parse_scoring_response`,
-`_extract_json_object` removed. `_MEDIA_RANKING_SYSTEM_PROMPT` + `_MEDIA_RANKING_SCHEMA` added.
-Prescreening (`_prescreen`: resolution ≥ 1280×720, landscape only, video ≥ beat_duration_sec) runs
-before every Claude call via `_verified_candidates` (concurrent HEAD checks). `fetch_all_beats()`
-now processes beats in parallel via `ThreadPoolExecutor(max_workers=6)` with thread-safe
-`_ProviderStatus` (Lock), `used_urls_lock` (atomic URL claim-before-download), `env_best_lock`.
-Dark fallback replaced with `_apply_env_reuse_or_text_card()`: (a) reuse highest-scored local clip
-from same `environment` in this run; (b) if none → `visual_source="text_card"`, `media_url="__dark_fallback__"`.
-`validate_beats_for_render` updated to allow `text_card` beats through the render gate.
-Pixabay video `thumb_url` fixed (was `userImageURL` — an avatar, not a preview; now `""`).
-Video-first implemented: for `query_style in ("action","environmental")` only video candidates sent
-to Claude; images added as fallback if no videos pass prescreen.
-`text_card` TextCard.tsx Remotion composition deferred to Block 6 (currently renders as dark frame;
-`visual_source="text_card"` set in props so Block 6 can wire the composition).
-
-**CDN access note (Block 5):**
-URL-based vision image blocks (`source.type="url"`) fail for many stock CDN URLs (Pixabay,
-Unsplash) because Anthropic's API servers cannot reach them (HTTP 400 "Unable to download").
-Pexels photo URLs typically work. When vision fails, `_verified_candidates` HEAD-check passes
-(CDN is reachable) but Claude API subsequently 400s — `score_media_candidates_with_claude` falls
-back to `_deterministic_best_candidate`. This is a CDN access restriction in Anthropic's datacenter,
-not a code bug. If vision hit rate needs to improve: switch to base64-encoded thumbnails (download
-→ encode → pass as `source.type="base64"`). Not implemented in Block 5 — too expensive per beat.
-
-**Block 6 — Render: pre-bundling, parallel chunks, bridge fps fix, TextCard beat, post-render verification (implemented in Block 6):**
-
-`verify.py` (`agent5_video/services/verify.py`) — `verify_render(mp4_path, expected_duration_ms, fmt)` runs after every
-Remotion render (gated by `VERIFY_RENDERS=true`): ffprobe checks duration ±2%, exactly one audio stream, correct
-resolution (1920×1080 main / 1080×1920 short); `blackdetect` catches any black interval ≥3 s;
-`silencedetect` catches any interior silence ≥4 s (ignoring first/last 1 s edge). Failure → `VerifyFailedError`
-raised in `_run_renders()` → VideoRender row NOT saved → `content.status = "NEEDS_REVIEW"` → error log
-(mp4 kept on disk for inspection). Shorts skip duration check (`expected_duration_ms=None`) because
-bookend padding is variable.
-
-`ensure_bundle()` in `renderer.py` — SHA-256 of `remotion/src/` tree + `package.json`/`package-lock.json`
-determines bundle identity. Bundle stored under `remotion/bundles/{hash}/`. Reused on cache hit;
-`npx remotion bundle` run on miss. Old bundles pruned to keep last 2. Gated by `REMOTION_PRE_BUNDLE=true`
-(default `false`). `render_*` functions all accept `bundle_dir=` and pass it as the Remotion CLI entry point.
-
-Parallel chunk rendering — `CHUNK_PARALLEL_WORKERS=N` (default 1). Set to 2 only after measuring
-single-chunk peak RSS on the VPS (`/usr/bin/time -v npx remotion render ...`) and confirming
-2× peak < 80% of total RAM. `render_main_video_chunked` uses `ThreadPoolExecutor(max_workers=N)`
-for the render phase; audio-slice + props-write phases remain sequential (no thread-safety issues).
-
-Bridge fps fix in `Short.tsx` — `shortCalculateMetadata` now computes `bridgeExtraFrames = Math.ceil(bridge_duration_ms / 1000 * 30)` using the stored `bridge_duration_ms` from props
-instead of the old fixed 60-frame (2 s) buffer. Legacy rows without `bridge_duration_ms` fall back to 60 frames.
-`rehook_duration_ms` likewise used to scope the rehook text overlay sequence.
-
-Rehook text overlay — when `rehook_text` is non-null in Short props, a `RehookOverlay` component
-displays it in gold (#FFD700) during the rehook audio window (fades in/out). This requires Block 3's
-bookend dict shape `{"path", "duration_ms", "text"}` — `_bookend_text()` shim returns `""` for legacy str entries.
-
-`TextCard.tsx` — `remotion/src/components/TextCard.tsx`: dark radial gradient + centred text + accent bar
-+ subtle slow-zoom (1.0→1.05). Wired in `MediaSection.tsx` when `section.visual_type === "text_card"`.
-Python side: `_section_for_remotion()` in `remotion_builder.py` overrides `visual_type = "text_card"`
-when the beat dict has `visual_source == "text_card"` (set by stock_fetcher's env-reuse fallback cascade).
-
-Bookend shims in `remotion_builder.py` — `_bookend_path()` / `_bookend_duration()` / `_bookend_text()`
-handle both old bare-string and new dict JSONB shapes. `build_short_props()` now writes
-`rehook_duration_ms`, `bridge_duration_ms`, `rehook_text` into the props JSON.
-
-New settings in `config.py`:
-- `CHUNK_PARALLEL_WORKERS` (int, default 1)
-- `REMOTION_PRE_BUNDLE` (bool, default false)
-- `VERIFY_RENDERS` (bool, default true)
-
-**Block 7 — Telegram summary wiring + existing-props verify (implemented in Block 7):**
-
-`run_story_scoring_gate()` now returns `tuple[Story, dict] | None` (was `Story | None`) — the second
-element is the full Claude `assessment` dict from `assess_story_quality()`. `run_discovery()` unpacks
-it and returns `(content, story, assessment)`. `run_agent2_for_channel` in `tasks.py` unpacks the
-3-tuple, loads `target_languages` from `ChannelLanguage`, and passes both to `send_for_validation()`.
-`send_for_validation()` now accepts `assessment` and `target_languages` and passes them to
-`generate_telegram_summary()` — top-2 scoring dimensions and language list now appear in the Telegram
-message. `estimated_duration_sec` still uses the word-count fallback (post-Agent 3 estimate requires
-Agent 3 to have run; not yet wired because Telegram is sent before Agent 3 runs).
-
-`_render_from_existing_props()` in `video.py` now calls `ensure_bundle()` and passes `bundle_dir` to
-every render call; calls `verify_render()` after the main render and each short; raises
-`VerifyFailedError` on failure. `_process_language` wraps the `_render_from_existing_props` call in a
-`try/except VerifyFailedError` block that sets `content.status = "NEEDS_REVIEW"` and returns `False`,
-matching the behavior of the `_run_renders` path.
+- Beat tasks are safety nets, not the only orchestration mechanism for critical handoffs.
+- Parent audio completion should immediately enqueue eligible child short audio.
+- Idempotency must be enforced at the worker/service layer.
+- Duplicate task dispatch is tolerable only if worker-level guards prevent duplicate side effects.
 
 ---
 
-## Claude Client Architecture
+# Part 2 — Rules
 
-Shared infrastructure lives in app/services/claude_client.py:
-- Anthropic client singleton (_get_client)
-- Retry logic with exponential backoff
-- Rate limit + timeout error handling
-- Empty response guard
-- Constants: _MAX_RETRIES, _BACKOFF_BASE
-- Entry points: call_claude(), call_claude_with_usage(), call_claude_structured(), call_claude_with_tools()
+## 15. Golden Rules
 
-Model routing lives in app/services/model_routing.py:
-- MODEL_ROUTING dict: task key → model ID
-- resolve_model(task, model_override=None) — resolution order: override → CLAUDE_TIER=dev → MODEL_ROUTING[task]
-- Unknown task → ValueError (fail-loud, no default)
-- CLAUDE_TIER=dev in .env forces Haiku globally for cheap dev iterations
+1. **Architecture first.** Do not optimize until the flow is correct.
+2. **Business rules live in Python.** Prompts generate; code decides.
+3. **No silent fallbacks.** Every fallback must log.
+4. **No legacy reactivation.** Removed parent-cut shorts must not return.
+5. **No development-phase names in production code.** Use product/domain names.
+6. **No direct provider clients from agents.** Use shared service wrappers.
+7. **No unvalidated AI output.** Parse and validate.
+8. **No remote media URLs in Remotion props.** Local paths only.
+9. **No live external API tests by Claude Code/Codex.** Use smoke tests and mocked tests only.
+10. **Update this file with architecture changes.**
 
-All call_claude* functions require `task=` as a keyword-only argument. The task key is used for model
-routing and appears in every log line for cost attribution.
+---
 
-call_claude_structured() uses forced tool-use (tool_choice={"type":"tool","name":schema_name}) to
-guarantee structured JSON output without text parsing. Use for Block 4+ storyboard and scoring calls.
+## 16. Naming Rules
 
-Each agent that uses Claude has its own system_prompt.py inside its folder:
-- agent1_setup/system_prompt.py     — field suggestion prompt
-- agent2_discovery/system_prompt.py — story discovery + script writing
-- agent3_validation/system_prompt.py — script quality checking
-- agent5_video/system_prompt.py     — scene splitting + visual decisions
-- agent5_video/subagents/system_prompt.py — section validation
-- agent6_metadata/system_prompt.py  — titles, descriptions, thumbnails
-- agent8_analytics/system_prompt.py — pattern analysis + recommendations
+### 16.1 Use Domain Names, Not Development Phase Names
 
-Agent 7 does not use Claude (platform APIs only).
-Agent 4 uses Claude only for Short bookend generation (`_BOOKEND_SYSTEM_PROMPT` in `agent4_audio/services/audio.py` — prompt is short, no separate system_prompt.py needed).
+Forbidden in new or touched code:
 
-max_tokens per agent:
-- Agent 1: 256   (short field values)
-- Agent 2: 4096  (full scripts); generate_native_script uses a higher limit for multilingual adaptation
-- Agent 3: 1024  (subjective validation — 3 checks only: tone, linguistic_naturalness, content_policy); 4096 for auto_correction
-- Agent 4: 512   (bookend text per Short — short Claude call)
-- Agent 5: 2048  (scene descriptions)
-- Agent 6: 1024  (titles + descriptions)
-- Agent 8: 2048  (weekly analysis report)
+```text
+phase1
+phase2
+phase3
+phase4
+phase5
+phase6
+phase_4
+PHASE4
+Phase4
+```
+
+Do not use development phase labels in:
+
+- file names
+- function names
+- class names
+- constants
+- model fields
+- log names
+- comments that describe current architecture
+- tests, unless the test is intentionally documenting old migration history
+
+Use product/domain terms instead:
+
+| Bad | Good |
+|---|---|
+| `phase4_short_render` | `render_standalone_short` |
+| `PHASE4_AUDIO_SHORT` | `SHORT_EPISODE_AUDIO` |
+| `phase4_child_audio` | `child_short_audio` |
+| `phase4_reuse_stats` | `short_episode_reuse_stats` |
+| `phase4_only_shorts` | `standalone_shorts_only` |
+
+Historical migration filenames may keep old names if already applied. Do not edit applied migrations just for naming.
+
+### 16.2 Function Naming
+
+Functions must describe the domain action and the object being acted on.
+
+Good:
+
+```python
+generate_story_blueprint()
+generate_script_sections()
+run_shorts_planner()
+ensure_child_short_audio_enqueued()
+remap_beats_for_short()
+build_short_props()
+render_short()
+```
+
+Bad:
+
+```python
+do_phase4()
+process_stuff()
+handle_video()
+new_flow()
+run_magic()
+fix_short()
+```
 
 Rules:
-- Never put a system prompt inside app/services/claude_client.py
-- Never call the Anthropic client directly from an agent — always go through call_claude()
-- Every call_claude* call must pass task= (keyword-only). Adding a new task requires adding it to MODEL_ROUTING first
-- Prompt caching (cache_control ephemeral) applied automatically when system prompt exceeds 800 chars
-- Every call logs: task, resolved model, cached(yes/no), input/output token counts
 
-## Model Strategy (Block 0 — task routing)
-- Model routing is per-task, not per-agent (app/services/model_routing.py)
-- Dev and prod resolve models identically from MODEL_ROUTING — no env-based override exists.
-  Testing in dev uses the same model as production; there is no Haiku dev-override.
-- Sonnet tasks (high quality or tool-use): script_generation, native_adaptation, quality_rewrite,
-  intro_optimization, auto_correction, storyboard, story_scoring, revision, story_research
-  (web_search — Haiku does not support it), channel_suggestion (onboarding quality)
-- Haiku tasks (fast/cheap): script_quality_check, script_validation, media_scoring, semantic_splits,
-  bookends, telegram_summary, content_reformat, section_validation, section_splitting,
-  visual_reinterpretation
-- CLAUDE_TIER in .env is an inert ops label — it has no effect on model selection
-- model_override= on individual calls bypasses routing (highest precedence; discouraged in production)
+- Use verbs for functions.
+- Use nouns for data objects.
+- Use `ensure_` for idempotent state reconciliation.
+- Use `create_` only when a new row/artifact is always created.
+- Use `get_` for pure retrieval.
+- Use `load_` for DB/file reads.
+- Use `build_` for in-memory structures/props.
+- Use `generate_` for AI or media generation.
+- Use `render_` only for Remotion/video rendering.
+- Use `validate_` for checks that return issues or raise.
+- Use `run_` for task/service orchestrators.
 
-## Prompt Engineering Rules for Claude API Calls
+### 16.3 Log Naming
 
-When modifying or adding prompts used by the application, follow these rules:
+Logs should answer:
 
-1. Each Claude prompt must have one clear responsibility only.
-2. Prefer strict JSON output schemas for any programmatic response.
-3. Prompts must explicitly say: “Return ONLY valid JSON. No markdown. No code fence. No extra keys.”
-4. Never rely only on prompt instructions for validation; add Python-side parsing and schema checks.
-5. Do not fabricate sources, facts, URLs, RSS feeds, or subreddits.
-6. For script generation, preserve factual grounding from the source material and avoid invented details.
-7. For revision/correction tasks, apply minimal changes unless a full rewrite is explicitly requested.
-8. Keep stable system prompts separate from dynamic user/context data to improve Claude prompt caching.
-9. Do not truncate scripts when asking Claude to revise full scripts unless the task is explicitly partial.
-10. After changing prompts, update related parsing/validation code and run tests or add tests when missing.
+- what happened
+- to which content ID
+- whether it was parent or child
+- whether it was skipped/enqueued/generated/rendered
+- why
 
-## Reliability Rules
+Good log names:
 
-When generating production code:
+```text
+CHILD_SHORT_AUDIO_SCAN
+CHILD_SHORT_AUDIO_ENQUEUED
+CHILD_SHORT_AUDIO_DONE
+STANDALONE_SHORT_RENDER
+STANDALONE_SHORT_RENDER_DONE
+STANDALONE_SHORT_REUSE_STATS
+PARENT_AUDIO_NO_SHORTS
+STORYBOARD_FINAL
+STORYBOARD_COST_ESTIMATE
+```
 
-1. Prefer deterministic behavior over creative behavior.
-2. Validate every Claude JSON response in Python.
-3. Never trust AI output without schema validation.
-4. Business rules belong in Python, not prompts.
-5. Prompts generate content; code enforces correctness.
-6. Never send partial data when expecting full regeneration.
-7. Log token usage, response time, and failures for every Claude call.
-8. All prompt changes must preserve backward compatibility unless explicitly approved.
-9. Every system prompt must have a version identifier.
-10. If Claude cannot determine an answer reliably, return an explicit error instead of guessing.
+Avoid vague logs:
 
-# Whenever Claude returns JSON:
+```text
+done
+started
+fix applied
+phase4 complete
+shorts ok
+```
 
-- Parse with json.loads()
-- Validate required keys
-- Validate value types
-- Reject unknown keys unless explicitly allowed
-- Raise ValueError on schema mismatch
+---
 
-# Token Budget Rules
+## 17. Python Coding Standards
 
-- Never send more than 80% of model context window.
-- Truncate source material before sending to Claude.
-- Prefer summaries over raw content when context exceeds 10k characters.
+### 17.1 General
+
+- Python 3.11+.
+- Use type hints on all public functions.
+- Keep functions single-responsibility.
+- Prefer pure functions for validation and transformations.
+- Avoid global mutable state.
+- Use `pathlib.Path` for filesystem paths.
+- Use `datetime` with explicit timezone when persisting dates.
+- Never hardcode secrets, paths, model IDs, or API keys.
+- Use `app/config.py` for settings.
+
+### 17.2 Error Handling
+
+- Wrap external API calls in `try/except`.
+- Log exception context without leaking secrets.
+- Raise or mark failure explicitly.
+- Do not swallow exceptions that leave DB state ambiguous.
+- Do not use broad `except Exception` without a log and a clear status decision.
+
+### 17.3 Idempotency
+
+Any task that may rerun must be idempotent.
+
+Rules:
+
+- Check if DB rows already exist before creating.
+- Check if files already exist before regenerating expensive artifacts.
+- Upsert rather than duplicate where appropriate.
+- If skipping because an artifact exists, verify that the DB row is consistent.
+- Log idempotent skips.
+
+### 17.4 Status Transitions
+
+- Status transitions must happen in services/tasks, not prompts.
+- Never rely on Claude to choose a DB status.
+- Commit after meaningful status changes.
+- If a task fails after setting an in-progress status, mark `FAILED` or leave a recoverable state intentionally.
+- Document intentional deferrals.
+
+### 17.5 Comments
+
+- Comments must explain why, not restate what code does.
+- Remove outdated comments immediately.
+- Do not leave development history as current architecture comments.
+- Use TODO only with a clear owner/context or explicit deferred feature.
+
+---
+
+## 18. SQLAlchemy and Database Rules
+
+
+### 18.1 Alembic Migration Naming
+
+Migration files must be sequential and descriptive:
+
+```text
+001_initial_schema.py
+002_add_content_language_index.py
+003_add_video_metadata_table.py
+```
+
+The Alembic revision id must match the numeric prefix:
+
+```python
+revision = "001"
+down_revision = None
+
+revision = "002"
+down_revision = "001"
+```
+
+Rules:
+
+- Never use random or generated Alembic revision ids.
+- Never create multiple migrations for one logical schema change.
+- During development, schema resets may consolidate migrations into `001_initial_schema.py` only when explicitly requested.
+- In production or staging, never rewrite existing migration history.
+
+- Use SQLAlchemy 2.0 style.
+- Use `Mapped[...]` and `mapped_column(...)`.
+- Use JSONB for PostgreSQL JSON columns.
+- Add Alembic migration for every schema change.
+- Never edit an applied migration.
+- Use descriptive migration slugs.
+- Keep model defaults and DB defaults aligned.
+- Add indexes for high-volume status/pickup queries.
+- Unique constraints must match idempotency requirements.
+- Avoid business logic in model properties when service-level logic is clearer.
+
+Expected useful constraints:
+
+- `AudioFile(content_id, language)` unique.
+- `Content.content_hash` unique.
+- Consider uniqueness for `VideoSection(content_id, language, section_order)` if concurrency becomes a problem.
+- Consider uniqueness for `VideoRender(content_id, language, format, short_order)` if duplicate renders appear.
+
+---
+
+## 19. Testing Rules
+
+### 19.1 Hard Rule: No Live API Runs by Claude Code/Codex
+
+Do not run commands that call real external services:
+
+- Claude API
+- Cartesia
+- ElevenLabs
+- fal.ai
+- OpenAI Whisper
+- Telegram
+- YouTube
+- Meta
+- TikTok
+- web search
+
+Do not run:
+
+```bash
+python test_full_pipeline.py
+```
+
+unless the user explicitly runs it outside Claude Code/Codex and pastes logs.
+
+Allowed validation:
+
+- `ast.parse`
+- import checks
+- pure Python smoke tests
+- mocked unit tests
+- function-source inspection
+- static assertions
+- dry-run tests with stubs
+
+### 19.2 Smoke Test Rules
+
+Smoke tests must:
+
+- avoid live API calls
+- be deterministic
+- use fixtures/stubs
+- assert the exact invariant being changed
+- print `SMOKE PASS`
+- include assertion count when useful
+
+### 19.3 Test Naming
+
+Use descriptive names:
+
+```text
+scripts/smoke_child_short_audio_orchestration.py
+scripts/smoke_standalone_short_render.py
+scripts/smoke_storyboard_cost_logging.py
+```
+
+Avoid development phase names in new tests unless preserving old historical tests.
+
+---
+
+## 20. Claude Code / Codex Work Rules
+
+When asked to modify code:
+
+1. Read `CLAUDE.md` first.
+2. Identify exact files and functions before editing.
+3. Make the smallest change that satisfies the task.
+4. Do not implement adjacent improvements unless requested.
+5. Do not run live external API calls.
+6. Add or update smoke tests.
+7. Return:
+   - root cause
+   - files changed
+   - implementation summary
+   - smoke output
+   - risks/open questions
+8. If architecture changes, update `CLAUDE.md`.
+9. If rules change, update the rules section.
+10. If behavior changes, update logs and tests.
+
+When asked for investigation only:
+
+- Do not change code.
+- Produce a report with file paths, function names, call paths, and risks.
+- Mark uncertain points as `UNCERTAIN`.
+- Do not guess.
+
+When asked for prompts:
+
+- Return only the prompt if the user requests that.
+- Keep prompts implementation-ready.
+- Include verification/smoke criteria.
+
+---
+
+## 21. Prompt Engineering Rules
+
+### 21.1 General Prompt Rules
+
+- Each prompt has one responsibility.
+- Stable system prompt and dynamic user/context data must be separated.
+- Long stable prompts should benefit from prompt caching.
+- Every system prompt must expose a version identifier.
+- Programmatic outputs should use structured calls.
+- Use `call_claude_structured()` for JSON outputs.
+- Validate every response in Python.
+- Do not rely on "please follow the rules" when Python can enforce the rule.
+
+### 21.2 JSON Output Rules
+
+When Claude returns JSON:
+
+- Use strict schemas when possible.
+- Prefer forced tool-use.
+- Validate required keys.
+- Validate value types.
+- Reject unknown keys unless explicitly allowed.
+- Validate ranges and enums.
+- Raise explicit error on schema mismatch.
+- Log truncation and retry if needed.
+
+Prompt text should include:
+
+```text
+Return ONLY valid JSON. No markdown. No code fence. No extra keys.
+```
+
+### 21.3 Script Prompt Rules
+
+Script prompts must:
+
+- Ground scripts in source material.
+- Avoid invented facts.
+- Use concrete scenes and actions.
+- Respect channel niche and tone.
+- Avoid generic documentary clichés.
+- Preserve narrative progression.
+- Keep section generation focused on one primary turn.
+- Keep TTS constraints visible.
+- Avoid long sentences.
+- End with a strong, relevant comment trigger when required.
+
+Script prompts must not:
+
+- invent names, locations, dates, statistics, or source details
+- resolve future turns too early
+- turn every body section into an abstract essay
+- use business logic to decide statuses or retries
+
+### 21.4 Visual Prompt Rules
+
+Storyboard/Flux prompts must answer:
+
+```text
+What exact thing would the camera be pointing at right now?
+```
+
+Flux prompts should include:
+
+1. concrete subject
+2. camera framing
+3. specific setting
+4. lighting
+5. era/context details
+6. texture/material detail
+7. negative constraints where useful
+
+Avoid:
+
+```text
+atmospheric
+cinematic
+mysterious
+eerie
+ominous
+dramatic
+moody
+haunting
+unsettling
+dark mood
+generic hallway
+generic worried face
+generic old house
+```
+
+Do not overuse object-only shots.
+
+Every recurring character should have a stable visual identity when story context requires it.
+
+### 21.5 Visual Continuity Rules
+
+Agent 4 visual output should preserve:
+
+- character identity
+- location continuity
+- era consistency
+- style consistency
+- emotional escalation
+- shot variety
+
+Avoid:
+
+- repeated identical frames too close together
+- random new locations with no narrative reason
+- random extra people
+- distorted faces
+- text artifacts in generated images
+- cheap horror clichés
+
+### 21.6 Short Episode Prompt Rules
+
+Short episode scripts must:
+
+- be standalone
+- use dedicated hooks
+- work without parent context
+- be optimized for short-form retention
+- maintain factual connection to parent story
+- avoid `[SECTION N]` markers
+- fit expected short duration
+- pass TTS checks before validation
+
+Short episode visual remap prompts must:
+
+- use the child narration
+- map only to relevant parent beats
+- not force reuse when the match is weak
+- allow new image generation when needed
+
+---
+
+## 22. Claude Client Usage Rules
+
+Allowed pattern:
+
+```python
+from app.services.claude_client import call_claude_structured
+from app.services.model_routing import resolve_model
+```
+
+Not allowed:
+
+```python
+import anthropic
+client = anthropic.Anthropic(...)
+```
+
+Rules:
+
+- All Claude calls must use shared client helpers.
+- All calls must pass `task=`.
+- `task` keys must exist in `MODEL_ROUTING`.
+- Use `call_claude_structured()` for:
+  - scoring
+  - planning
+  - storyboards
+  - remaps
+  - any JSON output used by code
+- Use `call_claude_with_tools()` only for tool/search use cases.
+- Use `call_claude()` only for free-form text where code does not require structured fields.
+- Log prompt length, token usage, elapsed time, and truncation.
+- If a response hits `max_tokens`, log and reduce scope or retry safely.
+
+---
+
+## 23. Model Routing Rules
+
+Model choice must match task type.
+
+High-quality/complex tasks:
+
+- story research
+- story gate scoring
+- story blueprint when quality is critical
+- section generation
+- short script generation
+- quality rewrite
+- storyboard generation
+
+Fast/cheap structured tasks:
+
+- global validation
+- script quality check
+- shorts planner
+- short storyboard remap
+- content reformat
+- simple suggestions
+
+Rules:
+
+- Do not use a cheap model for tasks requiring nuanced creative output unless quality has been validated.
+- Do not use an expensive model for deterministic checks.
+- Use Python for deterministic checks.
+- `model_override` is allowed only when documented.
+
+---
+
+## 24. Logging Rules
+
+Logs must be sufficient to debug:
+
+- status changes
+- retries
+- external calls
+- token usage
+- cost estimates
+- idempotency skips
+- fallback use
+- render paths
+- artifact paths
+- parent/child content relationships
+
+Important log families:
+
+```text
+SCRIPT_COST_ESTIMATE
+QUALITY_REWRITE_SKIPPED
+FINAL_TTS_BACKSTOP
+STORYBOARD_ESTIMATE
+STORYBOARD_RETRY_COST
+STORYBOARD_FINAL
+STORYBOARD_COST_ESTIMATE
+HINT_QUALITY_SUMMARY
+PARENT_AUDIO_NO_SHORTS
+CHILD_SHORT_AUDIO_SCAN
+CHILD_SHORT_AUDIO_ENQUEUED
+CHILD_SHORT_AUDIO_DONE
+STANDALONE_SHORT_REUSE_STATS
+STANDALONE_SHORT_RENDER
+STANDALONE_SHORT_RENDER_DONE
+PRE_RENDER_ASSET_AUDIT
+```
+
+Rules:
+
+- Warnings must indicate whether pipeline should continue.
+- Do not spam per-beat logs unless debugging a beat-level failure.
+- Aggregate noisy diagnostics into summary logs.
+- Never log secrets.
+- Never log raw credentials.
+- Log content IDs and child/parent relationships.
+
+---
+
+## 25. Reliability Rules
+
+- Prefer deterministic behavior over creative behavior.
+- Validate every Claude JSON response in Python.
+- Never trust AI output without schema validation.
+- Business rules belong in Python.
+- Prompts generate content; code enforces correctness.
+- Never send partial data when expecting full regeneration.
+- Log token usage, response time, and failures for every Claude call.
+- Prompt changes must preserve backward compatibility unless explicitly approved.
+- Every system prompt must have a version identifier.
+- If Claude cannot determine an answer reliably, return an explicit failure instead of guessing.
+
+---
+
+## 26. Token Budget Rules
+
+- Do not send more than 80% of model context.
+- Truncate source material intentionally and log truncation.
+- Prefer compact indexes over raw large objects.
+- Prefer summaries over raw content when context is too large.
 - Log prompt length and estimated token count.
+- For storyboards, monitor output tokens per beat.
+- If a batch approaches token limit, reduce target beats or split earlier.
 
-# Determinism Rules
+---
 
-For:
-- validation
-- scoring
-- ranking
-- classification
+## 27. Media Rules
 
-Claude must:
-- use fixed criteria
-- avoid subjective wording
-- produce repeatable outputs
+### 27.1 Images
 
-# Business rules belong in Python.
+- Flux images must be stored locally.
+- `media_url` must be local.
+- HTTP image URLs must never reach Remotion.
+- Flux prompt hash caching is allowed.
+- Cache reuse must not create poor viewer experience.
+- Reuse parent images for child shorts only when visually relevant.
 
-Prompts may:
-- generate content
-- classify content
-- summarize content
+### 27.2 Remotion Props
 
-Prompts must NOT:
-- implement workflow decisions
-- decide retries
-- decide database state transitions
-- enforce authorization
+- Props must contain local file paths only.
+- Parent props are for `MainVideo.tsx`.
+- Child short props are for `Short.tsx`.
+- Parent props must not contain parent-cut shorts.
+- Validate props before render.
+- Fail fast on remote URLs.
 
-# Every system prompt must expose:
+### 27.3 Rendering
 
-PROMPT_VERSION = "x.y"
+Parent long video:
 
-When behavior changes:
-- increment version
-- document reason
+```text
+MainVideo.tsx
+1920x1080
+VideoRender(format="main")
+```
 
-Current versions:
-- Agent 2 system_prompt.py: PROMPT_VERSION = "3.0"
-- Agent 3 system_prompt.py: PROMPT_VERSION = "2.0"
-- Agent 5 system_prompt.py: PROMPT_VERSION = "2.2", STORYBOARD_SCHEMA_VERSION = "2.5"
+Child short:
 
-# Hallucination Prevention
+```text
+Short.tsx
+1080x1920
+VideoRender(format="short")
+```
 
-Claude must never:
+Rules:
 
-- invent URLs
-- invent RSS feeds
-- invent Reddit communities
-- invent source facts
-- invent statistics
+- Long videos can use chunked render.
+- Shorts should render as single vertical videos.
+- Verify rendered files.
+- Do not publish unverified renders.
 
-# If information is unavailable:
-return explicit failure.
+---
 
-# Never send partial scripts to a revision prompt
-when expecting a full-script response.
+## 28. Standalone Short Episode Rules
+
+This is the current shorts architecture.
+
+Rules:
+
+- Shorts are child content rows.
+- Shorts are standalone episodes.
+- Shorts have their own scripts.
+- Shorts have their own audio.
+- Shorts have their own Whisper.
+- Shorts use remapped parent visual beats.
+- Shorts render vertically.
+- Parent content does not render shorts.
+- Parent content does not generate breakpoints for shorts.
+- Parent content does not generate rehooks or bridges.
+- Parent video cuts are not part of the current architecture.
+
+Forbidden current behavior:
+
+```text
+parent audio → semantic breakpoints → parent short cuts
+parent storyboard → cut_shorts()
+parent VideoRender(format="short")
+parent rehook/bridge audio for shorts
+```
+
+If any of these reappear, treat it as an architecture regression.
+
+---
+
+## 29. Visual Quality Rules
+
+Agent 4 visual output should feel like a professional video, not an AI slideshow.
+
+Required qualities:
+
+- coherent recurring character identity
+- coherent primary location
+- strong first frame
+- clear visual escalation
+- meaningful shot variety
+- low object-only filler rate
+- low repeated-image rate
+- environment diversity where narratively appropriate
+- strong subject framing
+- readable, purposeful text cards
+
+Diagnostics to maintain:
+
+```text
+VISUAL_REPEAT_RATE
+ENVIRONMENT_DIVERSITY
+OBJECT_SHOT_RATE
+AI_SLIDESHOW_RISK
+CHARACTER_CONSISTENCY_WARN
+STANDALONE_SHORT_REUSE_STATS
+```
+
+Do not optimize visual diversity by forcing random locations. Story logic wins.
+
+---
+
+## 30. Security Rules
+
+- Never commit `.env`.
+- Never log credentials.
+- Never log decrypted credentials.
+- Encrypt credentials before storage.
+- Decrypt only at execution/verification time.
+- Do not expose bot tokens.
+- Do not expose API keys.
+- Keep authentication unimplemented until explicitly scheduled, but do not design routes as if they are safe for public deployment.
+
+---
+
+## 31. Environment Rules
+
+Use `.env` only through config/settings.
+
+Expected important environment variables:
+
+```text
+DATABASE_URL
+REDIS_URL
+ANTHROPIC_API_KEY
+CARTESIA_API_KEY
+ELEVENLABS_API_KEY
+OPENAI_API_KEY
+FAL_KEY
+TELEGRAM_BOT_TOKEN
+TELEGRAM_CHAT_ID
+FERNET_KEY
+REMOTION_PATH
+```
+
+Rules:
+
+- Do not read environment variables directly in business logic.
+- Use config wrappers.
+- Fail clearly when required settings are missing.
+- Optional provider keys should degrade only if that provider is not selected.
+
+---
+
+## 32. Documentation Rules
+
+Update `CLAUDE.md` when:
+
+- a new module is introduced
+- a new invariant is created
+- a pipeline status changes
+- a DB table/field changes
+- a task handoff changes
+- a prompt contract changes
+- a provider behavior changes
+- a legacy path is removed
+
+Do not use `CLAUDE.md` as a phase log.
+
+Keep current architecture sections current. Remove obsolete sections.
+
+All generated architecture, audit, investigation, and code-review reports must be
+written under `code_report/`. Do not place report Markdown files in the repository
+root or scatter them across source directories.
+
+---
+
+## 33. Architecture Change Checklist
+
+Before changing a pipeline flow:
+
+- [ ] identify parent vs child behavior
+- [ ] identify affected statuses
+- [ ] identify affected DB rows
+- [ ] identify artifacts created/deleted
+- [ ] identify Celery/Beat handoff
+- [ ] identify idempotency behavior
+- [ ] add logs
+- [ ] add smoke tests
+- [ ] update `CLAUDE.md`
+
+---
+
+## 34. Current Known Risks
+
+These are current engineering risks to monitor, not future feature promises.
+
+| Area | Risk |
+|---|---|
+| Duplicate task dispatch | Beat and inline orchestration may enqueue same child if guards fail |
+| Stale props | Existing props files may hide newer DB/script/audio changes |
+| Visual quality | Character identity and visual continuity need stronger controls |
+| Storyboard cost | Storyboard output tokens per beat can be high |
+| Child short script quality | Short scripts must not validate with remaining MAJOR TTS issues |
+| Legacy fields | Breakpoint/bookend fields still exist and could be misused |
+| Concurrency | VideoSection delete/insert patterns need care under parallel runs |
+| Deferral loops | Child video can defer forever if parent visual pass fails |
+
+---
+
+## 35. Final Current Architecture Checklist
+
+### Standalone short correctness
+
+- Agent 2 creates child short content rows: required
+- Agent 2 creates child short scripts: required
+- Child rows wait for parent audio: required
+- Parent Agent 3 generates parent audio only: required
+- Parent Agent 3 enqueues child audio after `AUDIO_DONE`: required
+- Child Agent 3 generates child audio and Whisper: required
+- Parent Agent 4 generates parent visual beats: required
+- Child Agent 4 remaps parent visuals to child narration: required
+- Child renders with `Short.tsx`: required
+- Child render is `VideoRender(format="short")`: required
+- Parent never renders shorts: required
+
+### Visual readiness
+
+- Storyboard cost logs: required
+- Reuse stats logs: required
+- Character consistency controls: should be strengthened
+- Repetition diagnostics: should be monitored
+- Cache reuse diagnostics: should be monitored
+- Object-shot rate diagnostics: should be monitored
+
+---
+
+## 36. Definition of Done for Pipeline Work
+
+A pipeline change is done only when:
+
+- code path is implemented
+- deterministic tests/smokes pass
+- logs prove the path is used
+- rerun behavior is idempotent
+- failure path is explicit
+- parent/child behavior is correct
+- `CLAUDE.md` is updated if architecture changed
+- no obsolete phase/development naming is introduced
+
+---
+
+End of file.

@@ -1,5 +1,5 @@
 import uuid
-from sqlalchemy import String, Integer, Float, Boolean, ForeignKey
+from sqlalchemy import String, Integer, Float, ForeignKey
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.dialects.postgresql import UUID
 
@@ -17,8 +17,6 @@ class VideoRender(Base):
     # Position within Shorts sequence; null for main video
     short_order: Mapped[int | None] = mapped_column(Integer, nullable=True)
     duration_seconds: Mapped[float] = mapped_column(Float, nullable=False)
-    # Whether the first 3s hook was optimised by Shorts Cutter sub-agent
-    hook_modified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     render_time_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     content: Mapped["Content"] = relationship("Content", back_populates="video_renders")

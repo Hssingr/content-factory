@@ -1,4 +1,6 @@
+import hashlib
 import logging
+import re
 from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
@@ -12,6 +14,8 @@ from app.agents.agent2_discovery.system_prompt import (
     build_telegram_message,
     generate_revised_scripts,
 )
+
+_REDDIT_URL_RE = re.compile(r"https?://(?:www\.)?reddit\.com/", re.IGNORECASE)
 
 logger = logging.getLogger(__name__)
 
@@ -139,7 +143,22 @@ async def handle_telegram_update(update: Update, context: ContextTypes.DEFAULT_T
 
         validation, content, channel = result
 
-        if message_text.upper().startswith("APPROVE"):
+        if content.status == "AWAITING_MANUAL_STORY":
+            # Operator replied with a manual story (URL or pasted text)
+            pending_send = _handle_manual_story_input(
+                validation, content, channel, message_text, db
+            )
+            if pending_send:
+                chat_id, text = pending_send
+                new_msg_id = await telegram_client.send_message(chat_id, text)
+                if new_msg_id:
+                    db.refresh(content)
+                    if content.status == "PENDING_APPROVAL":
+                        # New story — track the reply for APPROVE/CHANGE routing
+                        validation.telegram_message_id = new_msg_id
+                        validation.sent_at = datetime.now(timezone.utc)
+                        db.commit()
+        elif message_text.upper().startswith("APPROVE"):
             _approve(validation, content, db)
         else:
             # Sync: update DB, regenerate scripts; returns Telegram message to send
@@ -158,6 +177,138 @@ async def handle_telegram_update(update: Update, context: ContextTypes.DEFAULT_T
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
+
+def _handle_manual_story_input(
+    validation: ContentValidation,
+    content: Content,
+    channel: Channel,
+    user_input: str,
+    db: Session,
+) -> tuple[str, str] | None:
+    """Process an operator's manual story reply to the AWAITING_MANUAL_STORY Telegram message.
+
+    Two input forms are accepted:
+    - Reddit URL (``https://reddit.com/...``) → fetched via ``fetch_batch`` + Claude web_search
+    - Pasted text → first line = title, remaining lines = body; synthetic manual:// URL assigned
+
+    Duplicate check runs after parsing. On duplicate:
+    - The placeholder Content is marked FAILED / validation REJECTED
+    - ``run_agent2_for_channel`` is re-dispatched with the expanded rejected list
+    - Returns a short notification message (no telegram_message_id update needed)
+
+    On new story:
+    - The placeholder Content is updated in-place (url, title, source_excerpt)
+    - ``content.status`` flips to ``"PENDING_APPROVAL"``
+    - Returns the normal APPROVE/CHANGE Telegram message
+
+    Args:
+        validation: ContentValidation row linked to the manual-fallback message.
+        content:    Placeholder Content row (``status="AWAITING_MANUAL_STORY"``).
+        channel:    Channel the story belongs to.
+        user_input: Raw Telegram message text from the operator.
+        db:         SQLAlchemy session (managed by the async handler).
+
+    Returns:
+        ``(chat_id, message_text)`` to send, or ``None`` on unrecoverable error.
+    """
+    from app.agents.agent2_discovery.services.fetcher import fetch_batch
+    from app.agents.agent2_discovery.services.story import Story
+    from app.scheduler import celery_app
+
+    user: User | None = db.get(User, channel.user_id)
+    if not user or not user.telegram_chat_id:
+        logger.error("No telegram_chat_id for channel %s user — cannot reply", channel.id)
+        return None
+
+    chat_id = user.telegram_chat_id
+    prior_rejected: list[dict] = (content.story_blueprint or {}).get("rejected_stories", [])
+
+    # ── Parse user input ──────────────────────────────────────────────────────
+    if _REDDIT_URL_RE.search(user_input):
+        # URL path: Claude fetches title + body from the specific page
+        url = user_input.strip()
+        logger.info("Manual story input: Reddit URL %s — fetching via Claude", url)
+        candidates = fetch_batch([(url, "url", 1.0)], niche=channel.niche)
+        if not candidates:
+            logger.warning("Manual URL fetch returned no story for %s", url)
+            return (
+                chat_id,
+                "⚠️ Could not fetch that URL. Please try again or paste the story text directly.",
+            )
+        story = candidates[0]
+    else:
+        # Paste path: first line = title, rest = body
+        lines = user_input.strip().splitlines()
+        title = lines[0].strip() if lines else user_input[:80].strip()
+        body = "\n".join(lines[1:]).strip() if len(lines) > 1 else ""
+        body_hash = hashlib.sha256(body.encode()).hexdigest()[:16]
+
+        story = Story(
+            url=f"manual://paste/{body_hash}",
+            title=title,
+            body=body,
+            language="en",
+            source_type="manual",
+            source_value="telegram_paste",
+            published_at=datetime.now(timezone.utc),
+            upvotes=0,
+            comments=0,
+        )
+        logger.info("Manual story input: pasted text (title=%r)", title[:60])
+
+    # ── Dedup check ───────────────────────────────────────────────────────────
+    url_dupe = db.query(Content.id).filter(Content.source_url == story.url).first()
+    hash_dupe = db.query(Content.id).filter(
+        Content.content_hash == story.content_hash
+    ).first()
+
+    if url_dupe or hash_dupe:
+        logger.info(
+            "Manual story is a duplicate (title=%r) — re-dispatching discovery",
+            story.title[:60],
+        )
+        expanded_rejected = list(prior_rejected)
+        expanded_rejected.append({"title": story.title, "url": story.url})
+
+        content.status   = "FAILED"
+        validation.status = "REJECTED"
+        db.commit()
+
+        # Re-dispatch discovery with the expanded exclusion list (avoids direct import)
+        celery_app.send_task(
+            "app.scheduler.tasks.run_agent2_for_channel",
+            kwargs={
+                "channel_id":       str(channel.id),
+                "rejected_stories": expanded_rejected,
+            },
+        )
+
+        return chat_id, "⚠️ That story is already in our library. Searching for a new one…"
+
+    # ── New story: update placeholder and re-enter APPROVE/CHANGE flow ────────
+    content.source_url    = story.url
+    content.content_hash  = story.content_hash
+    content.title         = story.title
+    content.source_excerpt = story.body[:8000] if story.body else None
+    content.status        = "PENDING_APPROVAL"
+    content.story_blueprint = {}
+
+    validation.status = "PENDING"
+    db.flush()
+
+    message = build_telegram_message(
+        title=content.title,
+        url=content.source_url,
+        assessment=None,
+        target_languages=None,
+        user_language=user.primary_language,
+    )
+    db.commit()
+    logger.info(
+        "Manual story accepted for content %s — title=%r", content.id, story.title[:60]
+    )
+    return chat_id, message
+
 
 def _find_validation(
     replied_to_id: str,

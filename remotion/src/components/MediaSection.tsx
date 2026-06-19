@@ -126,14 +126,14 @@ export const MediaSection: React.FC<Props> = ({ section, crossfadeIn = 0, incomi
 
   const validClips = clips.filter((c) => !isFallback(c.url));
 
-  // No usable stock media — render a background placeholder + any overlay text.
+  // No usable local media — render a background placeholder + any overlay text.
   //
   // Differentiation by visual_type:
   //   text_card         → TextCard.tsx (dark gradient + overlay_text, Block 5 fallback)
   //   generated_visual  → GeneratedPlaceholder (AI generation pending in MODE A,
   //                        or a hard MEDIA_FAILED beat that slipped through in MODE B)
-  //   text_overlay      → dark background (MODE A design choice; in MODE B this beat
-  //                        should always carry a real media_url from stock_fetcher)
+  //   text_overlay      → dark background; render props must carry a local Flux/cache
+  //                        asset or an approved local fallback. Remote URLs are forbidden before render.
   //   anything else     → GeneratedPlaceholder (shouldn't happen in a healthy pipeline)
   if (validClips.length === 0) {
     const effectiveOverlayPos = overlayPosition === "none" ? "center" : overlayPosition;
@@ -142,6 +142,7 @@ export const MediaSection: React.FC<Props> = ({ section, crossfadeIn = 0, incomi
         <TextCard
           text={section.overlay_text ?? ""}
           style={transitionStyle}
+          cardStyle={section.text_card_style}
         />
       );
     }

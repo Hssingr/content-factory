@@ -23,23 +23,26 @@ MODEL_ROUTING: dict[str, str] = {
     "script_generation":       SONNET,
     "native_adaptation":       SONNET,
     "quality_rewrite":         SONNET,
-    "intro_optimization":      SONNET,
     "auto_correction":         SONNET,  # dev-mode exception — correction quality matters
     "storyboard":              SONNET,
     "story_gate_scoring":      SONNET,  # single-story gate: 18-dimension structured call
     "revision":                SONNET,
     "story_research":          SONNET,  # uses web_search tool — Haiku does not support it
     "channel_suggestion":      SONNET,  # Agent 1 UX — poor suggestions harm onboarding quality
+    "story_blueprint":         SONNET,  # Narrative skeleton — foundation for all sections
+    "section_generation":      SONNET,  # Creative writing per section
+    "short_script":            SONNET,  # Standalone short planning: TikTok-optimised episode script
     # ── Fast / cheap (Haiku) ─────────────────────────────────────────────
     "script_quality_check":    HAIKU,
     "script_validation":       HAIKU,
     "media_scoring":           HAIKU,
-    "semantic_splits":         HAIKU,
-    "bookends":                HAIKU,
     "content_reformat":        HAIKU,   # reformatting prose discovery output to JSON
-    "section_validation":      HAIKU,   # Agent 5 section quality check
-    "section_splitting":       HAIKU,   # Agent 5 legacy section splitter
-    "visual_reinterpretation": HAIKU,   # Agent 5 alternative visual query generation
+    "section_validation":      HAIKU,   # Agent 4 section quality check
+    "section_splitting":       HAIKU,   # Agent 4 legacy section splitter
+    "visual_reinterpretation": HAIKU,   # Agent 4 alternative visual query generation
+    "global_validation":       HAIKU,   # Narrative coherence check after assembly
+    "shorts_planner":          HAIKU,   # Standalone short planning: structural planning for Short episodes
+    "short_storyboard_remap":  HAIKU,   # Child short visual remap: remap parent beats to Short narration timing
 }
 
 

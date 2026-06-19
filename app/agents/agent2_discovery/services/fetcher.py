@@ -42,11 +42,16 @@ Required keys: title, body, url, language, published_at (ISO8601 or null), upvot
 Never invent facts, URLs, or details not present in the input.\
 """
 
+# How many existing channel stories to include in the nuclear-retry exclusion list.
+# Keeps the user message within token budget while covering the full history.
+_MAX_NUCLEAR_EXCLUSION = 80
+
 
 def fetch_batch(
     sources: list[tuple[str, str, float]],
     niche: str,
     count: int = 1,  # kept for call-site compatibility; always fetches exactly 1 story
+    rejected_stories: list[dict] | None = None,
 ) -> list[Story]:
     """Browse sources and return the single highest-engagement story in one Claude call.
 
@@ -54,9 +59,12 @@ def fetch_batch(
     Falls back to a reformat pass if Claude returns prose, then to an empty list on failure.
 
     Args:
-        sources: List of ``(source_value, source_type, trust_score)`` tuples.
-        niche:   Channel niche description.
-        count:   Ignored — always returns at most 1 story.
+        sources:          List of ``(source_value, source_type, trust_score)`` tuples.
+        niche:            Channel niche description.
+        count:            Ignored — always returns at most 1 story.
+        rejected_stories: Optional list of ``{"title": str, "url": str}`` dicts that
+                          Claude must not return again. Injected as a hard exclusion block
+                          at the end of the user message.
 
     Returns:
         List containing 0 or 1 Story objects.
@@ -74,6 +82,21 @@ def fetch_batch(
         f"Sources to explore:\n{source_lines}\n\n"
         "Browse the sources, find the highest-engagement story, then output ONLY the JSON object."
     )
+
+    if rejected_stories:
+        rejected_block = "\n".join(
+            f"  {i + 1}. Title: {r['title']}\n     URL: {r['url']}"
+            for i, r in enumerate(rejected_stories)
+        )
+        user_message += (
+            f"\n\nDo NOT return any of these stories (already used or seen):\n"
+            f"{rejected_block}\n\n"
+            "Find a completely different story that is not in the list above."
+        )
+        logger.info(
+            "fetch_batch: %d story/stories in exclusion list",
+            len(rejected_stories),
+        )
 
     try:
         raw = call_claude_with_tools(

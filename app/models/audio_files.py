@@ -15,16 +15,7 @@ class AudioFile(Base):
     language: Mapped[str] = mapped_column(String(10), nullable=False)
     file_path: Mapped[str] = mapped_column(Text, nullable=False)
     duration_ms: Mapped[int] = mapped_column(Integer, nullable=False)
-    # Recalculated breakpoints after real audio duration is known
-    shorts_breakpoints: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     # Whisper word-level timestamps: [{"word": str, "start": float, "end": float}]
     whisper_transcript: Mapped[list | None] = mapped_column(JSONB, nullable=True)
-    # Per-Short bookend clips synthesized in Agent 4 after breakpoints are final.
-    # JSONB lists indexed by Short number (0-based); None at positions where a clip
-    # is not applicable (Part 1 rehook = None; last Part bridge = None).
-    # short_rehook_paths[i]: path to rehook mp3 prepended to Short i in Short.tsx.
-    # short_bridge_paths[i]: path to bridge CTA mp3 appended after Short i in Short.tsx.
-    short_rehook_paths: Mapped[list | None] = mapped_column(JSONB, nullable=True)
-    short_bridge_paths: Mapped[list | None] = mapped_column(JSONB, nullable=True)
 
     content: Mapped["Content"] = relationship("Content", back_populates="audio_files")

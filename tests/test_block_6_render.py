@@ -72,7 +72,7 @@ class TestVerifyRender:
     """verify_render — mocked subprocess, no real files needed."""
 
     def test_good_render_passes(self, tmp_path):
-        from app.agents.agent5_video.services.verify import verify_render
+        from app.agents.agent5_render.services.verify import verify_render
 
         mp4 = str(tmp_path / "good.mp4")
         _make_mp4(mp4)
@@ -90,13 +90,13 @@ class TestVerifyRender:
         assert issues == [], f"Expected no issues, got: {issues}"
 
     def test_missing_file_returns_issue(self):
-        from app.agents.agent5_video.services.verify import verify_render
+        from app.agents.agent5_render.services.verify import verify_render
 
         issues = verify_render("/tmp/nonexistent_xyz_abc.mp4", None, "main")
         assert any("not found" in i for i in issues)
 
     def test_wrong_resolution_detected(self, tmp_path):
-        from app.agents.agent5_video.services.verify import verify_render
+        from app.agents.agent5_render.services.verify import verify_render
 
         mp4 = str(tmp_path / "bad_res.mp4")
         _make_mp4(mp4)
@@ -113,7 +113,7 @@ class TestVerifyRender:
         assert any("wrong_resolution" in i for i in issues), f"Got: {issues}"
 
     def test_no_audio_stream_detected(self, tmp_path):
-        from app.agents.agent5_video.services.verify import verify_render
+        from app.agents.agent5_render.services.verify import verify_render
 
         mp4 = str(tmp_path / "no_audio.mp4")
         _make_mp4(mp4)
@@ -130,7 +130,7 @@ class TestVerifyRender:
         assert any("no_audio_stream" in i for i in issues), f"Got: {issues}"
 
     def test_black_frame_interval_detected(self, tmp_path):
-        from app.agents.agent5_video.services.verify import verify_render
+        from app.agents.agent5_render.services.verify import verify_render
 
         mp4 = str(tmp_path / "black.mp4")
         _make_mp4(mp4)
@@ -150,7 +150,7 @@ class TestVerifyRender:
         assert any("black_interval_detected" in i for i in issues), f"Got: {issues}"
 
     def test_interior_silence_detected(self, tmp_path):
-        from app.agents.agent5_video.services.verify import verify_render
+        from app.agents.agent5_render.services.verify import verify_render
 
         mp4 = str(tmp_path / "silence.mp4")
         _make_mp4(mp4)
@@ -173,7 +173,7 @@ class TestVerifyRender:
 
     def test_edge_silence_ignored(self, tmp_path):
         """Silence in the first 1 s should NOT be flagged."""
-        from app.agents.agent5_video.services.verify import verify_render
+        from app.agents.agent5_render.services.verify import verify_render
 
         mp4 = str(tmp_path / "edge_silence.mp4")
         _make_mp4(mp4)
@@ -195,7 +195,7 @@ class TestVerifyRender:
         assert not any("interior_silence" in i for i in issues), f"Got: {issues}"
 
     def test_duration_drift_detected(self, tmp_path):
-        from app.agents.agent5_video.services.verify import verify_render
+        from app.agents.agent5_render.services.verify import verify_render
 
         mp4 = str(tmp_path / "drift.mp4")
         _make_mp4(mp4)
@@ -220,7 +220,7 @@ class TestVerifyRender:
 
     def test_short_resolution_check(self, tmp_path):
         """Shorts expect 1080×1920 (portrait)."""
-        from app.agents.agent5_video.services.verify import verify_render
+        from app.agents.agent5_render.services.verify import verify_render
 
         mp4 = str(tmp_path / "short.mp4")
         _make_mp4(mp4)
@@ -244,44 +244,7 @@ class TestVerifyRender:
         assert issues == [], f"Expected no issues, got: {issues}"
 
 
-# ── 2. remotion_builder — bookend shims ──────────────────────────────────────
-
-class TestBookendShims:
-    """_bookend_path / _bookend_duration / _bookend_text handle both shapes."""
-
-    def test_bare_string_path(self):
-        from app.agents.agent5_video.services.remotion_builder import (
-            _bookend_path, _bookend_duration, _bookend_text,
-        )
-        entry = "/media/audio/abc/fr_rehook_1.mp3"
-        assert _bookend_path(entry) == entry
-        assert _bookend_duration(entry) == 0
-        assert _bookend_text(entry) == ""
-
-    def test_dict_shape(self):
-        from app.agents.agent5_video.services.remotion_builder import (
-            _bookend_path, _bookend_duration, _bookend_text,
-        )
-        entry = {"path": "/media/audio/abc/fr_rehook_1.mp3", "duration_ms": 2350, "text": "What happened next?"}
-        assert _bookend_path(entry) == "/media/audio/abc/fr_rehook_1.mp3"
-        assert _bookend_duration(entry) == 2350
-        assert _bookend_text(entry) == "What happened next?"
-
-    def test_none_entry(self):
-        from app.agents.agent5_video.services.remotion_builder import (
-            _bookend_path, _bookend_duration, _bookend_text,
-        )
-        assert _bookend_path(None) is None
-        assert _bookend_duration(None) == 0
-        assert _bookend_text(None) == ""
-
-    def test_dict_missing_text_key(self):
-        from app.agents.agent5_video.services.remotion_builder import _bookend_text
-        entry = {"path": "/foo.mp3", "duration_ms": 1000}
-        assert _bookend_text(entry) == ""
-
-
-# ── 3. remotion_builder — text_card visual_type override ─────────────────────
+# ── 2. remotion_builder — text_card visual_type override ───────────────────── remotion_builder — text_card visual_type override ─────────────────────
 
 class TestTextCardOverride:
     """_section_for_remotion sets visual_type='text_card' when visual_source='text_card'."""
@@ -306,122 +269,80 @@ class TestTextCardOverride:
         }
 
     def test_text_card_override(self):
-        from app.agents.agent5_video.services.remotion_builder import _section_for_remotion
+        from app.agents.agent5_render.services.remotion_builder import _section_for_remotion
         s = self._make_section(visual_source="text_card", visual_type="b-roll")
         out = _section_for_remotion(s)
         assert out["visual_type"] == "text_card", f"Got: {out['visual_type']}"
 
     def test_normal_beat_unchanged(self):
-        from app.agents.agent5_video.services.remotion_builder import _section_for_remotion
+        from app.agents.agent5_render.services.remotion_builder import _section_for_remotion
         s = self._make_section(visual_source=None, visual_type="action")
         out = _section_for_remotion(s)
         assert out["visual_type"] == "action"
 
     def test_no_visual_source_field(self):
-        from app.agents.agent5_video.services.remotion_builder import _section_for_remotion
+        from app.agents.agent5_render.services.remotion_builder import _section_for_remotion
         s = self._make_section()
         s.pop("visual_source", None)
         out = _section_for_remotion(s)
         assert out["visual_type"] == "b-roll"
 
 
-# ── 4. remotion_builder — build_short_props duration fields ──────────────────
+# ── 4. remotion_builder — V2 short props contain no bookend fields ───────────
 
-class TestBuildShortPropsDuration:
-    """build_short_props writes rehook_duration_ms / bridge_duration_ms to the JSON."""
+class TestBuildShortPropsV2Shape:
+    """build_short_props writes only standalone child-short props."""
 
-    def _short_dict(self):
-        return {
+    def test_v2_short_props_have_no_bookend_fields(self, tmp_path):
+        from unittest.mock import patch
+        from app.agents.agent5_render.services.remotion_builder import build_short_props
+
+        short = {
             "short_index": 0,
             "start_ms":    0,
             "end_ms":      65000,
-            "duration_sec": 65.0,
             "part_label":  "Part 1/2",
             "total_parts": 2,
-            "hook_modified": True,
             "sections":    [],
         }
 
-    def test_dict_shape_duration_written(self, tmp_path):
-        from unittest.mock import patch
-        from app.agents.agent5_video.services.remotion_builder import build_short_props
-
-        rehook_entry = {"path": str(tmp_path / "rehook.mp3"), "duration_ms": 2100, "text": "Wait for it"}
-        bridge_entry = {"path": str(tmp_path / "bridge.mp3"), "duration_ms": 3500, "text": ""}
-
-        with patch("app.agents.agent5_video.services.remotion_builder.settings") as mock_cfg:
+        with patch("app.agents.agent5_render.services.remotion_builder.settings") as mock_cfg:
             mock_cfg.media_path = str(tmp_path)
             props_path = build_short_props(
                 content_id="test-content-123",
                 language="en",
                 audio_file_path=str(tmp_path / "en.mp3"),
-                short=self._short_dict(),
+                short=short,
                 karaoke_subtitles=[],
-                rehook_paths=[rehook_entry],
-                bridge_paths=[bridge_entry],
             )
 
         data = json.loads(Path(props_path).read_text())
-        assert data["rehook_duration_ms"] == 2100
-        assert data["bridge_duration_ms"] == 3500
-        assert data["rehook_text"] == "Wait for it"
-
-    def test_legacy_str_shape_duration_zero(self, tmp_path):
-        from unittest.mock import patch
-        from app.agents.agent5_video.services.remotion_builder import build_short_props
-
-        with patch("app.agents.agent5_video.services.remotion_builder.settings") as mock_cfg:
-            mock_cfg.media_path = str(tmp_path)
-            props_path = build_short_props(
-                content_id="test-content-456",
-                language="fr",
-                audio_file_path=str(tmp_path / "fr.mp3"),
-                short=self._short_dict(),
-                karaoke_subtitles=[],
-                rehook_paths=[str(tmp_path / "rehook.mp3")],  # legacy bare string
-                bridge_paths=[str(tmp_path / "bridge.mp3")],
-            )
-
-        data = json.loads(Path(props_path).read_text())
-        # Legacy str → duration_ms = 0 → stored as None in props
-        assert data["rehook_duration_ms"] is None
-        assert data["bridge_duration_ms"] is None
-
-    def test_none_bookend_entries(self, tmp_path):
-        from unittest.mock import patch
-        from app.agents.agent5_video.services.remotion_builder import build_short_props
-
-        with patch("app.agents.agent5_video.services.remotion_builder.settings") as mock_cfg:
-            mock_cfg.media_path = str(tmp_path)
-            props_path = build_short_props(
-                content_id="test-content-789",
-                language="es",
-                audio_file_path=str(tmp_path / "es.mp3"),
-                short=self._short_dict(),
-                karaoke_subtitles=[],
-                rehook_paths=[None],
-                bridge_paths=[None],
-            )
-
-        data = json.loads(Path(props_path).read_text())
-        assert data["rehook_file"] is None
-        assert data["bridge_file"] is None
-        assert data["rehook_duration_ms"] is None
-        assert data["bridge_duration_ms"] is None
+        assert data["short_index"] == 0
+        assert data["duration_ms"] == 65000
+        for removed in (
+            "rehook_file",
+            "bridge_file",
+            "rehook_duration_ms",
+            "bridge_duration_ms",
+            "rehook_text",
+            "hook_modified",
+            "bookends_enabled",
+        ):
+            assert removed not in data
 
 
 # ── 5. renderer — ensure_bundle disabled ─────────────────────────────────────
 
 class TestEnsureBundle:
     def test_returns_none_when_disabled(self):
-        from app.agents.agent5_video.services.renderer import ensure_bundle
-        with patch("app.agents.agent5_video.services.renderer.settings") as mock_cfg:
+        from app.agents.agent5_render.services.renderer import ensure_bundle
+        with patch("app.agents.agent5_render.services.renderer.settings") as mock_cfg:
             mock_cfg.remotion_pre_bundle = False
             result = ensure_bundle()
         assert result is None
 
     def test_returns_cached_bundle_when_exists(self, tmp_path):
-        from app.agents.agent5_video.services.renderer import ensure_bundle
+        from app.agents.agent5_render.services.renderer import ensure_bundle
 
         # Create a fake src/ directory and matching bundle
         src_dir = tmp_path / "src"
@@ -430,7 +351,7 @@ class TestEnsureBundle:
         bundles_dir = tmp_path / "bundles"
 
         # Pre-compute what the hash would be (just test the reuse path works)
-        with patch("app.agents.agent5_video.services.renderer.settings") as mock_cfg:
+        with patch("app.agents.agent5_render.services.renderer.settings") as mock_cfg:
             mock_cfg.remotion_pre_bundle = True
             mock_cfg.remotion_path = str(tmp_path)
             mock_cfg.node_bin = "node"
@@ -449,14 +370,14 @@ class TestVerifyFailedErrorFlow:
     """_run_renders raises VerifyFailedError; _process_language sets NEEDS_REVIEW."""
 
     def test_verify_failed_error_is_importable(self):
-        from app.agents.agent5_video.services.video import VerifyFailedError
+        from app.agents.agent5_render.services.video import VerifyFailedError
         err = VerifyFailedError("test")
         assert isinstance(err, RuntimeError)
         assert "test" in str(err)
 
     def test_verify_failed_sets_needs_review(self):
         """_process_language should catch VerifyFailedError and set content.status=NEEDS_REVIEW."""
-        from app.agents.agent5_video.services.video import VerifyFailedError
+        from app.agents.agent5_render.services.video import VerifyFailedError
 
         # Build a minimal mock mimicking what _process_language does on VerifyFailedError
         content_mock = MagicMock()

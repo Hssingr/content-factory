@@ -1,7 +1,8 @@
+import json
 import logging
 import re
 
-from app.services.claude_client import call_claude, parse_claude_json
+from app.services.claude_client import call_claude, call_claude_structured
 
 logger = logging.getLogger(__name__)
 
@@ -181,13 +182,24 @@ def suggest_publish_timing(
         f"Videos per week: {videos_per_week}\n\n"
         "Return the optimal publish schedule JSON."
     )
-    raw = call_claude(_TIMING_SYSTEM_PROMPT, user_message, max_tokens=256, task="channel_suggestion")
-
-    data = parse_claude_json(
-        raw,
-        required_keys=["timezone", "optimal_days", "optimal_hour_start", "optimal_hour_end"],
-        type_checks={"timezone": str, "optimal_days": list,
-                     "optimal_hour_start": int, "optimal_hour_end": int},
+    data = call_claude_structured(
+        task="channel_suggestion",
+        system_prompt=_TIMING_SYSTEM_PROMPT,
+        user_message=user_message,
+        schema_name="publish_timing_suggestion",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "timezone": {"type": "string"},
+                "optimal_days": {"type": "array", "items": {"type": "string"}},
+                "optimal_hour_start": {"type": "integer"},
+                "optimal_hour_end": {"type": "integer"},
+                "shorts_spread_hours": {"type": "integer"},
+            },
+            "required": ["timezone", "optimal_days", "optimal_hour_start", "optimal_hour_end"],
+            "additionalProperties": False,
+        },
+        max_tokens=256,
     )
 
     # Warn if Claude returned wrong number of publish days

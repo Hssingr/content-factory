@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """
-Full Agent 2 → Agent 3 → Agent 4 → Agent 5 end-to-end test script.
+Full Agent 2 → Agent 4 → Agent 5 end-to-end test script.
 
 Steps:
   1. Discovery    — Claude browses your sources, picks the best story (fetch → dedup → score)
   2. Telegram     — sends title + URL + score to your phone, waits for APPROVE
-  3. Scripts      — Claude generates video + voice scripts in source language (after APPROVE)
-  4. Multilingual — generates culturally adapted scripts for every channel language
+  3. Scripts      — blueprint → section-by-section generation → quality gate → persist source Script
+                    → Shorts Planner (non-blocking, creates Short episode Content rows)
+  4. Multilingual — culturally adapted scripts for every channel language
   5. Validation   — deterministic checks + auto-correction, sets SCRIPTS_VALIDATED
-  6. Agent 4      — ElevenLabs TTS + Whisper transcription + breakpoints
-  7. Agent 5      — Storyboard (1×) → Flux Schnell image generation (1×)
-                    → Per-language: Shorts Cutter → Subtitles → Remotion render
+  6. Agent 4      — Cartesia TTS + Whisper transcription for parent content
+                    → Short episodes awaiting parent are flipped to SCRIPTS_VALIDATED
+  6b. Agent 4    — Cartesia TTS + Whisper for each child Short episode (owns its audio)
+  7. Agent 5      — Storyboard/remap → Flux Schnell image generation/reuse
+                    → Per-language: Subtitles → Remotion render
   8. Summary      — prints final DB state (scripts + audio + video renders)
+
+Note: Agent 3 is dissolved — validation (step 5) runs inline here and in the Celery pipeline.
 
 Usage:
     source venv/bin/activate
@@ -25,7 +30,7 @@ Usage:
     # Skip Telegram — content already approved, restart multilingual generation:
     python test_full_pipeline.py --from-multilingual <content_id>
 
-    # Skip multilingual generation — jump straight to Agent 3:
+    # Skip multilingual generation — jump straight to validation (step 5):
     python test_full_pipeline.py --from-agent3 <content_id>
 
     # Jump directly to Agent 4 — content already has SCRIPTS_VALIDATED status:
@@ -140,12 +145,11 @@ def _print_audio_summary(content_id: uuid.UUID, audio_ok: bool) -> None:
 
     print(f"\n  Audio files ({len(audio_files)} language(s)):")
     for af in sorted(audio_files, key=lambda a: a.language):
-        bp  = len(af.shorts_breakpoints or [])
         wc  = len(af.whisper_transcript or [])
         dur = af.duration_ms / 1000
         print(
             f"    [{af.language}]  {dur:.1f}s ({dur / 60:.1f}min)"
-            f"  {bp} breakpoints  {wc} Whisper words"
+            f"  {wc} Whisper words"
         )
         if af.whisper_transcript:
             sample = af.whisper_transcript[:3]
@@ -265,7 +269,7 @@ def _print_video_summary(content_id: uuid.UUID, video_ok: bool) -> None:
             rt = f"{sr.render_time_seconds:.0f}s render" if sr.render_time_seconds else ""
             print(
                 f"      Short  9:16   part={sr.short_order}  {sr.duration_seconds:.1f}s"
-                f"  hook={sr.hook_modified}  {rt}"
+                f"  {rt}"
             )
 
 
@@ -308,10 +312,9 @@ def _print_final_summary(
         seen.add(s.language)
         wc  = len(s.voice_script.split())
         dur = s.estimated_duration_sec or estimate_duration_sec(s.voice_script, s.language)
-        bp  = len(s.shorts_breakpoints or [])
         print(
             f"    [{s.language}] v{s.version}  validated={s.validated}"
-            f"  {wc}w  {dur:.0f}s ({dur / 60:.1f}min)  {bp} breakpoints"
+            f"  {wc}w  {dur:.0f}s ({dur / 60:.1f}min)"
         )
 
     _print_audio_summary(content_id, audio_ok)
@@ -330,7 +333,7 @@ def _print_final_summary(
         print(f"  ❌  AGENT 4 FAILED — check ELEVENLABS_API_KEY and OPENAI_API_KEY in .env")
         print(f"      Re-run:  python test_full_pipeline.py --from-audio {content_id}")
     elif multilingual_ok:
-        print(f"  ⚠   AGENT 3 BLOCKED — MAJOR issues remain after max auto-corrections")
+        print(f"  ⚠   VALIDATION BLOCKED — MAJOR script issues remain after max auto-corrections")
         print(f"      Review scripts in DB, then re-run:")
         print(f"      python test_full_pipeline.py --from-agent3 {content_id}")
     else:
@@ -341,18 +344,18 @@ def _print_final_summary(
 
 # ── Step runners (reused by multiple entry points) ────────────────────────────
 
-def _run_agent3(content_id: uuid.UUID) -> bool:
-    """Run deterministic script validation + auto-correction.
+def _run_script_validation(content_id: uuid.UUID) -> bool:
+    """Run cross-language deterministic checks + auto-correction + set SCRIPTS_VALIDATED.
 
-    Validation is now embedded in run_agent2_scripts_for_content (Celery flow),
-    but the test pipeline calls it separately because scripts were generated
-    manually step-by-step.  Returns True if all languages are MAJOR-issue-free
-    after up to 3 auto-correction rounds.
+    In production this runs embedded inside run_agent2_scripts_for_content() after
+    generate_multilingual_scripts() completes.  The test runner calls it as an
+    explicit step because scripts are generated one step at a time for debuggability.
+    Returns True if all languages are MAJOR-issue-free after up to 3 correction rounds.
     """
     from app.models import Channel, ChannelConfig, ChannelVoice, Content, Script
     from app.agents.agent2_discovery.system_prompt import auto_correct_script
     from app.services.script_checks import run_deterministic_checks
-    from app.services.script_estimator import estimate_duration_sec, compute_shorts_breakpoints
+    from app.services.script_estimator import estimate_duration_sec
 
     _MAX_ROUNDS = 3
 
@@ -363,7 +366,6 @@ def _run_agent3(content_id: uuid.UUID) -> bool:
         channel = db.get(Channel, content.channel_id)
         config  = db.get(ChannelConfig, channel.id)
         script_format = config.script_format if config else "youtube_long"
-        shorts_rule   = config.shorts_rule   if config else "auto"
 
         scripts_qs = (
             db.query(Script)
@@ -441,14 +443,21 @@ def _run_agent3(content_id: uuid.UUID) -> bool:
             if updated.get("voice_script"):
                 s.voice_script = updated["voice_script"]
             dur = estimate_duration_sec(s.voice_script, s.language)
-            bp  = compute_shorts_breakpoints(s.voice_script, dur, shorts_rule)
             s.estimated_duration_sec = dur
-            s.shorts_breakpoints     = bp
             s.validated              = True
 
         content.status = "SCRIPTS_VALIDATED"
         db.commit()
         print(f"  {'PASS' if all_passed else 'PARTIAL'} — {len(scripts_rows)} language(s) validated; status=SCRIPTS_VALIDATED")
+
+        # Non-blocking: create Short episode Content rows (mirrors tasks.py post-SCRIPTS_VALIDATED)
+        try:
+            from app.agents.agent2_discovery.services.scripts import run_shorts_planner
+            run_shorts_planner(content_id, channel, config, db)
+            print("  [shorts planner] Short episode rows created")
+        except Exception as exc:
+            print(f"  [shorts planner] skipped (non-blocking): {exc}")
+
         return all_passed
 
     finally:
@@ -456,11 +465,15 @@ def _run_agent3(content_id: uuid.UUID) -> bool:
 
 
 def _run_agent4(content_id: uuid.UUID) -> bool:
-    """Run Agent 4 TTS + Whisper. Returns True if at least one language succeeded."""
+    """Run Agent 4 TTS + Whisper. Returns True if at least one language succeeded.
+
+    On success, also flips any Short episode Content rows that were waiting for
+    this parent's audio to complete (mirrors pickup_short_episodes_awaiting_parent).
+    """
     from app.models import Content
     from app.agents.agent4_audio.services.audio import run_audio_generation
 
-    print(STEP("STEP 6: Agent 4 — ElevenLabs TTS + Whisper"))
+    print(STEP("STEP 6: Agent 4 — Cartesia TTS + Whisper"))
     db = _db()
     content = db.get(Content, content_id)
     if content.status not in ("SCRIPTS_VALIDATED", "AUDIO_DONE"):
@@ -468,7 +481,87 @@ def _run_agent4(content_id: uuid.UUID) -> bool:
         db.commit()
     audio_ok = run_audio_generation(content_id, db)
     db.close()
+
+    if audio_ok:
+        # Flip Short episode children that were waiting for parent audio
+        db2 = _db()
+        try:
+            children = (
+                db2.query(Content)
+                .filter(
+                    Content.parent_content_id == content_id,
+                    Content.status == "SCRIPTS_VALIDATED_AWAITING_PARENT",
+                )
+                .all()
+            )
+            for child in children:
+                child.status = "SCRIPTS_VALIDATED"
+            if children:
+                db2.commit()
+                print(f"  Flipped {len(children)} Short episode(s) → SCRIPTS_VALIDATED")
+        finally:
+            db2.close()
+
     return audio_ok
+
+
+def _run_child_shorts_agent4(parent_content_id: uuid.UUID) -> bool:
+    """Run Agent 4 TTS + Whisper for all SCRIPTS_VALIDATED child Short episodes.
+
+    Called immediately after parent AUDIO_DONE. Checks AudioFile existence before
+    each call to avoid re-generating audio that was already produced. Returns True
+    if at least one child already had audio or was generated successfully.
+    """
+    from app.models import AudioFile, Content
+    from app.agents.agent4_audio.services.audio import run_audio_generation
+
+    print(STEP("STEP 6b: Agent 4 — Child Short TTS + Whisper"))
+    db = _db()
+    try:
+        children = (
+            db.query(Content)
+            .filter(
+                Content.parent_content_id == parent_content_id,
+                Content.is_short_episode.is_(True),
+            )
+            .all()
+        )
+        if not children:
+            print("  No child Short episodes found — skipping")
+            return True
+
+        eligible = [c for c in children if c.status == "SCRIPTS_VALIDATED"]
+        if not eligible:
+            statuses = {}
+            for c in children:
+                statuses[c.status] = statuses.get(c.status, 0) + 1
+            print(
+                f"  {len(children)} child Short episode(s) found, "
+                f"none in SCRIPTS_VALIDATED (statuses={statuses}) — skipping"
+            )
+            return True
+
+        print(f"  {len(eligible)} SCRIPTS_VALIDATED child Short episode(s) to process")
+        any_ok = False
+        for child in eligible:
+            part_label = f"part {child.short_part_number}/{child.short_total_parts}"
+            audio_exists = (
+                db.query(AudioFile).filter(AudioFile.content_id == child.id).first()
+            ) is not None
+            if audio_exists:
+                print(f"    [{part_label}] audio already exists — skipping")
+                any_ok = True
+                continue
+            print(f"    [{part_label}] generating audio…")
+            ok = run_audio_generation(child.id, db)
+            if ok:
+                print(f"    [{part_label}] → AUDIO_DONE")
+                any_ok = True
+            else:
+                print(f"    [{part_label}] → FAILED (non-blocking — parent video will still render)")
+        return any_ok
+    finally:
+        db.close()
 
 
 def _run_agent5(content_id: uuid.UUID) -> bool:
@@ -513,14 +606,18 @@ def run(
         Content, ContentValidation, Script,
     )
     from app.agents.agent2_discovery.services.discovery import run_discovery
-    from app.agents.agent2_discovery.services.scripts import generate_multilingual_scripts
+    from app.agents.agent2_discovery.services.scripts import (
+        generate_multilingual_scripts,
+        generate_script_sections,
+        run_script_quality_gate,
+    )
     from app.agents.agent2_discovery.services.story import Story
     from app.agents.agent2_discovery.services.validation import send_for_validation
-    from app.agents.agent2_discovery.system_prompt import generate_scripts
+    from app.agents.agent2_discovery.system_prompt import generate_story_blueprint
     from app.services.script_estimator import estimate_duration_sec
 
     print(SEP)
-    print("  FULL PIPELINE TEST  —  Agent 2 → Agent 3 → Agent 4 → Agent 5")
+    print("  FULL PIPELINE TEST  —  Agent 2 → Agent 4 → Agent 5")
     print(SEP)
 
     # ── --from-video: jump directly to Agent 5 ───────────────────────────────
@@ -561,6 +658,8 @@ def run(
         print(f"  Status: {content.status}")
 
         audio_ok = _run_agent4(content_id)
+        if audio_ok:
+            _run_child_shorts_agent4(content_id)
         _print_audio_summary(content_id, audio_ok)
 
         video_ok = False
@@ -583,7 +682,7 @@ def run(
         print(SEP)
         return
 
-    # ── --from-agent3: jump directly to Agent 3 ──────────────────────────────
+    # ── --from-agent3: jump to validation step (det checks + auto-correction) ──
     if from_agent3_id_str:
         content_id = uuid.UUID(from_agent3_id_str)
         content = _load_content(content_id)
@@ -591,15 +690,17 @@ def run(
             print(f"\nERROR: Content not found: {content_id}")
             return
 
-        print(f"\n  Jumping to Agent 3 for content {content_id}")
+        print(f"\n  Jumping to validation step for content {content_id}")
         print(f"  Status: {content.status}")
 
-        passed      = _run_agent3(content_id)
+        passed      = _run_script_validation(content_id)
         audio_ok    = _run_agent4(content_id) if passed else False
+        if audio_ok:
+            _run_child_shorts_agent4(content_id)
         video_ok    = _run_agent5(content_id) if audio_ok else False
 
         if not passed:
-            print("\n  ⚠ Skipping Agents 4+5 — Agent 3 did not pass")
+            print("\n  ⚠ Skipping Agents 4+5 — validation did not pass")
         elif not audio_ok:
             print("\n  ⚠ Skipping Agent 5 — Agent 4 produced no audio")
 
@@ -635,12 +736,14 @@ def run(
 
         print(f"  Languages: {[s.language for s in lang_scripts]}")
 
-        passed   = _run_agent3(content_id)
+        passed   = _run_script_validation(content_id)
         audio_ok = _run_agent4(content_id) if passed else False
+        if audio_ok:
+            _run_child_shorts_agent4(content_id)
         video_ok = _run_agent5(content_id) if audio_ok else False
 
         if not passed:
-            print("\n  ⚠ Skipping Agents 4+5 — Agent 3 did not pass")
+            print("\n  ⚠ Skipping Agents 4+5 — validation did not pass")
         elif not audio_ok:
             print("\n  ⚠ Skipping Agent 5 — Agent 4 produced no audio")
 
@@ -672,7 +775,7 @@ def run(
         # Ensure status allows script generation
         if content.status not in (
             "APPROVED", "GENERATING_SCRIPTS", "SCRIPTS_READY",
-            "SCRIPTS_VALIDATED", "AUDIO_DONE",
+            "SCRIPTS_VALIDATED", "AUDIO_DONE", "GENERATING_VIDEO", "NEEDS_REVIEW",
         ):
             content.status = "APPROVED"
             db.commit()
@@ -773,7 +876,6 @@ def run(
     config  = db.get(ChannelConfig, channel_id)
     script_format      = config.script_format      if config else "youtube_long"
     audio_tags_enabled = config.audio_tags_enabled if config else False
-    shorts_rule        = config.shorts_rule        if config else "auto"
 
     # Re-use existing source script if this is a re-run (--from-content path)
     existing_src = (
@@ -817,30 +919,58 @@ def run(
         tts_model    = src_voice.tts_model if src_voice else "sonic-2"
         tts_provider = src_voice.provider if src_voice else "cartesia"
 
-        scripts = generate_scripts(
-            story, channel,
+        # Step 3a: blueprint
+        blueprint = generate_story_blueprint(story, channel, script_format=script_format)
+        content.story_blueprint = blueprint
+        db.commit()
+
+        # Step 3b: section-by-section generation
+        scripts = generate_script_sections(
+            story=story,
+            blueprint=blueprint,
+            channel=channel,
+            channel_voice=src_voice,
             script_format=script_format,
             audio_tags_enabled=audio_tags_enabled,
+        )
+
+        # Step 3c: quality gate (retention review + optional rewrite)
+        scripts = run_script_quality_gate(
+            scripts,
+            channel,
+            script_format=script_format,
+            language=content.source_language,
             tts_model=tts_model,
             tts_provider=tts_provider,
         )
 
         content.title = scripts.get("title", content.title)
+        src_voice_script = scripts["voice_script"]
+        src_dur_sec = estimate_duration_sec(src_voice_script, content.source_language)
+
+        # Merge visual_intent_history into story_blueprint (matches tasks.py)
+        visual_history = scripts.get("visual_intent_history")
+        if visual_history and content.story_blueprint is not None:
+            bp = dict(content.story_blueprint)
+            bp["visual_intent_history"] = visual_history
+            content.story_blueprint = bp
+
         db.add(Script(
             content_id=content_id,
             language=story.language,
             video_script=scripts["video_script"],
-            voice_script=scripts["voice_script"],
+            voice_script=src_voice_script,
+            estimated_duration_sec=src_dur_sec,
             version=1,
-            validated=False,
+            validated=True,  # matches tasks.py — source script is validated at generation
         ))
         db.commit()
 
-        wc        = len(scripts["voice_script"].split())
-        dur       = estimate_duration_sec(scripts["voice_script"], story.language)
+        wc        = len(src_voice_script.split())
         sec_count = scripts["video_script"].count("[SECTION")
-        print(f"  Title   : {scripts['title'][:70]}")
-        print(f"  Voice   : {wc} words → ~{dur:.0f}s ({dur / 60:.1f} min)")
+        print(f"  Title   : {scripts.get('title', content.title)[:70]}")
+        print(f"  Blueprint: {len(blueprint.get('major_turns', []))} major turns")
+        print(f"  Voice   : {wc} words → ~{src_dur_sec:.0f}s ({src_dur_sec / 60:.1f} min)")
         print(f"  Sections: {sec_count}")
 
     db.close()
@@ -862,15 +992,19 @@ def run(
         print(f"     Re-run: python test_full_pipeline.py --from-multilingual {content_id}")
         return
 
-    # ── STEP 5: Agent 3 ───────────────────────────────────────────────────────
-    passed   = _run_agent3(content_id)
+    # ── STEP 5: Script validation (det checks + auto-correction) ─────────────
+    passed   = _run_script_validation(content_id)
 
     # ── STEP 6: Agent 4 ───────────────────────────────────────────────────────
     audio_ok = False
     if passed:
         audio_ok = _run_agent4(content_id)
     else:
-        print("  ⚠ Skipping Agents 4+5 — Agent 3 did not pass")
+        print("  ⚠ Skipping Agents 4+5 — validation did not pass")
+
+    # ── STEP 6b: Child Short TTS + Whisper ────────────────────────────────────
+    if audio_ok:
+        _run_child_shorts_agent4(content_id)
 
     # ── STEP 7: Agent 5 ───────────────────────────────────────────────────────
     video_ok = False
@@ -890,7 +1024,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Full Agent 2 → Agent 3 → Agent 4 → Agent 5 end-to-end test.",
+        description="Full Agent 2 → Agent 4 → Agent 5 end-to-end test.",
     )
 
     parser.add_argument(
@@ -914,7 +1048,7 @@ if __name__ == "__main__":
         "--from-agent3",
         dest="from_agent3_id",
         metavar="CONTENT_ID",
-        help="Skip Telegram + multilingual. Restart Agent 3 validation (Step 5).",
+        help="Skip Telegram + multilingual. Jump to validation step (det checks + auto-correction, Step 5).",
     )
     parser.add_argument(
         "--from-audio",

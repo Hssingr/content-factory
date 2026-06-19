@@ -55,6 +55,51 @@ _FORBIDDEN_CHARS_RE = re.compile(r"[()/%&]")
 _DIGIT_RUN_RE = re.compile(r"\b\d{2,}\b")
 _CAPS_WORD_RE = re.compile(r"\b[A-Z]{3,}\b")
 
+# Split candidates for long-sentence backstop (natural break points only)
+# Group 1 alternative: semicolon or em-dash with trailing space
+# Group 2 alternative: comma + conjunction (lookahead — conjunction is kept in `after`)
+_LONG_SENT_SPLIT_RE = re.compile(
+    r"[;—]\s+"
+    r"|,\s+(?=(?:and|but|so|because|although|while|when|which|who|that)\b)",
+    re.IGNORECASE,
+)
+
+# TTS character normalisation — applied as a final backstop after retries are exhausted
+_NORM_PARENS_RE       = re.compile(r"\(([^)]*)\)")           # balanced (content) → content
+_NORM_LONE_PAREN_RE   = re.compile(r"[()]")                  # lone parens → remove
+_NORM_SLASH_WORD_RE   = re.compile(r"(\w+)\s*/\s*(\w+)")    # word/word → word or word
+_NORM_SLASH_RE        = re.compile(r"\s*/\s*")               # remaining / → space
+_NORM_PCT_RE          = re.compile(r"(\d+)\s*%")             # 50% → 50 percent
+_NORM_AMP_RE          = re.compile(r"\s*&\s*")               # & → and
+_NORM_MULTI_SPACE_RE  = re.compile(r" {2,}")                 # collapse double spaces
+
+_GENERIC_DOCUMENTARY_PHRASES: tuple[str, ...] = (
+    "this is not just",
+    "something far worse",
+    "what happened next",
+    "the answer is worse",
+    "but here's the thing",
+    "but that's not all",
+    "little did they know",
+    "it gets worse",
+    "you won't believe",
+    "the truth is",
+    "believe it or not",
+    "here's where it gets",
+    "things took a turn",
+    "what nobody knew",
+    "and that's when everything changed",
+    "in ways nobody could have imagined",
+    "a shocking revelation",
+    "brace yourself",
+    "this is the story of",
+    "but the story doesn't end there",
+    "what really happened",
+    "the real story behind",
+    "this changes everything",
+    "nobody saw it coming",
+)
+
 _SUMMARY_STARTERS = frozenset({
     "so",     "that",    "this",    "and that",
     "in the", "therefore", "thus",  "ultimately",
@@ -118,6 +163,121 @@ def _section_bodies(voice_script: str) -> list[tuple[str, str, bool]]:
         body = voice_script[body_start:body_end].strip()
         result.append((marker_text, body, i == len(positions) - 1))
     return result
+
+
+# ── Public backstop ──────────────────────────────────────────────────────────
+
+def split_long_sentences(text: str, max_words: int = 18) -> str:
+    """Deterministically split sentences that exceed max_words at a natural break point.
+
+    Applied as a pre-check backstop inside ``_generate_section_with_retry()`` before
+    ``check_tts_compliance`` runs. Eliminates the most common long-sentence TTS
+    violations without spending a Sonnet retry on them.
+
+    Break points tried in order (first match wins):
+    1. ``[;—]`` followed by whitespace
+    2. ``,`` followed by whitespace and a coordinating/subordinating conjunction
+       (``and``, ``but``, ``so``, ``because``, ``although``, ``while``, ``when``,
+       ``which``, ``who``, ``that``)
+
+    Sentences with no break point are left unchanged — ``check_tts_compliance`` will
+    still flag them and Claude's retry override will handle them.
+
+    Processes the text line-by-line to preserve paragraph structure (newlines).
+    Each line is split into sentences using the same ``_split_sentences()`` tokeniser
+    as ``check_tts_compliance`` so both functions see the same sentence boundaries.
+
+    Args:
+        text:      Section body text (no section-marker lines expected).
+        max_words: Sentence length threshold. Defaults to 18 to match TTS compliance rule.
+
+    Returns:
+        Text with qualifying long sentences split; original text returned if nothing changed.
+    """
+    lines = text.splitlines(keepends=True)
+    result: list[str] = []
+    total_fixed = 0
+
+    for line in lines:
+        stripped = line.rstrip("\n\r")
+        if not stripped.strip():
+            result.append(line)
+            continue
+
+        sentences = _split_sentences(stripped)
+        out: list[str] = []
+
+        for sent in sentences:
+            if len(sent.split()) <= max_words:
+                out.append(sent)
+                continue
+
+            m = _LONG_SENT_SPLIT_RE.search(sent)
+            if not m:
+                logger.debug(
+                    "split_long_sentences: no split point for %d-word sentence — leaving: %.80r",
+                    len(sent.split()), sent,
+                )
+                out.append(sent)
+                continue
+
+            before = sent[: m.start()].rstrip(",;—").rstrip()
+            after  = sent[m.end() :].strip()
+
+            if before and before[-1] not in ".!?":
+                before += "."
+            if after:
+                after = after[0].upper() + after[1:]
+
+            if before:
+                out.append(before)
+            if after:
+                out.append(after)
+            total_fixed += 1
+            logger.debug(
+                "split_long_sentences: split %d-word sentence at pos %d",
+                len(sent.split()), m.start(),
+            )
+
+        trailing = line[len(stripped):]   # restore original line ending (\n etc.)
+        result.append(" ".join(out) + trailing)
+
+    if total_fixed:
+        logger.info(
+            "split_long_sentences: fixed %d long sentence(s) (max_words=%d)",
+            total_fixed, max_words,
+        )
+    return "".join(result)
+
+
+def normalize_tts_chars(text: str) -> str:
+    """Replace or remove characters that are forbidden by check_tts_compliance.
+
+    Applied as a final deterministic backstop after Claude retries are exhausted.
+    Safe to call multiple times — idempotent.
+
+    Transformations (in order):
+    - ``(content)`` → ``content``  (parens removed, inner text kept)
+    - ``word/word`` → ``word or word``
+    - remaining ``/`` → space
+    - ``50%`` → ``50 percent``
+    - ``&`` → ``and``
+    - Collapses any double-spaces introduced by the above.
+
+    Args:
+        text: Script section body text (markers acceptable — they pass through unchanged).
+
+    Returns:
+        Text with forbidden characters normalised.
+    """
+    text = _NORM_PARENS_RE.sub(r"\1", text)
+    text = _NORM_LONE_PAREN_RE.sub("", text)
+    text = _NORM_SLASH_WORD_RE.sub(r"\1 or \2", text)
+    text = _NORM_SLASH_RE.sub(" ", text)
+    text = _NORM_PCT_RE.sub(r"\1 percent", text)
+    text = _NORM_AMP_RE.sub(" and ", text)
+    text = _NORM_MULTI_SPACE_RE.sub(" ", text)
+    return text
 
 
 # ── Individual check functions ────────────────────────────────────────────────
@@ -235,6 +395,11 @@ def check_minimum_length(voice_script: str, language: str, script_format: str = 
 
 def check_length_coherence(scripts_by_lang: dict[str, dict]) -> list[dict]:
     """Flag languages whose word count deviates >30% from the cross-language median.
+
+    PLACEMENT CONSTRAINT: must only be called after ALL language scripts (source +
+    all native adaptations) are fully assembled. Never call at section level or before
+    multilingual generation completes. The caller is run_deterministic_checks() which
+    is invoked from generate_multilingual_scripts() after all Script rows are persisted.
 
     Args:
         scripts_by_lang: Dict mapping language code → {"video_script": str, "voice_script": str}.
@@ -498,6 +663,92 @@ def check_retention_structure(
                 })
 
     return issues
+
+
+def check_section_transition(
+    current_section_text: str,
+    prior_section_summary: str,
+    language: str = "source",
+) -> list[dict]:
+    """Detect the recap anti-pattern: current section opens by restating prior section.
+
+    Pure Python — no I/O, no Claude calls.
+
+    Heuristic: the first 2 sentences of ``current_section_text`` contain ≥3 distinct
+    content tokens (>3 chars) that also appear in ``prior_section_summary``. This
+    signals the section is opening with a summary of what was just said rather than
+    advancing the story.
+
+    Always MINOR — logged and folded into the next retry override if one is triggered
+    by MAJOR issues. Does not hard-block section acceptance on its own.
+
+    Args:
+        current_section_text:  Narration text of the section being validated (no markers).
+        prior_section_summary: Summary string from the prior section's generation result.
+        language:              BCP-47 code used to tag the issue.
+
+    Returns:
+        List with one MINOR Issue dict if recap is detected, else empty list.
+    """
+    if not prior_section_summary.strip() or not current_section_text.strip():
+        return []
+
+    # Extract first 2 sentences of current section
+    raw_sentences = re.split(r"(?<=[.!?])\s+", current_section_text.strip())
+    opening = " ".join(s.strip() for s in raw_sentences[:2] if s.strip())
+    if not opening:
+        return []
+
+    def _content_tokens(text: str) -> set[str]:
+        return {w.lower() for w in re.findall(r"\b\w+\b", text) if len(w) > 3}
+
+    prior_tokens   = _content_tokens(prior_section_summary)
+    opening_tokens = _content_tokens(opening)
+    overlap        = prior_tokens & opening_tokens
+
+    if len(overlap) >= 3:
+        sample = ", ".join(sorted(overlap)[:5])
+        return [{
+            "language":      language,
+            "severity":      "MINOR",
+            "category":      "section_transition",
+            "description":   (
+                f"Section opens with recap of prior section "
+                f"({len(overlap)} overlapping phrases: {sample})"
+            ),
+            "suggestion": (
+                "Open this section with new information, not a restatement of what "
+                "was just said. Start with the next reveal, a new fact, or a question."
+            ),
+            "offending_text": opening[:120],
+        }]
+
+    return []
+
+
+def detect_generic_documentary_phrases(voice_script: str) -> list[dict]:
+    """Scan an assembled voice_script for banned generic AI-documentary phrases.
+
+    Pure Python — no I/O, no Claude calls. The caller is responsible for
+    logging at WARNING level. This function never blocks or fails the pipeline.
+
+    Args:
+        voice_script: Fully assembled voice_script (markers included are fine).
+
+    Returns:
+        List of dicts: {"phrase": str, "sentence": str}. Empty list = clean.
+    """
+    script_lower = voice_script.lower()
+    sentences    = re.split(r"(?<=[.!?])\s+", voice_script)
+    hits: list[dict] = []
+    for phrase in _GENERIC_DOCUMENTARY_PHRASES:
+        if phrase not in script_lower:
+            continue
+        for sent in sentences:
+            if phrase in sent.lower():
+                hits.append({"phrase": phrase, "sentence": sent.strip()[:150]})
+                break  # report the phrase once — first sentence containing it
+    return hits
 
 
 # ── Orchestrator ──────────────────────────────────────────────────────────────

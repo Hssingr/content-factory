@@ -178,14 +178,14 @@ def run_story_scoring_gate(
 ) -> tuple[Story, dict] | None:
     """Fetch the highest-engagement story then score and gate it in two Claude calls.
 
-    Phase 1 — Fetch: ``fetch_batch`` runs one web_search pass (story_research / Sonnet)
+    Fetch step: ``fetch_batch`` runs one web_search pass (story_research / Sonnet)
     and returns the single most engaged, highest-signal story from the configured sources.
 
-    Phase 2 — Score: ``score_story_for_gate`` calls Claude once (story_gate_scoring /
+    Score step: ``score_story_for_gate`` calls Claude once (story_gate_scoring /
     Sonnet, structured schema) to produce 18 dimension scores. No comparative scoring —
     there is only one candidate.
 
-    Phase 3 — Gate: Python applies the weighted threshold and all hard floors.
+    Gate step: Python applies the weighted threshold and all hard floors.
 
     The gate fails closed: if either the fetch or the scoring call fails, ``None`` is
     returned and nothing is persisted.
@@ -201,7 +201,7 @@ def run_story_scoring_gate(
         ``assessment`` is its scoring dict (for downstream Telegram message).
         Returns ``None`` if the story didn't clear the gate or no story was fetched.
     """
-    # Phase 1: fetch single highest-engagement story
+    # Fetch the single highest-engagement story
     stories: list[Story] = fetch_batch(sources, niche=niche)
     if not stories:
         logger.info(
@@ -214,7 +214,7 @@ def run_story_scoring_gate(
         "Story Scoring Gate: fetched story (title=%r url=%s)", story.title[:80], story.url
     )
 
-    # Phase 2: score the single story
+    # Score the single story
     try:
         assessment = score_story_for_gate(
             story=story,
@@ -229,7 +229,7 @@ def run_story_scoring_gate(
         )
         return None
 
-    # Phase 3: apply gate
+    # Apply the gate
     try:
         story_score = score_story_assessment(assessment)
     except Exception as exc:

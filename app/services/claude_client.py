@@ -10,17 +10,27 @@ from app.services.model_routing import resolve_model
 logger = logging.getLogger(__name__)
 
 
-def parse_claude_json(text: str, required_keys: list[str], type_checks: dict | None = None) -> dict:
+def parse_claude_json(
+    text: str,
+    required_keys: list[str] | None = None,
+    type_checks: dict | None = None,
+    allowed_keys: list[str] | None = None,
+    allow_extra_keys: bool = False,
+) -> dict:
     """Shared JSON parser for all Claude responses.
 
     Strips accidental code fences, parses JSON, validates required keys,
-    and optionally checks value types.
+    optionally checks value types, and rejects unexpected keys by default.
 
     Args:
         text:        Raw text from Claude.
-        required_keys: Keys that must be present (raises ValueError if missing).
+        required_keys: Optional keys that must be present.
         type_checks: Optional dict mapping key → expected Python type.
                      e.g. {"issues": list, "overall_status": str}
+        allowed_keys: Optional explicit set of keys allowed in the response. Extra
+                      keys are rejected unless allow_extra_keys=True. If omitted,
+                      only required/type checks run and extras are not checked.
+        allow_extra_keys: If True, unknown keys are accepted after logging.
 
     Returns:
         Parsed dict.
@@ -39,6 +49,8 @@ def parse_claude_json(text: str, required_keys: list[str], type_checks: dict | N
     if not isinstance(data, dict):
         raise ValueError(f"Claude returned non-object JSON (got {type(data).__name__})")
 
+    required_keys = required_keys or []
+
     missing = [k for k in required_keys if k not in data]
     if missing:
         logger.error("Missing keys %s in Claude response: %.300s", missing, text)
@@ -52,12 +64,14 @@ def parse_claude_json(text: str, required_keys: list[str], type_checks: dict | N
                     f"got {type(data[key]).__name__}"
                 )
 
-    # Log unexpected keys as warnings (CLAUDE.md: reject unknown keys unless explicitly allowed)
-    if type_checks:
-        known_keys = set(required_keys) | set(type_checks)
+    if allowed_keys is not None:
+        known_keys = set(allowed_keys)
         extra = set(data.keys()) - known_keys
         if extra:
-            logger.warning("Claude returned unexpected keys (ignored): %s", sorted(extra))
+            if not allow_extra_keys:
+                logger.error("Claude returned unexpected keys: %s", sorted(extra))
+                raise ValueError(f"Claude response contained unexpected keys: {sorted(extra)}")
+            logger.warning("Claude returned unexpected keys (allowed): %s", sorted(extra))
 
     return data
 
