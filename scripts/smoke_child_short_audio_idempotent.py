@@ -61,11 +61,15 @@ def check(label: str, condition: bool) -> None:
 # ── Load modules ──────────────────────────────────────────────────────────────
 import app.agents.agent3_audio.services.audio as _audio_mod
 from app.agents.agent3_audio.services.audio import run_audio_generation
+import app.agents.agent2_discovery.services.scripts as _script_mod
 from app.agents.agent2_discovery.services.scripts import run_shorts_planner
 
 _src_audio = inspect.getsource(_audio_mod)
 _src_rag   = inspect.getsource(run_audio_generation)
-_src_rsp   = inspect.getsource(run_shorts_planner)
+_src_rsp   = "\n".join([
+    inspect.getsource(run_shorts_planner),
+    inspect.getsource(_script_mod._child_shorts_already_exist),
+])
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1 — Parent audio path: no semantic_splits, no bookends

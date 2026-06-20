@@ -1767,7 +1767,7 @@ def auto_correct_script(
 
     fixed_voice, n_splits = _split_long_sentences_agent2(result["voice_script"])
     if n_splits:
-        logger.info(
+        logger.debug(
             "TTS backstop: auto_correct_script fixed %d sentence(s) in language=%s",
             n_splits, language,
         )

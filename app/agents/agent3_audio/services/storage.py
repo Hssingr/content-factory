@@ -59,10 +59,10 @@ def save_audio(content_id: uuid.UUID, language: str, audio_bytes: bytes) -> tupl
     path.parent.mkdir(parents=True, exist_ok=True)
 
     path.write_bytes(audio_bytes)
-    logger.info("Audio saved: %s (%d KB)", path, len(audio_bytes) // 1024)
+    logger.debug("Audio saved: %s (%d KB)", path, len(audio_bytes) // 1024)
 
     duration_ms = _measure_duration_ms(path)
-    logger.info("Duration: %d ms (%.1f s)", duration_ms, duration_ms / 1000)
+    logger.debug("Duration: %d ms (%.1f s)", duration_ms, duration_ms / 1000)
 
     return str(path), duration_ms
 

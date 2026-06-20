@@ -47,11 +47,6 @@ celery_app.conf.beat_schedule = {
         "task": "app.scheduler.tasks.dispatch_publishing",
         "schedule": crontab(minute="0,30"),            # every 30 minutes
     },
-    # Agent 2→3 gate: release Short episode scripts once parent reaches AUDIO_DONE
-    "pickup-short-episodes-awaiting-parent": {
-        "task": "app.scheduler.tasks.pickup_short_episodes_awaiting_parent",
-        "schedule": crontab(minute="*/5"),             # every 5 minutes — low-latency gate
-    },
     # Agent 3: generate audio for all validated scripts
     "pickup-scripts-validated": {
         "task": "app.scheduler.tasks.pickup_scripts_validated",

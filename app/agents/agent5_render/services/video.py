@@ -199,10 +199,9 @@ def run_video_generation(content_id: uuid.UUID, db: Session) -> bool:
         ) is not None
 
         if not _parent_visual_ready:
-            logger.info(
-                "Agent5 [DEFER] content=%s parent=%s — parent __visual__ beats not yet "
-                "available; reverting to AUDIO_DONE for re-pickup on next cycle "
-                "(normal wait, not an error)",
+            logger.warning(
+                "CHILD_SHORT_VISUALS_DEFERRED content_id=%s reason=parent_visuals_missing "
+                "parent_content_id=%s",
                 content_id, parent_content_id,
             )
             content.status = "AUDIO_DONE"
@@ -282,6 +281,10 @@ def run_video_generation(content_id: uuid.UUID, db: Session) -> bool:
                     content_id, language,
                 )
                 continue
+            logger.info(
+                "CHILD_SHORT_VISUALS_START content_id=%s parent_content_id=%s language=%s",
+                content_id, parent_content_id, language,
+            )
             logger.info(
                 "CHILD_SHORT_RENDER_START content_id=%s parent_content_id=%s "
                 "part=%s/%s language=%s format=short resolution=1080x1920",
@@ -399,6 +402,10 @@ def _run_visual_pass(
 
     source_duration_ms = source_audio.duration_ms
     logger.info(
+        "PARENT_VISUALS_START content_id=%s source_lang=%s source_duration_ms=%d",
+        content_id, source_lang, source_duration_ms,
+    )
+    logger.info(
         "Agent5 [VISUAL_PASS] content=%s source_lang=%s "
         "source_duration_ms=%d schema_version=%s",
         content_id, source_lang, source_duration_ms, _STORYBOARD_SCHEMA_VERSION,
@@ -484,6 +491,7 @@ def _run_visual_pass(
     # ── 4. Update saved beats with Flux media_url ─────────────────────────────
     _save_shared_beats(content_id, beats, db)
     db.commit()
+    logger.info("PARENT_VISUALS_DONE content_id=%s beats=%d", content_id, len(beats))
 
     return beats, source_duration_ms
 
@@ -772,6 +780,11 @@ def _process_language(
     # ── Save per-language sections (for DB audit/inspection) ──────────────────
     _save_video_sections(content_id, language, beats, db)
     db.commit()
+    if is_short_episode:
+        logger.info(
+            "CHILD_SHORT_VISUALS_DONE content_id=%s language=%s beats=%d",
+            content_id, language, len(beats),
+        )
 
     # ── Technical blocker check ────────────────────────────────────────────────
     standard_subs = build_standard_subtitles(audio.whisper_transcript or [])
@@ -848,7 +861,7 @@ def _process_language(
         )
         return False
 
-    logger.info(
+    logger.debug(
         "Agent5 [PRE_RENDER] language=%s content=%s "
         "beats=%d duration_ms=%d "
         "standard_captions=%d karaoke_chunks=%d format=%s",

@@ -81,16 +81,15 @@ flowchart TD
     D --> E[Long script generation]
     E --> F[Scripts validated]
     F --> G[Standalone short planner]
-    G --> H[Child short Content rows]
+    G --> H[Child short scripts validated]
     F --> I[Parent Agent 3 audio + Whisper]
-    I --> J[Parent AUDIO_DONE]
-    J --> K[Release/enqueue child short audio]
-    K --> L[Child Agent 3 audio + Whisper]
-    L --> M[Child AUDIO_DONE]
-    J --> N[Parent Agent 4 visual pass]
+    H --> J[Child Agent 3 audio + Whisper]
+    I --> K[Parent AUDIO_DONE]
+    J --> L[Child AUDIO_DONE]
+    K --> N[Parent Agent 4 visual pass]
     N --> O[Parent main render]
     O --> P[Parent VIDEO_DONE]
-    M --> Q[Child Agent 4 visual remap]
+    L --> Q[Child Agent 4 visual remap]
     N --> Q
     Q --> R[Agent 5 child vertical short render]
     R --> S[Child VIDEO_DONE]
@@ -104,10 +103,10 @@ Discovery
 → approval marks parent as `APPROVED`  
 → Agent 2 generates long scripts  
 → scripts reach `SCRIPTS_VALIDATED`  
-→ short planner creates child short contents  
+→ short planner creates child short contents and validated scripts  
 → parent Agent 3 generates parent audio and Whisper  
+→ child short episodes are immediately eligible for Agent 3 audio  
 → parent reaches `AUDIO_DONE`  
-→ child short episodes are released and enqueued for audio  
 → each child generates its own audio and Whisper  
 → parent Agent 4 generates shared visual beats and Agent 5 renders the long video  
 → child Agent 4 remaps parent visual beats to its own short narration  
@@ -150,7 +149,6 @@ FAILED
 
 ```text
 GENERATING_SCRIPTS
-→ SCRIPTS_VALIDATED_AWAITING_PARENT
 → SCRIPTS_VALIDATED
 → GENERATING_AUDIO
 → AUDIO_DONE
@@ -158,11 +156,11 @@ GENERATING_SCRIPTS
 → VIDEO_DONE
 ```
 
-Child short release rule:
+Child short audio rule:
 
-- Child short contents wait in `SCRIPTS_VALIDATED_AWAITING_PARENT`.
-- Once the parent reaches `AUDIO_DONE`, children are flipped to `SCRIPTS_VALIDATED`.
-- After release, each child must generate its own audio and Whisper.
+- Child short contents become `SCRIPTS_VALIDATED` as soon as their standalone scripts pass validation.
+- Child short audio does not wait for parent `AUDIO_DONE`.
+- Each child must generate its own audio and Whisper.
 
 ---
 
@@ -296,6 +294,53 @@ content-factory/
 │       └── components/
 └── scripts/
 ```
+
+---
+
+## 6A. Service Ownership Boundaries
+
+Scheduler and Celery tasks own orchestration only:
+
+- scheduling
+- enqueueing
+- retries
+- task coordination
+- worker guard checks
+- task-level status handoffs
+
+Scheduler and Celery tasks must not own prompt construction, script generation,
+storyboard logic, audio generation, Flux logic, render transformations, or media
+generation logic. When those behaviors are currently coordinated from a task for
+runtime sequencing, the business logic must live in the relevant agent service.
+
+Agent ownership:
+
+| Area | Owner | Owns |
+|---|---|---|
+| Story discovery and scripts | Agent 2 | discovery, validation handoff, long script generation, deterministic script validation, multilingual scripts, standalone short planning and child short script generation |
+| Audio | Agent 3 | TTS generation, Whisper transcription, audio persistence, audio validation |
+| Visuals | Agent 4 | storyboard generation and validation, beat generation, timestamp mapping, Flux prompt generation and validation, Flux image generation, media reuse, child short visual remap |
+| Rendering | Agent 5 | subtitles, Remotion props, rendering, render verification, `VideoRender` persistence |
+
+Shared services own only generic infrastructure:
+
+- API clients
+- credential/security helpers
+- common deterministic utilities
+- serialization/parsing helpers
+- generic storage/client abstractions
+
+Shared services must not contain agent orchestration or agent-specific business
+flows. Deterministic utilities may be used by agents when they remain generic and
+side-effect free.
+
+Current boundary exception:
+
+- `app/agents/agent5_render/services/video.py` still coordinates Agent 4 visual
+  services before Agent 5 render execution in one worker task so parent/child
+  visual readiness and render readiness stay sequenced. The visual business logic
+  remains in `app/agents/agent4_visuals/`; render business logic remains in
+  `app/agents/agent5_render/`.
 
 ---
 
@@ -454,17 +499,18 @@ flowchart TD
     E --> F[send_for_validation]
     F --> G[Telegram APPROVE]
     G --> H[Content APPROVED]
-    H --> I[run_agent2_scripts_for_content]
-    I --> J[generate_story_blueprint]
-    J --> K[generate_script_sections]
-    K --> L[run_script_quality_gate]
-    L --> M[persist source Script]
-    M --> N[generate_multilingual_scripts]
-    N --> O[Content SCRIPTS_VALIDATED]
-    O --> P[run_shorts_planner]
-    P --> Q[child Content rows]
-    Q --> R[child short Scripts]
-    R --> S[SCRIPTS_VALIDATED_AWAITING_PARENT]
+    H --> I[run_agent2_scripts_for_content task]
+    I --> J[run_script_workflow]
+    J --> K[generate_story_blueprint]
+    K --> L[generate_script_sections]
+    L --> M[run_script_quality_gate]
+    M --> N[persist source Script]
+    N --> O[generate_multilingual_scripts]
+    O --> P[Content SCRIPTS_VALIDATED]
+    P --> Q[run_shorts_planner]
+    Q --> R[child Content rows]
+    R --> S[child short Scripts]
+    S --> T[Child SCRIPTS_VALIDATED]
 ```
 
 ### 9.3 Important Agent 2 Functions
@@ -563,12 +609,36 @@ Input:
 
 Output:
 
+- Agent 2 script workflow task execution
+
+Responsibilities:
+
+- Load parent content.
+- Guard that content is still `APPROVED`.
+- Open and close the worker database session.
+- Call Agent 2 `run_script_workflow`.
+- Preserve task-level retry and failure logging.
+
+#### `run_script_workflow`
+
+File:
+
+```text
+app/agents/agent2_discovery/services/script_workflow.py
+```
+
+Input:
+
+- Approved parent `Content`
+- Database session
+
+Output:
+
 - Validated long scripts
 - Child short content rows/scripts
 
 Responsibilities:
 
-- Load parent content.
 - Move status to `GENERATING_SCRIPTS`.
 - Generate story blueprint.
 - Generate section scripts.
@@ -699,17 +769,16 @@ Parent SCRIPTS_VALIDATED
 → shorts planner
 → child Content rows
 → child short scripts
-→ SCRIPTS_VALIDATED_AWAITING_PARENT
-→ released after parent AUDIO_DONE
+→ child SCRIPTS_VALIDATED
 ```
 
 Rules:
 
 - Child short scripts are standalone.
 - Child short scripts are not parent cuts.
-- Child short scripts must be validated before release.
+- Child short scripts must be validated before the child row is marked `SCRIPTS_VALIDATED`.
 - If child short rows already exist, do not create duplicates.
-- Existing child rows must still be released/enqueued when the parent reaches audio completion.
+- Existing child rows in `SCRIPTS_VALIDATED` are picked up by normal Agent 3 audio pickup.
 - No child with MAJOR deterministic script issues may be marked ready.
 
 Naming rule:
@@ -718,7 +787,8 @@ Naming rule:
 - Do not name functions, files, constants, classes, logs, or DB concepts after development phase labels such as `phase4`.
 - Log messages may mention the current product concept, for example:
   - `STANDALONE_SHORTS_ALREADY_EXIST`
-  - `CHILD_SHORT_AUDIO_ENQUEUED`
+  - `AUDIO_PICKUP`
+  - `CHILD_SHORT_AUDIO_START`
   - `SHORT_EPISODE_RENDER_DONE`
 - Existing phase-labeled logs should be renamed when touched.
 
@@ -735,7 +805,7 @@ Agent 3 owns:
 - Duration measurement.
 - Whisper transcription.
 - AudioFile upsert.
-- Child short audio orchestration after parent audio completion.
+- Audio pickup for any content with `SCRIPTS_VALIDATED`, including child short episodes.
 
 Agent 3 must not:
 
@@ -758,7 +828,6 @@ flowchart TD
     E --> F[Whisper]
     F --> G[AudioFile upsert]
     G --> H[Parent AUDIO_DONE]
-    H --> I[ensure child short audio enqueued]
 ```
 
 Child short:
@@ -806,12 +875,12 @@ app/scheduler/tasks.py
 Responsibilities:
 
 - Run audio generation for one content ID.
-- After parent reaches `AUDIO_DONE`, call child audio enqueue helper using the same DB session.
+- Mark that content `AUDIO_DONE` after successful AudioFile persistence.
 
 Rules:
 
-- Parent success must trigger child audio enqueue immediately.
-- Do not rely only on Beat timing.
+- Parent success must not release, flip, or enqueue child short audio.
+- Child short audio is picked up from `SCRIPTS_VALIDATED` like any other content.
 - Do not open unnecessary second sessions for critical orchestration if the current session has the needed state.
 
 Temporary compatibility:
@@ -829,28 +898,14 @@ app/scheduler/tasks.py
 
 Responsibilities:
 
-- Query all child short rows for a parent.
-- Release awaiting children if parent audio is done.
-- Enqueue child audio if child status is `SCRIPTS_VALIDATED` and no `AudioFile` exists.
-- Skip children that already have audio or are in progress.
-
-Required logs:
-
-```text
-CHILD_SHORT_AUDIO_SCAN
-CHILD_SHORT_RELEASED
-CHILD_SHORT_AUDIO_ENQUEUED
-CHILD_SHORT_AUDIO_ALREADY_EXISTS
-CHILD_SHORT_AUDIO_SKIP
-```
+- Temporary compatibility no-op for old imports or queued code paths.
+- Return `0` and log that the parent-audio child gate has been removed.
 
 Rules:
 
-- Must query by `parent_content_id`.
-- Must check `AudioFile` existence.
-- Must not enqueue children with audio already present.
-- Must not enqueue parent content.
-- Must be idempotent.
+- Must not release, flip, or enqueue child short audio.
+- Must not depend on parent `AUDIO_DONE`.
+- New code must use `pickup_scripts_validated` for child audio pickup.
 
 #### `run_audio_generation`
 
@@ -1131,12 +1186,12 @@ Agent 5 must not:
 - Own storyboard or Flux generation logic.
 - Store remote media URLs in props.
 
-Current Phase 3A boundary note:
+Current orchestration boundary:
 
-- `app/agents/agent5_render/services/video.py` still orchestrates calls into Agent 4 visual services and Agent 5 render services in one worker task to preserve runtime sequencing.
+- `app/agents/agent5_render/services/video.py` orchestrates calls into Agent 4 visual services and Agent 5 render services in one worker task to preserve runtime sequencing.
 - Visual generation logic lives under `app/agents/agent4_visuals/`.
 - Rendering logic lives under `app/agents/agent5_render/`.
-- Phase 3B may split the orchestration further if explicitly requested.
+- Rendering starts only after the content has an `AudioFile` and usable `VideoSection` rows for the render path.
 
 ### 11A.2 Parent Agent 5 Render Flow
 
@@ -1176,13 +1231,16 @@ app/scheduler/tasks.py
 
 Responsibilities:
 
-- Find `AUDIO_DONE` content.
+- Find `AUDIO_DONE` content with an `AudioFile`.
+- Skip content that already has the relevant `VideoRender` row.
 - Enqueue `run_agent5_render_for_content`.
 
 Rules:
 
 - Can pick parent and child content.
+- Parent content can start the Agent 4 visual pass after parent audio exists.
 - Child content may defer until parent visual beats exist.
+- Render execution requires content audio, content video sections, and no existing render for that content/language/format.
 
 #### `run_agent5_render_for_content`
 
@@ -1394,18 +1452,18 @@ Important tasks:
 | `dispatch_discovery` | start scheduled discovery |
 | `run_agent2_for_channel` | discovery for one channel |
 | `pickup_approved_content` | enqueue script generation |
-| `run_agent2_scripts_for_content` | generate scripts and child short plans |
+| `run_agent2_scripts_for_content` | run Agent 2 script workflow task wrapper |
 | `pickup_scripts_validated` | enqueue Agent 3 audio |
 | `run_agent3_audio_for_content` | generate audio/Whisper |
-| `pickup_short_episodes_awaiting_parent` | safety net for child short release |
-| `ensure_child_short_audio_enqueued` | immediate child audio enqueue after parent audio |
+| `pickup_short_episodes_awaiting_parent` | compatibility no-op for old queued child-release messages |
+| `ensure_child_short_audio_enqueued` | compatibility no-op for old parent-audio child-release imports |
 | `pickup_audio_done` | enqueue Agent 5 render |
 | `run_agent5_render_for_content` | render video |
 
 Rules:
 
 - Beat tasks are safety nets, not the only orchestration mechanism for critical handoffs.
-- Parent audio completion should immediately enqueue eligible child short audio.
+- Child short audio pickup must not depend on parent audio completion.
 - Idempotency must be enforced at the worker/service layer.
 - Duplicate task dispatch is tolerable only if worker-level guards prevent duplicate side effects.
 
@@ -1479,7 +1537,7 @@ Good:
 generate_story_blueprint()
 generate_script_sections()
 run_shorts_planner()
-ensure_child_short_audio_enqueued()
+pickup_scripts_validated()
 remap_beats_for_short()
 build_short_props()
 render_short()
@@ -1523,8 +1581,8 @@ Logs should answer:
 Good log names:
 
 ```text
-CHILD_SHORT_AUDIO_SCAN
-CHILD_SHORT_AUDIO_ENQUEUED
+AUDIO_PICKUP
+CHILD_SHORT_AUDIO_START
 CHILD_SHORT_AUDIO_DONE
 STANDALONE_SHORT_RENDER
 STANDALONE_SHORT_RENDER_DONE
@@ -1971,9 +2029,14 @@ STORYBOARD_FINAL
 STORYBOARD_COST_ESTIMATE
 HINT_QUALITY_SUMMARY
 PARENT_AUDIO_NO_SHORTS
-CHILD_SHORT_AUDIO_SCAN
-CHILD_SHORT_AUDIO_ENQUEUED
+AUDIO_PICKUP
+CHILD_SHORT_AUDIO_START
 CHILD_SHORT_AUDIO_DONE
+PARENT_VISUALS_START
+PARENT_VISUALS_DONE
+CHILD_SHORT_VISUALS_DEFERRED
+CHILD_SHORT_VISUALS_START
+CHILD_SHORT_REUSE_STATS
 STANDALONE_SHORT_REUSE_STATS
 STANDALONE_SHORT_RENDER
 STANDALONE_SHORT_RENDER_DONE
@@ -2232,9 +2295,9 @@ These are current engineering risks to monitor, not future feature promises.
 
 - Agent 2 creates child short content rows: required
 - Agent 2 creates child short scripts: required
-- Child rows wait for parent audio: required
+- Child rows become `SCRIPTS_VALIDATED` without waiting for parent audio: required
 - Parent Agent 3 generates parent audio only: required
-- Parent Agent 3 enqueues child audio after `AUDIO_DONE`: required
+- Parent Agent 3 does not release or enqueue child audio after `AUDIO_DONE`: required
 - Child Agent 3 generates child audio and Whisper: required
 - Parent Agent 4 generates parent visual beats: required
 - Child Agent 4 remaps parent visuals to child narration: required

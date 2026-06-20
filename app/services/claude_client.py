@@ -71,7 +71,7 @@ def parse_claude_json(
             if not allow_extra_keys:
                 logger.error("Claude returned unexpected keys: %s", sorted(extra))
                 raise ValueError(f"Claude response contained unexpected keys: {sorted(extra)}")
-            logger.warning("Claude returned unexpected keys (allowed): %s", sorted(extra))
+            logger.info("Claude returned unexpected keys (allowed): %s", sorted(extra))
 
     return data
 
@@ -201,7 +201,7 @@ def _call_claude_core(
     cached_prompt = isinstance(system, list)
 
     prompt_chars = len(system_prompt) + len(user_message)
-    logger.info(
+    logger.debug(
         "call_claude start: task=%s model=%s cached_prompt=%s max_tokens=%d prompt_chars=%d (~%d tokens est.)",
         task, model, cached_prompt, max_tokens, prompt_chars, prompt_chars // 4,
     )
@@ -373,7 +373,7 @@ def call_claude_structured_with_usage(
         image_count = 0
         prompt_chars = len(system_prompt) + text_chars
 
-    logger.info(
+    logger.debug(
         "call_claude_structured start: task=%s model=%s schema=%s cached_prompt=%s "
         "max_tokens=%d prompt_chars=%d (~%d tokens est.) images=%d",
         task, model, schema_name, cached_prompt, max_tokens, prompt_chars,

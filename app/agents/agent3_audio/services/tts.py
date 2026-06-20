@@ -419,7 +419,7 @@ def prepare_script_for_tts(
         if sentences_out else 0.0
     )
     pause_points = text.count("...")
-    logger.info(
+    logger.debug(
         "TTS prepare: language=%s tone=%s is_short_episode=%s "
         "original_words=%d prepared_words=%d "
         "avg_sentence_len=%.1f long_sentences_fixed=%d pause_points=%d",
@@ -491,7 +491,7 @@ def _concat_mp3_chunks(chunk_bytes_list: list[bytes]) -> bytes:
             return b"".join(chunk_bytes_list)
 
         result = open(out_file, "rb").read()
-        logger.info(
+        logger.debug(
             "Concat: ffmpeg re-encode %d chunks → %d bytes (%.1f KB)",
             len(chunk_bytes_list), len(result), len(result) / 1024,
         )
@@ -571,7 +571,7 @@ def _generate_cartesia_audio(voice_script: str, channel_voice, is_short_episode:
         p = prepare_script_for_tts(chunk, language="", tone=emotion, tts_model=tts_model, is_short_episode=is_short_episode)
         prepared_chunks.append(p)
 
-    logger.info(
+    logger.debug(
         "Cartesia TTS: voice_id=%s model=%s speed=%s emotion=%s cartesia_emotion=%s chunks=%d is_short_episode=%s",
         voice_id, tts_model, speed_str, emotion, emotion_list, len(prepared_chunks), is_short_episode,
     )
@@ -581,7 +581,7 @@ def _generate_cartesia_audio(voice_script: str, channel_voice, is_short_episode:
         if not prepared.strip():
             continue
 
-        logger.info(
+        logger.debug(
             "Cartesia chunk %d/%d: words=%d chars=%d",
             i + 1, len(prepared_chunks), len(prepared.split()), len(prepared),
         )
@@ -596,7 +596,7 @@ def _generate_cartesia_audio(voice_script: str, channel_voice, is_short_episode:
         all_bytes.append(_wav_to_mp3(wav_bytes))
 
     audio_bytes = _concat_mp3_chunks(all_bytes) if all_bytes else b""
-    logger.info(
+    logger.debug(
         "Cartesia TTS complete: %d chunk(s) → %d bytes (%.1f KB)",
         len(prepared_chunks), len(audio_bytes), len(audio_bytes) / 1024,
     )
@@ -668,7 +668,7 @@ def generate_audio(voice_script: str, channel_voice, is_short_episode: bool = Fa
         stitching_path = "text-conditioning"
     else:
         stitching_path = "none (SDK too old)"
-    logger.info("ElevenLabs TTS stitching path: %s (%d chunk(s))", stitching_path, len(prepared_chunks))
+    logger.debug("ElevenLabs TTS stitching path: %s (%d chunk(s))", stitching_path, len(prepared_chunks))
 
     all_bytes: list[bytes] = []
 
@@ -676,7 +676,7 @@ def generate_audio(voice_script: str, channel_voice, is_short_episode: bool = Fa
         if not prepared.strip():
             continue
 
-        logger.info(
+        logger.debug(
             "ElevenLabs TTS chunk %d/%d: voice_id=%s emotion=%s words=%d model=%s chars=%d",
             i + 1, len(prepared_chunks), voice_id, emotion,
             len(prepared.split()), model_id, len(prepared),
@@ -700,7 +700,7 @@ def generate_audio(voice_script: str, channel_voice, is_short_episode: bool = Fa
         all_bytes.append(b"".join(audio_iter))
 
     audio_bytes = _concat_mp3_chunks(all_bytes) if all_bytes else b""
-    logger.info(
+    logger.debug(
         "ElevenLabs TTS complete: %d chunk(s) %d bytes (%.1f KB)",
         len(prepared_chunks), len(audio_bytes), len(audio_bytes) / 1024,
     )

@@ -217,36 +217,10 @@ def run_agent2_for_channel(
     default_retry_delay=300,
 )
 def run_agent2_scripts_for_content(self, content_id: str) -> None:
-    """Generate, validate, and adapt scripts for approved content.
-
-    Only processes content with ``status="APPROVED"``. Script-generation flow:
-      1. Reconstruct story proxy from Content.source_excerpt
-      2. Generate narrative blueprint (hook, major_turns, payoff, comment_trigger)
-      3. Persist blueprint to content.story_blueprint
-      4. Generate source-language scripts section-by-section via generate_script_sections()
-         (per-section TTS/hook checks + retry loop inside)
-      5. Script Quality Gate (retention review + optional rewrite)
-      6. Persist source Script (estimated duration, validated=True)
-      7. Merge visual_intent_history into content.story_blueprint
-      8. Generate multilingual scripts for all target languages
-      9. Set duration + validated=True on all language scripts
-      10. content.status = "SCRIPTS_VALIDATED"
-
-    Args:
-        content_id: UUID string of content with status ``"APPROVED"``.
-    """
+    """Run Agent 2 script workflow for approved content."""
     from app.database import _get_session_factory
-    from app.models import Channel, ChannelConfig, ChannelVoice, Content, Script
-    from app.agents.agent2_discovery.services.scripts import (
-        run_script_quality_gate,
-        generate_multilingual_scripts,
-        generate_script_sections,
-        run_shorts_planner,
-        _script_trace,
-    )
-    from app.agents.agent2_discovery.services.story import Story
-    from app.agents.agent2_discovery.system_prompt import generate_story_blueprint
-    from app.services.script_estimator import estimate_duration_sec
+    from app.agents.agent2_discovery.services.script_workflow import run_script_workflow
+    from app.models import Content
 
     cid = uuid.UUID(content_id)
     db = _get_session_factory()()
@@ -262,167 +236,7 @@ def run_agent2_scripts_for_content(self, content_id: str) -> None:
             )
             return
 
-        channel: Channel | None = db.get(Channel, content.channel_id)
-        if not channel:
-            logger.error("Channel not found for content %s", content_id)
-            return
-
-        config: ChannelConfig | None = db.get(ChannelConfig, channel.id)
-        script_format      = config.script_format      if config else "youtube_long"
-        audio_tags_enabled = config.audio_tags_enabled if config else False
-
-        # ── Resolve source-language voice ─────────────────────────────────────
-        src_voice: ChannelVoice | None = (
-            db.query(ChannelVoice)
-            .filter(
-                ChannelVoice.channel_id == channel.id,
-                ChannelVoice.language == content.source_language,
-            )
-            .first()
-        )
-        if not src_voice:
-            src_voice = (
-                db.query(ChannelVoice)
-                .filter(ChannelVoice.channel_id == channel.id)
-                .first()
-            )
-            if src_voice:
-                logger.info(
-                    "No voice for source lang=%s — using %s voice for TTS block",
-                    content.source_language, src_voice.language,
-                )
-
-        tts_model    = src_voice.tts_model if src_voice else "sonic-2"
-        tts_provider = src_voice.provider  if src_voice else "cartesia"
-
-        # ── Build voice map for multilingual duration estimates ───────────────
-        voice_map: dict[str, ChannelVoice] = {
-            v.language: v
-            for v in db.query(ChannelVoice).filter(ChannelVoice.channel_id == channel.id).all()
-        }
-
-        # ── Reconstruct story proxy from Content fields ───────────────────────
-        story = Story(
-            title=content.title,
-            url=content.source_url,
-            language=content.source_language,
-            body=content.source_excerpt or "",
-            source_type="db",
-            source_value="content_record",
-            published_at=datetime.now(timezone.utc),
-            upvotes=0,
-            comments=0,
-        )
-
-        # ── Mark as in-progress ───────────────────────────────────────────────
-        content.status = "GENERATING_SCRIPTS"
-        db.commit()
-
-        logger.info(
-            "Generating scripts for content %s… (format=%s provider=%s model=%s)",
-            content.id, script_format, tts_provider, tts_model,
-        )
-
-        # ── Step 1: Generate narrative blueprint ──────────────────────────────
-        blueprint = generate_story_blueprint(story, channel, script_format=script_format)
-        logger.info(
-            "Blueprint generated for content %s — %d major_turns, suggested_sections=%d",
-            content.id, len(blueprint.get("major_turns", [])),
-            blueprint.get("suggested_section_count", 3),
-        )
-
-        # ── Step 2: Persist blueprint ─────────────────────────────────────────
-        content.story_blueprint = blueprint
-        db.commit()
-
-        # ── Step 3: Generate scripts section-by-section ───────────────────────
-        scripts = generate_script_sections(
-            story=story,
-            blueprint=blueprint,
-            channel=channel,
-            channel_voice=src_voice,
-            script_format=script_format,
-            audio_tags_enabled=audio_tags_enabled,
-        )
-
-        hook_excerpt = scripts.get("voice_script", "").strip()[:300].replace("\n", " ")
-        logger.info("Script hook (first 300 chars) for content %s: %r", content.id, hook_excerpt)
-
-        # ── Step 4: Script Quality Gate (retention review) ────────────────────
-        scripts = run_script_quality_gate(
-            scripts, channel,
-            script_format=script_format,
-            language=content.source_language,
-            tts_model=tts_model,
-            tts_provider=tts_provider,
-        )
-        _script_trace("tasks_post_quality_gate", scripts.get("voice_script", ""))
-
-        # ── Step 5: Persist source Script ─────────────────────────────────────
-        content.title = scripts.get("title", content.title)
-        src_voice_script = scripts.get("voice_script", "")
-        src_dur_sec = estimate_duration_sec(src_voice_script, content.source_language)
-
-        script_record = Script(
-            content_id=content.id,
-            language=content.source_language,
-            video_script=scripts["video_script"],
-            voice_script=src_voice_script,
-            version=1,
-            validated=True,
-            estimated_duration_sec=src_dur_sec,
-        )
-        db.add(script_record)
-        db.commit()
-        logger.info(
-            "Source script saved for content %s — lang=%s dur=%.1fs",
-            content.id, content.source_language, src_dur_sec,
-        )
-
-        # ── Step 6: Merge visual_intent_history into story_blueprint ──────────
-        visual_history = scripts.get("visual_intent_history")
-        if visual_history and content.story_blueprint:
-            content.story_blueprint = {
-                **content.story_blueprint,
-                "visual_intent_history": visual_history,
-            }
-            db.commit()
-
-        # ── Step 7: Generate multilingual scripts ─────────────────────────────
-        # sha256 here must match quality_gate_final trace — different hash = stale script bug
-        _script_trace("tasks_entering_multilingual", src_voice_script)
-        generate_multilingual_scripts(content, channel, db, audio_tags_enabled=audio_tags_enabled)
-
-        # ── Step 8: Duration for all multilingual scripts ─────────────────────
-        db.refresh(content)
-        all_scripts: list[Script] = (
-            db.query(Script).filter(Script.content_id == content.id).all()
-        )
-        for s in all_scripts:
-            if s.language == content.source_language:
-                continue   # already set above
-            dur = estimate_duration_sec(s.voice_script, s.language)
-            s.estimated_duration_sec = dur
-            s.validated              = True
-            logger.info(
-                "Duration set for lang=%s content %s: %.1fs",
-                s.language, content.id, dur,
-            )
-        db.commit()
-
-        # ── Step 9: Set final status ──────────────────────────────────────────
-        content.status = "SCRIPTS_VALIDATED"
-        db.commit()
-        logger.info("Content %s — SCRIPTS_VALIDATED", content.id)
-
-        # ── Step 10: Shorts Planner (non-blocking — failure never affects parent) ──
-        try:
-            run_shorts_planner(content.id, channel, config, db)
-        except Exception as shorts_exc:
-            logger.error(
-                "run_shorts_planner failed for content %s (non-blocking): %s",
-                content.id, shorts_exc,
-            )
+        run_script_workflow(content, db)
 
     except Exception as exc:
         logger.error("run_agent2_scripts_for_content error for %s: %s", content_id, exc)
@@ -647,115 +461,19 @@ def dispatch_publishing() -> int:
     return count
 
 
-# ── Agent 2→3 gate: release Short episode scripts when parent reaches AUDIO_DONE ──
+# ── Compatibility alias for removed child-audio parent gate ───────────────────
 
 @celery_app.task(name="app.scheduler.tasks.pickup_short_episodes_awaiting_parent")
 def pickup_short_episodes_awaiting_parent() -> int:
-    """Flip/enqueue Short episodes whose parent has reached AUDIO_DONE.
+    """Compatibility no-op for old queued Beat messages.
 
-    Handles two cases in a single pass:
-      - ``SCRIPTS_VALIDATED_AWAITING_PARENT`` → flip to ``SCRIPTS_VALIDATED``, enqueue
-        Agent 3 with ``CHILD_SHORT_AUDIO_ENQUEUED``.
-      - ``SCRIPTS_VALIDATED`` (pre-existing stranded children) → enqueue Agent 3
-        directly with ``CHILD_SHORT_AUDIO_ENQUEUED``.
-
-    Children already in ``GENERATING_AUDIO``, ``AUDIO_DONE``, or further are not
-    included in the query and are never re-enqueued.
-
-    Condition: parent status in (AUDIO_DONE, GENERATING_VIDEO, VIDEO_DONE).
-
-    Returns:
-        Number of Short episodes flipped from AWAITING_PARENT → SCRIPTS_VALIDATED.
+    V2 standalone shorts are written as ``SCRIPTS_VALIDATED`` by Agent 2 and are
+    picked up by ``pickup_scripts_validated`` without waiting for parent audio.
     """
-    from app.database import _get_session_factory
-    from app.models import Content
-
-    db = _get_session_factory()()
-    released = 0
-    try:
-        # Single query: all short episodes that are ready to move forward.
-        actionable: list[Content] = (
-            db.query(Content)
-            .filter(
-                Content.is_short_episode.is_(True),
-                Content.status.in_([
-                    "SCRIPTS_VALIDATED_AWAITING_PARENT",
-                    "SCRIPTS_VALIDATED",
-                ]),
-            )
-            .all()
-        )
-
-        newly_released_ids: set = set()
-        to_enqueue: list[Content] = []
-
-        for short in actionable:
-            if not short.parent_content_id:
-                logger.warning(
-                    "pickup_short_episodes_awaiting_parent: Short episode content=%s "
-                    "has no parent_content_id — cannot gate; leaving in current status",
-                    short.id,
-                )
-                continue
-            parent: Content | None = db.get(Content, short.parent_content_id)
-            if not parent or parent.status not in ("AUDIO_DONE", "GENERATING_VIDEO", "VIDEO_DONE"):
-                continue
-
-            if short.status == "SCRIPTS_VALIDATED_AWAITING_PARENT":
-                short.status = "SCRIPTS_VALIDATED"
-                released += 1
-                newly_released_ids.add(short.id)
-                logger.info(
-                    "CHILD_SHORT_RELEASED child_content_id=%s part=%d/%d "
-                    "(parent=%s status=%s) → SCRIPTS_VALIDATED",
-                    short.id,
-                    short.short_part_number or 0,
-                    short.short_total_parts or 0,
-                    short.parent_content_id,
-                    parent.status,
-                )
-
-            to_enqueue.append(short)
-
-        db.commit()
-
-        # Log newly released grouped by parent
-        if newly_released_ids:
-            from collections import defaultdict as _defaultdict
-            _by_parent: dict = _defaultdict(list)
-            for s in to_enqueue:
-                if s.id in newly_released_ids:
-                    _by_parent[str(s.parent_content_id)].append(s)
-            for _parent_id, _shorts in _by_parent.items():
-                logger.info(
-                    "CHILD_SHORTS_RELEASED parent_content_id=%s count=%d",
-                    _parent_id, len(_shorts),
-                )
-
-        # Enqueue Agent 3 immediately for all actionable children
-        for s in to_enqueue:
-            run_agent3_audio_for_content.delay(str(s.id))
-            if s.id in newly_released_ids:
-                logger.info(
-                    "CHILD_SHORT_AUDIO_ENQUEUED child_content_id=%s part=%d/%d",
-                    s.id,
-                    s.short_part_number or 0,
-                    s.short_total_parts or 0,
-                )
-            else:
-                logger.info(
-                    "CHILD_SHORT_AUDIO_ENQUEUED child_content_id=%s part=%d/%d",
-                    s.id,
-                    s.short_part_number or 0,
-                    s.short_total_parts or 0,
-                )
-
-    finally:
-        db.close()
-
-    if released:
-        logger.info("pickup_short_episodes_awaiting_parent: %d Short episode(s) released", released)
-    return released
+    logger.info(
+        "CHILD_SHORT_PARENT_AUDIO_GATE_REMOVED task=pickup_short_episodes_awaiting_parent"
+    )
+    return 0
 
 
 # ── Agent 3 — Audio Generation tasks ─────────────────────────────────────────
@@ -765,98 +483,13 @@ def ensure_child_short_audio_enqueued(
     parent_content_id: "uuid.UUID",
     db: "Session",
 ) -> int:
-    """Release/enqueue Agent 3 for every child short episode of a parent.
-
-    Called immediately after the parent reaches AUDIO_DONE inside
-    ``run_agent3_audio_for_content``, reusing the parent's own DB session to avoid
-    transaction-isolation races that arise with a second session.
-
-    Child status handling:
-      - ``SCRIPTS_VALIDATED_AWAITING_PARENT`` → flip to ``SCRIPTS_VALIDATED``,
-        then enqueue (logs ``CHILD_SHORT_RELEASED``).
-      - ``SCRIPTS_VALIDATED`` + no ``AudioFile`` → enqueue directly
-        (logs ``CHILD_SHORT_AUDIO_ENQUEUED``).
-      - ``SCRIPTS_VALIDATED`` + ``AudioFile`` exists → skip
-        (logs ``CHILD_SHORT_AUDIO_ALREADY_EXISTS``).
-      - Any other status (``GENERATING_AUDIO``, ``AUDIO_DONE``, etc.) → skip
-        (logs ``CHILD_SHORT_AUDIO_SKIP``).
-
-    Args:
-        parent_content_id: UUID of the parent long-form content.
-        db: SQLAlchemy session owned by the caller — no new session is opened.
-
-    Returns:
-        Number of child Agent 3 tasks enqueued.
-    """
-    from app.models import AudioFile, Content
-    from sqlalchemy.orm import Session as _Session
-
-    children: list = (
-        db.query(Content)
-        .filter(
-            Content.parent_content_id == parent_content_id,
-            Content.is_short_episode.is_(True),
-        )
-        .all()
-    )
-
-    total = len(children)
-    if total == 0:
-        return 0
-
-    status_counts: dict[str, int] = {}
-    for _c in children:
-        status_counts[_c.status] = status_counts.get(_c.status, 0) + 1
-
+    """Compatibility no-op for the removed parent-audio child release hook."""
     logger.info(
-        "CHILD_SHORT_AUDIO_SCAN parent_content_id=%s total=%d statuses=%s",
-        parent_content_id, total, status_counts,
+        "CHILD_SHORT_PARENT_AUDIO_GATE_REMOVED helper=ensure_child_short_audio_enqueued "
+        "parent_content_id=%s",
+        parent_content_id,
     )
-
-    enqueued = 0
-    for child in children:
-        # Flip AWAITING_PARENT → SCRIPTS_VALIDATED so the Agent 3 guard passes
-        if child.status == "SCRIPTS_VALIDATED_AWAITING_PARENT":
-            child.status = "SCRIPTS_VALIDATED"
-            db.flush()
-            logger.info(
-                "CHILD_SHORT_RELEASED child_content_id=%s part=%d/%d",
-                child.id,
-                child.short_part_number or 0,
-                child.short_total_parts or 0,
-            )
-
-        if child.status == "SCRIPTS_VALIDATED":
-            audio_exists: bool = (
-                db.query(AudioFile)
-                .filter(AudioFile.content_id == child.id)
-                .first()
-            ) is not None
-
-            if audio_exists:
-                logger.info(
-                    "CHILD_SHORT_AUDIO_ALREADY_EXISTS child_content_id=%s — skipping enqueue",
-                    child.id,
-                )
-            else:
-                run_agent3_audio_for_content.delay(str(child.id))
-                enqueued += 1
-                logger.info(
-                    "CHILD_SHORT_AUDIO_ENQUEUED child_content_id=%s part=%d/%d",
-                    child.id,
-                    child.short_part_number or 0,
-                    child.short_total_parts or 0,
-                )
-        else:
-            logger.info(
-                "CHILD_SHORT_AUDIO_SKIP child_content_id=%s status=%s",
-                child.id, child.status,
-            )
-
-    if enqueued:
-        db.commit()
-
-    return enqueued
+    return 0
 
 
 @celery_app.task(name="app.scheduler.tasks.pickup_scripts_validated")
@@ -879,6 +512,10 @@ def pickup_scripts_validated() -> int:
         for content in validated:
             run_agent3_audio_for_content.delay(str(content.id))
             dispatched += 1
+            logger.info(
+                "AUDIO_PICKUP content_id=%s is_short_episode=%s",
+                content.id, bool(getattr(content, "is_short_episode", False)),
+            )
     finally:
         db.close()
 
@@ -929,18 +566,6 @@ def run_agent3_audio_for_content(self, content_id: str) -> None:
 
         run_audio_generation(cid, db)
 
-        # SQLAlchemy auto-expires content after run_audio_generation's commit;
-        # accessing .status below triggers a fresh SELECT.
-        if (
-            content.status == "AUDIO_DONE"
-            and not bool(getattr(content, "is_short_episode", False))
-        ):
-            logger.info(
-                "run_agent3_audio_for_content: parent %s AUDIO_DONE — scanning child short episodes",
-                content_id,
-            )
-            ensure_child_short_audio_enqueued(cid, db)
-
     except Exception as exc:
         logger.error("run_agent3_audio_for_content error for %s: %s", content_id, exc)
         db.rollback()
@@ -977,13 +602,37 @@ def pickup_audio_done() -> int:
         Number of video generation tasks dispatched.
     """
     from app.database import _get_session_factory
-    from app.models import Content
+    from app.models import AudioFile, Content, VideoRender
 
     db = _get_session_factory()()
     dispatched = 0
     try:
         ready = db.query(Content).filter(Content.status == "AUDIO_DONE").all()
         for content in ready:
+            has_audio = (
+                db.query(AudioFile)
+                .filter(AudioFile.content_id == content.id)
+                .limit(1)
+                .first()
+            ) is not None
+            if not has_audio:
+                logger.info("RENDER_PICKUP_SKIP content_id=%s reason=audio_missing", content.id)
+                continue
+
+            render_format = "short" if bool(getattr(content, "is_short_episode", False)) else "main"
+            has_render = (
+                db.query(VideoRender)
+                .filter(VideoRender.content_id == content.id, VideoRender.format == render_format)
+                .limit(1)
+                .first()
+            ) is not None
+            if has_render:
+                logger.info(
+                    "RENDER_PICKUP_SKIP content_id=%s reason=render_exists format=%s",
+                    content.id, render_format,
+                )
+                continue
+
             run_agent5_render_for_content.delay(str(content.id))
             dispatched += 1
     finally:

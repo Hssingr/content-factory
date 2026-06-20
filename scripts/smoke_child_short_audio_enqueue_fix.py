@@ -1,53 +1,15 @@
-"""Smoke test — Standalone short architecture child audio enqueue after parent AUDIO_DONE.
+"""Smoke test — child short audio no longer enqueues after parent AUDIO_DONE.
 
-Validates:
-  1. ensure_child_short_audio_enqueued helper exists and is correct
-     1a. function defined in tasks module
-     1b. CHILD_SHORT_AUDIO_SCAN log with total= and statuses=
-     1c. CHILD_SHORT_RELEASED log (flip AWAITING_PARENT → SCRIPTS_VALIDATED)
-     1d. CHILD_SHORT_AUDIO_ENQUEUED log (SCRIPTS_VALIDATED + no AudioFile)
-     1e. CHILD_SHORT_AUDIO_ALREADY_EXISTS log (SCRIPTS_VALIDATED + AudioFile exists — skip)
-     1f. CHILD_SHORT_AUDIO_SKIP log (AUDIO_DONE / GENERATING_AUDIO / etc — skip)
-     1g. AudioFile query present — existence check before enqueue
-     1h. run_agent3_audio_for_content.delay called inside ensure_child_short_audio_enqueued
-     1i. takes parent_content_id and db parameters (same-session, no new session opened)
+Phase 3B keeps the old helper/task names only as compatibility no-ops. Child
+short audio is picked up through pickup_scripts_validated once Agent 2 marks the
+child content SCRIPTS_VALIDATED.
 
-  2. run_agent3_audio_for_content calls ensure_child_short_audio_enqueued
-     2a. ensure_child_short_audio_enqueued(cid, db) called in run_agent3_audio_for_content
-     2b. call passes cid (UUID) and db (same session) — not pickup_short_episodes_awaiting_parent()
-     2c. gated on content.status == "AUDIO_DONE"
-     2d. gated on not is_short_episode (never fires for child's own audio generation)
-     2e. call comes after run_audio_generation completes
-
-  3. SCRIPTS_VALIDATED_AWAITING_PARENT case — flip then enqueue
-     3a. child.status == "SCRIPTS_VALIDATED_AWAITING_PARENT" check present
-     3b. child.status = "SCRIPTS_VALIDATED" assignment present
-     3c. db.flush() called after flip (keeps same transaction)
-     3d. CHILD_SHORT_RELEASED logged after flip
-     3e. enqueue (if check falls through to SCRIPTS_VALIDATED block)
-
-  4. SCRIPTS_VALIDATED + no AudioFile — enqueue
-     4a. AudioFile.content_id == child.id filter present
-     4b. run_agent3_audio_for_content.delay(str(child.id)) called when no AudioFile
-     4c. enqueued counter incremented
-     4d. db.commit() called only when enqueued > 0
-
-  5. AUDIO_DONE children are skipped — not re-enqueued
-     5a. AUDIO_DONE not in the filter for children (query has no status filter on children)
-     5b. AUDIO_DONE children fall into the else branch → CHILD_SHORT_AUDIO_SKIP
-
-  6. Beat path (pickup_short_episodes_awaiting_parent) still works independently
-     6a. pickup_short_episodes_awaiting_parent still defined
-     6b. still handles SCRIPTS_VALIDATED_AWAITING_PARENT status
-     6c. still handles SCRIPTS_VALIDATED (pre-existing) via CHILD_SHORT_AUDIO_ENQUEUED
-
-No API calls. Run with:
-    python scripts/smoke_child_short_audio_enqueue_fix.py
+No API calls, no DB access, no rendering.
 """
 
-import sys
-import os
 import inspect
+import os
+import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -64,122 +26,58 @@ def check(label: str, condition: bool) -> None:
         _failures += 1
 
 
-# ── Load modules ──────────────────────────────────────────────────────────────
-import app.scheduler.tasks as _tasks_mod
+import app.scheduler as _sched_pkg
 from app.scheduler.tasks import (
     ensure_child_short_audio_enqueued,
-    run_agent3_audio_for_content,
+    pickup_scripts_validated,
     pickup_short_episodes_awaiting_parent,
+    run_agent3_audio_for_content,
 )
+import app.agents.agent2_discovery.services.scripts as _script_mod
+from app.agents.agent2_discovery.services.scripts import run_shorts_planner
 
 _src_helper = inspect.getsource(ensure_child_short_audio_enqueued)
-_src_rac    = inspect.getsource(run_agent3_audio_for_content)
-_src_psep   = inspect.getsource(pickup_short_episodes_awaiting_parent)
+_src_psep = inspect.getsource(pickup_short_episodes_awaiting_parent)
+_src_pickup = inspect.getsource(pickup_scripts_validated)
+_src_rac = inspect.getsource(run_agent3_audio_for_content)
+_src_planner = "\n".join([
+    inspect.getsource(run_shorts_planner),
+    inspect.getsource(_script_mod._persist_child_short_script),
+])
+_src_sched = inspect.getsource(_sched_pkg)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1 — ensure_child_short_audio_enqueued helper
-# ─────────────────────────────────────────────────────────────────────────────
-print("\n── 1: ensure_child_short_audio_enqueued helper ──")
+print("\n-- 1: child scripts are immediately audio-eligible --")
+check("1a: run_shorts_planner marks child SCRIPTS_VALIDATED", 'short_content.status = "SCRIPTS_VALIDATED"' in _src_planner)
+check("1b: run_shorts_planner does not write awaiting-parent status", "SCRIPTS_VALIDATED_AWAITING_PARENT" not in _src_planner)
+check("1c: pickup_scripts_validated picks SCRIPTS_VALIDATED rows", 'Content.status == "SCRIPTS_VALIDATED"' in _src_pickup)
+check("1d: pickup_scripts_validated does not filter out short episodes", "is_short_episode.is_(False)" not in _src_pickup and "is_short_episode.is_(True)" not in _src_pickup)
+check("1e: AUDIO_PICKUP log includes is_short_episode", "AUDIO_PICKUP content_id=%s is_short_episode=%s" in _src_pickup)
 
-check("1a: function importable from tasks module",
-      callable(ensure_child_short_audio_enqueued))
-check("1b: CHILD_SHORT_AUDIO_SCAN log with total= and statuses=",
-      "CHILD_SHORT_AUDIO_SCAN" in _src_helper and
-      "total=" in _src_helper and "statuses=" in _src_helper)
-check("1c: CHILD_SHORT_RELEASED log present",
-      "CHILD_SHORT_RELEASED" in _src_helper)
-check("1d: CHILD_SHORT_AUDIO_ENQUEUED log present",
-      "CHILD_SHORT_AUDIO_ENQUEUED" in _src_helper)
-check("1e: CHILD_SHORT_AUDIO_ALREADY_EXISTS log present",
-      "CHILD_SHORT_AUDIO_ALREADY_EXISTS" in _src_helper)
-check("1f: CHILD_SHORT_AUDIO_SKIP log present",
-      "CHILD_SHORT_AUDIO_SKIP" in _src_helper)
-check("1g: AudioFile queried inside helper (existence check before enqueue)",
-      "AudioFile" in _src_helper and "AudioFile.content_id" in _src_helper)
-check("1h: run_agent3_audio_for_content.delay called inside helper",
-      "run_agent3_audio_for_content.delay(" in _src_helper)
-check("1i: accepts parent_content_id and db params (same session, no _get_session_factory)",
-      "parent_content_id" in _src_helper and
-      "db" in _src_helper and
-      "_get_session_factory" not in _src_helper)
+print("\n-- 2: parent AUDIO_DONE release path is removed --")
+check("2a: ensure_child_short_audio_enqueued remains callable", callable(ensure_child_short_audio_enqueued))
+check("2b: ensure_child_short_audio_enqueued is documented no-op", "Compatibility no-op" in _src_helper)
+check("2c: ensure_child_short_audio_enqueued returns 0", "return 0" in _src_helper)
+check("2d: ensure_child_short_audio_enqueued does not enqueue Agent 3", "run_agent3_audio_for_content.delay" not in _src_helper)
+check("2e: ensure_child_short_audio_enqueued does not query AudioFile", "AudioFile" not in _src_helper)
+check("2f: ensure_child_short_audio_enqueued does not mutate status", ".status =" not in _src_helper)
+check("2g: run_agent3_audio_for_content does not call the helper", "ensure_child_short_audio_enqueued(" not in _src_rac)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 2 — run_agent3_audio_for_content calls the helper
-# ─────────────────────────────────────────────────────────────────────────────
-print("\n── 2: run_agent3_audio_for_content uses ensure_child_short_audio_enqueued ──")
+print("\n-- 3: old Beat task is compatibility only --")
+check("3a: pickup_short_episodes_awaiting_parent remains callable", callable(pickup_short_episodes_awaiting_parent))
+check("3b: pickup_short_episodes_awaiting_parent is documented no-op", "Compatibility no-op" in _src_psep)
+check("3c: pickup_short_episodes_awaiting_parent returns 0", "return 0" in _src_psep)
+check("3d: pickup_short_episodes_awaiting_parent does not enqueue Agent 3", "run_agent3_audio_for_content.delay" not in _src_psep)
+check("3e: obsolete Beat schedule removed", "pickup-short-episodes-awaiting-parent" not in _src_sched)
 
-check("2a: ensure_child_short_audio_enqueued(cid, db) called in run_agent3_audio_for_content",
-      "ensure_child_short_audio_enqueued(cid, db)" in _src_rac)
-check("2b: pickup_short_episodes_awaiting_parent() NOT called inline in run_agent3_audio_for_content",
-      "pickup_short_episodes_awaiting_parent()" not in _src_rac)
-check("2c: gated on content.status == 'AUDIO_DONE'",
-      "AUDIO_DONE" in _src_rac and "ensure_child_short_audio_enqueued" in _src_rac)
-check("2d: gated on not is_short_episode",
-      "is_short_episode" in _src_rac and "ensure_child_short_audio_enqueued" in _src_rac)
-check("2e: ensure call comes after run_audio_generation",
-      _src_rac.index("run_audio_generation(") < _src_rac.index("ensure_child_short_audio_enqueued"))
+print("\n-- 4: obsolete release wording is absent from live helper/task bodies --")
+_live = "\n".join([_src_helper, _src_psep, _src_rac, _src_pickup, _src_planner])
+check("4a: no SCRIPTS_VALIDATED_AWAITING_PARENT in live audio handoff code", "SCRIPTS_VALIDATED_AWAITING_PARENT" not in _live)
+check("4b: no CHILD_SHORT_RELEASED log in live audio handoff code", "CHILD_SHORT_RELEASED" not in _live)
+check("4c: no CHILD_SHORT_AUDIO_ENQUEUED log in live audio handoff code", "CHILD_SHORT_AUDIO_ENQUEUED" not in _live)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3 — SCRIPTS_VALIDATED_AWAITING_PARENT case
-# ─────────────────────────────────────────────────────────────────────────────
-print("\n── 3: SCRIPTS_VALIDATED_AWAITING_PARENT: flip then enqueue ──")
-
-check("3a: SCRIPTS_VALIDATED_AWAITING_PARENT check in helper",
-      "SCRIPTS_VALIDATED_AWAITING_PARENT" in _src_helper)
-check("3b: child.status = 'SCRIPTS_VALIDATED' assignment",
-      'child.status = "SCRIPTS_VALIDATED"' in _src_helper)
-check("3c: db.flush() called after flip",
-      "db.flush()" in _src_helper)
-check("3d: CHILD_SHORT_RELEASED after flip block",
-      _src_helper.index("SCRIPTS_VALIDATED_AWAITING_PARENT") <
-      _src_helper.index("CHILD_SHORT_RELEASED"))
-check("3e: if child.status == SCRIPTS_VALIDATED check follows the flip block",
-      _src_helper.index("SCRIPTS_VALIDATED_AWAITING_PARENT") <
-      _src_helper.index('"SCRIPTS_VALIDATED"'))
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 4 — SCRIPTS_VALIDATED + no AudioFile — enqueue
-# ─────────────────────────────────────────────────────────────────────────────
-print("\n── 4: SCRIPTS_VALIDATED + no AudioFile → enqueue ──")
-
-check("4a: AudioFile.content_id == child.id filter in helper",
-      "AudioFile.content_id == child.id" in _src_helper)
-check("4b: run_agent3_audio_for_content.delay(str(child.id)) called on no-audio path",
-      "run_agent3_audio_for_content.delay(str(child.id))" in _src_helper)
-check("4c: enqueued counter incremented",
-      "enqueued += 1" in _src_helper or "enqueued=" in _src_helper)
-check("4d: db.commit() gated on enqueued > 0",
-      "if enqueued:" in _src_helper and "db.commit()" in _src_helper)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 5 — AUDIO_DONE children are skipped
-# ─────────────────────────────────────────────────────────────────────────────
-print("\n── 5: AUDIO_DONE children skipped ──")
-
-# Children query has no status filter — all children are loaded, then handled per status
-check("5a: children query has no status.in_ filter (fetches all children)",
-      "status.in_" not in _src_helper)
-check("5b: AUDIO_DONE children fall into else branch (CHILD_SHORT_AUDIO_SKIP)",
-      "CHILD_SHORT_AUDIO_SKIP" in _src_helper and "else:" in _src_helper)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 6 — Beat path still works
-# ─────────────────────────────────────────────────────────────────────────────
-print("\n── 6: Beat path (pickup_short_episodes_awaiting_parent) still independent ──")
-
-check("6a: pickup_short_episodes_awaiting_parent still defined and callable",
-      callable(pickup_short_episodes_awaiting_parent))
-check("6b: still handles SCRIPTS_VALIDATED_AWAITING_PARENT in Beat path",
-      "SCRIPTS_VALIDATED_AWAITING_PARENT" in _src_psep)
-check("6c: CHILD_SHORT_AUDIO_ENQUEUED still in Beat path",
-      "CHILD_SHORT_AUDIO_ENQUEUED" in _src_psep)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Result
-# ─────────────────────────────────────────────────────────────────────────────
 print()
 if _failures == 0:
-    print("SMOKE PASS — Standalone short architecture child enqueue fix: all assertions OK")
+    print("SMOKE PASS — child short audio parent-release path removed")
 else:
     print(f"SMOKE FAIL — {_failures} assertion(s) failed")
-    sys.exit(1)
+    raise SystemExit(1)

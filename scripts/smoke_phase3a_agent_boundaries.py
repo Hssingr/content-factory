@@ -78,8 +78,9 @@ pickup_src = inspect.getsource(tasks.pickup_scripts_validated)
 render_pickup_src = inspect.getsource(tasks.pickup_audio_done)
 check("5a: new Agent 3 task exists", hasattr(tasks, "run_agent3_audio_for_content"))
 check("5b: old Agent 4 task alias exists", hasattr(tasks, "run_agent4_for_content"))
-check("5c: child audio helper enqueues new Agent 3 task",
-      "run_agent3_audio_for_content.delay" in helper_src)
+check("5c: obsolete child audio helper is compatibility no-op",
+      "Compatibility no-op" in helper_src and "return 0" in helper_src and
+      "run_agent3_audio_for_content.delay" not in helper_src)
 check("5d: pickup_scripts_validated enqueues new Agent 3 task",
       "run_agent3_audio_for_content.delay" in pickup_src)
 check("5e: new Agent 5 render task exists", hasattr(tasks, "run_agent5_render_for_content"))

@@ -15,10 +15,10 @@ Validates:
    B5. VideoRender(format="short") NOT created in _run_renders or _render_from_existing_props.
    B6. short_props_pairs not referenced in _run_renders.
 
- C. PHASE 4 PIPELINE WIRING
+ C. STANDALONE SHORT PIPELINE WIRING
    C1. run_shorts_planner is called from tasks.py after SCRIPTS_VALIDATED.
-   C2. pickup_short_episodes_awaiting_parent task exists in tasks.py.
-   C3. pickup_short_episodes_awaiting_parent is scheduled in Celery Beat.
+   C2. child scripts are saved as SCRIPTS_VALIDATED directly.
+   C3. obsolete parent-audio gate task is a compatibility no-op and is not scheduled.
    C4. Agent 3 run_audio_generation handles is_short_episode=True.
    C5. remap_beats_for_short imported and called in video.py for short episodes.
    C6. CHILD_SHORT_RENDER_START log exists in run_video_generation with format=short.
@@ -129,27 +129,38 @@ check("B7: no *_short_*.json glob loop in _render_from_existing_props",
       "glob(" not in _src_rfep and "*.json" not in _src_rfep)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# C — PHASE 4 PIPELINE WIRING
+# C — STANDALONE SHORT PIPELINE WIRING
 # ─────────────────────────────────────────────────────────────────────────────
 print("\n── C: Standalone short architecture pipeline wiring ──")
 
-check("C1: run_shorts_planner called in tasks.py",
-      "run_shorts_planner" in _src_tasks and "run_shorts_planner(" in _src_tasks)
-check("C2: pickup_short_episodes_awaiting_parent task in tasks.py",
-      "pickup_short_episodes_awaiting_parent" in _src_tasks and
-      "def pickup_short_episodes_awaiting_parent" in _src_tasks)
+import app.agents.agent2_discovery.services.script_workflow as _workflow_mod
+_src_workflow = inspect.getsource(_workflow_mod.run_script_workflow)
+check("C1: run_shorts_planner called by Agent 2 workflow",
+      "run_shorts_planner" in _src_workflow and "run_shorts_planner(" in _src_workflow)
+import app.agents.agent2_discovery.services.scripts as _script_mod
+_src_short_planner = "\n".join([
+    inspect.getsource(_script_mod.run_shorts_planner),
+    inspect.getsource(_script_mod._create_child_short_content),
+    inspect.getsource(_script_mod._persist_child_short_script),
+])
+check("C2: child short scripts become SCRIPTS_VALIDATED directly",
+      'short_content.status = "SCRIPTS_VALIDATED"' in _src_short_planner and
+      "SCRIPTS_VALIDATED_AWAITING_PARENT" not in _src_short_planner)
 
 import app.scheduler as _sched_pkg
 _src_sched = inspect.getsource(_sched_pkg)
-check("C3: pickup_short_episodes_awaiting_parent scheduled in Celery Beat",
-      "pickup_short_episodes_awaiting_parent" in _src_sched)
+_src_parent_gate = inspect.getsource(_tasks_mod.pickup_short_episodes_awaiting_parent)
+check("C3a: pickup_short_episodes_awaiting_parent is compatibility no-op",
+      "Compatibility no-op" in _src_parent_gate and "return 0" in _src_parent_gate)
+check("C3b: pickup_short_episodes_awaiting_parent is not scheduled in Celery Beat",
+      "pickup_short_episodes_awaiting_parent" not in _src_sched)
 
 import app.agents.agent3_audio.services.audio as _audio_mod
 _src_audio = inspect.getsource(_audio_mod)
 check("C4a: is_short_episode read in run_audio_generation",
       "is_short_episode" in _src_audio)
-check("C4b: Agent 3 skips bookends for short episodes",
-      "is_short_episode" in _src_audio and ("skip" in _src_audio.lower() or "bookend" in _src_audio.lower()))
+check("C4b: Agent 3 has no child bookend generation path",
+      "is_short_episode" in _src_audio and "generate_short_bookends" not in _src_audio)
 
 from app.agents.agent5_render.services.video import run_video_generation
 _src_rvg = inspect.getsource(run_video_generation)

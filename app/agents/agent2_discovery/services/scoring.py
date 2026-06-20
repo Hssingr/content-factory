@@ -254,7 +254,7 @@ def run_story_scoring_gate(
     if accepted:
         return story, assessment
 
-    logger.info(
+    logger.warning(
         "Story Scoring Gate: story rejected (title=%r) — exiting cleanly, no Content created",
         story.title[:80],
     )

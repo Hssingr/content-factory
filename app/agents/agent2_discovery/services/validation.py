@@ -116,7 +116,7 @@ def check_validation_timeouts(db: Session) -> int:
         count += 1
 
     if count:
-        logger.info("Timeout sweep: %d validation(s) processed", count)
+        logger.warning("Timeout sweep: %d validation(s) processed", count)
     return count
 
 

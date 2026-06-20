@@ -19,7 +19,7 @@ class Content(Base):
     content_hash: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
     title: Mapped[str] = mapped_column(Text, nullable=False)
     # pipeline state machine — see CLAUDE.md §Agent descriptions for full list
-    # longest status: SCRIPTS_VALIDATED_AWAITING_PARENT (33 chars) → VARCHAR(64)
+    # VARCHAR(64) leaves room for recoverable orchestration/status labels.
     status: Mapped[str] = mapped_column(String(64), nullable=False, default="DRAFT")
     # raw source body stored at discovery time (≤8 000 chars) — used by Agent 3
     # auto_correct_script() to expand minimum_length corrections from source facts

@@ -183,13 +183,13 @@ def generate_beat_image(
     for tier, prompt in cascade:
         if not prompt:
             continue
-        logger.info(
+        logger.debug(
             "Flux beat=%d content=%s tier=%s prompt_words=%d",
             beat_index, content_id, tier, len(prompt.split()),
         )
         path = _call_fal(prompt, cache_dir, media_path)
         if path:
-            logger.info("Flux beat=%d tier=%s: saved %s", beat_index, tier, path)
+            logger.debug("Flux beat=%d tier=%s: saved %s", beat_index, tier, path)
             return path
         logger.warning(
             "Flux beat=%d tier=%s failed — trying next tier", beat_index, tier,
@@ -260,7 +260,7 @@ def generate_all_beat_images(beats: list[dict], content_id: str) -> list[dict]:
         if (b.get("media_url") or "").startswith("cache/")
     )
     failed = len(beats) - succeeded
-    logger.info(
+    logger.warning(
         "Flux generation complete: content=%s beats=%d succeeded=%d text_card_fallback=%d",
         content_id, len(beats), succeeded, failed,
     )

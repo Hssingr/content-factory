@@ -332,7 +332,7 @@ def render_main_video_chunked(
     n_chunks   = max(1, -(-duration_ms // (chunk_sec * 1000)))   # ceiling division
     conc       = concurrency if concurrency is not None else settings.render_concurrency
 
-    logger.info(
+    logger.debug(
         "Chunked render enabled: duration=%ds chunks=%d chunk_duration=%ds",
         duration_ms // 1000, n_chunks, chunk_sec,
     )
@@ -427,7 +427,7 @@ def render_main_video_chunked(
 
     # ── Render chunks — sequentially or in parallel ───────────────────────────
     parallel_workers = settings.chunk_parallel_workers
-    logger.info(
+    logger.debug(
         "Chunked render: %d chunks prepared, parallel_workers=%d",
         len(chunk_specs), parallel_workers,
     )
@@ -441,7 +441,7 @@ def render_main_video_chunked(
         cstart_sec    = spec["chunk_start_sec"]
         n_secs        = spec["n_sections"]
 
-        logger.info(
+        logger.debug(
             "Rendering chunk %d/%d: sections=%d dur=%.1fs offset=%.1fs",
             cidx + 1, n_chunks, n_secs, cdur_sec, cstart_sec,
         )
@@ -479,11 +479,11 @@ def render_main_video_chunked(
         raise RemotionRenderError(f"Chunked render: no chunks produced for language={language}")
 
     output_path = _ensure_output_path(content_id, f"{language}_main.mp4")
-    logger.info("Concatenating %d chunks → %s", len(final_chunk_paths), output_path)
+    logger.debug("Concatenating %d chunks → %s", len(final_chunk_paths), output_path)
     _concatenate_chunks(final_chunk_paths, str(output_path))
 
     total_time = time.monotonic() - t0
-    logger.info(
+    logger.debug(
         "Chunked render complete: language=%s chunks=%d total_time=%.1fs",
         language, len(chunk_paths), total_time,
     )
@@ -767,7 +767,7 @@ def _debug_find_crashing_section(
             if not _try(chunk):
                 bad_chunk_start = start
                 found_chunk = True
-                logger.info(
+                logger.debug(
                     "Remotion [REMOTION_DEBUG_SECTION] language=%s "
                     "crashing chunk: sections[%d:%d]",
                     language, start, start + chunk_size,
@@ -775,7 +775,7 @@ def _debug_find_crashing_section(
                 break
 
         if not found_chunk:
-            logger.info(
+            logger.debug(
                 "Remotion [REMOTION_DEBUG_SECTION] language=%s "
                 "no single 5-section chunk crashed — crash may be cumulative memory issue",
                 language,

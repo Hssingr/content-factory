@@ -102,7 +102,7 @@ def run_discovery(
         )
 
         if _is_duplicate(candidate, db):
-            logger.info(
+            logger.warning(
                 "Discovery: duplicate on attempt %d — adding to rejected list and retrying",
                 attempt + 1,
             )
@@ -162,7 +162,7 @@ def run_discovery(
     )
 
     if not accepted:
-        logger.info("Discovery: story rejected — exiting cleanly, no Content created")
+        logger.warning("Discovery: story rejected — exiting cleanly, no Content created")
         return None
 
     # ── Persist Content + ContentValidation ──────────────────────────────────
@@ -367,7 +367,7 @@ def _create_manual_fallback(
     if message_id:
         validation.telegram_message_id = message_id
         validation.sent_at = now
-        logger.info(
+        logger.warning(
             "Manual fallback sent for channel %s (message_id=%s placeholder_content=%s)",
             channel.id, message_id, content.id,
         )

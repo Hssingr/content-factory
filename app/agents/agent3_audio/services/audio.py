@@ -58,8 +58,8 @@ def run_audio_generation(content_id: uuid.UUID, db: Session) -> bool:
         )
     else:
         logger.info(
-            "PARENT_AUDIO_STANDALONE_SHORTS_ONLY content_id=%s "
-            "standalone_child_shorts_only=True",
+            "PARENT_AUDIO_START content_id=%s "
+            "is_short_episode=False own_audio=True own_whisper=True",
             content_id,
         )
 
@@ -88,7 +88,7 @@ def run_audio_generation(content_id: uuid.UUID, db: Session) -> bool:
             logger.warning("No voice configured for lang=%s — skipping", lang)
             continue
 
-        logger.info("Processing lang=%s voice_id=%s", lang, voice.voice_id)
+        logger.debug("Processing lang=%s voice_id=%s", lang, voice.voice_id)
 
         # ── Step 1: TTS (skip if file already on disk) ───────────────────────
         existing = audio_path(content_id, lang)
@@ -126,16 +126,20 @@ def run_audio_generation(content_id: uuid.UUID, db: Session) -> bool:
 
             db.commit()
             success_count += 1
-            logger.info(
+            logger.debug(
                 "Audio done lang=%s: %.1fs | standalone_short_architecture | %d whisper words",
                 lang, duration_ms / 1000, len(transcript),
             )
             if is_short_episode:
                 logger.info(
-                    "CHILD_SHORT_AUDIO_DONE child_content_id=%s duration_ms=%d lang=%s",
+                    "CHILD_SHORT_AUDIO_DONE content_id=%s duration_ms=%d lang=%s",
                     content_id, duration_ms, lang,
                 )
-
+            else:
+                logger.info(
+                    "PARENT_AUDIO_DONE content_id=%s duration_ms=%d lang=%s",
+                    content_id, duration_ms, lang,
+                )
         except Exception as exc:
             logger.error("Persist failed lang=%s: %s", lang, exc)
             db.rollback()

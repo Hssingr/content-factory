@@ -243,7 +243,7 @@ def split_long_sentences(text: str, max_words: int = 18) -> str:
         result.append(" ".join(out) + trailing)
 
     if total_fixed:
-        logger.info(
+        logger.debug(
             "split_long_sentences: fixed %d long sentence(s) (max_words=%d)",
             total_fixed, max_words,
         )

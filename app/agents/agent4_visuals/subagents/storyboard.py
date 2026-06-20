@@ -247,7 +247,7 @@ def split_into_beats(
         _STORYBOARD_SCHEMA_VERSION_LOG, language, len(segments), estimated_beats,
         total_words, beat_seconds,
     )
-    logger.info(
+    logger.debug(
         "STORYBOARD_ESTIMATE script_words=%d estimated_beats=%d estimated_formula_used=%s",
         total_words, estimated_beats,
         f"words({total_words})/WPM({_WORDS_PER_MINUTE})*60/beat_sec({beat_seconds:.1f})",
@@ -356,7 +356,7 @@ def split_into_beats(
         total_output_tokens, total_input_tokens, total_generation_time_ms,
         _retry_count, _truncation_count,
     )
-    logger.info(
+    logger.debug(
         "STORYBOARD_ESTIMATE_ACCURACY estimated_beats=%d actual_generated_beats=%d error_percent=%.1f",
         estimated_beats, _actual_beats, _estimate_error_pct,
     )
@@ -368,7 +368,7 @@ def split_into_beats(
     )
     if _hint_total > 0:
         _inv_rate = _hint_invalid / _hint_total * 100
-        logger.info(
+        logger.warning(
             "HINT_QUALITY_SUMMARY total_hints=%d valid_hints=%d invalid_hints=%d "
             "invalid_rate_percent=%.1f",
             _hint_total, _hint_valid, _hint_invalid, _inv_rate,
@@ -608,7 +608,7 @@ def map_storyboard_beats_to_timestamps(
     fallback_orders = [beats[i].get("beat_order", i) for i, t in enumerate(match_type) if t == "fallback"]
 
     avg_beat_ms = duration_ms / n if n > 0 else 0
-    logger.info(
+    logger.warning(
         "Storyboard timestamp mapping: total=%d exact=%d fuzzy=%d fallback=%d "
         "avg_beat_duration=%.0fms",
         n, n_exact, n_fuzzy, n_fallback, avg_beat_ms,
@@ -1181,7 +1181,7 @@ def remap_beats_for_short(
             )
             media_url = new_url if new_url else _TEXT_CARD_SENTINEL
             generate_count += 1
-            logger.info(
+            logger.debug(
                 "remap_beats_for_short: beat=%d score=%d threshold=%d — new image: %s",
                 i, match_score, _MATCH_SCORE_THRESHOLD,
                 "OK" if new_url else "text_card fallback",

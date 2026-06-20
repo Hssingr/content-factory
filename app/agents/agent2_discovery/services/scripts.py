@@ -50,7 +50,7 @@ def _script_trace(label: str, voice_script: str) -> None:
         re.MULTILINE | re.IGNORECASE,
     ))
     h = hashlib.sha256(voice_script.encode("utf-8", errors="replace")).hexdigest()[:8]
-    logger.info("SCRIPT_TRACE [%s] words=%d sections=%d sha256=%s", label, wc, sec, h)
+    logger.debug("SCRIPT_TRACE [%s] words=%d sections=%d sha256=%s", label, wc, sec, h)
 
 
 def _max_sentence_len(text: str) -> int:
@@ -118,13 +118,13 @@ def diagnose_section_repetition(sections: list[dict]) -> list[dict]:
             "severity":        severity,
         })
         if severity == "HIGH":
-            logger.warning(
+            logger.debug(
                 "REPETITION[HIGH] label=%s overlap=%.3f vs=%r repeated=%s — "
                 "section repeats prior material (non-blocking)",
                 label, max_overlap, vs_label, repeated[:6],
             )
         else:
-            logger.info(
+            logger.debug(
                 "REPETITION label=%s severity=%s overlap=%.3f vs=%r repeated=%s",
                 label, severity, max_overlap, vs_label, repeated[:6],
             )
@@ -153,77 +153,14 @@ def run_script_quality_gate(
     tts_model: str = "sonic-2",
     tts_provider: str = "cartesia",
 ) -> dict:
-    """Run the Script Quality Gate — assess retention quality, rewrite if needed.
-
-    Distinct from Agent 3's technical validator: this checks whether a normal
-    YouTube viewer would actually keep watching (hook, clarity, pacing, generic
-    AI phrasing, TTS readability) using fixed editorial criteria. Runs BEFORE
-    persistence/Telegram so the user only ever sees retention-worthy scripts.
-
-    Augments Claude's assessment with deterministic TTS and hook-quality checks
-    (``check_tts_compliance`` and ``check_hook_quality``). Any MAJOR findings are
-    folded into the rewrite pass so a single Sonnet call fixes everything at once.
-
-    Loops at most ``_MAX_QUALITY_REWRITES`` times: assess → if NEEDS_REWRITE or
-    det MAJOR, rewrite the FULL script preserving facts/markers, then re-assess.
-    If still failing after the limit, the latest version is kept and a warning is
-    logged — the pipeline never blocks on this check.
-
-    Args:
-        scripts:       Dict with ``title``, ``video_script``, ``voice_script``
-                       (source-language, output of ``generate_scripts()``).
-        channel:       Channel ORM object (provides niche and tone as context).
-        script_format: Format key from ``channel_config.script_format``.
-        language:      BCP-47 code for the source language (used by det checkers
-                       to tag their issues). Defaults to "source" when unknown.
-        tts_model:     TTS model ID for the source-language voice.
-        tts_provider:  TTS provider ("cartesia" | "elevenlabs").
-
-    Returns:
-        The final scripts dict — rewritten if the gate required it, otherwise
-        the original. Always has ``title``, ``video_script``, ``voice_script``.
-    """
-    current        = scripts
-    _rewrite_calls = 0   # telemetry counter
-
-    # ── FINAL TTS BACKSTOP — deterministic pre-gate cleanup ───────────────────
-    # Strips forbidden chars and splits over-limit sentences before ANY Claude call
-    # so the assessor evaluates an already-clean script and the rewriter doesn't
-    # inherit deterministic MAJOR issues as its baseline.
-    _bs_vs = current.get("voice_script", "")
-    _bs_over_before = sum(
-        1 for s in re.split(r"(?<=[.!?])\s+", _bs_vs) if len(s.split()) > 18
-    )
-    _bs_clean = split_long_sentences(normalize_tts_chars(_bs_vs))
-    _bs_over_after = sum(
-        1 for s in re.split(r"(?<=[.!?])\s+", _bs_clean) if len(s.split()) > 18
-    )
-    logger.info(
-        "FINAL_TTS_BACKSTOP sentences_over_limit_before=%d sentences_over_limit_after=%d",
-        _bs_over_before, _bs_over_after,
-    )
-    if _bs_clean != _bs_vs:
-        current = {**current, "voice_script": _bs_clean, "video_script": _bs_clean}
+    """Run the Script Quality Gate — assess retention quality, rewrite if needed."""
+    current = _apply_final_tts_backstop(scripts)
+    rewrite_calls = 0
 
     for attempt in range(1, _MAX_QUALITY_REWRITES + 1):
         _script_trace(f"quality_gate_input_{attempt}", current.get("voice_script", ""))
-        # ── First / last sentence trace (quality gate input) ─────────────────
-        _qg_vs = current.get("voice_script", "")
-        _intro_m = re.search(r"\[INTRO\]\s*(.*?)(?=\n\s*\[|\Z)", _qg_vs, re.DOTALL | re.IGNORECASE)
-        if _intro_m:
-            _intro_sents = [s for s in re.split(r"(?<=[.!?])\s+", _intro_m.group(1).strip()) if s.strip()]
-            logger.info(
-                "QUALITY_GATE_INPUT attempt=%d intro_first=%r",
-                attempt, (_intro_sents[0][:120] if _intro_sents else ""),
-            )
-        _outro_m = re.search(r"\[OUTRO\]\s*(.*?)$", _qg_vs, re.DOTALL | re.IGNORECASE)
-        if _outro_m:
-            _outro_sents = [s for s in re.split(r"(?<=[.!?])\s+", _outro_m.group(1).strip()) if s.strip()]
-            logger.info(
-                "QUALITY_GATE_INPUT attempt=%d outro_last=%r",
-                attempt, (_outro_sents[-1][:120] if _outro_sents else ""),
-            )
-        # ── Claude assessment ─────────────────────────────────────────────────
+        _log_quality_gate_input(current, attempt)
+
         try:
             review = assess_script_quality(current, channel, script_format=script_format)
         except Exception as exc:
@@ -231,83 +168,37 @@ def run_script_quality_gate(
                 "Script Quality Gate assessment failed (attempt %d): %s — keeping script as-is",
                 attempt, exc,
             )
-            _emit_script_cost_estimate(scripts, _rewrite_calls)
+            _emit_script_cost_estimate(scripts, rewrite_calls)
             return current
 
-        status = review.get("status", "PASSED")
-        claude_issues: list[dict] = review.get("issues", [])
-
-        # ── Deterministic TTS + hook checks ───────────────────────────────────
-        voice_script = current.get("voice_script", "")
-        tts_det = check_tts_compliance(voice_script, language)
-        hook_det = check_hook_quality(voice_script, language)
-        det_majors = [i for i in tts_det + hook_det if i["severity"] == "MAJOR"]
-
-        # Convert det issues to quality-gate format (HIGH severity, "fix" key)
-        converted_det: list[dict] = [
-            {
-                "severity": "HIGH",
-                "category": i["category"],
-                "description": i["description"],
-                "fix": i["suggestion"],
-            }
-            for i in det_majors
-        ]
-
-        all_issues = claude_issues + converted_det
-        high = sum(1 for i in all_issues if i.get("severity") == "HIGH")
-
-        logger.info(
-            "Script Quality Gate: claude=%s det_major=%d issues=%d (high=%d) attempt=%d",
-            status, len(converted_det), len(all_issues), high, attempt,
+        issue_group = _collect_quality_gate_issues(
+            review=review,
+            current=current,
+            language=language,
         )
-        _tts_maj_cnt  = len([i for i in tts_det  if i["severity"] == "MAJOR"])
-        _hook_maj_cnt = len([i for i in hook_det if i["severity"] == "MAJOR"])
-        logger.info(
-            "QUALITY_GATE_BREAKDOWN attempt=%d det_tts_maj=%d det_hook_maj=%d",
-            attempt, _tts_maj_cnt, _hook_maj_cnt,
-        )
-        for issue in all_issues:
-            logger.info(
-                "Script quality issue [%s/%s]: %s -> %s",
-                issue.get("severity", "?"), issue.get("category", "?"),
-                issue.get("description", ""), issue.get("fix", ""),
-            )
+        _log_quality_gate_review(issue_group, attempt)
 
-        # ── Decision: pass or rewrite ─────────────────────────────────────────
-        if status == "PASSED" and not converted_det:
+        if issue_group["status"] == "PASSED" and not issue_group["converted_det"]:
             _script_trace(f"quality_gate_passed_attempt_{attempt}", current.get("voice_script", ""))
-            _emit_script_cost_estimate(scripts, _rewrite_calls)
+            _emit_script_cost_estimate(scripts, rewrite_calls)
             return current
 
-        # ── Skip rewrite if every remaining HIGH issue is TTS-only ───────────
-        # sentence-length violations are cheaper to fix deterministically than to
-        # spend 5k+ output tokens on a full Sonnet quality rewrite.
-        _high_issues = [i for i in all_issues if i.get("severity") == "HIGH"]
-        _tts_only    = bool(_high_issues) and all(
-            i.get("category") == "tts_compliance" for i in _high_issues
-        )
-        if _tts_only:
-            logger.info(
-                "QUALITY_REWRITE_SKIPPED reason=TTS_ONLY high_count=%d attempt=%d",
-                len(_high_issues), attempt,
+        if _has_tts_only_high_issues(issue_group["all_issues"]):
+            current = _apply_tts_only_quality_cleanup(
+                current=current,
+                issue_group=issue_group,
+                attempt=attempt,
             )
-            _vs = current.get("voice_script", "")
-            _cleaned = split_long_sentences(normalize_tts_chars(_vs))
-            if _cleaned != _vs:
-                current = {**current, "voice_script": _cleaned, "video_script": _cleaned}
-                logger.info("QUALITY_REWRITE_SKIPPED: deterministic cleanup applied")
-            _script_trace(f"quality_gate_tts_only_cleanup_{attempt}", current.get("voice_script", ""))
-            continue  # re-assess next iteration — no Claude call
+            continue
 
         try:
             current = rewrite_script_for_quality(
-                current, all_issues, channel,
+                current, issue_group["all_issues"], channel,
                 script_format=script_format,
                 tts_model=tts_model,
                 tts_provider=tts_provider,
             )
-            _rewrite_calls += 1
+            rewrite_calls += 1
             logger.info("QUALITY_REWRITE_SCHEMA_OK attempt=%d", attempt)
         except Exception as exc:
             logger.error(
@@ -315,36 +206,169 @@ def run_script_quality_gate(
                 attempt, exc,
             )
             _script_trace(f"quality_gate_rewrite_failed_{attempt}", current.get("voice_script", ""))
-            _emit_script_cost_estimate(scripts, _rewrite_calls)
+            _emit_script_cost_estimate(scripts, rewrite_calls)
             return current
 
-        # Deterministic cleanup after rewrite — rewrite output may introduce long sentences
-        # or forbidden TTS chars (/ % & ()). Without this the next loop iteration finds the
-        # same det MAJORs again, which loops Claude into the same rewrite. Both must be applied
-        # so the re-assessment loop has clean input.
-        _rw_vs = current.get("voice_script", "")
-        _rw_clean = split_long_sentences(normalize_tts_chars(_rw_vs))
-        if _rw_clean != _rw_vs:
-            current = {**current, "voice_script": _rw_clean, "video_script": _rw_clean}
-            logger.info(
-                "Script Quality Gate: deterministic cleanup applied after rewrite (attempt %d)",
-                attempt,
-            )
+        current = _apply_post_rewrite_cleanup(current, attempt)
         _script_trace(f"quality_gate_after_rewrite_{attempt}", current.get("voice_script", ""))
 
     logger.warning(
         "Script Quality Gate: still NEEDS_REWRITE after %d attempt(s) — proceeding with latest version",
         _MAX_QUALITY_REWRITES,
     )
-    # Final cleanup — ensures the script entering multilingual generation satisfies as
-    # many deterministic TTS rules as possible even when Claude couldn't fully comply.
-    _final_vs = current.get("voice_script", "")
-    _final_clean = split_long_sentences(normalize_tts_chars(_final_vs))
-    if _final_clean != _final_vs:
-        current = {**current, "voice_script": _final_clean, "video_script": _final_clean}
-        logger.info("Script Quality Gate: final deterministic cleanup applied before returning")
+    current = _apply_final_quality_cleanup(current)
     _script_trace("quality_gate_max_retries_return", current.get("voice_script", ""))
-    _emit_script_cost_estimate(scripts, _rewrite_calls)
+    _emit_script_cost_estimate(scripts, rewrite_calls)
+    return current
+
+
+def _apply_final_tts_backstop(current: dict) -> dict:
+    voice_script = current.get("voice_script", "")
+    over_before = sum(
+        1 for sentence in re.split(r"(?<=[.!?])\s+", voice_script)
+        if len(sentence.split()) > 18
+    )
+    cleaned = split_long_sentences(normalize_tts_chars(voice_script))
+    over_after = sum(
+        1 for sentence in re.split(r"(?<=[.!?])\s+", cleaned)
+        if len(sentence.split()) > 18
+    )
+    logger.debug(
+        "FINAL_TTS_BACKSTOP sentences_over_limit_before=%d sentences_over_limit_after=%d",
+        over_before, over_after,
+    )
+    if cleaned != voice_script:
+        return {**current, "voice_script": cleaned, "video_script": cleaned}
+    return current
+
+
+def _log_quality_gate_input(current: dict, attempt: int) -> None:
+    voice_script = current.get("voice_script", "")
+    intro_match = re.search(
+        r"\[INTRO\]\s*(.*?)(?=\n\s*\[|\Z)",
+        voice_script,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if intro_match:
+        intro_sents = [
+            sentence for sentence in re.split(r"(?<=[.!?])\s+", intro_match.group(1).strip())
+            if sentence.strip()
+        ]
+        logger.debug(
+            "QUALITY_GATE_INPUT attempt=%d intro_first=%r",
+            attempt, (intro_sents[0][:120] if intro_sents else ""),
+        )
+    outro_match = re.search(r"\[OUTRO\]\s*(.*?)$", voice_script, re.DOTALL | re.IGNORECASE)
+    if outro_match:
+        outro_sents = [
+            sentence for sentence in re.split(r"(?<=[.!?])\s+", outro_match.group(1).strip())
+            if sentence.strip()
+        ]
+        logger.debug(
+            "QUALITY_GATE_INPUT attempt=%d outro_last=%r",
+            attempt, (outro_sents[-1][:120] if outro_sents else ""),
+        )
+
+
+def _collect_quality_gate_issues(
+    review: dict,
+    current: dict,
+    language: str,
+) -> dict:
+    status = review.get("status", "PASSED")
+    claude_issues: list[dict] = review.get("issues", [])
+    voice_script = current.get("voice_script", "")
+    tts_det = check_tts_compliance(voice_script, language)
+    hook_det = check_hook_quality(voice_script, language)
+    det_majors = [issue for issue in tts_det + hook_det if issue["severity"] == "MAJOR"]
+    converted_det: list[dict] = [
+        {
+            "severity": "HIGH",
+            "category": issue["category"],
+            "description": issue["description"],
+            "fix": issue["suggestion"],
+        }
+        for issue in det_majors
+    ]
+    all_issues = claude_issues + converted_det
+    return {
+        "status": status,
+        "tts_det": tts_det,
+        "hook_det": hook_det,
+        "converted_det": converted_det,
+        "all_issues": all_issues,
+    }
+
+
+def _log_quality_gate_review(issue_group: dict, attempt: int) -> None:
+    all_issues = issue_group["all_issues"]
+    high = sum(1 for issue in all_issues if issue.get("severity") == "HIGH")
+    logger.info(
+        "Script Quality Gate: claude=%s det_major=%d issues=%d (high=%d) attempt=%d",
+        issue_group["status"], len(issue_group["converted_det"]), len(all_issues), high, attempt,
+    )
+    tts_major_count = len([
+        issue for issue in issue_group["tts_det"] if issue["severity"] == "MAJOR"
+    ])
+    hook_major_count = len([
+        issue for issue in issue_group["hook_det"] if issue["severity"] == "MAJOR"
+    ])
+    logger.debug(
+        "QUALITY_GATE_BREAKDOWN attempt=%d det_tts_maj=%d det_hook_maj=%d",
+        attempt, tts_major_count, hook_major_count,
+    )
+    for issue in all_issues:
+        logger.debug(
+            "Script quality issue [%s/%s]: %s -> %s",
+            issue.get("severity", "?"), issue.get("category", "?"),
+            issue.get("description", ""), issue.get("fix", ""),
+        )
+
+
+def _has_tts_only_high_issues(all_issues: list[dict]) -> bool:
+    high_issues = [issue for issue in all_issues if issue.get("severity") == "HIGH"]
+    return bool(high_issues) and all(
+        issue.get("category") == "tts_compliance" for issue in high_issues
+    )
+
+
+def _apply_tts_only_quality_cleanup(
+    current: dict,
+    issue_group: dict,
+    attempt: int,
+) -> dict:
+    high_issues = [issue for issue in issue_group["all_issues"] if issue.get("severity") == "HIGH"]
+    logger.info(
+        "QUALITY_REWRITE_SKIPPED reason=TTS_ONLY high_count=%d attempt=%d",
+        len(high_issues), attempt,
+    )
+    voice_script = current.get("voice_script", "")
+    cleaned = split_long_sentences(normalize_tts_chars(voice_script))
+    if cleaned != voice_script:
+        current = {**current, "voice_script": cleaned, "video_script": cleaned}
+        logger.info("QUALITY_REWRITE_SKIPPED: deterministic cleanup applied")
+    _script_trace(f"quality_gate_tts_only_cleanup_{attempt}", current.get("voice_script", ""))
+    return current
+
+
+def _apply_post_rewrite_cleanup(current: dict, attempt: int) -> dict:
+    voice_script = current.get("voice_script", "")
+    cleaned = split_long_sentences(normalize_tts_chars(voice_script))
+    if cleaned != voice_script:
+        current = {**current, "voice_script": cleaned, "video_script": cleaned}
+        logger.info(
+            "Script Quality Gate: deterministic cleanup applied after rewrite (attempt %d)",
+            attempt,
+        )
+    return current
+
+
+def _apply_final_quality_cleanup(current: dict) -> dict:
+    voice_script = current.get("voice_script", "")
+    cleaned = split_long_sentences(normalize_tts_chars(voice_script))
+    if cleaned != voice_script:
+        current = {**current, "voice_script": cleaned, "video_script": cleaned}
+        logger.info("Script Quality Gate: final deterministic cleanup applied before returning")
     return current
 
 
@@ -600,7 +624,7 @@ def _match_turns(
                 label, i, _best_reveal_score, turn[:60],
             )
 
-    logger.info("TURN_MATCH label=%s covered=%s/%d", label, sorted(covered), len(major_turns))
+    logger.debug("TURN_MATCH label=%s covered=%s/%d", label, sorted(covered), len(major_turns))
     return covered
 
 
@@ -644,6 +668,195 @@ def _update_accumulator(
     })
 
 
+def _log_section_retry_input(
+    label: str,
+    attempt: int,
+    prior_sections_summary: list[dict],
+    visual_intent_accumulator: dict,
+    override: str,
+) -> None:
+    logger.debug(
+        "SECTION_INPUT label=%s attempt=%d prior_count=%d avoid_count=%d override=%s",
+        label, attempt, len(prior_sections_summary),
+        len(visual_intent_accumulator.get("avoid_repeating", [])),
+        bool(override),
+    )
+    for prior_section in prior_sections_summary[-3:]:
+        logger.debug(
+            "  SECTION_INPUT prior[%s] summary=%r reveals=%s open_q=%s",
+            prior_section.get("label"),
+            (prior_section.get("summary") or "")[:80],
+            (prior_section.get("reveals") or [])[:3],
+            (prior_section.get("open_questions") or [])[:2],
+        )
+
+
+def _call_section_generation(
+    label: str,
+    story,
+    blueprint: dict,
+    prior_sections_summary: list[dict],
+    visual_intent_accumulator: dict,
+    channel: Channel,
+    script_format: str,
+    tts_model: str,
+    tts_provider: str,
+    audio_tags_enabled: bool,
+    override: str,
+    primary_required_turn: str | None,
+    future_uncovered_turns: list[str] | None,
+    attempt: int,
+) -> dict | None:
+    try:
+        return generate_section(
+            label=label,
+            story=story,
+            blueprint=blueprint,
+            prior_sections_summary=prior_sections_summary,
+            visual_intent_accumulator=visual_intent_accumulator,
+            channel=channel,
+            script_format=script_format,
+            tts_model=tts_model,
+            tts_provider=tts_provider,
+            audio_tags_enabled=audio_tags_enabled,
+            override_instruction=override,
+            primary_required_turn=primary_required_turn,
+            future_uncovered_turns=future_uncovered_turns,
+        )
+    except Exception as exc:
+        logger.error("Section %s generation error (attempt %d): %s", label, attempt, exc)
+        return None
+
+
+def _log_section_generation_output(label: str, attempt: int, result: dict) -> dict:
+    script_text = result.get("script_text", "")
+    metrics = {
+        "word_count": len(script_text.split()),
+        "sentence_count": _count_sentences(script_text),
+        "max_sentence_len": _max_sentence_len(script_text),
+    }
+    first_sentence = (re.split(r"(?<=[.!?])\s+", script_text.strip()) or [""])[0][:120]
+    logger.debug(
+        "SECTION_OUTPUT label=%s attempt=%d words=%d sents=%d max_sent=%d suggests_outro=%s",
+        label, attempt, metrics["word_count"], metrics["sentence_count"],
+        metrics["max_sentence_len"], result.get("suggests_outro", False),
+    )
+    logger.debug("SECTION_OUTPUT label=%s first_sent=%r", label, first_sentence)
+    logger.debug(
+        "SECTION_OUTPUT label=%s summary=%r reveals=%s open_q=%s vi_goal=%r",
+        label,
+        (result.get("summary") or "")[:100],
+        [(reveal or "")[:60] for reveal in (result.get("reveals") or [])[:3]],
+        [(question or "")[:60] for question in (result.get("open_questions") or [])[:2]],
+        ((result.get("visual_intent") or {}).get("section_goal") or "")[:80],
+    )
+    return metrics
+
+
+def _clean_generated_section(result: dict) -> tuple[dict, str, bool]:
+    script_text = result.get("script_text", "")
+    cleaned = normalize_tts_chars(script_text)
+    cleaned = split_long_sentences(cleaned)
+    backstop_changed = cleaned != script_text
+    if backstop_changed:
+        result = {**result, "script_text": cleaned}
+    return result, cleaned, backstop_changed
+
+
+def _collect_section_retry_issues(
+    script_text: str,
+    check_hook: bool,
+    prior_summary_text: str,
+) -> dict:
+    tts_issues = check_tts_compliance(script_text, "source")
+    hook_issues = check_hook_quality(script_text, "source") if check_hook else []
+    transition_issues = (
+        check_section_transition(script_text, prior_summary_text)
+        if prior_summary_text else []
+    )
+    majors = [issue for issue in tts_issues + hook_issues if issue["severity"] == "MAJOR"]
+    return {
+        "tts_issues": tts_issues,
+        "hook_issues": hook_issues,
+        "transition_issues": transition_issues,
+        "majors": majors,
+    }
+
+
+def _log_section_cleanup(
+    label: str,
+    attempt: int,
+    backstop_changed: bool,
+    raw_metrics: dict,
+    script_text: str,
+    issue_group: dict,
+) -> None:
+    tts_major_count = len([
+        issue for issue in issue_group["tts_issues"] if issue["severity"] == "MAJOR"
+    ])
+    logger.debug(
+        "SECTION_CLEANUP label=%s attempt=%d backstop=%s words=%d→%d "
+        "max_sent=%d→%d tts_maj=%d total_maj=%d",
+        label, attempt, backstop_changed,
+        raw_metrics["word_count"], len(script_text.split()),
+        raw_metrics["max_sentence_len"], _max_sentence_len(script_text),
+        tts_major_count, len(issue_group["majors"]),
+    )
+
+
+def _log_section_transition_issues(label: str, transition_issues: list[dict]) -> None:
+    for transition_issue in transition_issues:
+        logger.info(
+            "Section %s transition check [MINOR]: %s",
+            label,
+            transition_issue["description"],
+        )
+
+
+def _finalize_section_after_retry_limit(
+    label: str,
+    result: dict,
+    script_text: str,
+    check_hook: bool,
+) -> dict:
+    cleaned = normalize_tts_chars(script_text)
+    cleaned = split_long_sentences(cleaned)
+    if cleaned != script_text:
+        script_text = cleaned
+        result = {**result, "script_text": script_text}
+
+    final_majors = [
+        issue for issue in
+        check_tts_compliance(script_text, "source")
+        + (check_hook_quality(script_text, "source") if check_hook else [])
+        if issue["severity"] == "MAJOR"
+    ]
+    if final_majors:
+        logger.warning(
+            "Section %s: proceeding with %d known TTS MAJOR issue(s) after "
+            "final deterministic cleanup — %s",
+            label, len(final_majors),
+            [f"{issue['category']}: {(issue.get('offending_text') or '')[:50]}"
+             for issue in final_majors],
+        )
+    else:
+        logger.info(
+            "Section %s: final deterministic cleanup resolved all MAJOR issues",
+            label,
+        )
+    return result
+
+
+def _build_section_retry_instruction(
+    majors: list[dict],
+    transition_issues: list[dict],
+) -> str:
+    feedback_parts = [issue["description"] for issue in majors[:3]]
+    if transition_issues:
+        feedback_parts.append(transition_issues[0]["description"])
+    return f"Fix these issues from the previous attempt: {'; '.join(feedback_parts)}"
+
+
 def _generate_section_with_retry(
     label: str,
     story,
@@ -660,177 +873,56 @@ def _generate_section_with_retry(
     primary_required_turn: str | None = None,
     future_uncovered_turns: list[str] | None = None,
 ) -> dict | None:
-    """Generate a single section, retrying up to _MAX_SECTION_RETRIES on MAJOR violations.
-
-    Per-section checks (in order):
-    1. check_tts_compliance — always run.
-    2. check_hook_quality   — INTRO only (check_hook=True).
-    3. check_section_transition — body/OUTRO only; MINOR, folded into retry override
-       if a MAJOR retry is already triggered. Never hard-blocks on its own.
-
-    On MAJOR findings the specific descriptions (plus any MINOR transition note) are
-    forwarded as override_instruction to the next attempt.
-
-    Args:
-        label:                   Section label ("INTRO", "SECTION 1", "OUTRO", …).
-        story:                   Story object passed to generate_section().
-        blueprint:               Blueprint dict.
-        prior_sections_summary:  Accumulated summaries from all prior sections.
-        visual_intent_accumulator: Accumulated visual avoid list.
-        channel:                 Channel ORM object.
-        script_format:           Format key.
-        tts_model:               TTS model ID.
-        tts_provider:            TTS provider.
-        audio_tags_enabled:      ElevenLabs v3 audio tag opt-in.
-        check_hook:              Whether to run check_hook_quality (INTRO only).
-        prior_summary_text:      Summary text of the immediately preceding section —
-                                 used by check_section_transition. Empty string skips
-                                 the check (correct for INTRO).
-        primary_required_turn:   The single earliest uncovered turn to advance. None for
-                                 INTRO/OUTRO (no constraint). Forwarded to generate_section().
-        future_uncovered_turns:  Remaining uncovered turns after the primary. Injected as
-                                 "do NOT resolve yet". None when ≤1 uncovered turn remains.
-
-    Returns:
-        Section dict from generate_section(), or None if all retries exhausted.
-    """
+    """Generate a single section, retrying up to _MAX_SECTION_RETRIES on MAJOR violations."""
     override = ""
     for attempt in range(1, _MAX_SECTION_RETRIES + 2):
-        # ── Section generation input log ──────────────────────────────────────
-        logger.info(
-            "SECTION_INPUT label=%s attempt=%d prior_count=%d avoid_count=%d override=%s",
-            label, attempt, len(prior_sections_summary),
-            len(visual_intent_accumulator.get("avoid_repeating", [])),
-            bool(override),
+        _log_section_retry_input(
+            label, attempt, prior_sections_summary, visual_intent_accumulator, override
         )
-        for _ps in prior_sections_summary[-3:]:
-            logger.debug(
-                "  SECTION_INPUT prior[%s] summary=%r reveals=%s open_q=%s",
-                _ps.get("label"),
-                (_ps.get("summary") or "")[:80],
-                (_ps.get("reveals") or [])[:3],
-                (_ps.get("open_questions") or [])[:2],
-            )
-        try:
-            result = generate_section(
-                label=label,
-                story=story,
-                blueprint=blueprint,
-                prior_sections_summary=prior_sections_summary,
-                visual_intent_accumulator=visual_intent_accumulator,
-                channel=channel,
-                script_format=script_format,
-                tts_model=tts_model,
-                tts_provider=tts_provider,
-                audio_tags_enabled=audio_tags_enabled,
-                override_instruction=override,
-                primary_required_turn=primary_required_turn,
-                future_uncovered_turns=future_uncovered_turns,
-            )
-        except Exception as exc:
-            logger.error("Section %s generation error (attempt %d): %s", label, attempt, exc)
+        result = _call_section_generation(
+            label=label,
+            story=story,
+            blueprint=blueprint,
+            prior_sections_summary=prior_sections_summary,
+            visual_intent_accumulator=visual_intent_accumulator,
+            channel=channel,
+            script_format=script_format,
+            tts_model=tts_model,
+            tts_provider=tts_provider,
+            audio_tags_enabled=audio_tags_enabled,
+            override=override,
+            primary_required_turn=primary_required_turn,
+            future_uncovered_turns=future_uncovered_turns,
+            attempt=attempt,
+        )
+        if result is None:
             if attempt > _MAX_SECTION_RETRIES:
                 return None
             continue
 
-        script_text = result.get("script_text", "")
-
-        # ── Section generation output log ─────────────────────────────────────
-        _wc_raw      = len(script_text.split())
-        _sc_raw      = _count_sentences(script_text)
-        _max_len_raw = _max_sentence_len(script_text)
-        _first_raw   = (re.split(r"(?<=[.!?])\s+", script_text.strip()) or [""])[0][:120]
-        logger.info(
-            "SECTION_OUTPUT label=%s attempt=%d words=%d sents=%d max_sent=%d suggests_outro=%s",
-            label, attempt, _wc_raw, _sc_raw, _max_len_raw, result.get("suggests_outro", False),
+        raw_metrics = _log_section_generation_output(label, attempt, result)
+        result, script_text, backstop_changed = _clean_generated_section(result)
+        issue_group = _collect_section_retry_issues(
+            script_text=script_text,
+            check_hook=check_hook,
+            prior_summary_text=prior_summary_text,
         )
-        logger.info("SECTION_OUTPUT label=%s first_sent=%r", label, _first_raw)
-        logger.debug(
-            "SECTION_OUTPUT label=%s summary=%r reveals=%s open_q=%s vi_goal=%r",
-            label,
-            (result.get("summary") or "")[:100],
-            [(r or "")[:60] for r in (result.get("reveals") or [])[:3]],
-            [(q or "")[:60] for q in (result.get("open_questions") or [])[:2]],
-            ((result.get("visual_intent") or {}).get("section_goal") or "")[:80],
+        _log_section_cleanup(
+            label, attempt, backstop_changed, raw_metrics, script_text, issue_group
         )
+        _log_section_transition_issues(label, issue_group["transition_issues"])
 
-        # ── Deterministic backstop: normalize forbidden chars, then split long sentences ─
-        # Runs on EVERY attempt — normalize first so split operates on clean text.
-        # A section that passes on attempt 1 or 2 has its forbidden chars (/ % & ())
-        # removed here; without this normalize would only run in the final-cleanup block
-        # (after max retries), letting "/" survive into the assembled script and
-        # re-trigger issues at the quality gate.
-        cleaned = normalize_tts_chars(script_text)
-        cleaned = split_long_sentences(cleaned)
-        _backstop_changed = (cleaned != script_text)
-        if _backstop_changed:
-            script_text = cleaned
-            result = {**result, "script_text": script_text}
-
-        # ── Deterministic checks ──────────────────────────────────────────────
-        tts_issues        = check_tts_compliance(script_text, "source")
-        hook_issues       = check_hook_quality(script_text, "source") if check_hook else []
-        transition_issues = (
-            check_section_transition(script_text, prior_summary_text)
-            if prior_summary_text else []
-        )
-        majors = [i for i in tts_issues + hook_issues if i["severity"] == "MAJOR"]
-
-        # ── Cleanup log ───────────────────────────────────────────────────────
-        _tts_maj = len([i for i in tts_issues if i["severity"] == "MAJOR"])
-        logger.info(
-            "SECTION_CLEANUP label=%s attempt=%d backstop=%s words=%d→%d "
-            "max_sent=%d→%d tts_maj=%d total_maj=%d",
-            label, attempt, _backstop_changed,
-            _wc_raw, len(script_text.split()),
-            _max_len_raw, _max_sentence_len(script_text),
-            _tts_maj, len(majors),
-        )
-
-        # Log MINOR transition issues regardless of retry outcome
-        for ti in transition_issues:
-            logger.info(
-                "Section %s transition check [MINOR]: %s", label, ti["description"]
-            )
-
-        if not majors:
+        if not issue_group["majors"]:
             return result
 
         if attempt > _MAX_SECTION_RETRIES:
-            # Final deterministic cleanup — normalize forbidden chars then re-split
-            cleaned = normalize_tts_chars(script_text)
-            cleaned = split_long_sentences(cleaned)
-            if cleaned != script_text:
-                script_text = cleaned
-                result = {**result, "script_text": script_text}
+            return _finalize_section_after_retry_limit(
+                label, result, script_text, check_hook
+            )
 
-            # Re-check to get accurate final issue count for logging
-            final_majors = [
-                i for i in
-                check_tts_compliance(script_text, "source")
-                + (check_hook_quality(script_text, "source") if check_hook else [])
-                if i["severity"] == "MAJOR"
-            ]
-            if final_majors:
-                logger.warning(
-                    "Section %s: proceeding with %d known TTS MAJOR issue(s) after "
-                    "final deterministic cleanup — %s",
-                    label, len(final_majors),
-                    [f"{i['category']}: {(i.get('offending_text') or '')[:50]}"
-                     for i in final_majors],
-                )
-            else:
-                logger.info(
-                    "Section %s: final deterministic cleanup resolved all MAJOR issues",
-                    label,
-                )
-            return result
-
-        # Build override: MAJOR descriptions + MINOR transition note (if any)
-        feedback_parts = [i["description"] for i in majors[:3]]
-        if transition_issues:
-            feedback_parts.append(transition_issues[0]["description"])
-        override = f"Fix these issues from the previous attempt: {'; '.join(feedback_parts)}"
+        override = _build_section_retry_instruction(
+            issue_group["majors"], issue_group["transition_issues"]
+        )
         logger.info("Section %s retry %d — issues: %s", label, attempt, override)
 
     return None
@@ -940,6 +1032,694 @@ def check_narrative_completeness(
     return issues
 
 
+def _build_section_generation_context(
+    channel_voice: ChannelVoice | None,
+    blueprint: dict,
+) -> dict:
+    major_turns = blueprint.get("major_turns") or []
+    max_body = max(
+        _MIN_BODY_SECTIONS,
+        min(_MAX_BODY_SECTIONS, blueprint.get("suggested_section_count", 3)),
+    )
+    min_body_for_blueprint = (
+        max(_MIN_BODY_SECTIONS, min(4, len(major_turns)))
+        if len(major_turns) >= 4
+        else _MIN_BODY_SECTIONS
+    )
+    return {
+        "tts_model": channel_voice.tts_model if channel_voice else "sonic-2",
+        "tts_provider": channel_voice.provider if channel_voice else "cartesia",
+        "major_turns": major_turns,
+        "max_body": max_body,
+        "min_body_for_blueprint": min_body_for_blueprint,
+    }
+
+
+def _create_section_loop_state() -> dict:
+    return {
+        "visual_intent_accumulator": {"avoid_repeating": []},
+        "prior_sections_summary": [],
+        "sections": [],
+        "visual_intent_history": [],
+        "covered_turns": set(),
+        "section_calls": 0,
+        "narrative_retry_calls": 0,
+    }
+
+
+def _log_blueprint_summary(blueprint: dict, major_turns: list[str], max_body: int) -> None:
+    logger.info(
+        "BLUEPRINT hook=%r payoff=%r trigger=%r section_count=%d turns=%d max_body=%d",
+        (blueprint.get("hook") or "")[:80],
+        (blueprint.get("final_payoff") or "")[:60],
+        (blueprint.get("comment_trigger") or "")[:60],
+        blueprint.get("suggested_section_count", 0),
+        len(major_turns),
+        max_body,
+    )
+    for _ti, _turn in enumerate(major_turns):
+        logger.info("BLUEPRINT turn[%d]=%r", _ti, _turn[:80])
+
+
+def _append_generated_section(
+    state: dict,
+    label: str,
+    section: dict,
+    major_turns: list[str],
+    add_prior_summary: bool = True,
+    track_turns: bool = True,
+) -> set[int]:
+    state["section_calls"] += 1
+    state["sections"].append({"label": label, "script_text": section["script_text"]})
+    _update_accumulator(
+        state["visual_intent_accumulator"],
+        section,
+        state["visual_intent_history"],
+        label,
+    )
+    if add_prior_summary:
+        state["prior_sections_summary"].append({
+            "label": label,
+            "summary": section.get("summary", ""),
+            "reveals": section.get("reveals", []),
+            "open_questions": section.get("open_questions", []),
+        })
+    if not track_turns:
+        return set()
+    return _match_turns(
+        section.get("reveals", []),
+        major_turns,
+        section.get("script_text", ""),
+        label=label,
+    )
+
+
+def _select_required_turns(
+    major_turns: list[str],
+    covered_turns: set[int],
+) -> tuple[list[int], int | None, str | None, list[str]]:
+    uncovered = [i for i in range(len(major_turns)) if i not in covered_turns]
+    primary_idx = uncovered[0] if uncovered else None
+    primary_turn = major_turns[primary_idx] if primary_idx is not None else None
+    future_turns = [major_turns[i] for i in uncovered[1:]]
+    return uncovered, primary_idx, primary_turn, future_turns
+
+
+def _generate_intro_section(
+    story,
+    blueprint: dict,
+    channel: Channel,
+    script_format: str,
+    audio_tags_enabled: bool,
+    context: dict,
+    state: dict,
+) -> None:
+    major_turns = context["major_turns"]
+    _uncov = list(range(len(major_turns)))
+    logger.debug("SECTION_INPUT label=INTRO sections_so_far=0 covered=[] uncovered=%s", _uncov)
+    intro = _generate_section_with_retry(
+        label="INTRO",
+        story=story,
+        blueprint=blueprint,
+        prior_sections_summary=[],
+        visual_intent_accumulator=state["visual_intent_accumulator"],
+        channel=channel,
+        script_format=script_format,
+        tts_model=context["tts_model"],
+        tts_provider=context["tts_provider"],
+        audio_tags_enabled=audio_tags_enabled,
+        check_hook=True,
+        prior_summary_text="",
+        primary_required_turn=None,
+        future_uncovered_turns=None,
+    )
+    if intro is None:
+        raise RuntimeError("generate_script_sections: INTRO generation failed after retries")
+    state["covered_turns"] |= _append_generated_section(state, "INTRO", intro, major_turns)
+
+
+def _credit_body_turn_coverage(
+    covered_turns: set[int],
+    matched_turns: set[int],
+    label: str,
+    primary_idx: int | None,
+) -> None:
+    if len(matched_turns) >= 3:
+        logger.debug(
+            "generate_script_sections: %s over-compressed major turns — "
+            "matched %d turns %s, crediting only primary turn [%s]",
+            label, len(matched_turns), sorted(matched_turns), primary_idx,
+        )
+        if primary_idx is not None:
+            covered_turns.add(primary_idx)
+        else:
+            covered_turns |= matched_turns
+    else:
+        covered_turns |= matched_turns
+        if primary_idx is not None:
+            covered_turns.add(primary_idx)
+
+
+def _should_stop_body_loop(
+    body_index: int,
+    section: dict,
+    blueprint: dict,
+    major_turns: list[str],
+    covered_turns: set[int],
+    max_body: int,
+    min_body_for_blueprint: int,
+) -> bool:
+    all_turns_covered = len(covered_turns) >= len(major_turns)
+    at_min = body_index > min_body_for_blueprint
+    claude_suggests_outro = bool(section.get("suggests_outro", False))
+    at_soft_max = body_index > max_body
+    at_hard_max = body_index > _MAX_BODY_SECTIONS
+    payoff_done = _payoff_reached(section, blueprint)
+
+    logger.debug(
+        "LOOP_DECISION body_index=%d covered=%d/%d all_covered=%s payoff=%s "
+        "suggests_outro=%s at_min=%s at_soft=%s at_hard=%s min_body=%d",
+        body_index, len(covered_turns), len(major_turns),
+        all_turns_covered, payoff_done, claude_suggests_outro,
+        at_min, at_soft_max, at_hard_max, min_body_for_blueprint,
+    )
+
+    if at_hard_max:
+        if not all_turns_covered:
+            logger.warning(
+                "generate_script_sections: hard cap (%d body sections) reached with "
+                "%d/%d major turns still uncovered — proceeding to OUTRO",
+                _MAX_BODY_SECTIONS,
+                len(major_turns) - len(covered_turns), len(major_turns),
+            )
+            logger.debug("LOOP_DECISION: break_hard_cap reason=uncovered_turns_remain")
+        else:
+            logger.warning(
+                "generate_script_sections: ending body loop after %d section(s) "
+                "(hard cap reached, all turns covered)",
+                body_index - 1,
+            )
+            logger.debug("LOOP_DECISION: break_hard_cap reason=all_covered")
+        return True
+
+    if at_soft_max and not all_turns_covered:
+        logger.warning(
+            "generate_script_sections: soft max (%d) reached with %d/%d major turns "
+            "uncovered — extending to hard cap (%d)",
+            max_body,
+            len(major_turns) - len(covered_turns), len(major_turns),
+            _MAX_BODY_SECTIONS,
+        )
+        logger.debug("LOOP_DECISION: continue reason=soft_max_but_uncovered_turns")
+        return False
+
+    if all_turns_covered and at_min and (at_soft_max or claude_suggests_outro):
+        logger.info(
+            "generate_script_sections: ending body loop after %d section(s) "
+            "(covered_turns=%d/%d, suggests_outro=%s, at_soft_max=%s)",
+            body_index - 1, len(covered_turns), len(major_turns),
+            claude_suggests_outro, at_soft_max,
+        )
+        logger.debug(
+            "LOOP_DECISION: break_normal reason=all_covered+past_min+(%s)",
+            "soft_max" if at_soft_max else "claude_suggests",
+        )
+        return True
+
+    logger.debug(
+        "LOOP_DECISION: continue reason=not_all_conditions_met "
+        "(all_covered=%s at_min=%s at_soft=%s claude=%s)",
+        all_turns_covered, at_min, at_soft_max, claude_suggests_outro,
+    )
+    return False
+
+
+def _run_body_section_loop(
+    story,
+    blueprint: dict,
+    channel: Channel,
+    script_format: str,
+    audio_tags_enabled: bool,
+    context: dict,
+    state: dict,
+) -> None:
+    body_index = 1
+    major_turns = context["major_turns"]
+    while True:
+        label = f"SECTION {body_index}"
+        uncovered, primary_idx, primary_turn, future_turns = _select_required_turns(
+            major_turns, state["covered_turns"]
+        )
+        logger.debug(
+            "SECTION_INPUT label=%s sections_so_far=%d covered=[%s] "
+            "primary_turn_idx=%s uncovered=%s",
+            label, len(state["prior_sections_summary"]),
+            ",".join(str(i) for i in sorted(state["covered_turns"])),
+            primary_idx, uncovered,
+        )
+        section = _generate_section_with_retry(
+            label=label,
+            story=story,
+            blueprint=blueprint,
+            prior_sections_summary=state["prior_sections_summary"],
+            visual_intent_accumulator=state["visual_intent_accumulator"],
+            channel=channel,
+            script_format=script_format,
+            tts_model=context["tts_model"],
+            tts_provider=context["tts_provider"],
+            audio_tags_enabled=audio_tags_enabled,
+            check_hook=False,
+            prior_summary_text=state["prior_sections_summary"][-1]["summary"] if state["prior_sections_summary"] else "",
+            primary_required_turn=primary_turn,
+            future_uncovered_turns=future_turns if future_turns else None,
+        )
+        if section is None:
+            logger.warning(
+                "generate_script_sections: %s failed after retries — stopping body loop", label
+            )
+            break
+
+        matched_turns = _append_generated_section(state, label, section, major_turns)
+        _credit_body_turn_coverage(state["covered_turns"], matched_turns, label, primary_idx)
+        body_index += 1
+
+        if _should_stop_body_loop(
+            body_index=body_index,
+            section=section,
+            blueprint=blueprint,
+            major_turns=major_turns,
+            covered_turns=state["covered_turns"],
+            max_body=context["max_body"],
+            min_body_for_blueprint=context["min_body_for_blueprint"],
+        ):
+            break
+
+
+def _generate_outro_section(
+    story,
+    blueprint: dict,
+    channel: Channel,
+    script_format: str,
+    audio_tags_enabled: bool,
+    context: dict,
+    state: dict,
+) -> None:
+    major_turns = context["major_turns"]
+    _uncov_outro = [i for i in range(len(major_turns)) if i not in state["covered_turns"]]
+    logger.debug(
+        "SECTION_INPUT label=OUTRO sections_so_far=%d covered=[%s] uncovered=%s",
+        len(state["prior_sections_summary"]),
+        ",".join(str(i) for i in sorted(state["covered_turns"])),
+        _uncov_outro,
+    )
+    outro = _generate_section_with_retry(
+        label="OUTRO",
+        story=story,
+        blueprint=blueprint,
+        prior_sections_summary=state["prior_sections_summary"],
+        visual_intent_accumulator=state["visual_intent_accumulator"],
+        channel=channel,
+        script_format=script_format,
+        tts_model=context["tts_model"],
+        tts_provider=context["tts_provider"],
+        audio_tags_enabled=audio_tags_enabled,
+        check_hook=False,
+        prior_summary_text=state["prior_sections_summary"][-1]["summary"] if state["prior_sections_summary"] else "",
+        primary_required_turn=None,
+        future_uncovered_turns=None,
+    )
+    if outro is None:
+        raise RuntimeError("generate_script_sections: OUTRO generation failed after retries")
+    _append_generated_section(
+        state, "OUTRO", outro, major_turns, add_prior_summary=False, track_turns=False
+    )
+    _log_outro_overlap(state["sections"], outro)
+
+
+def _log_outro_overlap(sections: list[dict], outro: dict) -> None:
+    _outro_text = outro["script_text"]
+    _prev_body = [s for s in sections[:-1] if s["label"] not in ("INTRO", "OUTRO")]
+    if _prev_body:
+        _outro_tokens = _get_content_tokens(_outro_text)
+        _prev_tokens = _get_content_tokens(_prev_body[-1]["script_text"])
+        if _outro_tokens:
+            _outro_ov = len(_outro_tokens & _prev_tokens) / len(_outro_tokens)
+            _repeated = sorted(_outro_tokens & _prev_tokens)[:8]
+            if _outro_ov > 0.5:
+                logger.debug(
+                    "OUTRO_OVERLAP previous_section_overlap=%.3f repeated_terms=%s "
+                    "— OUTRO heavily repeats prior section (non-blocking)",
+                    _outro_ov, _repeated,
+                )
+            else:
+                logger.debug(
+                    "OUTRO_OVERLAP previous_section_overlap=%.3f repeated_terms=%s",
+                    _outro_ov, _repeated,
+                )
+
+
+def _assemble_sections_with_diagnostics(
+    state: dict,
+    story,
+    blueprint: dict,
+    channel: Channel,
+    script_format: str,
+    context: dict,
+) -> tuple[str, str]:
+    sections = state["sections"]
+    diagnose_section_repetition(sections)
+    voice_script, video_script = assemble_script(sections)
+    _script_trace("after_section_assembly", voice_script)
+
+    _phrase_hits = detect_generic_documentary_phrases(voice_script)
+    for _hit in _phrase_hits:
+        logger.debug(
+            "GENERIC_PHRASE detected=%r in sentence=%r — rewrite recommended (non-blocking)",
+            _hit["phrase"], _hit["sentence"],
+        )
+
+    completeness_issues = check_completeness(video_script, voice_script, "source")
+    length_issues = check_minimum_length(voice_script, "source", script_format)
+
+    if completeness_issues:
+        logger.warning(
+            "generate_script_sections: post-assembly completeness issue(s) (telemetry): %s",
+            [i.get("description") for i in completeness_issues],
+        )
+
+    length_majors = [i for i in length_issues if i.get("severity") == "MAJOR"]
+    if length_majors:
+        voice_script, video_script = _apply_length_correction(
+            voice_script=voice_script,
+            video_script=video_script,
+            length_majors=length_majors,
+            story=story,
+            channel=channel,
+            script_format=script_format,
+            context=context,
+        )
+
+    _run_global_script_validation(voice_script, blueprint)
+    return voice_script, video_script
+
+
+def _apply_length_correction(
+    voice_script: str,
+    video_script: str,
+    length_majors: list[dict],
+    story,
+    channel: Channel,
+    script_format: str,
+    context: dict,
+) -> tuple[str, str]:
+    wc_before = len(voice_script.split())
+    logger.warning(
+        "generate_script_sections: voice_script under minimum length (%d words) — "
+        "calling auto_correct_script once with source_excerpt",
+        wc_before,
+    )
+    try:
+        corrected = auto_correct_script(
+            current_scripts={"video_script": video_script, "voice_script": voice_script},
+            issues=length_majors,
+            language=story.language,
+            channel=channel,
+            script_format=script_format,
+            source_excerpt=(story.body or "")[:8000],
+            tts_model=context["tts_model"],
+            tts_provider=context["tts_provider"],
+        )
+        video_script = corrected.get("video_script", video_script)
+        voice_script = corrected.get("voice_script", voice_script)
+        wc_after = len(voice_script.split())
+        logger.info(
+            "generate_script_sections: length correction applied — %d → %d words",
+            wc_before, wc_after,
+        )
+    except Exception as exc:
+        logger.debug(
+            "generate_script_sections: length correction failed (non-blocking): %s", exc
+        )
+    return voice_script, video_script
+
+
+def _run_global_script_validation(voice_script: str, blueprint: dict) -> None:
+    try:
+        gv = validate_script_globally(voice_script, blueprint)
+        if gv.get("status") == "NEEDS_FIX":
+            for issue in gv.get("issues", []):
+                logger.info(
+                    "Global validation [%s]: %s — %s",
+                    issue.get("section"), issue.get("description"), issue.get("suggestion"),
+                )
+    except Exception as exc:
+        logger.debug("Global validation failed (non-blocking): %s", exc)
+
+
+def _log_turn_coverage_alignment(
+    voice_script: str,
+    major_turns: list[str],
+    covered_turns: set[int],
+) -> None:
+    _vs_body_tokens = _get_content_tokens(voice_script)
+    _nc_would_flag: list[int] = []
+    for _i, _turn in enumerate(major_turns):
+        _tt = _get_content_tokens(_turn)
+        _ov = len(_tt & _vs_body_tokens) / len(_tt) if _tt else 0.0
+        if _ov < 0.6:
+            _nc_would_flag.append(_i)
+    logger.debug(
+        "TURN_COVERAGE_SOURCE section_progression=%s narrative_check=%s",
+        sorted(covered_turns), _nc_would_flag,
+    )
+    _disagreement = covered_turns & set(_nc_would_flag)
+    if _disagreement:
+        logger.debug(
+            "TURN_COVERAGE_DISAGREEMENT: section_progression credits turns %s but "
+            "60%%-overlap check would flag them — section_progression is authoritative, "
+            "these turns will be excluded from narrative retry",
+            sorted(_disagreement),
+        )
+
+    logger.debug(
+        "TURN_COVERAGE_FINAL authoritative=%s total=%d/%d",
+        sorted(covered_turns), len(covered_turns), len(major_turns),
+    )
+
+
+def _group_narrative_retry_instructions(
+    nc_issues: list[str],
+    sections: list[dict],
+) -> dict[str, list[str]]:
+    issue_to_section: list[tuple[str, str | None]] = [
+        ("Hook:", "INTRO"),
+        ("Major turns", None),
+        ("final_payoff", "OUTRO"),
+        ("comment_trigger", "OUTRO"),
+    ]
+    body_labels = [s["label"] for s in sections if s["label"] not in ("INTRO", "OUTRO")]
+    section_instructions: dict[str, list[str]] = {}
+    for issue in nc_issues:
+        target_label: str | None = None
+        for prefix, lbl in issue_to_section:
+            if issue.startswith(prefix):
+                target_label = lbl
+                break
+        if target_label is None:
+            target_label = body_labels[-1] if body_labels else "OUTRO"
+        section_instructions.setdefault(target_label, []).append(issue)
+    return section_instructions
+
+
+def _run_single_narrative_retry(
+    target_label: str,
+    instructions: list[str],
+    state: dict,
+    story,
+    blueprint: dict,
+    channel: Channel,
+    script_format: str,
+    audio_tags_enabled: bool,
+    context: dict,
+) -> None:
+    sections = state["sections"]
+    major_turns = context["major_turns"]
+    covered_turns = state["covered_turns"]
+    label_to_idx: dict[str, int] = {s["label"]: i for i, s in enumerate(sections)}
+    idx = label_to_idx.get(target_label)
+    if idx is None:
+        logger.warning(
+            "generate_script_sections: narrative retry — section %r not found, skipping",
+            target_label,
+        )
+        return
+
+    combined = "; ".join(instructions)
+    override = (
+        f"The assembled script has these narrative completeness issues: {combined}. "
+        f"Fix all of them in this section."
+    )
+    logger.info(
+        "generate_script_sections: narrative retry for section %r — %s",
+        target_label, combined,
+    )
+    logger.info(
+        "NARRATIVE_COMPLETENESS target=%r issues=%s covered_before=%d/%d",
+        target_label, instructions, len(covered_turns), len(major_turns),
+    )
+    state["narrative_retry_calls"] += 1
+    _old_sha = hashlib.sha256(
+        sections[idx]["script_text"].encode("utf-8", errors="replace")
+    ).hexdigest()[:8]
+    _covered_before_retry = len(covered_turns)
+    try:
+        prior_for_retry = [
+            {"label": s["label"], "summary": "", "reveals": [], "open_questions": []}
+            for s in sections[:idx]
+        ]
+        result = generate_section(
+            label=target_label,
+            story=story,
+            blueprint=blueprint,
+            prior_sections_summary=prior_for_retry,
+            visual_intent_accumulator=state["visual_intent_accumulator"],
+            channel=channel,
+            script_format=script_format,
+            tts_model=context["tts_model"],
+            tts_provider=context["tts_provider"],
+            audio_tags_enabled=audio_tags_enabled,
+            override_instruction=override,
+        )
+        retry_text = _clean_narrative_retry_text(result.get("script_text", ""), target_label)
+        sections[idx] = {"label": target_label, "script_text": retry_text}
+        _new_sha = hashlib.sha256(
+            retry_text.encode("utf-8", errors="replace")
+        ).hexdigest()[:8]
+        _new_first = (re.split(r"(?<=[.!?])\s+", retry_text.strip()) or [""])[0][:80]
+        _retry_coverage = _match_turns(
+            result.get("reveals", []), major_turns, retry_text,
+            label=f"{target_label}_retry_check",
+        )
+        _covered_after_retry = len(covered_turns | _retry_coverage)
+        logger.debug(
+            "NARRATIVE_RETRY target=%r sha=%s→%s first_sent=%r",
+            target_label, _old_sha, _new_sha, _new_first,
+        )
+        logger.debug(
+            "NARRATIVE_RETRY target=%r new_reveals=%s turns_covered=%d→%d/%d",
+            target_label,
+            [(r or "")[:60] for r in (result.get("reveals") or [])[:3]],
+            _covered_before_retry, _covered_after_retry, len(major_turns),
+        )
+        logger.info(
+            "generate_script_sections: narrative retry replaced section %r", target_label
+        )
+    except Exception as exc:
+        logger.warning(
+            "generate_script_sections: narrative retry call failed for %r: %s — "
+            "proceeding with original section",
+            target_label, exc,
+        )
+
+
+def _clean_narrative_retry_text(retry_text: str, target_label: str) -> str:
+    cleaned = split_long_sentences(normalize_tts_chars(retry_text))
+    if cleaned != retry_text:
+        retry_text = cleaned
+        logger.info(
+            "generate_script_sections: narrative retry backstop modified %r",
+            target_label,
+        )
+
+    if target_label == "INTRO":
+        _hook_after = [
+            i for i in check_hook_quality(retry_text, "source")
+            if i["severity"] == "MAJOR"
+        ]
+        if _hook_after:
+            logger.warning(
+                "generate_script_sections: INTRO narrative retry still has "
+                "MAJOR hook issue(s) after backstop — %s",
+                [i["description"] for i in _hook_after],
+            )
+    return retry_text
+
+
+def _log_post_retry_narrative_result(
+    voice_script: str,
+    blueprint: dict,
+    major_turns: list[str],
+    covered_turns: set[int],
+) -> None:
+    nc_issues_after = check_narrative_completeness(
+        voice_script, blueprint, already_covered=covered_turns
+    )
+    if nc_issues_after:
+        logger.warning(
+            "generate_script_sections: narrative completeness still failing after retry: %s",
+            nc_issues_after,
+        )
+        _post_nc_body = _get_content_tokens(voice_script)
+        for _i_post, _t_post in enumerate(major_turns):
+            if _i_post in covered_turns:
+                _tp = _get_content_tokens(_t_post)
+                _ov_post = len(_tp & _post_nc_body) / len(_tp) if _tp else 0.0
+                if _ov_post < 0.6:
+                    logger.warning(
+                        "TURN_COVERAGE_DISAGREEMENT_POST_RETRY turn[%d] overlap=%.2f "
+                        "— section_progression is authoritative, ignoring",
+                        _i_post, _ov_post,
+                    )
+    else:
+        logger.info(
+            "generate_script_sections: narrative completeness PASSED after retry"
+        )
+
+
+def _run_narrative_completeness_retry(
+    voice_script: str,
+    video_script: str,
+    state: dict,
+    story,
+    blueprint: dict,
+    channel: Channel,
+    script_format: str,
+    audio_tags_enabled: bool,
+    context: dict,
+) -> tuple[str, str]:
+    major_turns = context["major_turns"]
+    covered_turns = state["covered_turns"]
+    _log_turn_coverage_alignment(voice_script, major_turns, covered_turns)
+
+    nc_issues = check_narrative_completeness(
+        voice_script, blueprint, already_covered=covered_turns
+    )
+    if not nc_issues:
+        return voice_script, video_script
+
+    logger.info(
+        "generate_script_sections: narrative completeness issues before retry: %s", nc_issues
+    )
+    section_instructions = _group_narrative_retry_instructions(nc_issues, state["sections"])
+    for target_label, instructions in section_instructions.items():
+        _run_single_narrative_retry(
+            target_label=target_label,
+            instructions=instructions,
+            state=state,
+            story=story,
+            blueprint=blueprint,
+            channel=channel,
+            script_format=script_format,
+            audio_tags_enabled=audio_tags_enabled,
+            context=context,
+        )
+
+    voice_script, video_script = assemble_script(state["sections"])
+    _script_trace("after_narrative_retry", voice_script)
+    _log_post_retry_narrative_result(voice_script, blueprint, major_turns, covered_turns)
+    return voice_script, video_script
+
+
 def generate_script_sections(
     story,
     blueprint: dict,
@@ -960,545 +1740,43 @@ def generate_script_sections(
     - validate_script_globally (Haiku) checks narrative coherence; issues logged only.
     - check_narrative_completeness (pure Python) is blocking: failing sections are
       regenerated once with targeted override instructions before proceeding.
-
-    Args:
-        story:           Story object (title, url, body, language).
-        blueprint:       Dict from generate_story_blueprint().
-        channel:         Channel ORM object.
-        channel_voice:   ChannelVoice for TTS model/provider. May be None (cartesia default).
-        script_format:   Format key from channel_config.script_format.
-        audio_tags_enabled: ElevenLabs v3 audio tag opt-in.
-
-    Returns:
-        Dict with: title, video_script, voice_script, visual_intent_history.
-        visual_intent_history is a list of {label, section_goal, primary_visual_focus,
-        avoid_repeating} per section — merged into content.story_blueprint by tasks.py.
-
-    Raises:
-        RuntimeError: If INTRO or OUTRO generation fails after all retries.
     """
-    tts_model    = (channel_voice.tts_model   if channel_voice else "sonic-2")
-    tts_provider = (channel_voice.provider    if channel_voice else "cartesia")
-    major_turns  = blueprint.get("major_turns") or []
-    max_body     = max(
-        _MIN_BODY_SECTIONS,
-        min(_MAX_BODY_SECTIONS, blueprint.get("suggested_section_count", 3)),
-    )
-    # When the blueprint has 4+ turns, require at least min(4, n_turns) body sections
-    # so suggests_outro cannot collapse the loop before each turn gets its own section.
-    _min_body_for_bp = (
-        max(_MIN_BODY_SECTIONS, min(4, len(major_turns)))
-        if len(major_turns) >= 4
-        else _MIN_BODY_SECTIONS
-    )
+    context = _build_section_generation_context(channel_voice, blueprint)
+    state = _create_section_loop_state()
+    _log_blueprint_summary(blueprint, context["major_turns"], context["max_body"])
 
-    visual_intent_accumulator: dict     = {"avoid_repeating": []}
-    prior_sections_summary:    list     = []
-    sections:                  list     = []
-    visual_intent_history:     list     = []
-    covered_turns:             set[int] = set()
-    _sec_calls:                int      = 0    # section generation calls (telemetry)
-    _narrative_retry_calls:    int      = 0    # narrative retry section calls (telemetry)
-
-    # ── Blueprint log ─────────────────────────────────────────────────────────
-    logger.info(
-        "BLUEPRINT hook=%r payoff=%r trigger=%r section_count=%d turns=%d max_body=%d",
-        (blueprint.get("hook") or "")[:80],
-        (blueprint.get("final_payoff") or "")[:60],
-        (blueprint.get("comment_trigger") or "")[:60],
-        blueprint.get("suggested_section_count", 0),
-        len(major_turns),
-        max_body,
+    _generate_intro_section(
+        story, blueprint, channel, script_format, audio_tags_enabled, context, state
     )
-    for _ti, _turn in enumerate(major_turns):
-        logger.info("BLUEPRINT turn[%d]=%r", _ti, _turn[:80])
-
-    # ── INTRO ─────────────────────────────────────────────────────────────────
-    _uncov = list(range(len(major_turns)))
-    logger.info("SECTION_INPUT label=INTRO sections_so_far=0 covered=[] uncovered=%s", _uncov)
-    intro = _generate_section_with_retry(
-        label="INTRO",
+    _run_body_section_loop(
+        story, blueprint, channel, script_format, audio_tags_enabled, context, state
+    )
+    _generate_outro_section(
+        story, blueprint, channel, script_format, audio_tags_enabled, context, state
+    )
+    voice_script, video_script = _assemble_sections_with_diagnostics(
+        state, story, blueprint, channel, script_format, context
+    )
+    voice_script, video_script = _run_narrative_completeness_retry(
+        voice_script=voice_script,
+        video_script=video_script,
+        state=state,
         story=story,
         blueprint=blueprint,
-        prior_sections_summary=[],
-        visual_intent_accumulator=visual_intent_accumulator,
         channel=channel,
         script_format=script_format,
-        tts_model=tts_model,
-        tts_provider=tts_provider,
         audio_tags_enabled=audio_tags_enabled,
-        check_hook=True,
-        prior_summary_text="",   # no prior section — transition check skipped
-        primary_required_turn=None,    # INTRO sets the stage; no single-turn constraint
-        future_uncovered_turns=None,
+        context=context,
     )
-    if intro is None:
-        raise RuntimeError("generate_script_sections: INTRO generation failed after retries")
-    _sec_calls += 1
-    sections.append({"label": "INTRO", "script_text": intro["script_text"]})
-    _update_accumulator(visual_intent_accumulator, intro, visual_intent_history, "INTRO")
-    prior_sections_summary.append({
-        "label": "INTRO",
-        "summary": intro.get("summary", ""),
-        "reveals": intro.get("reveals", []),
-        "open_questions": intro.get("open_questions", []),
-    })
-    covered_turns |= _match_turns(intro.get("reveals", []), major_turns, intro.get("script_text", ""), label="INTRO")
-
-    # ── Body sections ─────────────────────────────────────────────────────────
-    body_index = 1
-    while True:
-        label = f"SECTION {body_index}"
-        _uncov_now    = [i for i in range(len(major_turns)) if i not in covered_turns]
-        _primary_idx  = _uncov_now[0] if _uncov_now else None
-        _primary_turn = major_turns[_primary_idx] if _primary_idx is not None else None
-        _future_turns = [major_turns[i] for i in _uncov_now[1:]]
-        logger.info(
-            "SECTION_INPUT label=%s sections_so_far=%d covered=[%s] "
-            "primary_turn_idx=%s uncovered=%s",
-            label, len(prior_sections_summary),
-            ",".join(str(i) for i in sorted(covered_turns)),
-            _primary_idx, _uncov_now,
-        )
-        section = _generate_section_with_retry(
-            label=label,
-            story=story,
-            blueprint=blueprint,
-            prior_sections_summary=prior_sections_summary,
-            visual_intent_accumulator=visual_intent_accumulator,
-            channel=channel,
-            script_format=script_format,
-            tts_model=tts_model,
-            tts_provider=tts_provider,
-            audio_tags_enabled=audio_tags_enabled,
-            check_hook=False,
-            prior_summary_text=prior_sections_summary[-1]["summary"] if prior_sections_summary else "",
-            primary_required_turn=_primary_turn,
-            future_uncovered_turns=_future_turns if _future_turns else None,
-        )
-        if section is None:
-            logger.warning(
-                "generate_script_sections: %s failed after retries — stopping body loop", label
-            )
-            break
-        _sec_calls += 1
-        sections.append({"label": label, "script_text": section["script_text"]})
-        _update_accumulator(visual_intent_accumulator, section, visual_intent_history, label)
-        prior_sections_summary.append({
-            "label": label,
-            "summary": section.get("summary", ""),
-            "reveals": section.get("reveals", []),
-            "open_questions": section.get("open_questions", []),
-        })
-        _all_matched = _match_turns(
-            section.get("reveals", []), major_turns,
-            section.get("script_text", ""), label=label,
-        )
-        if len(_all_matched) >= 3:
-            logger.warning(
-                "generate_script_sections: %s over-compressed major turns — "
-                "matched %d turns %s, crediting only primary turn [%s]",
-                label, len(_all_matched), sorted(_all_matched), _primary_idx,
-            )
-            if _primary_idx is not None:
-                covered_turns.add(_primary_idx)
-            else:
-                covered_turns |= _all_matched
-        else:
-            # 0, 1, or 2 matched — credit all; also always credit primary
-            covered_turns |= _all_matched
-            if _primary_idx is not None:
-                covered_turns.add(_primary_idx)
-
-        body_index += 1
-
-        all_turns_covered     = len(covered_turns) >= len(major_turns)
-        at_min                = body_index > _min_body_for_bp
-        claude_suggests_outro = bool(section.get("suggests_outro", False))
-        at_soft_max           = body_index > max_body          # blueprint-guided cap
-        at_hard_max           = body_index > _MAX_BODY_SECTIONS  # absolute V2 cap
-        payoff_done           = _payoff_reached(section, blueprint)
-
-        logger.info(
-            "LOOP_DECISION body_index=%d covered=%d/%d all_covered=%s payoff=%s "
-            "suggests_outro=%s at_min=%s at_soft=%s at_hard=%s min_body=%d",
-            body_index, len(covered_turns), len(major_turns),
-            all_turns_covered, payoff_done, claude_suggests_outro,
-            at_min, at_soft_max, at_hard_max, _min_body_for_bp,
-        )
-
-        # Hard cap — always exit, log a warning if turns are still uncovered
-        if at_hard_max:
-            if not all_turns_covered:
-                logger.warning(
-                    "generate_script_sections: hard cap (%d body sections) reached with "
-                    "%d/%d major turns still uncovered — proceeding to OUTRO",
-                    _MAX_BODY_SECTIONS,
-                    len(major_turns) - len(covered_turns), len(major_turns),
-                )
-                logger.info("LOOP_DECISION: break_hard_cap reason=uncovered_turns_remain")
-            else:
-                logger.info(
-                    "generate_script_sections: ending body loop after %d section(s) "
-                    "(hard cap reached, all turns covered)",
-                    body_index - 1,
-                )
-                logger.info("LOOP_DECISION: break_hard_cap reason=all_covered")
-            break
-
-        # Soft cap reached but turns are uncovered — keep going to hard cap
-        if at_soft_max and not all_turns_covered:
-            logger.warning(
-                "generate_script_sections: soft max (%d) reached with %d/%d major turns "
-                "uncovered — extending to hard cap (%d)",
-                max_body,
-                len(major_turns) - len(covered_turns), len(major_turns),
-                _MAX_BODY_SECTIONS,
-            )
-            logger.info("LOOP_DECISION: continue reason=soft_max_but_uncovered_turns")
-            # fall through — loop continues to next body section
-
-        # Normal exit: turns covered + past min + (soft max OR Claude says done)
-        elif all_turns_covered and at_min and (at_soft_max or claude_suggests_outro):
-            logger.info(
-                "generate_script_sections: ending body loop after %d section(s) "
-                "(covered_turns=%d/%d, suggests_outro=%s, at_soft_max=%s)",
-                body_index - 1, len(covered_turns), len(major_turns),
-                claude_suggests_outro, at_soft_max,
-            )
-            logger.info(
-                "LOOP_DECISION: break_normal reason=all_covered+past_min+(%s)",
-                "soft_max" if at_soft_max else "claude_suggests",
-            )
-            break
-        else:
-            logger.info(
-                "LOOP_DECISION: continue reason=not_all_conditions_met "
-                "(all_covered=%s at_min=%s at_soft=%s claude=%s)",
-                all_turns_covered, at_min, at_soft_max, claude_suggests_outro,
-            )
-
-    # ── OUTRO ─────────────────────────────────────────────────────────────────
-    _uncov_outro = [i for i in range(len(major_turns)) if i not in covered_turns]
-    logger.info(
-        "SECTION_INPUT label=OUTRO sections_so_far=%d covered=[%s] uncovered=%s",
-        len(prior_sections_summary),
-        ",".join(str(i) for i in sorted(covered_turns)),
-        _uncov_outro,
-    )
-    outro = _generate_section_with_retry(
-        label="OUTRO",
-        story=story,
-        blueprint=blueprint,
-        prior_sections_summary=prior_sections_summary,
-        visual_intent_accumulator=visual_intent_accumulator,
-        channel=channel,
-        script_format=script_format,
-        tts_model=tts_model,
-        tts_provider=tts_provider,
-        audio_tags_enabled=audio_tags_enabled,
-        check_hook=False,
-        prior_summary_text=prior_sections_summary[-1]["summary"] if prior_sections_summary else "",
-        primary_required_turn=None,   # OUTRO resolves; no single-turn constraint
-        future_uncovered_turns=None,
-    )
-    if outro is None:
-        raise RuntimeError("generate_script_sections: OUTRO generation failed after retries")
-    _sec_calls += 1
-    sections.append({"label": "OUTRO", "script_text": outro["script_text"]})
-    _update_accumulator(visual_intent_accumulator, outro, visual_intent_history, "OUTRO")
-
-    # ── OUTRO overlap diagnostic ───────────────────────────────────────────────
-    _outro_text       = outro["script_text"]
-    _prev_body        = [s for s in sections[:-1] if s["label"] not in ("INTRO", "OUTRO")]
-    if _prev_body:
-        _outro_tokens = _get_content_tokens(_outro_text)
-        _prev_tokens  = _get_content_tokens(_prev_body[-1]["script_text"])
-        if _outro_tokens:
-            _outro_ov   = len(_outro_tokens & _prev_tokens) / len(_outro_tokens)
-            _repeated   = sorted(_outro_tokens & _prev_tokens)[:8]
-            if _outro_ov > 0.5:
-                logger.warning(
-                    "OUTRO_OVERLAP previous_section_overlap=%.3f repeated_terms=%s "
-                    "— OUTRO heavily repeats prior section (non-blocking)",
-                    _outro_ov, _repeated,
-                )
-            else:
-                logger.info(
-                    "OUTRO_OVERLAP previous_section_overlap=%.3f repeated_terms=%s",
-                    _outro_ov, _repeated,
-                )
-
-    # ── Repetition diagnostics (diagnostic only — non-blocking) ───────────────
-    diagnose_section_repetition(sections)
-
-    # ── Assemble ──────────────────────────────────────────────────────────────
-    voice_script, video_script = assemble_script(sections)
-    _script_trace("after_section_assembly", voice_script)
-
-    # ── Generic-phrase scan (diagnostic only — non-blocking) ─────────────────
-    _phrase_hits = detect_generic_documentary_phrases(voice_script)
-    for _hit in _phrase_hits:
-        logger.warning(
-            "GENERIC_PHRASE detected=%r in sentence=%r — rewrite recommended (non-blocking)",
-            _hit["phrase"], _hit["sentence"],
-        )
-
-    # ── Post-assembly deterministic checks ────────────────────────────────────
-    # check_completeness: structural markers are guaranteed by assemble_script() —
-    # these issues are telemetry only and never trigger correction.
-    # check_minimum_length: per-section generation has no word-count floor, so
-    # an under-length assembly is possible; correct it once with source_excerpt.
-    completeness_issues = check_completeness(video_script, voice_script, "source")
-    length_issues       = check_minimum_length(voice_script, "source", script_format)
-
-    if completeness_issues:
-        logger.warning(
-            "generate_script_sections: post-assembly completeness issue(s) (telemetry): %s",
-            [i.get("description") for i in completeness_issues],
-        )
-
-    length_majors = [i for i in length_issues if i.get("severity") == "MAJOR"]
-    if length_majors:
-        wc_before = len(voice_script.split())
-        logger.warning(
-            "generate_script_sections: voice_script under minimum length (%d words) — "
-            "calling auto_correct_script once with source_excerpt",
-            wc_before,
-        )
-        try:
-            corrected = auto_correct_script(
-                current_scripts={"video_script": video_script, "voice_script": voice_script},
-                issues=length_majors,
-                language=story.language,
-                channel=channel,
-                script_format=script_format,
-                source_excerpt=(story.body or "")[:8000],
-                tts_model=tts_model,
-                tts_provider=tts_provider,
-            )
-            video_script = corrected.get("video_script", video_script)
-            voice_script = corrected.get("voice_script", voice_script)
-            wc_after = len(voice_script.split())
-            logger.info(
-                "generate_script_sections: length correction applied — %d → %d words",
-                wc_before, wc_after,
-            )
-        except Exception as exc:
-            logger.warning(
-                "generate_script_sections: length correction failed (non-blocking): %s", exc
-            )
-
-    # ── Global validation (Haiku — narrative coherence; non-blocking) ─────────
-    try:
-        gv = validate_script_globally(voice_script, blueprint)
-        if gv.get("status") == "NEEDS_FIX":
-            for issue in gv.get("issues", []):
-                logger.info(
-                    "Global validation [%s]: %s — %s",
-                    issue.get("section"), issue.get("description"), issue.get("suggestion"),
-                )
-    except Exception as exc:
-        logger.warning("Global validation failed (non-blocking): %s", exc)
-
-    # ── Narrative completeness — BLOCKING with targeted section retry ─────────
-    # Issue prefix → which section label to regenerate (max 1 call per issue).
-    # Multiple issues targeting the same section are merged into one call.
-    _ISSUE_TO_SECTION: list[tuple[str, str | None]] = [
-        ("Hook:",            "INTRO"),
-        ("Major turns",      None),      # resolved at runtime: last body section
-        ("final_payoff",     "OUTRO"),
-        ("comment_trigger",  "OUTRO"),
-    ]
-
-    # ── Turn coverage alignment — log both views before checking ─────────────
-    _vs_body_tokens = _get_content_tokens(voice_script)
-    _nc_would_flag: list[int] = []
-    for _i, _turn in enumerate(major_turns):
-        _tt = _get_content_tokens(_turn)
-        _ov = len(_tt & _vs_body_tokens) / len(_tt) if _tt else 0.0
-        if _ov < 0.6:
-            _nc_would_flag.append(_i)
-    logger.info(
-        "TURN_COVERAGE_SOURCE section_progression=%s narrative_check=%s",
-        sorted(covered_turns), _nc_would_flag,
-    )
-    _disagreement = covered_turns & set(_nc_would_flag)
-    if _disagreement:
-        logger.warning(
-            "TURN_COVERAGE_DISAGREEMENT: section_progression credits turns %s but "
-            "60%%-overlap check would flag them — section_progression is authoritative, "
-            "these turns will be excluded from narrative retry",
-            sorted(_disagreement),
-        )
-
-    logger.info(
-        "TURN_COVERAGE_FINAL authoritative=%s total=%d/%d",
-        sorted(covered_turns), len(covered_turns), len(major_turns),
-    )
-
-    nc_issues = check_narrative_completeness(voice_script, blueprint, already_covered=covered_turns)
-    if nc_issues:
-        logger.info(
-            "generate_script_sections: narrative completeness issues before retry: %s", nc_issues
-        )
-
-        # Build label_to_idx for in-place replacement
-        label_to_idx: dict[str, int] = {s["label"]: i for i, s in enumerate(sections)}
-        body_labels   = [s["label"] for s in sections if s["label"] not in ("INTRO", "OUTRO")]
-
-        # Group issues by target section label (deduplicate targets)
-        section_instructions: dict[str, list[str]] = {}
-        for issue in nc_issues:
-            target_label: str | None = None
-            for prefix, lbl in _ISSUE_TO_SECTION:
-                if issue.startswith(prefix):
-                    target_label = lbl
-                    break
-            if target_label is None:
-                # "Major turns" fallback: last body section
-                target_label = body_labels[-1] if body_labels else "OUTRO"
-            section_instructions.setdefault(target_label, []).append(issue)
-
-        # One generate_section() call per affected section
-        for target_label, instructions in section_instructions.items():
-            idx = label_to_idx.get(target_label)
-            if idx is None:
-                logger.warning(
-                    "generate_script_sections: narrative retry — section %r not found, skipping",
-                    target_label,
-                )
-                continue
-
-            combined = "; ".join(instructions)
-            override = (
-                f"The assembled script has these narrative completeness issues: {combined}. "
-                f"Fix all of them in this section."
-            )
-            logger.info(
-                "generate_script_sections: narrative retry for section %r — %s",
-                target_label, combined,
-            )
-            logger.info(
-                "NARRATIVE_COMPLETENESS target=%r issues=%s covered_before=%d/%d",
-                target_label, instructions, len(covered_turns), len(major_turns),
-            )
-            _narrative_retry_calls += 1
-            _old_sha   = hashlib.sha256(sections[idx]["script_text"].encode("utf-8", errors="replace")).hexdigest()[:8]
-            _old_first = (re.split(r"(?<=[.!?])\s+", sections[idx]["script_text"].strip()) or [""])[0][:80]
-            _covered_before_retry = len(covered_turns)
-            try:
-                # Prior summary is everything before this section's index
-                prior_for_retry = [
-                    {"label": s["label"], "summary": "", "reveals": [], "open_questions": []}
-                    for s in sections[:idx]
-                ]
-                result = generate_section(
-                    label=target_label,
-                    story=story,
-                    blueprint=blueprint,
-                    prior_sections_summary=prior_for_retry,
-                    visual_intent_accumulator=visual_intent_accumulator,
-                    channel=channel,
-                    script_format=script_format,
-                    tts_model=tts_model,
-                    tts_provider=tts_provider,
-                    audio_tags_enabled=audio_tags_enabled,
-                    override_instruction=override,
-                )
-                retry_text = result.get("script_text", "")
-
-                # Backstop — generate_section() is called directly here, bypassing the
-                # normalize+split loop in _generate_section_with_retry(). Apply it now
-                # so that the retried section is as clean as any regularly generated one.
-                _rt_cleaned = split_long_sentences(normalize_tts_chars(retry_text))
-                if _rt_cleaned != retry_text:
-                    retry_text = _rt_cleaned
-                    logger.info(
-                        "generate_script_sections: narrative retry backstop modified %r",
-                        target_label,
-                    )
-
-                # INTRO: verify hook quality — a bad opener here would survive to the
-                # quality gate and re-trigger the same MAJOR hook issue.
-                if target_label == "INTRO":
-                    _hook_after = [
-                        i for i in check_hook_quality(retry_text, "source")
-                        if i["severity"] == "MAJOR"
-                    ]
-                    if _hook_after:
-                        logger.warning(
-                            "generate_script_sections: INTRO narrative retry still has "
-                            "MAJOR hook issue(s) after backstop — %s",
-                            [i["description"] for i in _hook_after],
-                        )
-
-                sections[idx] = {"label": target_label, "script_text": retry_text}
-                _new_sha   = hashlib.sha256(retry_text.encode("utf-8", errors="replace")).hexdigest()[:8]
-                _new_first = (re.split(r"(?<=[.!?])\s+", retry_text.strip()) or [""])[0][:80]
-                _retry_coverage = _match_turns(
-                    result.get("reveals", []), major_turns, retry_text,
-                    label=f"{target_label}_retry_check",
-                )
-                _covered_after_retry = len(covered_turns | _retry_coverage)
-                logger.info(
-                    "NARRATIVE_RETRY target=%r sha=%s→%s first_sent=%r",
-                    target_label, _old_sha, _new_sha, _new_first,
-                )
-                logger.info(
-                    "NARRATIVE_RETRY target=%r new_reveals=%s turns_covered=%d→%d/%d",
-                    target_label,
-                    [(r or "")[:60] for r in (result.get("reveals") or [])[:3]],
-                    _covered_before_retry, _covered_after_retry, len(major_turns),
-                )
-                logger.info(
-                    "generate_script_sections: narrative retry replaced section %r", target_label
-                )
-            except Exception as exc:
-                logger.warning(
-                    "generate_script_sections: narrative retry call failed for %r: %s — "
-                    "proceeding with original section",
-                    target_label, exc,
-                )
-
-        # Reassemble after retries
-        voice_script, video_script = assemble_script(sections)
-        _script_trace("after_narrative_retry", voice_script)
-
-        # Re-check once — pass already_covered so section_progression turns are not
-        # false-alarmed here (the post-retry overlap view differs from the per-section
-        # reveal-matching view, causing spurious "still failing" warnings).
-        nc_issues_after = check_narrative_completeness(voice_script, blueprint, already_covered=covered_turns)
-        if nc_issues_after:
-            logger.warning(
-                "generate_script_sections: narrative completeness still failing after retry: %s",
-                nc_issues_after,
-            )
-            # Compute any turns that overlap disagrees with section_progression and log them
-            _post_nc_body = _get_content_tokens(voice_script)
-            for _i_post, _t_post in enumerate(major_turns):
-                if _i_post in covered_turns:
-                    _tp = _get_content_tokens(_t_post)
-                    _ov_post = len(_tp & _post_nc_body) / len(_tp) if _tp else 0.0
-                    if _ov_post < 0.6:
-                        logger.warning(
-                            "TURN_COVERAGE_DISAGREEMENT_POST_RETRY turn[%d] overlap=%.2f "
-                            "— section_progression is authoritative, ignoring",
-                            _i_post, _ov_post,
-                        )
-        else:
-            logger.info(
-                "generate_script_sections: narrative completeness PASSED after retry"
-            )
 
     _script_trace("generate_script_sections_returning", voice_script)
     return {
-        "title":                  blueprint.get("suggested_title", story.title),
-        "video_script":           video_script,
-        "voice_script":           voice_script,
-        "visual_intent_history":  visual_intent_history,
-        "_section_calls":         _sec_calls,
-        "_retry_calls":           _narrative_retry_calls,
+        "title": blueprint.get("suggested_title", story.title),
+        "video_script": video_script,
+        "voice_script": voice_script,
+        "visual_intent_history": state["visual_intent_history"],
+        "_section_calls": state["section_calls"],
+        "_retry_calls": state["narrative_retry_calls"],
     }
 
 
@@ -1514,35 +1792,74 @@ def run_shorts_planner(
     config: ChannelConfig | None,
     db: Session,
 ) -> None:
-    """Generate 3–5 standalone TikTok episode scripts from a validated long-form content.
+    """Generate 3-5 standalone TikTok episode scripts from validated long content."""
+    planner_source = _load_shorts_planner_source(long_content_id, db)
+    if planner_source is None:
+        return
 
-    Orchestrates the Shorts Planner pipeline:
-      1. Load source Script for the long-form content.
-      2. Call generate_shorts_plan() (Haiku) — returns part plan with 3–5 parts.
-         Python validates 3 ≤ total_parts ≤ 5. Retries once on range violation.
-      3. For each part:
-         a. Create Content row (is_short_episode=True, parent_content_id, etc.).
-         b. Call generate_short_episode_script() (Sonnet) to write TikTok narration.
-         c. Run check_tts_compliance() only (not run_deterministic_checks — Short
-            episode scripts have no [SECTION N] markers and intentionally short word
-            count; check_completeness and check_minimum_length would always false-MAJOR).
-         d. Auto-correct up to _MAX_SHORT_CORRECTION_ROUNDS rounds on MAJOR TTS issues.
-         e. Persist Script row. Set content.status = "SCRIPTS_VALIDATED".
-      4. Returns None — Shorts failures are logged but never affect the parent content.
+    long_content, source_script = planner_source
+    blueprint: dict = long_content.story_blueprint or {}
+    voice_script = source_script.voice_script or ""
+    channel_voice = _load_short_source_voice(long_content, channel, db)
 
-    Args:
-        long_content_id: UUID of the parent long-form Content row (status=SCRIPTS_VALIDATED).
-        channel:         Channel ORM object.
-        config:          ChannelConfig ORM object (may be None — defaults applied).
-        db:              SQLAlchemy session managed by the caller.
-    """
-    script_format = config.script_format if config else "youtube_long"
+    plan = _generate_shorts_plan_with_retry(voice_script, blueprint, channel)
+    if plan is None:
+        return
 
-    # ── Load source Script ────────────────────────────────────────────────────
+    total_parts: int = plan["total_parts"]
+    parts: list[dict] = plan["parts"]
+    logger.info(
+        "run_shorts_planner: plan generated for content %s — %d parts",
+        long_content_id,
+        total_parts,
+    )
+
+    if _child_shorts_already_exist(long_content_id, db):
+        return
+
+    for part_plan in parts:
+        part_n = part_plan.get("part", 0)
+        part_plan_with_total = {**part_plan, "_total_parts": total_parts}
+        short_content = _create_child_short_content(
+            long_content=long_content,
+            long_content_id=long_content_id,
+            blueprint=blueprint,
+            part_n=part_n,
+            total_parts=total_parts,
+            db=db,
+        )
+
+        generated = _generate_validated_short_script(
+            part_plan=part_plan_with_total,
+            part_n=part_n,
+            voice_script=voice_script,
+            blueprint=blueprint,
+            channel=channel,
+            channel_voice=channel_voice,
+            source_language=long_content.source_language,
+        )
+        if generated is None:
+            _remove_failed_short_content(short_content, part_n, db)
+            continue
+
+        _persist_child_short_script(
+            short_content=short_content,
+            generated=generated,
+            source_language=long_content.source_language,
+            part_n=part_n,
+            total_parts=total_parts,
+            db=db,
+        )
+
+
+def _load_shorts_planner_source(
+    long_content_id: "uuid.UUID",
+    db: Session,
+) -> tuple[Content, Script] | None:
     long_content: Content | None = db.get(Content, long_content_id)
     if not long_content:
         logger.error("run_shorts_planner: content %s not found", long_content_id)
-        return
+        return None
 
     source_script: Script | None = (
         db.query(Script)
@@ -1558,13 +1875,17 @@ def run_shorts_planner(
         logger.error(
             "run_shorts_planner: no validated source script for content %s", long_content_id
         )
-        return
+        return None
 
-    blueprint: dict = long_content.story_blueprint or {}
-    voice_script = source_script.voice_script or ""
+    return long_content, source_script
 
-    # ── Resolve channel voice for TTS block ──────────────────────────────────
-    channel_voice: ChannelVoice | None = (
+
+def _load_short_source_voice(
+    long_content: Content,
+    channel: Channel,
+    db: Session,
+) -> ChannelVoice | None:
+    return (
         db.query(ChannelVoice)
         .filter(
             ChannelVoice.channel_id == channel.id,
@@ -1573,12 +1894,15 @@ def run_shorts_planner(
         .first()
     )
 
-    # ── Step 1: Generate part plan (Haiku) ────────────────────────────────────
-    plan: dict | None = None
+
+def _generate_shorts_plan_with_retry(
+    voice_script: str,
+    blueprint: dict,
+    channel: Channel,
+) -> dict | None:
     for attempt in (1, 2):
         try:
-            plan = generate_shorts_plan(voice_script, blueprint, channel)
-            break
+            return generate_shorts_plan(voice_script, blueprint, channel)
         except ValueError as exc:
             if attempt == 1:
                 logger.warning(
@@ -1589,24 +1913,17 @@ def run_shorts_planner(
                 "run_shorts_planner: plan generation failed after 2 attempts (%s) — skipping Shorts",
                 exc,
             )
-            return
+            return None
         except Exception as exc:
             logger.error(
                 "run_shorts_planner: plan generation API error (%s) — skipping Shorts", exc
             )
-            return
+            return None
+    return None
 
-    if plan is None:
-        return
 
-    total_parts: int = plan["total_parts"]
-    parts: list[dict] = plan["parts"]
-    logger.info(
-        "run_shorts_planner: plan generated for content %s — %d parts", long_content_id, total_parts
-    )
-
-    # ── Idempotency guard: skip if child Short episodes already exist ──────────
-    _existing_count: int = (
+def _child_shorts_already_exist(long_content_id: "uuid.UUID", db: Session) -> bool:
+    existing_count: int = (
         db.query(Content)
         .filter(
             Content.parent_content_id == long_content_id,
@@ -1614,163 +1931,199 @@ def run_shorts_planner(
         )
         .count()
     )
-    if _existing_count > 0:
-        _existing_shorts: list[Content] = (
-            db.query(Content)
-            .filter(
-                Content.parent_content_id == long_content_id,
-                Content.is_short_episode.is_(True),
-            )
-            .all()
+    if existing_count <= 0:
+        return False
+
+    existing_shorts: list[Content] = (
+        db.query(Content)
+        .filter(
+            Content.parent_content_id == long_content_id,
+            Content.is_short_episode.is_(True),
         )
-        _status_counts: dict[str, int] = {}
-        for _s in _existing_shorts:
-            _status_counts[_s.status] = _status_counts.get(_s.status, 0) + 1
-        logger.info(
-            "STANDALONE_SHORTS_ALREADY_EXIST parent_content_id=%s count=%d statuses=%s",
-            long_content_id, _existing_count, _status_counts,
-        )
-        return
+        .all()
+    )
+    status_counts: dict[str, int] = {}
+    for short_content in existing_shorts:
+        status_counts[short_content.status] = status_counts.get(short_content.status, 0) + 1
+    logger.info(
+        "STANDALONE_SHORTS_ALREADY_EXIST parent_content_id=%s count=%d statuses=%s",
+        long_content_id,
+        existing_count,
+        status_counts,
+    )
+    return True
 
-    # ── Step 2: Generate one Short episode per part ───────────────────────────
-    for part_plan in parts:
-        part_n = part_plan.get("part", 0)
-        # Inject total_parts so generate_short_episode_script can reference it
-        part_plan_with_total = {**part_plan, "_total_parts": total_parts}
 
-        # Create Content row for this Short episode
-        short_content = Content(
-            channel_id=long_content.channel_id,
-            source_url=long_content.source_url,
-            source_language=long_content.source_language,
-            content_hash=f"{long_content.content_hash}_short_{part_n}",
-            title=f"{long_content.title} — Part {part_n}/{total_parts}",
-            status="GENERATING_SCRIPTS",
-            source_excerpt=long_content.source_excerpt,
-            story_blueprint=blueprint,
-            is_short_episode=True,
-            parent_content_id=long_content_id,
-            short_part_number=part_n,
-            short_total_parts=total_parts,
-        )
-        db.add(short_content)
-        db.flush()  # populate short_content.id
+def _create_child_short_content(
+    long_content: Content,
+    long_content_id: "uuid.UUID",
+    blueprint: dict,
+    part_n: int,
+    total_parts: int,
+    db: Session,
+) -> Content:
+    short_content = Content(
+        channel_id=long_content.channel_id,
+        source_url=long_content.source_url,
+        source_language=long_content.source_language,
+        content_hash=f"{long_content.content_hash}_short_{part_n}",
+        title=f"{long_content.title} — Part {part_n}/{total_parts}",
+        status="GENERATING_SCRIPTS",
+        source_excerpt=long_content.source_excerpt,
+        story_blueprint=blueprint,
+        is_short_episode=True,
+        parent_content_id=long_content_id,
+        short_part_number=part_n,
+        short_total_parts=total_parts,
+    )
+    db.add(short_content)
+    db.flush()
 
-        logger.info(
-            "run_shorts_planner: created Content %s for part %d/%d",
-            short_content.id, part_n, total_parts,
-        )
+    logger.info(
+        "run_shorts_planner: created Content %s for part %d/%d",
+        short_content.id,
+        part_n,
+        total_parts,
+    )
+    return short_content
 
-        # Script generation with TTS + hook correction loop
-        generated: dict | None = None
-        _tts_majors: list[dict] = []
-        for correction_round in range(1, _MAX_SHORT_CORRECTION_ROUNDS + 2):
-            try:
-                result = generate_short_episode_script(
-                    part_plan=part_plan_with_total,
-                    long_voice_script=voice_script,
-                    blueprint=blueprint,
-                    channel=channel,
-                    channel_voice=channel_voice,
-                    override_instruction="" if correction_round == 1 else (
-                        f"Fix these issues from the previous attempt: "
-                        f"{'; '.join(i['description'] for i in _tts_majors[:3])}"
-                    ),
-                )
-            except Exception as exc:
-                logger.error(
-                    "run_shorts_planner: script error for part %d attempt %d: %s",
-                    part_n, correction_round, exc,
-                )
-                break
 
-            ep_voice_script = result.get("voice_script", "")
-
-            # TTS compliance — same rules as long-form scripts
-            tts_issues = check_tts_compliance(ep_voice_script, long_content.source_language)
-
-            # First-sentence hook check: Short scripts are flat narration with no
-            # [INTRO] marker, so we wrap the first sentence in a synthetic prefix to
-            # let check_hook_quality() locate it without modifying the check itself.
-            first_sent = (
-                re.split(r"(?<=[.!?])\s+", ep_voice_script.strip())[0]
-                if ep_voice_script.strip() else ""
+def _generate_validated_short_script(
+    part_plan: dict,
+    part_n: int,
+    voice_script: str,
+    blueprint: dict,
+    channel: Channel,
+    channel_voice: ChannelVoice | None,
+    source_language: str,
+) -> dict | None:
+    generated: dict | None = None
+    tts_majors: list[dict] = []
+    for correction_round in range(1, _MAX_SHORT_CORRECTION_ROUNDS + 2):
+        try:
+            result = generate_short_episode_script(
+                part_plan=part_plan,
+                long_voice_script=voice_script,
+                blueprint=blueprint,
+                channel=channel,
+                channel_voice=channel_voice,
+                override_instruction="" if correction_round == 1 else (
+                    f"Fix these issues from the previous attempt: "
+                    f"{'; '.join(i['description'] for i in tts_majors[:3])}"
+                ),
             )
-            hook_issues = check_hook_quality(
-                f"[INTRO]\n{first_sent}", long_content.source_language
-            )
-
-            _tts_majors = [
-                i for i in tts_issues + hook_issues
-                if i["severity"] == "MAJOR"
-            ]
-
-            # Word count ceiling — enforced in code regardless of prompt compliance
-            ep_wc = len(ep_voice_script.split())
-            if ep_wc > _MAX_SHORT_WORDS:
-                _tts_majors.append({
-                    "severity": "MAJOR",
-                    "category": "script_too_long",
-                    "description": (
-                        f"voice_script is {ep_wc} words — exceeds the {_MAX_SHORT_WORDS}-word hard cap "
-                        f"(≈83 s at Cartesia speed). Target 160–{_MAX_SHORT_WORDS} words. "
-                        f"Cut {ep_wc - _MAX_SHORT_WORDS} words by removing the least essential sentences."
-                    ),
-                })
-                logger.warning(
-                    "run_shorts_planner: part %d attempt %d word count %d > cap %d — will retry",
-                    part_n, correction_round, ep_wc, _MAX_SHORT_WORDS,
-                )
-
-            if not _tts_majors:
-                generated = result
-                break
-
-            if correction_round > _MAX_SHORT_CORRECTION_ROUNDS:
-                logger.warning(
-                    "run_shorts_planner: part %d still has MAJOR issues after %d round(s) — "
-                    "using latest version",
-                    part_n, _MAX_SHORT_CORRECTION_ROUNDS,
-                )
-                generated = result
-                break
-
-            logger.info(
-                "run_shorts_planner: part %d retry %d — %d MAJOR issue(s): %s",
-                part_n, correction_round, len(_tts_majors),
-                [i["category"] for i in _tts_majors],
-            )
-
-        if generated is None:
-            # Script generation completely failed — clean up the Content row
-            db.delete(short_content)
-            db.commit()
+        except Exception as exc:
             logger.error(
-                "run_shorts_planner: part %d script generation failed — content row removed",
+                "run_shorts_planner: script error for part %d attempt %d: %s",
                 part_n,
+                correction_round,
+                exc,
             )
-            continue
+            break
 
-        # Persist Script
-        short_script = Script(
-            content_id=short_content.id,
-            language=long_content.source_language,
-            video_script=generated.get("voice_script", ""),  # same as voice_script for shorts
-            voice_script=generated.get("voice_script", ""),
-            version=1,
-            validated=True,
+        ep_voice_script = result.get("voice_script", "")
+        tts_majors = _collect_short_script_major_issues(
+            ep_voice_script=ep_voice_script,
+            source_language=source_language,
+            part_n=part_n,
+            correction_round=correction_round,
         )
-        db.add(short_script)
+        if not tts_majors:
+            generated = result
+            break
 
-        # Update title and set awaiting-parent status.
-        # Audio generation is gated behind the parent reaching AUDIO_DONE —
-        # pickup_short_episodes_awaiting_parent() flips this to SCRIPTS_VALIDATED
-        # once the parent's audio is complete, releasing the Short into Agent 3 audio.
-        short_content.title = generated.get("title", short_content.title)
-        short_content.status = "SCRIPTS_VALIDATED_AWAITING_PARENT"
-        db.commit()
+        if correction_round > _MAX_SHORT_CORRECTION_ROUNDS:
+            logger.warning(
+                "run_shorts_planner: part %d still has MAJOR issues after %d round(s) — "
+                "using latest version",
+                part_n,
+                _MAX_SHORT_CORRECTION_ROUNDS,
+            )
+            generated = result
+            break
 
         logger.info(
-            "run_shorts_planner: part %d/%d SCRIPTS_VALIDATED_AWAITING_PARENT — content=%s",
-            part_n, total_parts, short_content.id,
+            "run_shorts_planner: part %d retry %d — %d MAJOR issue(s): %s",
+            part_n,
+            correction_round,
+            len(tts_majors),
+            [i["category"] for i in tts_majors],
         )
+    return generated
+
+
+def _collect_short_script_major_issues(
+    ep_voice_script: str,
+    source_language: str,
+    part_n: int,
+    correction_round: int,
+) -> list[dict]:
+    tts_issues = check_tts_compliance(ep_voice_script, source_language)
+    first_sent = (
+        re.split(r"(?<=[.!?])\s+", ep_voice_script.strip())[0]
+        if ep_voice_script.strip() else ""
+    )
+    hook_issues = check_hook_quality(f"[INTRO]\n{first_sent}", source_language)
+    tts_majors = [
+        issue for issue in tts_issues + hook_issues
+        if issue["severity"] == "MAJOR"
+    ]
+
+    ep_wc = len(ep_voice_script.split())
+    if ep_wc > _MAX_SHORT_WORDS:
+        tts_majors.append({
+            "severity": "MAJOR",
+            "category": "script_too_long",
+            "description": (
+                f"voice_script is {ep_wc} words — exceeds the {_MAX_SHORT_WORDS}-word hard cap "
+                f"(≈83 s at Cartesia speed). Target 160–{_MAX_SHORT_WORDS} words. "
+                f"Cut {ep_wc - _MAX_SHORT_WORDS} words by removing the least essential sentences."
+            ),
+        })
+        logger.warning(
+            "run_shorts_planner: part %d attempt %d word count %d > cap %d — will retry",
+            part_n,
+            correction_round,
+            ep_wc,
+            _MAX_SHORT_WORDS,
+        )
+    return tts_majors
+
+
+def _remove_failed_short_content(short_content: Content, part_n: int, db: Session) -> None:
+    db.delete(short_content)
+    db.commit()
+    logger.error(
+        "run_shorts_planner: part %d script generation failed — content row removed",
+        part_n,
+    )
+
+
+def _persist_child_short_script(
+    short_content: Content,
+    generated: dict,
+    source_language: str,
+    part_n: int,
+    total_parts: int,
+    db: Session,
+) -> None:
+    short_script = Script(
+        content_id=short_content.id,
+        language=source_language,
+        video_script=generated.get("voice_script", ""),
+        voice_script=generated.get("voice_script", ""),
+        version=1,
+        validated=True,
+    )
+    db.add(short_script)
+
+    short_content.title = generated.get("title", short_content.title)
+    short_content.status = "SCRIPTS_VALIDATED"
+    db.commit()
+
+    logger.info(
+        "run_shorts_planner: part %d/%d SCRIPTS_VALIDATED — content=%s",
+        part_n,
+        total_parts,
+        short_content.id,
+    )

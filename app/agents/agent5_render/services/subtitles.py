@@ -197,7 +197,7 @@ def build_karaoke_subtitles(
 
     avg_chunk_words = (sum(len(c["words"]) for c in chunks) / len(chunks)) if chunks else 0.0
     over_cap        = sum(1 for c in chunks if len(c["words"]) > _MAX_WORDS_KARAOKE)
-    logger.info(
+    logger.debug(
         "Karaoke subtitles: %d chunks, avg %.1f words, %d over cap",
         len(chunks), avg_chunk_words, over_cap,
     )
