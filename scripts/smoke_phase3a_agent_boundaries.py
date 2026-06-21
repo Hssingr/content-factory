@@ -54,12 +54,18 @@ for old_path in old_paths:
 
 print("\n── 3: Visual logic lives in Agent 4 package ──")
 video_src = inspect.getsource(agent5_render_mod)
-check("3a: Agent 5 render imports remap from Agent 4 visuals",
-      "app.agents.agent4_visuals.subagents.storyboard" in video_src)
-check("3b: Agent 5 render imports Flux from Agent 4 visuals",
-      "app.agents.agent4_visuals.services.flux_generator" in video_src)
+agent4_orchestrator = importlib.import_module(
+    "app.agents.agent4_visuals.services.visual_orchestrator"
+)
+check("3a: Agent 5 render calls only the Agent 4 visual entrypoint",
+      "app.agents.agent4_visuals.services.visual_orchestrator" in video_src)
+check("3b: Agent 5 render does not import Agent 4 internal storyboard/Flux helpers",
+      "app.agents.agent4_visuals.subagents.storyboard" not in video_src
+      and "app.agents.agent4_visuals.services.flux_generator" not in video_src)
 check("3c: remap_beats_for_short remains reachable from Agent 4 visuals",
       callable(agent4_storyboard.remap_beats_for_short))
+check("3d: Agent 4 visual entrypoint run_visual_generation exists",
+      hasattr(agent4_orchestrator, "run_visual_generation"))
 
 print("\n── 4: Render logic lives in Agent 5 package ──")
 check("4a: build_short_props remains reachable from Agent 5 render",
@@ -75,7 +81,8 @@ print("\n── 5: Scheduler task names and compatibility aliases ──")
 tasks = importlib.import_module("app.scheduler.tasks")
 helper_src = inspect.getsource(tasks.ensure_child_short_audio_enqueued)
 pickup_src = inspect.getsource(tasks.pickup_scripts_validated)
-render_pickup_src = inspect.getsource(tasks.pickup_audio_done)
+visual_pickup_src = inspect.getsource(tasks.pickup_audio_done)
+render_pickup_src = inspect.getsource(tasks.pickup_visual_ready)
 check("5a: new Agent 3 task exists", hasattr(tasks, "run_agent3_audio_for_content"))
 check("5b: old Agent 4 task alias exists", hasattr(tasks, "run_agent4_for_content"))
 check("5c: obsolete child audio helper is compatibility no-op",
@@ -85,7 +92,9 @@ check("5d: pickup_scripts_validated enqueues new Agent 3 task",
       "run_agent3_audio_for_content.delay" in pickup_src)
 check("5e: new Agent 5 render task exists", hasattr(tasks, "run_agent5_render_for_content"))
 check("5f: old Agent 5 task alias exists", hasattr(tasks, "run_agent5_for_content"))
-check("5g: pickup_audio_done enqueues new Agent 5 render task",
+check("5g: pickup_audio_done enqueues the Agent 4 visual generation task",
+      "run_agent4_visual_generation_for_content.delay" in visual_pickup_src)
+check("5h: pickup_visual_ready enqueues the Agent 5 render task",
       "run_agent5_render_for_content.delay" in render_pickup_src)
 
 print("\n── 6: Parent-cut short code remains absent ──")

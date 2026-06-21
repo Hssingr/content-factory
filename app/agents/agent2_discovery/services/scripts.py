@@ -6,6 +6,7 @@ import uuid
 from sqlalchemy.orm import Session
 
 from app.models import Channel, ChannelConfig, ChannelLanguage, ChannelVoice, Content, Script
+from app.services.script_estimator import estimate_duration_sec
 from app.agents.agent2_discovery.system_prompt import (
     assess_script_quality,
     auto_correct_script,
@@ -378,30 +379,29 @@ def generate_multilingual_scripts(
     db: Session,
     audio_tags_enabled: bool = False,
 ) -> list[Script]:
-    """Generate culturally adapted scripts for every channel target language.
+    """Generate and validate the complete required script set for a content row.
 
-    The source-language script must already exist in the DB (written by the
-    discovery Celery task after ``generate_scripts()``). For each target
-    language that differs from the source, ``generate_native_script()`` is
-    called and a new ``Script`` record is persisted.
+    The validated source-language script must already exist in the DB. For each
+    configured channel language that differs from the source, ``generate_native_script()``
+    is called when a validated script does not already exist.
 
-    On completion, ``content.status`` is updated to ``SCRIPTS_READY``.
-    Partial failures (one language fails) are logged and skipped — the batch
-    continues so other languages still get their scripts.
+    This function does not write a terminal script status. The caller owns the
+    final ``SCRIPTS_VALIDATED`` transition after the complete required script set
+    exists and every required script row is validated.
 
     Args:
-        content:  Content ORM object with ``status="APPROVED"``.
+        content:  Content ORM object currently in Agent 2 script generation.
         channel:  Channel ORM object (provides ``niche`` and ``tone``).
         db:       SQLAlchemy session managed by the caller.
 
     Returns:
-        All ``Script`` records that exist for this content after the run,
-        covering both the source language and successfully adapted languages.
-        Returns the source script alone if adaptation fails for all languages.
-        Returns an empty list and sets ``status="FAILED"`` if no source script exists.
+        The complete required validated ``Script`` set. Returns an empty list
+        and sets ``status="FAILED"`` if the source script is missing or any
+        required configured language could not be generated.
     """
-    content.status = "GENERATING_SCRIPTS"
-    db.commit()
+    if content.status != "GENERATING_SCRIPTS":
+        content.status = "GENERATING_SCRIPTS"
+        db.commit()
 
     # ── Load source script ────────────────────────────────────────────────────
     source_script: Script | None = (
@@ -409,6 +409,7 @@ def generate_multilingual_scripts(
         .filter(
             Script.content_id == content.id,
             Script.language == content.source_language,
+            Script.validated.is_(True),
         )
         .order_by(Script.version.desc())
         .first()
@@ -416,7 +417,7 @@ def generate_multilingual_scripts(
 
     if not source_script:
         logger.error(
-            "No source script found for content %s (language=%s) — cannot generate multilingual",
+            "No validated source script found for content %s (language=%s) — cannot generate multilingual",
             content.id, content.source_language,
         )
         content.status = "FAILED"
@@ -437,30 +438,23 @@ def generate_multilingual_scripts(
         for v in db.query(ChannelVoice).filter(ChannelVoice.channel_id == channel.id).all()
     }
 
-    # ── Extract hook context from the (potentially optimised) source script ───
+    # ── Extract hook context from the source script ───────────────────────────
     hook_context = _extract_hook_context(source_script.voice_script, script_format)
 
-    # ── Load channel target languages ─────────────────────────────────────────
-    channel_langs: list[ChannelLanguage] = (
-        db.query(ChannelLanguage)
-        .filter(ChannelLanguage.channel_id == channel.id)
-        .all()
-    )
-    target_codes = [cl.language for cl in channel_langs]
-
-    if not target_codes:
+    required_languages = _required_script_languages(content, channel, db)
+    if required_languages == [content.source_language]:
         logger.warning(
-            "Channel %s has no languages configured — using source language only",
+            "Channel %s has no target languages configured — source script set is complete",
             channel.id,
         )
-        content.status = "SCRIPTS_READY"
+        _mark_script_validated(source_script)
         db.commit()
         return [source_script]
 
     # ── Detect which languages already have scripts (safe for retries) ────────
-    already_done: set[str] = {
-        lang
-        for (lang,) in db.query(Script.language)
+    existing_by_lang: dict[str, Script] = {
+        script.language: script
+        for script in db.query(Script)
         .filter(Script.content_id == content.id)
         .all()
     }
@@ -468,26 +462,18 @@ def generate_multilingual_scripts(
     # ── Generate per-language scripts ─────────────────────────────────────────
     result: list[Script] = []
 
-    for lang in target_codes:
+    for lang in required_languages:
         if lang == content.source_language:
-            # Source script already exists — include as-is
             result.append(source_script)
             continue
 
-        if lang in already_done:
-            # Previously generated (e.g. retry after partial failure)
-            existing = (
-                db.query(Script)
-                .filter(Script.content_id == content.id, Script.language == lang)
-                .order_by(Script.version.desc())
-                .first()
-            )
-            if existing:
-                result.append(existing)
-                logger.debug("Script for lang=%s already exists — skipping", lang)
+        if lang in existing_by_lang:
+            existing = existing_by_lang[lang]
+            _mark_script_validated(existing)
+            result.append(existing)
+            logger.debug("Script for lang=%s already exists — skipping", lang)
             continue
 
-        # Resolve per-language voice model and provider; fallback to Cartesia defaults
         lang_voice: ChannelVoice | None = voice_map.get(lang)
         lang_model    = lang_voice.tts_model if lang_voice else "sonic-2"
         lang_provider = lang_voice.provider if lang_voice else "cartesia"
@@ -516,7 +502,7 @@ def generate_multilingual_scripts(
                 "Native script generation failed (lang=%s, content=%s): %s",
                 lang, content.id, exc,
             )
-            continue   # partial failure — other languages still proceed
+            continue
 
         script = Script(
             content_id=content.id,
@@ -524,24 +510,60 @@ def generate_multilingual_scripts(
             video_script=adapted["video_script"],
             voice_script=adapted["voice_script"],
             version=1,
-            validated=False,
-            # estimated_duration_sec set by Agent 3
+            validated=True,
+            estimated_duration_sec=estimate_duration_sec(adapted["voice_script"], lang),
         )
         db.add(script)
-        db.flush()    # populate script.id before next iteration
+        db.flush()
         result.append(script)
         logger.debug("Script saved: lang=%s id=%s", lang, script.id)
 
-    # ── Finalise ──────────────────────────────────────────────────────────────
-    content.status = "SCRIPTS_READY"
+    scripts_by_lang = {script.language: script for script in result}
+    missing = [lang for lang in required_languages if lang not in scripts_by_lang]
+    if missing:
+        logger.error(
+            "Multilingual script set incomplete for content %s — missing languages=%s",
+            content.id,
+            missing,
+        )
+        content.status = "FAILED"
+        db.commit()
+        return []
+
+    for script in result:
+        _mark_script_validated(script)
     db.commit()
 
     languages = [s.language for s in result]
     logger.info(
-        "Multilingual scripts ready for content %s — %d language(s): %s",
+        "Multilingual scripts validated for content %s — %d language(s): %s",
         content.id, len(result), languages,
     )
     return result
+
+
+def _required_script_languages(
+    content: Content,
+    channel: Channel,
+    db: Session,
+) -> list[str]:
+    channel_langs: list[ChannelLanguage] = (
+        db.query(ChannelLanguage)
+        .filter(ChannelLanguage.channel_id == channel.id)
+        .all()
+    )
+    target_codes = [cl.language for cl in channel_langs]
+    ordered = [content.source_language]
+    for lang in target_codes:
+        if lang not in ordered:
+            ordered.append(lang)
+    return ordered
+
+
+def _mark_script_validated(script: Script) -> None:
+    if script.estimated_duration_sec is None:
+        script.estimated_duration_sec = estimate_duration_sec(script.voice_script, script.language)
+    script.validated = True
 
 
 # ── Blueprint-first section generation ───────────────────────────────────────
@@ -1846,6 +1868,8 @@ def run_shorts_planner(
             short_content=short_content,
             generated=generated,
             source_language=long_content.source_language,
+            channel=channel,
+            audio_tags_enabled=config.audio_tags_enabled if config else False,
             part_n=part_n,
             total_parts=total_parts,
             db=db,
@@ -2103,6 +2127,8 @@ def _persist_child_short_script(
     short_content: Content,
     generated: dict,
     source_language: str,
+    channel: Channel,
+    audio_tags_enabled: bool,
     part_n: int,
     total_parts: int,
     db: Session,
@@ -2116,14 +2142,31 @@ def _persist_child_short_script(
         validated=True,
     )
     db.add(short_script)
+    db.flush()
+
+    required_scripts = generate_multilingual_scripts(
+        short_content,
+        channel,
+        db,
+        audio_tags_enabled=audio_tags_enabled,
+    )
+    if not required_scripts:
+        logger.error(
+            "run_shorts_planner: part %d/%d script set incomplete — content=%s",
+            part_n,
+            total_parts,
+            short_content.id,
+        )
+        return
 
     short_content.title = generated.get("title", short_content.title)
     short_content.status = "SCRIPTS_VALIDATED"
     db.commit()
 
     logger.info(
-        "run_shorts_planner: part %d/%d SCRIPTS_VALIDATED — content=%s",
+        "run_shorts_planner: part %d/%d SCRIPTS_VALIDATED — content=%s languages=%d",
         part_n,
         total_parts,
         short_content.id,
+        len(required_scripts),
     )

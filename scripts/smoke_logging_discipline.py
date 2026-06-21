@@ -83,6 +83,7 @@ changed_python = [
     "app/agents/agent3_audio/services/storage.py",
     "app/agents/agent3_audio/services/tts.py",
     "app/agents/agent4_visuals/services/flux_generator.py",
+    "app/agents/agent4_visuals/services/visual_orchestrator.py",
     "app/agents/agent4_visuals/subagents/storyboard.py",
     "app/agents/agent5_render/services/renderer.py",
     "app/agents/agent5_render/services/subtitles.py",
@@ -126,11 +127,11 @@ assert_marker_level("app/agents/agent3_audio/services/audio.py", "PARENT_AUDIO_S
 assert_marker_level("app/agents/agent3_audio/services/audio.py", "PARENT_AUDIO_DONE", "info")
 assert_marker_level("app/agents/agent3_audio/services/audio.py", "CHILD_SHORT_AUDIO_START", "info")
 assert_marker_level("app/agents/agent3_audio/services/audio.py", "CHILD_SHORT_AUDIO_DONE", "info")
-assert_marker_level("app/agents/agent5_render/services/video.py", "PARENT_VISUALS_START", "info")
-assert_marker_level("app/agents/agent5_render/services/video.py", "PARENT_VISUALS_DONE", "info")
-assert_marker_level("app/agents/agent5_render/services/video.py", "CHILD_SHORT_VISUALS_DEFERRED", "warning")
-assert_marker_level("app/agents/agent5_render/services/video.py", "CHILD_SHORT_VISUALS_START", "info")
-assert_marker_level("app/agents/agent5_render/services/video.py", "CHILD_SHORT_VISUALS_DONE", "info")
+assert_marker_level("app/agents/agent4_visuals/services/visual_orchestrator.py", "PARENT_VISUALS_START", "info")
+assert_marker_level("app/agents/agent4_visuals/services/visual_orchestrator.py", "PARENT_VISUALS_DONE", "info")
+assert_marker_level("app/agents/agent4_visuals/services/visual_orchestrator.py", "CHILD_SHORT_VISUALS_DEFERRED", "warning")
+assert_marker_level("app/agents/agent4_visuals/services/visual_orchestrator.py", "CHILD_SHORT_VISUALS_START", "info")
+assert_marker_level("app/agents/agent4_visuals/services/visual_orchestrator.py", "CHILD_SHORT_VISUALS_DONE", "info")
 assert_marker_level("app/agents/agent5_render/services/video.py", "CHILD_SHORT_RENDER_START", "info")
 assert_marker_level("app/agents/agent5_render/services/video.py", "CHILD_SHORT_RENDER_DONE", "info")
 assert_marker_level("app/scheduler/tasks.py", "AUDIO_PICKUP", "info")

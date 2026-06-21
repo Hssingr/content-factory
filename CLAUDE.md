@@ -87,12 +87,14 @@ flowchart TD
     I --> K[Parent AUDIO_DONE]
     J --> L[Child AUDIO_DONE]
     K --> N[Parent Agent 4 visual pass]
-    N --> O[Parent main render]
-    O --> P[Parent VIDEO_DONE]
+    N --> N2[Parent PARENT_VISUALS_DONE]
+    N2 --> O[Agent 5 parent main render]
+    O --> P[Parent RENDERED]
     L --> Q[Child Agent 4 visual remap]
-    N --> Q
-    Q --> R[Agent 5 child vertical short render]
-    R --> S[Child VIDEO_DONE]
+    N2 --> Q
+    Q --> Q2[Child CHILD_SHORT_VISUALS_DONE]
+    Q2 --> R[Agent 5 child vertical short render]
+    R --> S[Child RENDERED]
 ```
 
 Arrow explanation:
@@ -101,22 +103,41 @@ Discovery
 → creates parent `Content` row  
 → sends Telegram validation  
 → approval marks parent as `APPROVED`  
-→ Agent 2 generates long scripts  
-→ scripts reach `SCRIPTS_VALIDATED`  
-→ short planner creates child short contents and validated scripts  
+→ Agent 2 generates and validates the parent source script  
+→ Agent 2 generates and validates all required parent multilingual scripts  
+→ parent scripts reach `SCRIPTS_VALIDATED`  
+→ short planner creates child short contents and validated source scripts (requires the
+parent's own validated source `Script` row — see `run_shorts_planner`)  
+→ Agent 2 generates and validates all required child multilingual scripts  
+→ child scripts reach `SCRIPTS_VALIDATED`  
 → parent Agent 3 generates parent audio and Whisper  
 → child short episodes are immediately eligible for Agent 3 audio  
 → parent reaches `AUDIO_DONE`  
 → each child generates its own audio and Whisper  
-→ parent Agent 4 generates shared visual beats and Agent 5 renders the long video  
-→ child Agent 4 remaps parent visual beats to its own short narration  
+→ parent Agent 4 generates shared visual beats and writes `PARENT_VISUALS_DONE`  
+→ child Agent 4 remaps parent visual beats to its own short narration — this
+requires the parent's persisted `VideoSection(language="__visual__")` rows,
+i.e. requires `PARENT_VISUALS_DONE` to have been reached at least once — and
+writes `CHILD_SHORT_VISUALS_DONE`  
+→ Agent 5 renders the long video once parent is `PARENT_VISUALS_DONE`, and each
+child short once it is `CHILD_SHORT_VISUALS_DONE`  
 → each child renders as vertical `Short.tsx`  
-→ parent and children reach `VIDEO_DONE` independently
+→ parent and children reach `RENDERED` independently
 
 Important ordering rule:
 
-- Child short videos require child audio and parent visual beats.
-- Child short videos do **not** require the parent MP4 to be fully rendered.
+- Child script generation requires the parent's validated source `Script` row
+  (`run_shorts_planner` aborts if it is missing). Short planning may use the
+  parent source script, but parent `SCRIPTS_VALIDATED` is written only after
+  the complete required parent script set is generated and validated.
+- Agent 3 pickup must see only fully completed script sets: for both parent and
+  child content, `SCRIPTS_VALIDATED` means the required source-language script
+  exists, the required source-language script is validated, all configured
+  multilingual scripts exist, and all configured multilingual scripts are validated.
+- Child short videos require child audio and the parent's persisted visual
+  beats (`PARENT_VISUALS_DONE` reached at least once for the parent).
+- Child short videos do **not** require the parent MP4 to be fully rendered
+  (parent `RENDERED`).
 - Child short videos must never use parent audio.
 - Parent content must never render cut-down parent shorts.
 
@@ -133,8 +154,10 @@ PENDING_APPROVAL
 → SCRIPTS_VALIDATED
 → GENERATING_AUDIO
 → AUDIO_DONE
-→ GENERATING_VIDEO
-→ VIDEO_DONE
+→ GENERATING_VISUALS
+→ PARENT_VISUALS_DONE
+→ RENDERING
+→ RENDERED
 ```
 
 Optional/problem statuses:
@@ -152,15 +175,66 @@ GENERATING_SCRIPTS
 → SCRIPTS_VALIDATED
 → GENERATING_AUDIO
 → AUDIO_DONE
-→ GENERATING_VIDEO
-→ VIDEO_DONE
+→ GENERATING_VISUALS
+→ CHILD_SHORT_VISUALS_DONE
+→ RENDERING
+→ RENDERED
 ```
+
+A child may revert from `GENERATING_VISUALS` back to `AUDIO_DONE` if its
+parent has not yet reached `PARENT_VISUALS_DONE` — this is a normal wait, not
+a failure, and the child is re-picked-up on the next Beat cycle.
+
+Script completion rule:
+
+- For both parent and child content, `SCRIPTS_VALIDATED` means: required source-language script exists; required source-language script is validated; all required multilingual scripts exist; all required multilingual scripts are validated; and no intermediate script status remains active.
+- For parent content, `SCRIPTS_VALIDATED` means the source-language long script
+  exists and is validated, and every configured multilingual script exists and
+  is validated. If no channel target languages are configured, the validated
+  source-language script is the complete required script set.
+- For child short episodes, `SCRIPTS_VALIDATED` means the source-language short
+  script exists and is validated, and every configured multilingual child short
+  script exists and is validated. If no channel target languages are configured,
+  the validated source-language short script is the complete required script set.
+- `SCRIPTS_READY` is retired and must not be read or written by live runtime code.
+- `SCRIPTS_VALIDATED_AWAITING_PARENT` is retired and must not be read or
+  written by live runtime code. Child short audio is picked up from
+  `SCRIPTS_VALIDATED` like any other content; there is no parent-audio gate
+  status in the current architecture.
+- `run_script_workflow()` owns the final parent `SCRIPTS_VALIDATED` transition.
+- `run_shorts_planner()` owns the final child `SCRIPTS_VALIDATED` transition.
 
 Child short audio rule:
 
-- Child short contents become `SCRIPTS_VALIDATED` as soon as their standalone scripts pass validation.
+- Child short contents become `SCRIPTS_VALIDATED` only after their complete
+  required standalone short script set passes validation.
 - Child short audio does not wait for parent `AUDIO_DONE`.
 - Each child must generate its own audio and Whisper.
+
+### 4.3 Status Ownership
+
+| Transition | Owner |
+|---|---|
+| `PENDING_APPROVAL` → `APPROVED` | Telegram approval handler |
+| `APPROVED` → `GENERATING_SCRIPTS` → `SCRIPTS_VALIDATED` | Agent 2 |
+| `SCRIPTS_VALIDATED` → `GENERATING_AUDIO` → `AUDIO_DONE` | Agent 3 |
+| `AUDIO_DONE` → `GENERATING_VISUALS` → `PARENT_VISUALS_DONE` / `CHILD_SHORT_VISUALS_DONE` (or back to `AUDIO_DONE` on child defer) | Agent 4 |
+| `PARENT_VISUALS_DONE` / `CHILD_SHORT_VISUALS_DONE` → `RENDERING` → `RENDERED` | Agent 5 |
+| any stage → `FAILED` | the agent active at that stage |
+
+No agent writes a status outside its own row in this table. Agent 4 never
+writes `RENDERING`/`RENDERED`; Agent 5 never writes
+`GENERATING_VISUALS`/`PARENT_VISUALS_DONE`/`CHILD_SHORT_VISUALS_DONE`.
+
+`VIDEO_DONE` and `GENERATING_VIDEO` are retired — no runtime code path reads
+or writes them. They previously conflated Agent 4's visual-generation window
+and Agent 5's render window into one ambiguous status with crossover
+ownership; this section's split removes that ambiguity. `SCRIPTS_READY` and
+`SCRIPTS_VALIDATED_AWAITING_PARENT` are also retired script-stage statuses;
+current script/audio pickup uses only `SCRIPTS_VALIDATED`. No compatibility
+shim was needed for the retired video statuses: nothing outside the render
+pipeline itself ever filtered on `VIDEO_DONE`/`GENERATING_VIDEO` (no Agent
+6/publishing consumer existed yet).
 
 ---
 
@@ -319,8 +393,8 @@ Agent ownership:
 |---|---|---|
 | Story discovery and scripts | Agent 2 | discovery, validation handoff, long script generation, deterministic script validation, multilingual scripts, standalone short planning and child short script generation |
 | Audio | Agent 3 | TTS generation, Whisper transcription, audio persistence, audio validation |
-| Visuals | Agent 4 | storyboard generation and validation, beat generation, timestamp mapping, Flux prompt generation and validation, Flux image generation, media reuse, child short visual remap |
-| Rendering | Agent 5 | subtitles, Remotion props, rendering, render verification, `VideoRender` persistence |
+| Visuals | Agent 4 | storyboard generation and validation, beat generation, timestamp mapping, Flux prompt generation and validation, Flux image generation, media reuse, child short visual remap, `VideoSection` persistence, visual-readiness task orchestration |
+| Rendering | Agent 5 | reading existing `VideoSection`/`AudioFile` rows, subtitles, Remotion props, rendering, render verification, `VideoRender` persistence |
 
 Shared services own only generic infrastructure:
 
@@ -334,13 +408,61 @@ Shared services must not contain agent orchestration or agent-specific business
 flows. Deterministic utilities may be used by agents when they remain generic and
 side-effect free.
 
-Current boundary exception:
+Current state (Phase 4D-D implemented — Agent 4 is the visual-ready producer,
+Agent 5 is a render-only consumer, and status is the pickup source of truth):
 
-- `app/agents/agent5_render/services/video.py` still coordinates Agent 4 visual
-  services before Agent 5 render execution in one worker task so parent/child
-  visual readiness and render readiness stay sequenced. The visual business logic
-  remains in `app/agents/agent4_visuals/`; render business logic remains in
-  `app/agents/agent5_render/`.
+- `app/agents/agent4_visuals/services/visual_orchestrator.py` owns visual
+  generation end to end. `run_visual_generation_for_content(content_id, db)`
+  is the Agent 4 **task** entrypoint (called from the
+  `run_agent4_visual_generation_for_content` Celery task): it loads its own
+  preconditions (`Content`, `Channel`, `ChannelConfig`, validated `Script`
+  rows, `AudioFile` rows), transitions `AUDIO_DONE` -> `GENERATING_VISUALS`,
+  and calls `run_visual_generation()` — storyboard generation, storyboard
+  validation, Flux prompt generation, Flux image generation/cache reuse,
+  child short narration remap, and all `VideoSection` persistence
+  (`VideoSection(language="__visual__")` for parents and per-language
+  `VideoSection` rows for both parent and child short). On success it writes
+  `Content.status = "PARENT_VISUALS_DONE"` (parent) or
+  `"CHILD_SHORT_VISUALS_DONE"` (child) — Agent 4 is the sole writer of these
+  three statuses. On `CHILD_SHORT_VISUALS_DEFERRED` it reverts `Content.status`
+  to `AUDIO_DONE` for re-pickup; on `VISUALS_FAILED` it sets `"FAILED"`.
+- `app/agents/agent5_render/services/video.py` does not import any
+  `app.agents.agent4_visuals` module and does not call Agent 4 in any form.
+  `run_video_generation()` loads its own preconditions independently
+  (`Content`, `Channel`, `ChannelConfig`, validated `Script` rows, `AudioFile`
+  rows), requires `Content.status` to already be `PARENT_VISUALS_DONE`,
+  `CHILD_SHORT_VISUALS_DONE`, or `RENDERING` (re-entrant retry), and
+  transitions to `RENDERING` at the start. It reads existing `VideoSection`
+  rows with a private read-only loader (`_load_video_sections()`) as a
+  **defensive** check — it never writes that table, and never generates
+  storyboards, runs Flux, performs remap, or falls back to Agent 4 in any way.
+  If a language has no persisted `VideoSection` rows despite the status saying
+  ready, Agent 5 defers that language (`RENDER_DEFERRED ...
+  reason=visual_sections_missing`) rather than treating it as a hard failure.
+  On success it writes `Content.status = "RENDERED"` — Agent 5 is the sole
+  writer of `RENDERING`/`RENDERED`. Agent 5 owns subtitles, Remotion props,
+  rendering, render verification, and `VideoRender` persistence.
+- Agent 4 and Agent 5 are fully decoupled at the Celery layer, not just the
+  Python-import layer: `pickup_audio_done` (status `AUDIO_DONE`, has
+  `AudioFile`, no `VideoRender` yet) dispatches
+  `run_agent4_visual_generation_for_content`. `pickup_visual_ready` (status
+  `PARENT_VISUALS_DONE`/`CHILD_SHORT_VISUALS_DONE` — **status is the primary
+  readiness signal**, not `VideoSection` existence) independently dispatches
+  `run_agent5_render_for_content`; `VideoSection` row existence is checked
+  again only as a defensive validation (a status/row mismatch is logged as a
+  data-consistency warning and skipped, not silently rendered). Neither Celery
+  task calls the other directly; the handoff is purely through `Content.status`
+  polled every 15 minutes by Celery Beat (`pickup-audio-done`,
+  `pickup-visual-ready`).
+- Visual-readiness milestone logs (`PARENT_VISUALS_START`, `PARENT_VISUALS_DONE`,
+  `CHILD_SHORT_VISUALS_START`, `CHILD_SHORT_VISUALS_DONE`,
+  `CHILD_SHORT_VISUALS_DEFERRED`) are emitted from the Agent 4 orchestrator.
+  Render milestone logs (`RENDER_START`, `RENDER_DONE`,
+  `CHILD_SHORT_RENDER_START`, `CHILD_SHORT_RENDER_DONE`, `RENDER_DEFERRED`)
+  stay in Agent 5.
+- `VIDEO_DONE` and `GENERATING_VIDEO` are fully retired — see Section 4.3 for
+  the complete status ownership table and the dependency graph (Section 3) for
+  the parent→child script and visual dependencies this pickup model assumes.
 
 ---
 
@@ -504,13 +626,14 @@ flowchart TD
     J --> K[generate_story_blueprint]
     K --> L[generate_script_sections]
     L --> M[run_script_quality_gate]
-    M --> N[persist source Script]
-    N --> O[generate_multilingual_scripts]
+    M --> N[persist validated source Script]
+    N --> O[generate and validate multilingual scripts]
     O --> P[Content SCRIPTS_VALIDATED]
     P --> Q[run_shorts_planner]
     Q --> R[child Content rows]
-    R --> S[child short Scripts]
-    S --> T[Child SCRIPTS_VALIDATED]
+    R --> S[child validated source short Script]
+    S --> U[generate and validate child multilingual scripts]
+    U --> T[Child SCRIPTS_VALIDATED]
 ```
 
 ### 9.3 Important Agent 2 Functions
@@ -643,10 +766,10 @@ Responsibilities:
 - Generate story blueprint.
 - Generate section scripts.
 - Run quality gate.
-- Persist scripts.
-- Generate multilingual scripts.
-- Mark parent `SCRIPTS_VALIDATED`.
-- Call `run_shorts_planner`.
+- Persist validated source script.
+- Generate and validate required multilingual scripts.
+- Mark parent `SCRIPTS_VALIDATED` only after the complete required script set exists.
+- Call `run_shorts_planner` after parent `SCRIPTS_VALIDATED`.
 
 #### `generate_story_blueprint`
 
@@ -730,15 +853,19 @@ app/agents/agent2_discovery/services/scripts.py
 
 Responsibilities:
 
-- Generate/adapt scripts into configured languages.
+- Generate/adapt scripts into configured languages for parent and child content.
 - Persist `Script` rows.
 - Validate language outputs.
+- Return the complete required validated script set to the caller.
 
 Rules:
 
 - Native adaptation, not literal translation.
 - Maintain factual consistency.
 - Do not silently shorten content across languages.
+- Must not write `SCRIPTS_READY` or any terminal status.
+- Must fail the script step rather than allowing `SCRIPTS_VALIDATED` when any
+  required configured language is missing or unvalidated.
 
 ### 9.4 Standalone Short Planning
 
@@ -776,7 +903,8 @@ Rules:
 
 - Child short scripts are standalone.
 - Child short scripts are not parent cuts.
-- Child short scripts must be validated before the child row is marked `SCRIPTS_VALIDATED`.
+- Child short source scripts and all required child multilingual scripts must
+  be validated before the child row is marked `SCRIPTS_VALIDATED`.
 - If child short rows already exist, do not create duplicates.
 - Existing child rows in `SCRIPTS_VALIDATED` are picked up by normal Agent 3 audio pickup.
 - No child with MAJOR deterministic script issues may be marked ready.
@@ -1011,31 +1139,43 @@ Agent 4 must not:
 - Persist `VideoRender` rows.
 - Cut parent videos into shorts.
 - Use network assets during Remotion rendering.
+- Call Agent 5 or import any `app.agents.agent5_render` module.
+
+Agent 4 is triggered independently of Agent 5 (Phase 4D-C): `pickup_audio_done`
+dispatches `run_agent4_visual_generation_for_content`, which loads its own
+`Content`/`Channel`/`ChannelConfig`/`Script`/`AudioFile` rows and runs the
+flows below. Agent 5 only discovers the resulting `VideoSection` rows later,
+through its own independent `pickup_visual_ready` pickup.
 
 ### 11.2 Parent Agent 4 Visual Flow
 
 ```mermaid
 flowchart TD
-    A[Parent AUDIO_DONE] --> B[Agent 5 render orchestration]
-    B --> C[Agent 4 parent visual pass]
-    C --> D[split_into_beats]
+    A[Parent AUDIO_DONE] --> B[pickup_audio_done]
+    B --> C[run_agent4_visual_generation_for_content]
+    C --> C2[Parent GENERATING_VISUALS]
+    C2 --> D[split_into_beats]
     D --> E[generate_storyboard_batch]
     E --> F[map beats to Whisper timestamps]
     F --> G[generate_all_beat_images]
     G --> H[save __visual__ VideoSection rows]
+    H --> I[Parent PARENT_VISUALS_DONE]
 ```
 
 ### 11.3 Child Short Agent 4 Visual Flow
 
 ```mermaid
 flowchart TD
-    A[Child AUDIO_DONE] --> B[Agent 5 render orchestration]
-    B --> C[check parent __visual__ rows]
-    C -->|missing| D[defer back to AUDIO_DONE]
-    C -->|exists| E[remap_beats_for_short]
-    E --> F[reuse parent images or generate new]
-    F --> G[map to child Whisper timestamps]
-    G --> H[save child VideoSection rows]
+    A[Child AUDIO_DONE] --> B[pickup_audio_done]
+    B --> C[run_agent4_visual_generation_for_content]
+    C --> C2[Child GENERATING_VISUALS]
+    C2 --> D[check parent __visual__ rows]
+    D -->|missing| E[defer back to Child AUDIO_DONE]
+    D -->|exists| F[remap_beats_for_short]
+    F --> G[reuse parent images or generate new]
+    G --> H[map to child Whisper timestamps]
+    H --> I[save child VideoSection rows]
+    I --> J[Child CHILD_SHORT_VISUALS_DONE]
 ```
 
 ### 11.4 Important Agent 4 Functions
@@ -1163,13 +1303,14 @@ Avoid phase-labeled names in new code.
 
 ---
 
-## 11A. Agent 5 — Rendering
+## 11A. Agent 5 — Rendering (render-only)
 
 ### 11A.1 Agent 5 Responsibilities
 
 Agent 5 owns:
 
-- Render orchestration for content in `AUDIO_DONE`.
+- Render-ready pickup for content with an existing `AudioFile` and at least
+  one persisted `VideoSection` row.
 - Parent/child render routing.
 - Subtitle chunk generation.
 - Remotion props generation.
@@ -1183,40 +1324,71 @@ Agent 5 must not:
 - Generate audio.
 - Recreate scripts.
 - Cut parent videos into shorts.
-- Own storyboard or Flux generation logic.
+- Generate or validate storyboards, generate or validate Flux prompts,
+  generate media, perform child remapping, or persist `VideoSection` rows.
+- Import any `app.agents.agent4_visuals` module, or call Agent 4 in any form.
+- Fall back to visual generation when `VideoSection` rows are missing — it
+  must defer instead.
 - Store remote media URLs in props.
 
-Current orchestration boundary:
+Current boundary (Phase 4D-C — fully implemented):
 
-- `app/agents/agent5_render/services/video.py` orchestrates calls into Agent 4 visual services and Agent 5 render services in one worker task to preserve runtime sequencing.
-- Visual generation logic lives under `app/agents/agent4_visuals/`.
-- Rendering logic lives under `app/agents/agent5_render/`.
-- Rendering starts only after the content has an `AudioFile` and usable `VideoSection` rows for the render path.
+- Agent 4 (`app/agents/agent4_visuals/`) is the sole producer of visual-ready
+  content: it loads its own preconditions, generates/remaps visuals, and
+  persists `VideoSection` rows, all without any call from or into Agent 5.
+- Agent 5 (`app/agents/agent5_render/`) is a pure consumer: it loads its own
+  preconditions independently, reads existing `VideoSection` rows with a
+  private read-only loader, and never writes that table.
+- The two agents are decoupled at the Celery layer: `pickup_audio_done`
+  dispatches Agent 4's visual task; `pickup_visual_ready` independently
+  dispatches Agent 5's render task once `VideoSection` rows exist. Neither
+  Celery task calls the other.
+- Rendering starts only after the content has an `AudioFile` and at least one
+  persisted `VideoSection` row; a language with neither is deferred, not
+  failed, and not generated by Agent 5 as a fallback.
+- Agent 5 render verification is deterministic technical verification only.
+  When enabled, `verify_render()` checks that the rendered MP4 file exists,
+  uses ffprobe for duration drift, audio/video stream presence, and expected
+  resolution, and uses ffmpeg blackdetect/silencedetect for black-frame and
+  interior-silence intervals. It is not AI quality verification and does not
+  judge storyboard quality, Flux prompt quality, image quality, visual taste,
+  narrative alignment, or creative continuity.
 
 ### 11A.2 Parent Agent 5 Render Flow
 
 ```mermaid
 flowchart TD
-    A[Parent AUDIO_DONE] --> B[run_agent5_render_for_content]
-    B --> C[ensure Agent 4 visual rows exist]
-    C --> D[build_main_props]
-    D --> E[render_main_video or chunked render]
-    E --> F[verify_render]
-    F --> G[VideoRender format=main]
-    G --> H[Parent VIDEO_DONE]
+    A[Parent AUDIO_DONE] --> B[pickup_audio_done]
+    B --> C[run_agent4_visual_generation_for_content]
+    C --> D[Parent PARENT_VISUALS_DONE]
+    D --> E[pickup_visual_ready]
+    E --> F[run_agent5_render_for_content]
+    F --> F2[Parent RENDERING]
+    F2 --> G[build_main_props]
+    G --> H[render_main_video or chunked render]
+    H --> I[verify_render]
+    I --> J[VideoRender format=main]
+    J --> K[Parent RENDERED]
 ```
 
 ### 11A.3 Child Short Agent 5 Render Flow
 
 ```mermaid
 flowchart TD
-    A[Child AUDIO_DONE] --> B[run_agent5_render_for_content]
-    B --> C[ensure child visual remap exists]
-    C --> D[build_short_props]
-    D --> E[render_short Short.tsx]
-    E --> F[verify_render]
-    F --> G[VideoRender format=short]
-    G --> H[Child VIDEO_DONE]
+    A[Child AUDIO_DONE] --> B[pickup_audio_done]
+    B --> C[run_agent4_visual_generation_for_content]
+    C --> D{parent __visual__ rows exist?}
+    D -->|no| E[defer to Child AUDIO_DONE]
+    D -->|yes| F[remap + persist child VideoSection rows]
+    F --> F1[Child CHILD_SHORT_VISUALS_DONE]
+    F1 --> G[pickup_visual_ready]
+    G --> H[run_agent5_render_for_content]
+    H --> H2[Child RENDERING]
+    H2 --> I[build_short_props]
+    I --> J[render_short Short.tsx]
+    J --> K[verify_render]
+    K --> L[VideoRender format=short]
+    L --> M[Child RENDERED]
 ```
 
 ### 11A.4 Important Agent 5 Functions
@@ -1233,14 +1405,36 @@ Responsibilities:
 
 - Find `AUDIO_DONE` content with an `AudioFile`.
 - Skip content that already has the relevant `VideoRender` row.
-- Enqueue `run_agent5_render_for_content`.
+- Enqueue `run_agent4_visual_generation_for_content` (Agent 4, not Agent 5).
 
 Rules:
 
 - Can pick parent and child content.
-- Parent content can start the Agent 4 visual pass after parent audio exists.
-- Child content may defer until parent visual beats exist.
-- Render execution requires content audio, content video sections, and no existing render for that content/language/format.
+- Does not dispatch Agent 5 directly — Agent 5 pickup is a separate path.
+
+#### `pickup_visual_ready`
+
+File:
+
+```text
+app/scheduler/tasks.py
+```
+
+Responsibilities:
+
+- Find content with `Content.status` in (`PARENT_VISUALS_DONE`,
+  `CHILD_SHORT_VISUALS_DONE`) — status is the primary readiness signal.
+- Defensively verify at least one persisted per-language `VideoSection` row
+  exists (`language != "__visual__"`); skip and log a data-consistency
+  warning if status says ready but the row is missing.
+- Skip content that already has the relevant `VideoRender` row.
+- Enqueue `run_agent5_render_for_content`.
+
+Rules:
+
+- This is the only path that hands ready content to Agent 5.
+- Gates on `Content.status`, not on `VideoSection` row existence — the row
+  check is a defensive validation only, per Phase 4D-D.
 
 #### `run_agent5_render_for_content`
 
@@ -1253,7 +1447,8 @@ app/scheduler/tasks.py
 Responsibilities:
 
 - Run rendering orchestration for one content ID.
-- Preserve current Agent 2 → Agent 3 → Agent 5 sequencing.
+- Requires `Content.status` to already be `PARENT_VISUALS_DONE`,
+  `CHILD_SHORT_VISUALS_DONE`, or `RENDERING`; never calls Agent 4.
 
 Temporary compatibility:
 
@@ -1272,14 +1467,14 @@ Responsibilities:
 
 - Route parent vs child rendering.
 - Manage status transitions.
-- Call Agent 4 visual services when visual rows/remaps are needed.
+- Load existing `VideoSection` rows (read-only) for each language.
 - Persist video outputs.
 
 Rules:
 
-- Parent generates shared `__visual__` rows through Agent 4 visual services.
-- Child requires parent `__visual__` rows.
-- Child deferral to `AUDIO_DONE` is allowed while waiting.
+- Does not import or call any `app.agents.agent4_visuals` module.
+- A language with no persisted `VideoSection` rows is deferred
+  (`RENDER_DEFERRED ... reason=visual_sections_missing`), not generated.
 - Parent renders only `format="main"`.
 - Child renders only `format="short"`.
 - Parent must not create short props or short renders.
@@ -1457,8 +1652,10 @@ Important tasks:
 | `run_agent3_audio_for_content` | generate audio/Whisper |
 | `pickup_short_episodes_awaiting_parent` | compatibility no-op for old queued child-release messages |
 | `ensure_child_short_audio_enqueued` | compatibility no-op for old parent-audio child-release imports |
-| `pickup_audio_done` | enqueue Agent 5 render |
-| `run_agent5_render_for_content` | render video |
+| `pickup_audio_done` | enqueue Agent 4 visual generation |
+| `run_agent4_visual_generation_for_content` | generate storyboard/Flux visuals or child remap; persist `VideoSection` rows |
+| `pickup_visual_ready` | enqueue Agent 5 render once status is `PARENT_VISUALS_DONE`/`CHILD_SHORT_VISUALS_DONE` |
+| `run_agent5_render_for_content` | render video; requires visual-done status and existing `AudioFile`/`VideoSection` rows |
 
 Rules:
 
@@ -2123,7 +2320,11 @@ Rules:
 
 - Long videos can use chunked render.
 - Shorts should render as single vertical videos.
-- Verify rendered files.
+- Verify rendered files with deterministic technical checks when render
+  verification is enabled: file existence, ffprobe duration/stream/resolution
+  checks, blackdetect, and silencedetect.
+- Render verification is not AI quality verification; visual quality and
+  creative continuity belong to Agent 4 validation and diagnostics.
 - Do not publish unverified renders.
 
 ---

@@ -82,12 +82,18 @@ def run_script_workflow(content: Content, db: Session) -> None:
     _merge_visual_intent_history(content, scripts, db)
 
     _script_trace("tasks_entering_multilingual", src_voice_script)
-    generate_multilingual_scripts(
+    required_scripts = generate_multilingual_scripts(
         content,
         context.channel,
         db,
         audio_tags_enabled=context.audio_tags_enabled,
     )
+    if not required_scripts:
+        logger.error(
+            "Content %s script workflow stopped before SCRIPTS_VALIDATED — script set incomplete",
+            content.id,
+        )
+        return
     _set_multilingual_durations(content, db)
 
     content.status = "SCRIPTS_VALIDATED"

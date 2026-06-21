@@ -84,10 +84,17 @@ assert_ok(
     not _should_reuse(90, _TEXT_CARD_SENTINEL),
 )
 
-# ── 7. video.py imports remap_beats_for_short ─────────────────────────────────
+# ── 7. Agent 4 visual orchestrator routes remap_beats_for_short; Agent 5 does not ──
 
 import importlib
 import ast
+
+orchestrator_py = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "app", "agents", "agent4_visuals", "services", "visual_orchestrator.py",
+)
+with open(orchestrator_py, encoding="utf-8") as fh:
+    orchestrator_src = fh.read()
 
 video_py = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -97,16 +104,23 @@ with open(video_py, encoding="utf-8") as fh:
     video_src = fh.read()
 
 assert_ok(
-    "video.py imports remap_beats_for_short",
-    "remap_beats_for_short" in video_src,
-    "symbol not found in video.py source",
+    "visual_orchestrator.py imports remap_beats_for_short",
+    "remap_beats_for_short" in orchestrator_src,
+    "symbol not found in visual_orchestrator.py source",
 )
 
 # Also confirm it's used in the routing block
 assert_ok(
-    "video.py calls remap_beats_for_short()",
-    "remap_beats_for_short(" in video_src,
-    "call site not found in video.py source",
+    "visual_orchestrator.py calls remap_beats_for_short()",
+    "remap_beats_for_short(" in orchestrator_src,
+    "call site not found in visual_orchestrator.py source",
+)
+
+# Agent 5 must call only Agent 4's public entrypoint, not internal helpers.
+assert_ok(
+    "video.py does not call remap_beats_for_short() directly",
+    "remap_beats_for_short(" not in video_src,
+    "Agent 5 should not orchestrate Agent 4 internal helpers directly",
 )
 
 # ── 8. _SHORT_REMAP_SCHEMA structure ─────────────────────────────────────────

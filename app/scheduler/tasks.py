@@ -589,17 +589,21 @@ def run_agent4_for_content(self, content_id: str) -> None:
     return run_agent3_audio_for_content.run(content_id)
 
 
-# ── Agent 5 — Rendering tasks ─────────────────────────────────────────
+# ── Agent 4 — Visual generation tasks ────────────────────────────────────────
 
 @celery_app.task(name="app.scheduler.tasks.pickup_audio_done")
 def pickup_audio_done() -> int:
-    """Trigger Agent 5 render generation for every content with status AUDIO_DONE.
+    """Trigger Agent 4 visual generation for every content with status AUDIO_DONE.
 
-    Runs every 15 minutes. Atomically transitions each item to GENERATING_VIDEO
-    inside ``run_agent5_render_for_content`` so concurrent beats cannot double-process.
+    Runs every 15 minutes. Atomically transitions each item to
+    GENERATING_VISUALS inside ``run_agent4_visual_generation_for_content`` so
+    concurrent beats cannot double-process. Agent 5 render pickup is a
+    separate path (``pickup_visual_ready``) gated on Agent 4 writing
+    PARENT_VISUALS_DONE/CHILD_SHORT_VISUALS_DONE, not on this pickup directly
+    enqueueing it.
 
     Returns:
-        Number of video generation tasks dispatched.
+        Number of visual generation tasks dispatched.
     """
     from app.database import _get_session_factory
     from app.models import AudioFile, Content, VideoRender
@@ -616,7 +620,155 @@ def pickup_audio_done() -> int:
                 .first()
             ) is not None
             if not has_audio:
+                logger.info("VISUAL_PICKUP_SKIP content_id=%s reason=audio_missing", content.id)
+                continue
+
+            render_format = "short" if bool(getattr(content, "is_short_episode", False)) else "main"
+            has_render = (
+                db.query(VideoRender)
+                .filter(VideoRender.content_id == content.id, VideoRender.format == render_format)
+                .limit(1)
+                .first()
+            ) is not None
+            if has_render:
+                logger.info(
+                    "VISUAL_PICKUP_SKIP content_id=%s reason=render_exists format=%s",
+                    content.id, render_format,
+                )
+                continue
+
+            run_agent4_visual_generation_for_content.delay(str(content.id))
+            dispatched += 1
+    finally:
+        db.close()
+
+    if dispatched:
+        logger.info("pickup_audio_done: %d task(s) dispatched", dispatched)
+    return dispatched
+
+
+@celery_app.task(
+    name="app.scheduler.tasks.run_agent4_visual_generation_for_content",
+    bind=True,
+    max_retries=2,
+    default_retry_delay=120,
+)
+def run_agent4_visual_generation_for_content(self, content_id: str) -> None:
+    """Run the full Agent 4 visual generation pipeline for one content item.
+
+    For parent content:
+      1. Storyboard         — map script to timed visual beats
+      2. Storyboard validator — validate/retry visual beats
+      3. Flux generator     — create/cache local images
+      4. Save VideoSection rows (language="__visual__" + per-language)
+
+    For child short content:
+      1. Gate on parent VideoSection(language="__visual__") existing
+      2. Remap parent beats to the child's own narration
+      3. Save per-language VideoSection rows
+
+    Sets ``content.status = "GENERATING_VISUALS"`` while visuals are being
+    generated, then ``"PARENT_VISUALS_DONE"`` (parent) or
+    ``"CHILD_SHORT_VISUALS_DONE"`` (child) on success — the status Agent 5's
+    ``pickup_visual_ready`` polls on. Reverts to ``"AUDIO_DONE"`` if a child
+    defers waiting on its parent, and sets ``"FAILED"`` if visual generation
+    fails outright. Never renders.
+
+    Args:
+        content_id: UUID string of content with status ``AUDIO_DONE``.
+    """
+    from app.database import _get_session_factory
+    from app.models import Content
+    from app.agents.agent4_visuals.services.visual_orchestrator import (
+        run_visual_generation_for_content,
+    )
+
+    cid = uuid.UUID(content_id)
+    db = _get_session_factory()()
+    try:
+        content: Content | None = db.get(Content, cid)
+        if not content:
+            logger.warning("Content %s not found — skipping", content_id)
+            return
+        if content.status not in ("AUDIO_DONE", "GENERATING_VISUALS"):
+            logger.debug(
+                "Content %s status=%s — skipping visual generation",
+                content_id, content.status,
+            )
+            return
+
+        run_visual_generation_for_content(cid, db)
+
+    except Exception as exc:
+        logger.error(
+            "run_agent4_visual_generation_for_content error for %s: %s", content_id, exc,
+        )
+        db.rollback()
+        try:
+            raise self.retry(exc=exc)
+        except self.MaxRetriesExceededError:
+            logger.error("Max retries reached for Agent 4 visual generation of %s", content_id)
+    finally:
+        db.close()
+
+
+# ── Agent 5 — Render-only tasks ──────────────────────────────────────────────
+
+@celery_app.task(name="app.scheduler.tasks.pickup_visual_ready")
+def pickup_visual_ready() -> int:
+    """Trigger Agent 5 render for every content whose Agent 4 visuals are ready.
+
+    Runs every 15 minutes. Status is the source of truth: dispatches content
+    with ``Content.status`` in (``PARENT_VISUALS_DONE``,
+    ``CHILD_SHORT_VISUALS_DONE``) — those are written exclusively by Agent 4
+    (``run_agent4_visual_generation_for_content``). `VideoSection` row
+    existence is checked only as a defensive validation (it should always be
+    true when status says ready; if it is not, that is a data inconsistency,
+    not a normal wait state, so this pickup skips and logs rather than
+    dispatching a render that would just defer). Agent 5 never generates
+    visuals itself; this pickup is the only path that hands it ready content.
+
+    Returns:
+        Number of render tasks dispatched.
+    """
+    from app.database import _get_session_factory
+    from app.models import AudioFile, Content, VideoRender, VideoSection
+
+    db = _get_session_factory()()
+    dispatched = 0
+    try:
+        candidates = (
+            db.query(Content)
+            .filter(Content.status.in_(("PARENT_VISUALS_DONE", "CHILD_SHORT_VISUALS_DONE")))
+            .all()
+        )
+        for content in candidates:
+            has_audio = (
+                db.query(AudioFile)
+                .filter(AudioFile.content_id == content.id)
+                .limit(1)
+                .first()
+            ) is not None
+            if not has_audio:
                 logger.info("RENDER_PICKUP_SKIP content_id=%s reason=audio_missing", content.id)
+                continue
+
+            # Defensive validation only — status is the primary readiness signal.
+            has_visual_sections = (
+                db.query(VideoSection)
+                .filter(
+                    VideoSection.content_id == content.id,
+                    VideoSection.language != "__visual__",
+                )
+                .limit(1)
+                .first()
+            ) is not None
+            if not has_visual_sections:
+                logger.warning(
+                    "RENDER_PICKUP_SKIP content_id=%s reason=status_videosection_mismatch "
+                    "status=%s",
+                    content.id, content.status,
+                )
                 continue
 
             render_format = "short" if bool(getattr(content, "is_short_episode", False)) else "main"
@@ -639,7 +791,7 @@ def pickup_audio_done() -> int:
         db.close()
 
     if dispatched:
-        logger.info("pickup_audio_done: %d task(s) dispatched", dispatched)
+        logger.info("pickup_visual_ready: %d task(s) dispatched", dispatched)
     return dispatched
 
 
@@ -650,22 +802,28 @@ def pickup_audio_done() -> int:
     default_retry_delay=300,
 )
 def run_agent5_render_for_content(self, content_id: str) -> None:
-    """Run the full Agent 5 render generation pipeline for one content item.
+    """Run the Agent 5 render-only pipeline for one content item.
 
-    For each validated audio language:
-      1. Storyboard        — map script to timed visual beats
-      2. Section Validator — validate/enrich visual beats
-      3. Save video_sections to DB
-      4. Flux generator    — create/cache local images
-      5. Subtitles         — standard (main) + karaoke (Shorts)
-      6. Remotion builder  — write JSON props files
-      7. Remotion renderer — render MP4s, save VideoRender records
+    Requires that Agent 4 has already written ``content.status`` to
+    ``PARENT_VISUALS_DONE`` or ``CHILD_SHORT_VISUALS_DONE`` (see
+    ``run_agent4_visual_generation_for_content``) — that status is the
+    primary readiness signal; persisted VideoSection rows are checked again
+    defensively inside ``run_video_generation``. For each render-ready
+    language:
+      1. Load VideoSection rows (read-only)
+      2. Subtitles         — standard (main) + karaoke (Shorts)
+      3. Remotion builder  — write JSON props files
+      4. Remotion renderer — render MP4s, save VideoRender records
 
-    Sets ``content.status = "VIDEO_DONE"`` on full success,
-    ``"FAILED"`` if all languages fail.
+    Sets ``content.status = "RENDERED"`` on full success, ``"FAILED"`` if all
+    languages fail. Does not generate storyboards, run Flux, perform remap, or
+    persist VideoSection rows, and has no Agent 4 fallback — if visuals are
+    not actually ready it defers without changing status.
 
     Args:
-        content_id: UUID string of content with status ``AUDIO_DONE``.
+        content_id: UUID string of content with status
+            ``PARENT_VISUALS_DONE``, ``CHILD_SHORT_VISUALS_DONE``, or
+            ``RENDERING`` (re-entrant retry).
     """
     from app.database import _get_session_factory
     from app.models import Content
@@ -678,7 +836,7 @@ def run_agent5_render_for_content(self, content_id: str) -> None:
         if not content:
             logger.warning("Content %s not found — skipping", content_id)
             return
-        if content.status not in ("AUDIO_DONE", "GENERATING_VIDEO"):
+        if content.status not in ("PARENT_VISUALS_DONE", "CHILD_SHORT_VISUALS_DONE", "RENDERING"):
             logger.debug(
                 "Content %s status=%s — skipping video generation",
                 content_id, content.status,

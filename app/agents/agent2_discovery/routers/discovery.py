@@ -54,7 +54,7 @@ def list_content(
 
     Filters:
     - ``channel_id``: restrict to one channel
-    - ``status``:     e.g. ``PENDING_APPROVAL``, ``APPROVED``, ``SCRIPTS_READY``
+    - ``status``:     e.g. ``PENDING_APPROVAL``, ``APPROVED``, ``SCRIPTS_VALIDATED``
     - ``limit``:      max results (default 50)
 
     Results are ordered newest first.

@@ -163,11 +163,15 @@ check("C4b: Agent 3 has no child bookend generation path",
       "is_short_episode" in _src_audio and "generate_short_bookends" not in _src_audio)
 
 from app.agents.agent5_render.services.video import run_video_generation
+import app.agents.agent4_visuals.services.visual_orchestrator as _orchestrator_mod
 _src_rvg = inspect.getsource(run_video_generation)
-check("C5a: remap_beats_for_short imported in video.py",
-      "remap_beats_for_short" in _src_video)
-check("C5b: remap_beats_for_short called for short episodes",
-      "remap_beats_for_short(" in _src_rvg)
+_src_orchestrator = inspect.getsource(_orchestrator_mod)
+check("C5a: remap_beats_for_short imported in Agent 4 visual orchestrator (not video.py)",
+      "remap_beats_for_short" in _src_orchestrator and "remap_beats_for_short" not in _src_video)
+check("C5b: remap_beats_for_short called for short episodes via Agent 4 orchestrator, "
+      "not from Agent 5 render.py",
+      "remap_beats_for_short(" in _src_orchestrator
+      and "run_visual_generation(" not in _src_rvg)
 check("C6: CHILD_SHORT_RENDER_START log in run_video_generation with format=short",
       "CHILD_SHORT_RENDER_START" in _src_rvg and "format=short" in _src_rvg)
 check("C7: resolution=1080x1920 in CHILD_SHORT_RENDER_START log",

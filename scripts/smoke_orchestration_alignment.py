@@ -18,6 +18,7 @@ from app.scheduler import tasks
 from app.agents.agent2_discovery.services import scripts as script_service
 from app.agents.agent3_audio.services import audio as audio_service
 from app.agents.agent5_render.services import video as video_service
+from app.agents.agent4_visuals.services import visual_orchestrator
 
 checks = 0
 failures: list[str] = []
@@ -47,10 +48,11 @@ src_parent_gate_helper = inspect.getsource(tasks.ensure_child_short_audio_enqueu
 src_run_agent3 = inspect.getsource(tasks.run_agent3_audio_for_content)
 src_audio = inspect.getsource(audio_service.run_audio_generation)
 src_video_generation = inspect.getsource(video_service.run_video_generation)
-src_visual_pass = inspect.getsource(video_service._run_visual_pass)
+src_visual_pass = inspect.getsource(visual_orchestrator._run_visual_pass)
+src_visual_orchestrator = inspect.getsource(visual_orchestrator)
 src_process_language = inspect.getsource(video_service._process_language)
 src_run_short_render = inspect.getsource(video_service._run_short_render)
-src_remap = inspect.getsource(video_service.remap_beats_for_short)
+src_remap = inspect.getsource(visual_orchestrator.remap_beats_for_short)
 src_pickup_audio_done = inspect.getsource(tasks.pickup_audio_done)
 scheduler_init = (ROOT / "app" / "scheduler" / "__init__.py").read_text(encoding="utf-8")
 
@@ -86,9 +88,11 @@ check("obsolete parent-gate Beat schedule removed", "pickup-short-episodes-await
 print("\n-- Agent 4 visual readiness --")
 check("parent visuals start log present", "PARENT_VISUALS_START content_id=%s" in src_visual_pass)
 check("parent visuals done log present", "PARENT_VISUALS_DONE content_id=%s" in src_visual_pass)
-check("child visuals defer when parent visuals are missing", "CHILD_SHORT_VISUALS_DEFERRED content_id=%s reason=parent_visuals_missing" in src_video_generation)
-check("child visuals start after parent visuals exist", "CHILD_SHORT_VISUALS_START content_id=%s parent_content_id=%s" in src_video_generation)
+check("child visuals defer when parent visuals are missing", "CHILD_SHORT_VISUALS_DEFERRED content_id=%s reason=parent_visuals_missing" in src_visual_orchestrator)
+check("child visuals start after parent visuals exist", "CHILD_SHORT_VISUALS_START content_id=%s parent_content_id=%s" in src_visual_orchestrator)
 check("child reuse stats log present", "CHILD_SHORT_REUSE_STATS content_id=%s" in src_remap)
+check("Agent 5 render does not call Agent 4 at all (render-only since Phase 4D-C)",
+      "run_visual_generation(" not in src_video_generation)
 
 print("\n-- Agent 5 render readiness --")
 check("render pickup requires AudioFile", "from app.models import AudioFile, Content, VideoRender" in src_pickup_audio_done and "reason=audio_missing" in src_pickup_audio_done)

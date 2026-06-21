@@ -52,9 +52,14 @@ celery_app.conf.beat_schedule = {
         "task": "app.scheduler.tasks.pickup_scripts_validated",
         "schedule": crontab(minute="*/15"),            # every 15 minutes
     },
-    # Agent 5: render video for all audio-done content
+    # Agent 4: generate storyboard/Flux visuals (or child remap) for audio-done content
     "pickup-audio-done": {
         "task": "app.scheduler.tasks.pickup_audio_done",
+        "schedule": crontab(minute="*/15"),            # every 15 minutes
+    },
+    # Agent 5: render video for content Agent 4 marked PARENT_VISUALS_DONE/CHILD_SHORT_VISUALS_DONE
+    "pickup-visual-ready": {
+        "task": "app.scheduler.tasks.pickup_visual_ready",
         "schedule": crontab(minute="*/15"),            # every 15 minutes
     },
 }
