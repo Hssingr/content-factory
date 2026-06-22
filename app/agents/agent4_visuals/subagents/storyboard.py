@@ -38,7 +38,7 @@ from app.agents.agent4_visuals.system_prompt import (
     generate_storyboard_batch,
 )
 from app.models import VideoSection
-from app.services.claude_client import call_claude_structured
+from app.services.claude_client import call_claude_structured_with_usage
 from app.agents.agent4_visuals.services.flux_generator import generate_beat_image
 from app.shared.text_normalize import normalize_for_matching as _normalize_for_matching
 
@@ -151,6 +151,8 @@ _SHORT_REMAP_SYSTEM_PROMPT = (
     "- Return ONLY valid JSON. No markdown. No code fence. No extra keys.\n"
     "PROMPT_VERSION = \"1.0\""
 )
+
+_SHORT_REMAP_MAX_TOKENS = 4096
 
 _SHORT_REMAP_SCHEMA: dict = {
     "type": "object",
@@ -1135,15 +1137,18 @@ def remap_beats_for_short(
         + json.dumps(beat_index, ensure_ascii=False)
     )
 
-    try:
-        result = call_claude_structured(
+    def _run_remap() -> tuple[dict, dict]:
+        return call_claude_structured_with_usage(
             task="short_storyboard_remap",
             system_prompt=_SHORT_REMAP_SYSTEM_PROMPT,
             user_message=user_message,
             schema_name="short_storyboard_remap",
             input_schema=_SHORT_REMAP_SCHEMA,
-            max_tokens=1024,
+            max_tokens=_SHORT_REMAP_MAX_TOKENS,
         )
+
+    try:
+        result, usage = _run_remap()
     except Exception as exc:
         logger.error(
             "remap_beats_for_short: Claude call failed for content=%s: %s",
@@ -1151,11 +1156,44 @@ def remap_beats_for_short(
         )
         return []
 
+    output_tokens = usage.get("output_tokens", 0)
     assignments: list[dict] = result.get("assignments") or []
+
+    if not assignments and output_tokens >= _SHORT_REMAP_MAX_TOKENS:
+        # Truncated — Claude hit max_tokens mid-response; the forced tool-use
+        # input comes back empty in this case (same failure shape as the
+        # truncation case in generate_storyboard_batch()). A larger parent
+        # storyboard (more beats in beat_index) and/or a longer short
+        # narration (more phrases to assign) makes this more likely — retry
+        # once unmodified; if it truncates again, the narration is genuinely
+        # too long for one remap call and this is a real failure, not a fluke.
+        logger.warning(
+            "remap_beats_for_short: truncated (output_tokens=%d == max_tokens=%d) "
+            "for content=%s — retrying once",
+            output_tokens, _SHORT_REMAP_MAX_TOKENS, content_id_str,
+        )
+        try:
+            result, usage = _run_remap()
+        except Exception as exc:
+            logger.error(
+                "remap_beats_for_short: retry Claude call failed for content=%s: %s",
+                content_id_str, exc,
+            )
+            return []
+        output_tokens = usage.get("output_tokens", 0)
+        assignments = result.get("assignments") or []
+        if not assignments and output_tokens >= _SHORT_REMAP_MAX_TOKENS:
+            logger.error(
+                "remap_beats_for_short: truncated again on retry (output_tokens=%d) "
+                "for content=%s — narration may be too long for one remap call",
+                output_tokens, content_id_str,
+            )
+
     if not assignments:
         logger.warning(
-            "remap_beats_for_short: no assignments returned for content=%s",
-            content_id_str,
+            "remap_beats_for_short: no assignments returned for content=%s "
+            "(output_tokens=%d, not a truncation)",
+            content_id_str, output_tokens,
         )
         return []
 

@@ -1227,6 +1227,24 @@ Rules:
 - Prompt must not rely on vague mood words.
 - Prompt must support visual continuity and identity consistency.
 
+Retry behavior (two independent, bounded retry classes — never combined into
+one retry path):
+
+- **Truncation retry** — when `output_tokens >= STORYBOARD_BATCH_MAX_TOKENS`,
+  retries once with a reduced `target_beat_count` to free token budget. Logs
+  `STORYBOARD_RETRY_COST`. Raises if the retry is truncated again.
+- **Shape retry** — when the response is structurally malformed (a required
+  key missing, or present with the wrong type — e.g. `beats` returned as a
+  string instead of a list on an otherwise complete, non-truncated response;
+  a real model quirk observed in production) — retries the same segment once
+  with the same `target_beat_count`, no reduction, since this is not a
+  token-budget problem. Logs `STORYBOARD_SHAPE_INVALID` (the actual malformed
+  value, truncated to 200 chars, every time the shape check fails — this is
+  the diagnostic capture that earlier runs lacked) and `STORYBOARD_SHAPE_RETRY`
+  before retrying. Raises (fail-loud, aborts the entire storyboard via the
+  caller in `storyboard.py`) if the retry is also malformed — there is no
+  third attempt and no repair/coercion of the malformed value.
+
 #### `map_storyboard_beats_to_timestamps`
 
 File:
@@ -1499,6 +1517,23 @@ Ordering rule (Phase 4E-E):
   through unchanged. This matters only for the child path — the parent
   never has a `media_url` set at this point — but dropping the field here
   would silently erase every reuse-vs-pending decision this function makes.
+
+Retry behavior:
+
+- The Haiku `short_storyboard_remap` call uses
+  `call_claude_structured_with_usage()` (not the usage-discarding
+  `call_claude_structured()`) specifically so truncation can be detected:
+  if the call returns no `assignments` and `output_tokens >= max_tokens`
+  (`_SHORT_REMAP_MAX_TOKENS = 4096`), the forced tool-use input came back
+  empty — the same truncation failure shape as `generate_storyboard_batch()`
+  — and the call is retried once, unmodified. A real production failure
+  (parent storyboard with many beats + a long short narration needing many
+  narration-phrase assignments) hit this exact truncation at the old
+  `max_tokens=1024` on every short for an affected parent. If the retry
+  also truncates, `remap_beats_for_short()` logs and returns `[]` as before
+  (fail-loud — the caller defers/fails the child, it does not invent beats).
+  An `assignments` list that comes back empty **without** hitting the token
+  cap is a different, non-truncation case and is not retried.
 
 Preferred log names when touched:
 

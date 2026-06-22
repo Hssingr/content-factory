@@ -410,6 +410,37 @@ def generate_storyboard_batch(
             max_tokens=STORYBOARD_BATCH_MAX_TOKENS,
         )
 
+    def _check_shape(storyboard: dict) -> None:
+        """Raise ValueError on the first required key that is missing or wrong-typed.
+
+        Logs the actual malformed value (truncated) before raising — earlier
+        runs raised the same ValueError with no record of what Claude actually
+        returned, making the failure unreproducible/undiagnosable after the fact.
+        """
+        for key, expected_type in (
+            ("storyboard_status", str), ("overall_style", str),
+            ("beats", list), ("global_notes", list),
+        ):
+            if key not in storyboard:
+                logger.error(
+                    "STORYBOARD_SHAPE_INVALID segment=%s key=%s issue=missing "
+                    "present_keys=%s",
+                    segment_label, key, sorted(storyboard.keys()),
+                )
+                raise ValueError(f"storyboard_batch response missing required key '{key}'")
+            if not isinstance(storyboard[key], expected_type):
+                actual = storyboard[key]
+                logger.error(
+                    "STORYBOARD_SHAPE_INVALID segment=%s key=%s issue=wrong_type "
+                    "expected=%s got=%s value=%r",
+                    segment_label, key, expected_type.__name__, type(actual).__name__,
+                    actual if not isinstance(actual, str) else actual[:200],
+                )
+                raise ValueError(
+                    f"storyboard_batch key '{key}' expected {expected_type.__name__}, "
+                    f"got {type(actual).__name__}"
+                )
+
     _t0 = time.monotonic()
     storyboard, usage = _run(target_beat_count)
     _elapsed_ms1 = int((time.monotonic() - _t0) * 1000)
@@ -464,17 +495,26 @@ def generate_storyboard_batch(
             100 * output_tokens / STORYBOARD_BATCH_MAX_TOKENS,
         )
 
-    for key, expected_type in (
-        ("storyboard_status", str), ("overall_style", str),
-        ("beats", list), ("global_notes", list),
-    ):
-        if key not in storyboard:
-            raise ValueError(f"storyboard_batch response missing required key '{key}'")
-        if not isinstance(storyboard[key], expected_type):
-            raise ValueError(
-                f"storyboard_batch key '{key}' expected {expected_type.__name__}, "
-                f"got {type(storyboard[key]).__name__}"
-            )
+    try:
+        _check_shape(storyboard)
+    except ValueError:
+        # One bounded retry for a structurally-malformed (not truncated) response —
+        # e.g. Claude returning a required array field as a string on an otherwise
+        # complete, non-truncated tool-use call. This is a different failure class
+        # from truncation (above) and gets its own retry rather than falling back
+        # to the truncation branch's reduced-beat-count logic, which would not help.
+        logger.warning(
+            "STORYBOARD_SHAPE_RETRY segment=%s — malformed response shape, "
+            "retrying this segment once with the same target_beat_count=%d",
+            segment_label, target_beat_count,
+        )
+        _t2 = time.monotonic()
+        storyboard, usage = _run(target_beat_count)
+        _elapsed_ms3 = int((time.monotonic() - _t2) * 1000)
+        _attempt_count += 1
+        _total_input_tokens += usage.get("input_tokens", 0)
+        _total_elapsed_ms += _elapsed_ms3
+        _check_shape(storyboard)  # raises (fail-loud) if the retry is also malformed
 
     diag: dict = {
         "was_truncated": _was_truncated,

@@ -438,9 +438,16 @@ def _run_step_audio(content, db, *, force: bool = False) -> bool:
     from app.agents.agent3_audio.services.audio import run_audio_generation
 
     label = _label(content)
-    if content.status not in ("SCRIPTS_VALIDATED", "GENERATING_AUDIO", "AUDIO_DONE"):
+    if content.status not in ("SCRIPTS_VALIDATED", "GENERATING_AUDIO", "AUDIO_DONE", "FAILED"):
         print(f"  [{label}] status={content.status} — not eligible for audio yet, skipping")
         return content.status == "AUDIO_DONE"
+
+    if content.status == "FAILED":
+        # FAILED is a failure state, not valid data — retrying is the default
+        # resumable behavior and needs no --force. run_audio_generation() does not
+        # require a specific starting status (it only needs validated scripts), so
+        # no status reset is needed before calling it, unlike the visuals/render steps.
+        print(f"  [{label}] status=FAILED — retrying audio generation (see application logs for the original failure)")
 
     existing = _audio_exists(content.id, db)
     if content.status == "AUDIO_DONE" and existing and not force:
@@ -469,11 +476,19 @@ def _run_step_visuals(content, db, *, force: bool = False) -> bool:
         print(f"  [{label}] REUSED — already {done_status} ({n} persisted VideoSection row(s)), skipping")
         return True
 
-    if content.status not in ("AUDIO_DONE", "GENERATING_VISUALS", done_status):
+    if content.status not in ("AUDIO_DONE", "GENERATING_VISUALS", done_status, "FAILED"):
         print(f"  [{label}] status={content.status} — not eligible for visuals yet, skipping")
         return False
 
-    if force and content.status == done_status:
+    if content.status == "FAILED":
+        # FAILED is not "valid data that exists" — it's a failure state, so retrying
+        # it is the default resumable behavior and needs no --force (unlike redoing
+        # an already-successful done_status row, which does). See application logs
+        # for why it failed previously.
+        print(f"  [{label}] status=FAILED — retrying visual generation (see application logs for the original failure)")
+        content.status = "AUDIO_DONE"
+        db.commit()
+    elif force and content.status == done_status:
         print(
             f"  [{label}] WARNING --force-visuals set on {done_status} content — "
             "run_visual_generation_for_content() only proceeds from AUDIO_DONE/GENERATING_VISUALS, "
@@ -499,11 +514,17 @@ def _run_step_render(content, db, *, force: bool = False) -> bool:
         print(f"  [{label}] REUSED — already RENDERED ({n} VideoRender row(s)), skipping")
         return True
 
-    if content.status not in (visuals_done_status, "RENDERING", "RENDERED"):
+    if content.status not in (visuals_done_status, "RENDERING", "RENDERED", "FAILED"):
         print(f"  [{label}] status={content.status} — not eligible for render yet, skipping")
         return False
 
-    if force and content.status == "RENDERED":
+    if content.status == "FAILED":
+        # Same reasoning as the visuals step: FAILED is a failure state, not valid
+        # data — retrying it is the default resumable behavior and needs no --force.
+        print(f"  [{label}] status=FAILED — retrying render (see application logs for the original failure)")
+        content.status = visuals_done_status
+        db.commit()
+    elif force and content.status == "RENDERED":
         print(
             f"  [{label}] WARNING --force-render set on RENDERED content — resetting Content.status "
             f"to {visuals_done_status} to re-enter the render pass. No VideoRender rows are deleted; "
