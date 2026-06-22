@@ -1,51 +1,76 @@
 #!/usr/bin/env python3
 """
-Full Agent 2 → Agent 4 → Agent 5 end-to-end test script.
+Full operator entrypoint — Agent 2 (discovery + scripts) -> Agent 3 (audio)
+-> Agent 4 (visuals) -> Agent 5 (render).
+
+This is the real-money, real-API harness an operator runs to produce one
+finished parent video and its standalone Shorts end to end. It is resumable:
+every step first checks the database for already-valid artifacts and reuses
+them instead of regenerating, unless the matching --force-* flag is passed.
+
+Frozen parent flow:
+    APPROVED -> Agent 2 scripts + multilingual -> SCRIPTS_VALIDATED
+    -> Agent 3 audio + Whisper -> AUDIO_DONE
+    -> Agent 4 visuals + validate_storyboard() + validate_media_assets() -> PARENT_VISUALS_DONE
+    -> Agent 5 render -> RENDERED
+
+Frozen child (standalone Short) flow:
+    created by Agent 2's shorts planner from the parent's validated source script
+    -> child source + multilingual scripts -> SCRIPTS_VALIDATED
+    -> Agent 3 audio + Whisper (own audio, never the parent's) -> AUDIO_DONE
+    -> Agent 4 remap + same two validators -> CHILD_SHORT_VISUALS_DONE
+    -> Agent 5 render -> RENDERED
+
+Child status never changes as a side effect of parent audio or parent visual
+success — each child only advances through its own script/audio/visual/render
+step, called independently in the same loop body the parent uses.
 
 Steps:
-  1. Discovery    — Claude browses your sources, picks the best story (fetch → dedup → score)
-  2. Telegram     — sends title + URL + score to your phone, waits for APPROVE
-  3. Scripts      — blueprint → section-by-section generation → quality gate → persist source Script
-                    → Shorts Planner (non-blocking, creates Short episode Content rows)
-  4. Multilingual — culturally adapted scripts for every channel language
-  5. Validation   — deterministic checks + auto-correction, sets SCRIPTS_VALIDATED
-  6. Agent 4      — Cartesia TTS + Whisper transcription for parent content
-                    → Short episodes awaiting parent are flipped to SCRIPTS_VALIDATED
-  6b. Agent 4    — Cartesia TTS + Whisper for each child Short episode (owns its audio)
-  7. Agent 5      — Storyboard/remap → Flux Schnell image generation/reuse
-                    → Per-language: Subtitles → Remotion render
-  8. Summary      — prints final DB state (scripts + audio + video renders)
-
-Note: Agent 3 is dissolved — validation (step 5) runs inline here and in the Celery pipeline.
+    STEP 0  Preflight             — env vars, DB target, mode (dry-run/confirm)
+    STEP 1  Discovery / load      — find a story, or load an existing content row
+    STEP 2  Approval (Telegram)   — skipped/reused if already APPROVED+
+    STEP 3  Parent scripts        — blueprint/sections/quality-gate (skipped if
+                                     a validated source script already exists)
+                                     + generate_multilingual_scripts() (already
+                                     idempotent per language) -> SCRIPTS_VALIDATED
+    STEP 4  Child short planning  — run_shorts_planner() (skipped if child rows
+                                     already exist, unless --force-scripts)
+    STEP 5  Parent + child audio  — run_audio_generation() per content row
+    STEP 6  Parent visuals        — run_visual_generation_for_content() (parent)
+    STEP 7  Child visuals         — run_visual_generation_for_content() (each child)
+    STEP 8  Parent + child render — run_video_generation() per content row
+    STEP 9  Final summary         — status table + rerun command suggestions
 
 Usage:
     source venv/bin/activate
 
-    # Full run (discovery → Agent 5):
-    python test_full_pipeline.py [channel_id]
+    # Inspect what would happen, no paid calls, no DB writes:
+    python test_full_pipeline.py --dry-run [channel_id]
 
-    # Skip discovery + Telegram — content exists and is already approved, restart scripts:
-    python test_full_pipeline.py --from-content <content_id>
+    # Full real run (discovery -> render). Requires --confirm:
+    python test_full_pipeline.py --confirm [channel_id]
 
-    # Skip Telegram — content already approved, restart multilingual generation:
-    python test_full_pipeline.py --from-multilingual <content_id>
+    # Resume points (each requires --confirm for a real run):
+    python test_full_pipeline.py --confirm --from-content <content_id>
+    python test_full_pipeline.py --confirm --from-validation <content_id>
+    python test_full_pipeline.py --confirm --from-audio <content_id>
+    python test_full_pipeline.py --confirm --from-visuals <content_id>
+    python test_full_pipeline.py --confirm --from-render <content_id>
 
-    # Skip multilingual generation — jump straight to validation (step 5):
-    python test_full_pipeline.py --from-agent3 <content_id>
-
-    # Jump directly to Agent 4 — content already has SCRIPTS_VALIDATED status:
-    python test_full_pipeline.py --from-audio <content_id>
-
-    # Jump directly to Agent 5 — content already has AUDIO_DONE status:
-    python test_full_pipeline.py --from-video <content_id>
+    # Force flags (never delete anything; only skip the "reuse" shortcut):
+    python test_full_pipeline.py --confirm --from-audio <content_id> --force-audio
 
 If no channel_id is given, uses the first active channel found.
 """
 
+import argparse
 import logging
+import sys
 import time
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -54,8 +79,23 @@ logging.basicConfig(
     format="%(levelname)s: %(name)s — %(message)s",
 )
 
-SEP  = "=" * 62
-STEP = lambda title: f"\n── {title} " + "─" * max(0, 58 - len(title))
+SEP  = "=" * 70
+STEP = lambda title: f"\n── {title} " + "─" * max(0, 66 - len(title))
+
+# Required for any real (non-dry-run) call. Each tuple is
+# (settings attribute, displayed env var name, used by).
+REQUIRED_ENV_VARS = [
+    ("database_url",       "DATABASE_URL",       "all steps"),
+    ("anthropic_api_key",  "ANTHROPIC_API_KEY",  "Agent 2 + Agent 4 (Claude)"),
+    ("cartesia_api_key",   "CARTESIA_API_KEY",   "Agent 3 (TTS, default provider)"),
+    ("openai_api_key",     "OPENAI_API_KEY",      "Agent 3 (Whisper)"),
+    ("fal_key",            "FAL_KEY",             "Agent 4 (Flux image generation)"),
+    ("telegram_bot_token", "TELEGRAM_BOT_TOKEN",  "Step 2 (story approval)"),
+    ("telegram_chat_id",   "TELEGRAM_CHAT_ID",    "Step 2 (story approval)"),
+]
+OPTIONAL_ENV_VARS = [
+    ("elevenlabs_api_key", "ELEVENLABS_API_KEY", "Agent 3 (legacy TTS provider, only if a channel voice uses it)"),
+]
 
 
 # ── DB helper ────────────────────────────────────────────────────────────────
@@ -63,6 +103,45 @@ STEP = lambda title: f"\n── {title} " + "─" * max(0, 58 - len(title))
 def _db():
     from app.database import _get_session_factory
     return _get_session_factory()()
+
+
+# ── Preflight: env vars + DB target (Part 4 / safe operator mode) ────────────
+
+def _check_env_vars() -> tuple[bool, list[tuple[str, str, bool]]]:
+    """Returns (all_required_present, rows) where rows = (name, used_by, present)."""
+    from app.config import settings
+
+    rows: list[tuple[str, str, bool]] = []
+    all_required = True
+    for attr, name, used_by in REQUIRED_ENV_VARS:
+        present = bool(getattr(settings, attr, ""))
+        rows.append((name, used_by, present))
+        all_required = all_required and present
+    for attr, name, used_by in OPTIONAL_ENV_VARS:
+        present = bool(getattr(settings, attr, ""))
+        rows.append((f"{name} (optional)", used_by, present))
+    return all_required, rows
+
+
+def _print_env_check() -> bool:
+    all_required, rows = _check_env_vars()
+    print("\n  Required environment variables:")
+    for name, used_by, present in rows:
+        mark = "✅" if present else "❌"
+        print(f"    {mark}  {name:<28} ({used_by})")
+    if not all_required:
+        print("\n  ❌ One or more required env vars are missing — no paid API will be called.")
+    return all_required
+
+
+def _print_db_target() -> None:
+    from app.config import settings
+    parsed = urlsplit(settings.database_url)
+    host = parsed.hostname or "?"
+    port = parsed.port
+    dbname = (parsed.path or "/?").lstrip("/")
+    target = f"{host}:{port}/{dbname}" if port else f"{host}/{dbname}"
+    print(f"\n  Database target : {target}   (credentials not shown)")
 
 
 # ── Telegram helpers ──────────────────────────────────────────────────────────
@@ -126,774 +205,104 @@ def poll_telegram(bot_token: str, expected_reply_to_id: str, timeout_sec: int = 
     return "APPROVE", "timeout"
 
 
-# ── Summary helpers ───────────────────────────────────────────────────────────
+# ── State-detection dataclasses (Part 2 — resume / idempotency) ──────────────
 
-def _print_audio_summary(content_id: uuid.UUID, audio_ok: bool) -> None:
-    from app.models import AudioFile
-    db = _db()
-    audio_files = (
-        db.query(AudioFile)
-        .filter(AudioFile.content_id == content_id)
-        .all()
-    )
-    db.close()
+@dataclass
+class ScriptState:
+    source_exists: bool
+    source_validated: bool
+    required_languages: list[str]
+    validated_languages: set[str] = field(default_factory=set)
 
-    if not audio_files:
-        if audio_ok:
-            print("  ⚠ No AudioFile records found despite reported success")
-        return
-
-    print(f"\n  Audio files ({len(audio_files)} language(s)):")
-    for af in sorted(audio_files, key=lambda a: a.language):
-        wc  = len(af.whisper_transcript or [])
-        dur = af.duration_ms / 1000
-        print(
-            f"    [{af.language}]  {dur:.1f}s ({dur / 60:.1f}min)"
-            f"  {wc} Whisper words"
-        )
-        if af.whisper_transcript:
-            sample = af.whisper_transcript[:3]
-            print(f"             Whisper sample: {sample}")
+    @property
+    def complete(self) -> bool:
+        return self.source_validated and set(self.required_languages) <= self.validated_languages
 
 
-def _print_agent5_failure_diagnostic(content_id: uuid.UUID) -> None:
-    """Query DB and print per-language diagnostic when Agent 5 fails."""
-    from app.models import AudioFile, Script, VideoRender, VideoSection, Content
-    db = _db()
-    content   = db.get(Content, content_id)
-    scripts   = db.query(Script).filter(Script.content_id == content_id, Script.validated.is_(True)).all()
-    audios    = db.query(AudioFile).filter(AudioFile.content_id == content_id).all()
-    sections  = db.query(VideoSection).filter(VideoSection.content_id == content_id).all()
-    renders   = db.query(VideoRender).filter(VideoRender.content_id == content_id).all()
-    db.close()
+def _script_state(content, channel, db) -> ScriptState:
+    from app.models import Script
+    from app.agents.agent2_discovery.services.scripts import _required_script_languages
 
-    # "__visual__" rows = shared visual-pass beats (storyboard + Flux, run once)
-    visual_beats  = sum(1 for s in sections if s.language == "__visual__")
-    expected_langs = {s.language for s in scripts}
-    audio_langs    = {a.language for a in audios}
-    section_langs  = {}
-    for s in sections:
-        if s.language != "__visual__":
-            section_langs.setdefault(s.language, 0)
-            section_langs[s.language] += 1
-    render_langs   = {}
-    for r in renders:
-        render_langs.setdefault(r.language, 0)
-        render_langs[r.language] += 1
-
-    print(f"\n  Agent 5 failure diagnostic for content {content_id}:")
-    print(f"  Status: {content.status if content else 'NOT FOUND'}")
-    print(f"  Shared visual-pass beats (Storyboard+Flux, once): {visual_beats}")
-
-    print(f"\n  {'Lang':<6}  {'Audio':>6}  {'Sections':>9}  {'Renders':>7}  Inferred failure stage")
-    for lang in sorted(expected_langs):
-        has_audio  = lang in audio_langs
-        n_sections = section_langs.get(lang, 0)
-        n_renders  = render_langs.get(lang, 0)
-        if n_renders > 0:
-            stage = "SUCCESS"
-        elif n_sections > 0:
-            # Sections saved but no render — check logs for Agent5 [FAIL] status=...
-            stage = (
-                "FAILED after sections saved — check logs for Agent5 [FAIL] status=... "
-                "(RENDER_BLOCKED=too many text_card beats | "
-                "REMOTION_FAILED=Page crashed or render error | "
-                "INVALID_PROPS=props sanity check | "
-                "VERIFY_FAILED=post-render black/silence check)"
-            )
-        elif visual_beats > 0:
-            stage = "FAILED during render setup — visual pass ran but sections not saved for this lang"
-        elif has_audio:
-            stage = "FAILED in visual pass — storyboard or Flux generation failed (0 shared beats)"
-        else:
-            stage = "SKIPPED — no audio file"
-        print(f"  {lang:<6}  {'yes' if has_audio else 'NO':>6}  {n_sections:>9}  {n_renders:>7}  {stage}")
-
-    missing_audio = expected_langs - audio_langs
-    if missing_audio:
-        print(f"\n  Missing audio for: {sorted(missing_audio)}")
-        print("  → Check Agent 4 output or run --from-audio")
-
-
-def _print_video_summary(content_id: uuid.UUID, video_ok: bool) -> None:
-    from app.models import VideoRender, VideoSection
-    db = _db()
-    renders = (
-        db.query(VideoRender)
-        .filter(VideoRender.content_id == content_id)
-        .order_by(VideoRender.language, VideoRender.format, VideoRender.short_order)
-        .all()
-    )
-    sections = (
-        db.query(VideoSection)
-        .filter(VideoSection.content_id == content_id)
-        .all()
-    )
-    db.close()
-
-    if not renders:
-        if video_ok:
-            print("  ⚠ No VideoRender records found despite reported success")
-        return
-
-    langs       = sorted({r.language for r in renders})
-    # Separate shared visual-pass beats (language="__visual__") from per-lang sections
-    visual_beats = [s for s in sections if s.language == "__visual__"]
-    sec_by_lang  = {}
-    for s in sections:
-        if s.language != "__visual__":
-            sec_by_lang.setdefault(s.language, []).append(s)
-
-    flux_ok = sum(
-        1 for s in visual_beats
-        if (getattr(s, "generation_prompt", None) or "").find('"media_url": "cache/') >= 0
-    )
-    print(
-        f"\n  Visual pass: {len(visual_beats)} shared beats"
-        + (f"  (~{flux_ok} with Flux images)" if visual_beats else "")
-    )
-    print(f"  Video renders ({len(renders)} total across {len(langs)} language(s)):")
-    for lang in langs:
-        lang_renders  = [r for r in renders if r.language == lang]
-        lang_sections = sec_by_lang.get(lang, [])
-        main_r   = next((r for r in lang_renders if r.format == "main"), None)
-        short_rs = sorted(
-            [r for r in lang_renders if r.format == "short"],
-            key=lambda r: r.short_order or 0,
-        )
-        print(f"\n    [{lang}]  {len(lang_sections)} section(s)")
-        if main_r:
-            rt = f"{main_r.render_time_seconds:.0f}s render" if main_r.render_time_seconds else ""
-            print(f"      Main   16:9   {main_r.duration_seconds:.1f}s  {rt}")
-        for sr in short_rs:
-            rt = f"{sr.render_time_seconds:.0f}s render" if sr.render_time_seconds else ""
-            print(
-                f"      Short  9:16   part={sr.short_order}  {sr.duration_seconds:.1f}s"
-                f"  {rt}"
-            )
-
-
-def _print_final_summary(
-    content_id: uuid.UUID,
-    audio_ok: bool,
-    video_ok: bool,
-    passed: bool,
-    multilingual_ok: bool,
-) -> None:
-    from app.models import Content, ContentValidation, Script
-    from app.services.script_estimator import estimate_duration_sec
-
-    db = _db()
-    content     = db.get(Content, content_id)
-    val         = db.query(ContentValidation).filter(ContentValidation.content_id == content_id).first()
-    scripts_all = (
+    rows = (
         db.query(Script)
-        .filter(Script.content_id == content_id)
+        .filter(Script.content_id == content.id)
         .order_by(Script.language, Script.version.desc())
         .all()
     )
-    db.close()
+    latest_by_lang = {}
+    for s in rows:
+        latest_by_lang.setdefault(s.language, s)
 
-    print(f"\n  Title    : {content.title[:65]}")
-    print(f"  Status   : {content.status}")
-    if val:
-        issues = [i for i in (val.script_issues_log or []) if isinstance(i, dict) and "severity" in i]
-        print(
-            f"  Validation: {val.script_validation_status}"
-            f" | corrections={val.self_correction_attempts}"
-            f" | issues_logged={len(issues)}"
-        )
+    source = latest_by_lang.get(content.source_language)
+    required = _required_script_languages(content, channel, db)
+    validated_langs = {lang for lang, s in latest_by_lang.items() if s.validated}
 
-    print(f"\n  Scripts:")
-    seen: set[str] = set()
-    for s in scripts_all:
-        if s.language in seen:
-            continue
-        seen.add(s.language)
-        wc  = len(s.voice_script.split())
-        dur = s.estimated_duration_sec or estimate_duration_sec(s.voice_script, s.language)
-        print(
-            f"    [{s.language}] v{s.version}  validated={s.validated}"
-            f"  {wc}w  {dur:.0f}s ({dur / 60:.1f}min)"
-        )
-
-    _print_audio_summary(content_id, audio_ok)
-    _print_video_summary(content_id, video_ok)
-
-    print()
-    print(SEP)
-    if video_ok:
-        print(f"  ✅  COMPLETE — content is {content.status} → ready for Agent 6")
-    elif audio_ok:
-        print(f"  ❌  AGENT 5 FAILED")
-        _print_agent5_failure_diagnostic(content_id)
-        print(f"\n      Re-run:  python test_full_pipeline.py --from-video {content_id}")
-        print(f"      If Node.js / Remotion missing: check that npx is in PATH")
-    elif passed:
-        print(f"  ❌  AGENT 4 FAILED — check ELEVENLABS_API_KEY and OPENAI_API_KEY in .env")
-        print(f"      Re-run:  python test_full_pipeline.py --from-audio {content_id}")
-    elif multilingual_ok:
-        print(f"  ⚠   VALIDATION BLOCKED — MAJOR script issues remain after max auto-corrections")
-        print(f"      Review scripts in DB, then re-run:")
-        print(f"      python test_full_pipeline.py --from-agent3 {content_id}")
-    else:
-        print(f"  ❌  MULTILINGUAL GENERATION FAILED")
-        print(f"      Re-run:  python test_full_pipeline.py --from-multilingual {content_id}")
-    print(SEP)
-
-
-# ── Step runners (reused by multiple entry points) ────────────────────────────
-
-def _run_script_validation(content_id: uuid.UUID) -> bool:
-    """Run cross-language deterministic checks + auto-correction + set SCRIPTS_VALIDATED.
-
-    In production this runs embedded inside run_agent2_scripts_for_content() after
-    generate_multilingual_scripts() completes.  The test runner calls it as an
-    explicit step because scripts are generated one step at a time for debuggability.
-    Returns True if all languages are MAJOR-issue-free after up to 3 correction rounds.
-    """
-    from app.models import Channel, ChannelConfig, ChannelVoice, Content, Script
-    from app.agents.agent2_discovery.system_prompt import auto_correct_script
-    from app.services.script_checks import run_deterministic_checks
-    from app.services.script_estimator import estimate_duration_sec
-
-    _MAX_ROUNDS = 3
-
-    print(STEP("STEP 5: Script validation (det checks + auto-correction)"))
-    db = _db()
-    try:
-        content = db.get(Content, content_id)
-        channel = db.get(Channel, content.channel_id)
-        config  = db.get(ChannelConfig, channel.id)
-        script_format = config.script_format if config else "youtube_long"
-
-        scripts_qs = (
-            db.query(Script)
-            .filter(Script.content_id == content_id)
-            .order_by(Script.language, Script.version.desc())
-            .all()
-        )
-        # Keep only the latest version per language
-        seen: dict[str, Script] = {}
-        for s in scripts_qs:
-            if s.language not in seen:
-                seen[s.language] = s
-        scripts_rows = list(seen.values())
-
-        if not scripts_rows:
-            print("  No scripts found — skipping validation")
-            return False
-
-        scripts_by_lang = {
-            s.language: {"video_script": s.video_script, "voice_script": s.voice_script}
-            for s in scripts_rows
-        }
-
-        # ── Deterministic checks + auto-correct loop (per language) ──────────
-        all_passed = True
-        for lang, row in zip(scripts_by_lang, scripts_rows):
-            voice_map_entry = (
-                db.query(ChannelVoice)
-                .filter(ChannelVoice.channel_id == channel.id, ChannelVoice.language == lang)
-                .first()
-            )
-            tts_model    = voice_map_entry.tts_model if voice_map_entry else "sonic-2"
-            tts_provider = voice_map_entry.provider if voice_map_entry else "cartesia"
-
-            lang_passed = False
-            for round_n in range(1, _MAX_ROUNDS + 1):
-                issues_by_lang = run_deterministic_checks(scripts_by_lang, script_format)
-                major = [i for i in issues_by_lang.get(lang, []) if i["severity"] == "MAJOR"]
-                minor = [i for i in issues_by_lang.get(lang, []) if i["severity"] == "MINOR"]
-
-                if not major:
-                    lang_passed = True
-                    if minor:
-                        print(f"  [{lang}] PASS ({len(minor)} MINOR issues logged)")
-                    else:
-                        print(f"  [{lang}] PASS (clean)")
-                    break
-
-                print(f"  [{lang}] round={round_n} MAJOR={len(major)} — auto-correcting")
-                try:
-                    corrected = auto_correct_script(
-                        current_scripts=scripts_by_lang[lang],
-                        issues=major,
-                        language=lang,
-                        channel=channel,
-                        script_format=script_format,
-                        source_excerpt=content.source_excerpt,
-                        tts_model=tts_model,
-                        tts_provider=tts_provider,
-                    )
-                    scripts_by_lang[lang] = corrected
-                except Exception as exc:
-                    print(f"  [{lang}] auto-correct round {round_n} failed: {exc} — stopping")
-                    break
-
-            if not lang_passed:
-                print(f"  [{lang}] FAIL — MAJOR issues remain after {_MAX_ROUNDS} rounds")
-                all_passed = False
-
-        # ── Persist corrected scripts + set validated=True ────────────────────
-        for s in scripts_rows:
-            updated = scripts_by_lang.get(s.language, {})
-            if updated.get("video_script"):
-                s.video_script = updated["video_script"]
-            if updated.get("voice_script"):
-                s.voice_script = updated["voice_script"]
-            dur = estimate_duration_sec(s.voice_script, s.language)
-            s.estimated_duration_sec = dur
-            s.validated              = True
-
-        content.status = "SCRIPTS_VALIDATED"
-        db.commit()
-        print(f"  {'PASS' if all_passed else 'PARTIAL'} — {len(scripts_rows)} language(s) validated; status=SCRIPTS_VALIDATED")
-
-        # Non-blocking: create Short episode Content rows (mirrors tasks.py post-SCRIPTS_VALIDATED)
-        try:
-            from app.agents.agent2_discovery.services.scripts import run_shorts_planner
-            run_shorts_planner(content_id, channel, config, db)
-            print("  [shorts planner] Short episode rows created")
-        except Exception as exc:
-            print(f"  [shorts planner] skipped (non-blocking): {exc}")
-
-        return all_passed
-
-    finally:
-        db.close()
-
-
-def _run_agent4(content_id: uuid.UUID) -> bool:
-    """Run Agent 4 TTS + Whisper. Returns True if at least one language succeeded.
-
-    On success, also flips any Short episode Content rows that were waiting for
-    this parent's audio to complete (mirrors pickup_short_episodes_awaiting_parent).
-    """
-    from app.models import Content
-    from app.agents.agent4_audio.services.audio import run_audio_generation
-
-    print(STEP("STEP 6: Agent 4 — Cartesia TTS + Whisper"))
-    db = _db()
-    content = db.get(Content, content_id)
-    if content.status not in ("SCRIPTS_VALIDATED", "AUDIO_DONE"):
-        content.status = "SCRIPTS_VALIDATED"
-        db.commit()
-    audio_ok = run_audio_generation(content_id, db)
-    db.close()
-
-    if audio_ok:
-        # Flip Short episode children that were waiting for parent audio
-        db2 = _db()
-        try:
-            children = (
-                db2.query(Content)
-                .filter(
-                    Content.parent_content_id == content_id,
-                    Content.status == "SCRIPTS_VALIDATED_AWAITING_PARENT",
-                )
-                .all()
-            )
-            for child in children:
-                child.status = "SCRIPTS_VALIDATED"
-            if children:
-                db2.commit()
-                print(f"  Flipped {len(children)} Short episode(s) → SCRIPTS_VALIDATED")
-        finally:
-            db2.close()
-
-    return audio_ok
-
-
-def _run_child_shorts_agent4(parent_content_id: uuid.UUID) -> bool:
-    """Run Agent 4 TTS + Whisper for all SCRIPTS_VALIDATED child Short episodes.
-
-    Called immediately after parent AUDIO_DONE. Checks AudioFile existence before
-    each call to avoid re-generating audio that was already produced. Returns True
-    if at least one child already had audio or was generated successfully.
-    """
-    from app.models import AudioFile, Content
-    from app.agents.agent4_audio.services.audio import run_audio_generation
-
-    print(STEP("STEP 6b: Agent 4 — Child Short TTS + Whisper"))
-    db = _db()
-    try:
-        children = (
-            db.query(Content)
-            .filter(
-                Content.parent_content_id == parent_content_id,
-                Content.is_short_episode.is_(True),
-            )
-            .all()
-        )
-        if not children:
-            print("  No child Short episodes found — skipping")
-            return True
-
-        eligible = [c for c in children if c.status == "SCRIPTS_VALIDATED"]
-        if not eligible:
-            statuses = {}
-            for c in children:
-                statuses[c.status] = statuses.get(c.status, 0) + 1
-            print(
-                f"  {len(children)} child Short episode(s) found, "
-                f"none in SCRIPTS_VALIDATED (statuses={statuses}) — skipping"
-            )
-            return True
-
-        print(f"  {len(eligible)} SCRIPTS_VALIDATED child Short episode(s) to process")
-        any_ok = False
-        for child in eligible:
-            part_label = f"part {child.short_part_number}/{child.short_total_parts}"
-            audio_exists = (
-                db.query(AudioFile).filter(AudioFile.content_id == child.id).first()
-            ) is not None
-            if audio_exists:
-                print(f"    [{part_label}] audio already exists — skipping")
-                any_ok = True
-                continue
-            print(f"    [{part_label}] generating audio…")
-            ok = run_audio_generation(child.id, db)
-            if ok:
-                print(f"    [{part_label}] → AUDIO_DONE")
-                any_ok = True
-            else:
-                print(f"    [{part_label}] → FAILED (non-blocking — parent video will still render)")
-        return any_ok
-    finally:
-        db.close()
-
-
-def _run_agent5(content_id: uuid.UUID) -> bool:
-    """Run Agent 5 Remotion video generation. Returns True on success."""
-    from app.models import Content
-    from app.agents.agent5_video.services.video import run_video_generation
-
-    print(STEP("STEP 7: Agent 5 — Video generation (Remotion)"))
-    db = _db()
-    content = db.get(Content, content_id)
-    if content.status not in ("AUDIO_DONE", "GENERATING_VIDEO"):
-        content.status = "AUDIO_DONE"
-        db.commit()
-    video_ok = run_video_generation(content_id, db)
-    db.close()
-    return video_ok
-
-
-# ── Entry-point: Content model not imported at top level ─────────────────────
-
-def _load_content(content_id: uuid.UUID):
-    from app.models import Content
-    db = _db()
-    content = db.get(Content, content_id)
-    db.close()
-    return content
-
-
-# ── Main pipeline ─────────────────────────────────────────────────────────────
-
-def run(
-    channel_id_str: str | None = None,
-    from_content_id_str: str | None = None,
-    from_multilingual_id_str: str | None = None,
-    from_agent3_id_str: str | None = None,
-    from_audio_id_str: str | None = None,
-    from_video_id_str: str | None = None,
-) -> None:
-    from app.config import settings
-    from app.models import (
-        Channel, ChannelConfig, ChannelLanguage, ChannelSource, ChannelVoice,
-        Content, ContentValidation, Script,
+    return ScriptState(
+        source_exists=source is not None,
+        source_validated=bool(source and source.validated),
+        required_languages=required,
+        validated_languages=validated_langs,
     )
-    from app.agents.agent2_discovery.services.discovery import run_discovery
+
+
+def _audio_exists(content_id: uuid.UUID, db) -> int:
+    from app.models import AudioFile
+    return db.query(AudioFile).filter(AudioFile.content_id == content_id).count()
+
+
+def _visual_sections_count(content_id: uuid.UUID, db) -> int:
+    from app.models import VideoSection
+    return (
+        db.query(VideoSection)
+        .filter(VideoSection.content_id == content_id, VideoSection.language != "__visual__")
+        .count()
+    )
+
+
+def _existing_children(parent_content_id: uuid.UUID, db) -> list:
+    from app.models import Content
+    return (
+        db.query(Content)
+        .filter(Content.parent_content_id == parent_content_id, Content.is_short_episode.is_(True))
+        .order_by(Content.short_part_number)
+        .all()
+    )
+
+
+# ── Step 3: parent source + multilingual scripts ─────────────────────────────
+
+def _run_step_scripts(content, channel, config, db, *, story=None, force: bool = False) -> bool:
+    """Generate (or reuse) the parent's complete required script set.
+
+    Returns True iff content.status == SCRIPTS_VALIDATED after this step.
+    """
+    from app.models import Channel, ChannelVoice, Script
     from app.agents.agent2_discovery.services.scripts import (
-        generate_multilingual_scripts,
-        generate_script_sections,
-        run_script_quality_gate,
+        generate_multilingual_scripts, generate_script_sections, run_script_quality_gate,
     )
     from app.agents.agent2_discovery.services.story import Story
-    from app.agents.agent2_discovery.services.validation import send_for_validation
     from app.agents.agent2_discovery.system_prompt import generate_story_blueprint
     from app.services.script_estimator import estimate_duration_sec
 
-    print(SEP)
-    print("  FULL PIPELINE TEST  —  Agent 2 → Agent 4 → Agent 5")
-    print(SEP)
+    print(STEP("STEP 3: Parent scripts + multilingual scripts"))
 
-    # ── --from-video: jump directly to Agent 5 ───────────────────────────────
-    if from_video_id_str:
-        content_id = uuid.UUID(from_video_id_str)
-        content = _load_content(content_id)
-        if not content:
-            print(f"\nERROR: Content not found: {content_id}")
-            return
-
-        print(f"\n  Jumping to Agent 5 for content {content_id}")
-        print(f"  Status: {content.status}")
-
-        video_ok = _run_agent5(content_id)
-        _print_audio_summary(content_id, True)
-        _print_video_summary(content_id, video_ok)
-        print()
-        print(SEP)
-        if video_ok:
-            print(f"  ✅  COMPLETE — ready for Agent 6")
-        else:
-            print(f"  ❌  AGENT 5 FAILED")
-            _print_agent5_failure_diagnostic(content_id)
-            print(f"\n      Re-run:  python test_full_pipeline.py --from-video {content_id}")
-            print(f"      If Node.js / Remotion missing: check that npx is in PATH")
-        print(SEP)
-        return
-
-    # ── --from-audio: jump directly to Agent 4 ───────────────────────────────
-    if from_audio_id_str:
-        content_id = uuid.UUID(from_audio_id_str)
-        content = _load_content(content_id)
-        if not content:
-            print(f"\nERROR: Content not found: {content_id}")
-            return
-
-        print(f"\n  Jumping to Agent 4 for content {content_id}")
-        print(f"  Status: {content.status}")
-
-        audio_ok = _run_agent4(content_id)
-        if audio_ok:
-            _run_child_shorts_agent4(content_id)
-        _print_audio_summary(content_id, audio_ok)
-
-        video_ok = False
-        if audio_ok:
-            video_ok = _run_agent5(content_id)
-            _print_video_summary(content_id, video_ok)
-        else:
-            print("\n  ⚠ Skipping Agent 5 — Agent 4 produced no audio")
-
-        print()
-        print(SEP)
-        if video_ok:
-            print(f"  ✅  COMPLETE — ready for Agent 6")
-        elif audio_ok:
-            print(f"  ❌  AGENT 5 FAILED")
-            print(f"      Re-run:  python test_full_pipeline.py --from-video {content_id}")
-        else:
-            print(f"  ❌  AGENT 4 FAILED — check ELEVENLABS_API_KEY and OPENAI_API_KEY")
-            print(f"      Re-run:  python test_full_pipeline.py --from-audio {content_id}")
-        print(SEP)
-        return
-
-    # ── --from-agent3: jump to validation step (det checks + auto-correction) ──
-    if from_agent3_id_str:
-        content_id = uuid.UUID(from_agent3_id_str)
-        content = _load_content(content_id)
-        if not content:
-            print(f"\nERROR: Content not found: {content_id}")
-            return
-
-        print(f"\n  Jumping to validation step for content {content_id}")
-        print(f"  Status: {content.status}")
-
-        passed      = _run_script_validation(content_id)
-        audio_ok    = _run_agent4(content_id) if passed else False
-        if audio_ok:
-            _run_child_shorts_agent4(content_id)
-        video_ok    = _run_agent5(content_id) if audio_ok else False
-
-        if not passed:
-            print("\n  ⚠ Skipping Agents 4+5 — validation did not pass")
-        elif not audio_ok:
-            print("\n  ⚠ Skipping Agent 5 — Agent 4 produced no audio")
-
-        _print_final_summary(content_id, audio_ok, video_ok, passed, multilingual_ok=True)
-        return
-
-    # ── --from-multilingual: skip Telegram, restart multilingual generation ──
-    if from_multilingual_id_str:
-        content_id = uuid.UUID(from_multilingual_id_str)
-        db = _db()
-        content = db.get(Content, content_id)
-        if not content:
-            print(f"\nERROR: Content not found: {content_id}")
-            db.close()
-            return
-        channel   = db.get(Channel, content.channel_id)
-        db.close()
-
-        print(f"\n  Jumping to multilingual generation for content {content_id}")
-        print(f"  Status: {content.status}")
-
-        print(STEP("STEP 4: Generating multilingual scripts"))
-        db = _db()
-        content = db.get(Content, content_id)
-        channel = db.get(Channel, content.channel_id)
-        lang_scripts = generate_multilingual_scripts(content, channel, db)
-        db.close()
-
-        if not lang_scripts:
-            print("  ❌ Multilingual generation produced no scripts")
-            print(f"      Re-run:  python test_full_pipeline.py --from-multilingual {content_id}")
-            return
-
-        print(f"  Languages: {[s.language for s in lang_scripts]}")
-
-        passed   = _run_script_validation(content_id)
-        audio_ok = _run_agent4(content_id) if passed else False
-        if audio_ok:
-            _run_child_shorts_agent4(content_id)
-        video_ok = _run_agent5(content_id) if audio_ok else False
-
-        if not passed:
-            print("\n  ⚠ Skipping Agents 4+5 — validation did not pass")
-        elif not audio_ok:
-            print("\n  ⚠ Skipping Agent 5 — Agent 4 produced no audio")
-
-        _print_final_summary(content_id, audio_ok, video_ok, passed, multilingual_ok=True)
-        return
-
-    # ── Find channel ──────────────────────────────────────────────────────────
-    db = _db()
-
-    content_id    = None
-    story: Story | None = None
-    _assessment   = None
-    skip_to_scripts = False  # True when jumping in after Telegram approval
-
-    if from_content_id_str:
-        # Content already exists and is approved — skip discovery + Telegram,
-        # jump straight to script generation.
-        content_id = uuid.UUID(from_content_id_str)
-        content    = db.get(Content, content_id)
-
-        if not content:
-            print(f"\nERROR: Content not found: {content_id}")
-            db.close()
-            return
-
-        channel    = db.get(Channel, content.channel_id)
-        channel_id = channel.id
-
-        # Ensure status allows script generation
-        if content.status not in (
-            "APPROVED", "GENERATING_SCRIPTS", "SCRIPTS_READY",
-            "SCRIPTS_VALIDATED", "AUDIO_DONE", "GENERATING_VIDEO", "NEEDS_REVIEW",
-        ):
-            content.status = "APPROVED"
-            db.commit()
-
-        skip_to_scripts = True
-
-    elif channel_id_str:
-        channel = db.get(Channel, uuid.UUID(channel_id_str))
-    else:
-        channel = db.query(Channel).filter(Channel.active.is_(True)).first()
-
-    if not channel:
-        print("\nERROR: No active channel found. Activate one via the UI first.")
-        db.close()
-        return
-
-    config  = db.get(ChannelConfig, channel.id)
-    sources = db.query(ChannelSource).filter(ChannelSource.channel_id == channel.id).all()
-
-    print(f"\n  Channel : {channel.name}")
-    print(f"  Niche   : {channel.niche}")
-    print(f"  Tone    : {channel.tone}")
-    print(f"  Sources : {[(s.source_type, s.source_value[:50]) for s in sources]}")
-
-    channel_id = channel.id
-    db.close()
-
-    if not skip_to_scripts:
-        # ── STEP 1: Discovery ────────────────────────────────────────────────
-        print(STEP("STEP 1: Discovery — fetch → dedup → score (30-60s)"))
-
-        db     = _db()
-        result = run_discovery(channel_id, db)
-        db.close()
-
-        if not result:
-            print("  ❌ No story found.")
-            print("     Check: is the channel active? Are sources configured?")
-            return
-
-        content, story, _assessment = result
-        content_id = content.id
-
-        print(f"  Story   : {story.title[:70]}")
-        print(f"  URL     : {story.url}")
-        print(f"  Language: {story.language}")
-        print(f"  Score   : {_assessment.get('overall_score', '?') if _assessment else '?'}")
-
-        # ── STEP 2: Telegram — title + URL + score, no scripts ───────────────
-        print(STEP("STEP 2: Telegram approval (title + URL + score)"))
-
-        db      = _db()
-        content = db.get(Content, content_id)
-        channel = db.get(Channel, channel_id)
-        target_languages = [
-            cl.language
-            for cl in db.query(ChannelLanguage)
-            .filter(ChannelLanguage.channel_id == channel_id)
-            .all()
-        ]
-        send_for_validation(
-            content, channel, db,
-            assessment=_assessment,
-            target_languages=target_languages,
-        )
-        val    = db.query(ContentValidation).filter(ContentValidation.content_id == content_id).first()
-        msg_id = val.telegram_message_id if val else None
-        db.close()
-
-        if not msg_id:
-            print("  ❌ Telegram send failed — check TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID in .env")
-            print(f"     When fixed, re-run: python test_full_pipeline.py --from-content {content_id}")
-            return
-
-        print(f"  ✅ Sent (message_id={msg_id})")
-        print("  Reply APPROVE in Telegram (or wait 5 min for auto-approve)…\n")
-
-        decision, from_user = poll_telegram(settings.telegram_bot_token, msg_id, timeout_sec=300)
-        reason = f"approved by @{from_user}" if from_user != "timeout" else "auto-approved (timeout)"
-
-        db      = _db()
-        content = db.get(Content, content_id)
-        val     = db.query(ContentValidation).filter(ContentValidation.content_id == content_id).first()
-        if val:
-            val.status      = "APPROVED"
-            val.approved_at = datetime.now(timezone.utc)
-        content.status = "APPROVED"
-        db.commit()
-        db.close()
-        print(f"  ✅ Content {reason}")
-
-    # ── STEP 3: Generate source-language scripts (after APPROVE) ──────────────
-    print(STEP("STEP 3: Generating source scripts (Claude)"))
-
-    db      = _db()
-    content = db.get(Content, content_id)
-    channel = db.get(Channel, channel_id)
-    config  = db.get(ChannelConfig, channel_id)
-    script_format      = config.script_format      if config else "youtube_long"
-    audio_tags_enabled = config.audio_tags_enabled if config else False
-
-    # Re-use existing source script if this is a re-run (--from-content path)
-    existing_src = (
-        db.query(Script)
-        .filter(
-            Script.content_id == content_id,
-            Script.language   == content.source_language,
-        )
-        .order_by(Script.version.desc())
-        .first()
+    state = _script_state(content, channel, db)
+    print(f"  Required languages: {state.required_languages}")
+    print(
+        f"  Source script: {'exists+validated' if state.source_validated else 'exists, not validated' if state.source_exists else 'missing'}"
     )
 
-    if existing_src:
-        print(f"  Existing source script found for lang={content.source_language} — skipping generation")
-        wc = len(existing_src.voice_script.split())
-        print(f"  Voice: {wc} words")
+    if state.source_validated and not force:
+        print("  REUSED — validated source script already exists, skipping blueprint/section generation")
     else:
-        # Reconstruct story proxy from content record when skipping discovery
+        if state.source_exists and force:
+            print("  WARNING --force-scripts set — a source script already exists; "
+                  "this will insert a NEW Script version row (nothing is deleted).")
+
+        config_obj = config
+        script_format      = config_obj.script_format      if config_obj else "youtube_long"
+        audio_tags_enabled = config_obj.audio_tags_enabled if config_obj else False
+
         if story is None:
             story = Story(
                 title=content.title,
@@ -909,167 +318,641 @@ def run(
 
         src_voice = (
             db.query(ChannelVoice)
-            .filter(
-                ChannelVoice.channel_id == channel_id,
-                ChannelVoice.language   == content.source_language,
-            )
+            .filter(ChannelVoice.channel_id == channel.id, ChannelVoice.language == content.source_language)
             .first()
-        ) or db.query(ChannelVoice).filter(ChannelVoice.channel_id == channel_id).first()
-
+        ) or db.query(ChannelVoice).filter(ChannelVoice.channel_id == channel.id).first()
         tts_model    = src_voice.tts_model if src_voice else "sonic-2"
         tts_provider = src_voice.provider if src_voice else "cartesia"
 
-        # Step 3a: blueprint
+        content.status = "GENERATING_SCRIPTS"
+        db.commit()
+
         blueprint = generate_story_blueprint(story, channel, script_format=script_format)
         content.story_blueprint = blueprint
         db.commit()
 
-        # Step 3b: section-by-section generation
         scripts = generate_script_sections(
-            story=story,
-            blueprint=blueprint,
-            channel=channel,
-            channel_voice=src_voice,
-            script_format=script_format,
-            audio_tags_enabled=audio_tags_enabled,
+            story=story, blueprint=blueprint, channel=channel, channel_voice=src_voice,
+            script_format=script_format, audio_tags_enabled=audio_tags_enabled,
         )
-
-        # Step 3c: quality gate (retention review + optional rewrite)
         scripts = run_script_quality_gate(
-            scripts,
-            channel,
-            script_format=script_format,
-            language=content.source_language,
-            tts_model=tts_model,
-            tts_provider=tts_provider,
+            scripts, channel, script_format=script_format, language=content.source_language,
+            tts_model=tts_model, tts_provider=tts_provider,
         )
 
         content.title = scripts.get("title", content.title)
-        src_voice_script = scripts["voice_script"]
-        src_dur_sec = estimate_duration_sec(src_voice_script, content.source_language)
+        voice_script = scripts["voice_script"]
+        dur_sec = estimate_duration_sec(voice_script, content.source_language)
 
-        # Merge visual_intent_history into story_blueprint (matches tasks.py)
         visual_history = scripts.get("visual_intent_history")
         if visual_history and content.story_blueprint is not None:
             bp = dict(content.story_blueprint)
             bp["visual_intent_history"] = visual_history
             content.story_blueprint = bp
 
+        next_version = 1
+        if state.source_exists:
+            prev = (
+                db.query(Script)
+                .filter(Script.content_id == content.id, Script.language == content.source_language)
+                .order_by(Script.version.desc())
+                .first()
+            )
+            next_version = (prev.version + 1) if prev else 1
+
         db.add(Script(
-            content_id=content_id,
-            language=story.language,
-            video_script=scripts["video_script"],
-            voice_script=src_voice_script,
-            estimated_duration_sec=src_dur_sec,
-            version=1,
-            validated=True,  # matches tasks.py — source script is validated at generation
+            content_id=content.id, language=content.source_language,
+            video_script=scripts["video_script"], voice_script=voice_script,
+            estimated_duration_sec=dur_sec, version=next_version, validated=True,
         ))
         db.commit()
+        wc = len(voice_script.split())
+        print(f"  GENERATED — source script v{next_version}: {wc}w, ~{dur_sec:.0f}s")
 
-        wc        = len(src_voice_script.split())
-        sec_count = scripts["video_script"].count("[SECTION")
-        print(f"  Title   : {scripts.get('title', content.title)[:70]}")
-        print(f"  Blueprint: {len(blueprint.get('major_turns', []))} major turns")
-        print(f"  Voice   : {wc} words → ~{src_dur_sec:.0f}s ({src_dur_sec / 60:.1f} min)")
-        print(f"  Sections: {sec_count}")
+    # generate_multilingual_scripts() is already idempotent per-language
+    # (skips any language that already has a validated Script row) — see
+    # app/agents/agent2_discovery/services/scripts.py. It owns the complete
+    # required-set check and sets Content.status="FAILED" itself if any
+    # required language could not be generated; it never writes
+    # SCRIPTS_VALIDATED — that transition belongs to the caller, mirroring
+    # run_script_workflow() exactly.
+    required_scripts = generate_multilingual_scripts(content, channel, db)
+    print(f"  Multilingual set: {[s.language for s in required_scripts] or 'INCOMPLETE'}")
 
-    db.close()
+    if not required_scripts:
+        print("  ❌ SCRIPTS INCOMPLETE — required language(s) could not be generated/validated.")
+        print(f"     Content.status is now {content.status!r} (set by generate_multilingual_scripts()).")
+        print(f"     Re-run after investigating:  python test_full_pipeline.py --confirm --from-validation {content.id}")
+        return False
 
-    # ── STEP 4: Multilingual scripts ──────────────────────────────────────────
-    print(STEP("STEP 4: Generating multilingual scripts"))
+    content.status = "SCRIPTS_VALIDATED"
+    db.commit()
+    print(f"  ✅ SCRIPTS_VALIDATED — {len(required_scripts)} language(s) complete")
+    return True
 
-    db           = _db()
-    content      = db.get(Content, content_id)
-    channel      = db.get(Channel, channel_id)
-    lang_scripts = generate_multilingual_scripts(content, channel, db)
-    db.close()
 
-    multilingual_ok = bool(lang_scripts)
-    print(f"  Languages: {[s.language for s in lang_scripts]}")
+# ── Step 4: child short planning ──────────────────────────────────────────────
 
-    if not multilingual_ok:
-        print("  ❌ Multilingual generation produced no scripts")
-        print(f"     Re-run: python test_full_pipeline.py --from-multilingual {content_id}")
+def _run_step_shorts_planning(content, channel, config, db, *, force: bool = False) -> list:
+    from app.agents.agent2_discovery.services.scripts import run_shorts_planner
+
+    print(STEP("STEP 4: Child short planning + scripts"))
+
+    existing = _existing_children(content.id, db)
+    if existing and not force:
+        print(f"  REUSED — {len(existing)} child Short row(s) already exist, skipping shorts planner")
+        return existing
+
+    if existing and force:
+        print(
+            f"  WARNING --force-scripts set — {len(existing)} child row(s) already exist. "
+            "run_shorts_planner() will not create duplicate Content rows (it checks for "
+            "existing children before persisting), but it will still make a Claude planning "
+            "call that is discarded. No child rows will be deleted."
+        )
+
+    try:
+        run_shorts_planner(content.id, channel, config, db)
+    except Exception as exc:
+        print(f"  ⚠ run_shorts_planner failed (non-blocking, matches production): {exc}")
+
+    children = _existing_children(content.id, db)
+    if not children:
+        print("  No child Short rows were created (planner declined, or parent source script not validated)")
+    else:
+        print(f"  {len(children)} child Short row(s) present:")
+        for c in children:
+            print(f"    part {c.short_part_number}/{c.short_total_parts}  id={c.id}  status={c.status}")
+    return children
+
+
+# ── Step 5/6/7/8: per-content generic step runners ────────────────────────────
+
+def _label(content) -> str:
+    if content.is_short_episode:
+        return f"child part {content.short_part_number}/{content.short_total_parts} ({content.id})"
+    return f"parent ({content.id})"
+
+
+def _run_step_audio(content, db, *, force: bool = False) -> bool:
+    from app.agents.agent3_audio.services.audio import run_audio_generation
+
+    label = _label(content)
+    if content.status not in ("SCRIPTS_VALIDATED", "GENERATING_AUDIO", "AUDIO_DONE"):
+        print(f"  [{label}] status={content.status} — not eligible for audio yet, skipping")
+        return content.status == "AUDIO_DONE"
+
+    existing = _audio_exists(content.id, db)
+    if content.status == "AUDIO_DONE" and existing and not force:
+        print(f"  [{label}] REUSED — AUDIO_DONE with {existing} AudioFile row(s), skipping")
+        return True
+    if force and existing:
+        print(
+            f"  [{label}] WARNING --force-audio set — re-running audio generation. "
+            "TTS is skipped only if the mp3 is still on disk; Whisper will be re-billed "
+            "for every language regardless. No AudioFile rows will be deleted (upsert only)."
+        )
+
+    ok = run_audio_generation(content.id, db)
+    print(f"  [{label}] {'✅ AUDIO_DONE' if ok else '❌ FAILED'} (status={content.status})")
+    return ok
+
+
+def _run_step_visuals(content, db, *, force: bool = False) -> bool:
+    from app.agents.agent4_visuals.services.visual_orchestrator import run_visual_generation_for_content
+
+    label = _label(content)
+    done_status = "CHILD_SHORT_VISUALS_DONE" if content.is_short_episode else "PARENT_VISUALS_DONE"
+
+    if content.status == done_status and not force:
+        n = _visual_sections_count(content.id, db)
+        print(f"  [{label}] REUSED — already {done_status} ({n} persisted VideoSection row(s)), skipping")
+        return True
+
+    if content.status not in ("AUDIO_DONE", "GENERATING_VISUALS", done_status):
+        print(f"  [{label}] status={content.status} — not eligible for visuals yet, skipping")
+        return False
+
+    if force and content.status == done_status:
+        print(
+            f"  [{label}] WARNING --force-visuals set on {done_status} content — "
+            "run_visual_generation_for_content() only proceeds from AUDIO_DONE/GENERATING_VISUALS, "
+            "so this resets Content.status to AUDIO_DONE to re-enter the visual pass. "
+            "No VideoSection rows are deleted; Flux only regenerates beats whose cached image is missing."
+        )
+        content.status = "AUDIO_DONE"
+        db.commit()
+
+    ok = run_visual_generation_for_content(content.id, db)
+    print(f"  [{label}] {'✅ ' + done_status if ok else '⏸ deferred/failed'} (status={content.status})")
+    return ok
+
+
+def _run_step_render(content, db, *, force: bool = False) -> bool:
+    from app.agents.agent5_render.services.video import run_video_generation
+
+    label = _label(content)
+    visuals_done_status = "CHILD_SHORT_VISUALS_DONE" if content.is_short_episode else "PARENT_VISUALS_DONE"
+
+    if content.status == "RENDERED" and not force:
+        n = _render_count(content.id, db)
+        print(f"  [{label}] REUSED — already RENDERED ({n} VideoRender row(s)), skipping")
+        return True
+
+    if content.status not in (visuals_done_status, "RENDERING", "RENDERED"):
+        print(f"  [{label}] status={content.status} — not eligible for render yet, skipping")
+        return False
+
+    if force and content.status == "RENDERED":
+        print(
+            f"  [{label}] WARNING --force-render set on RENDERED content — resetting Content.status "
+            f"to {visuals_done_status} to re-enter the render pass. No VideoRender rows are deleted; "
+            "Agent 5 itself skips re-rendering a language whose MP4 + VideoRender row already exist."
+        )
+        content.status = visuals_done_status
+        db.commit()
+
+    ok = run_video_generation(content.id, db)
+    print(f"  [{label}] {'✅ RENDERED' if ok else '❌ FAILED'} (status={content.status})")
+    return ok
+
+
+def _render_count(content_id: uuid.UUID, db) -> int:
+    from app.models import VideoRender
+    return db.query(VideoRender).filter(VideoRender.content_id == content_id).count()
+
+
+# ── Final summary (Part 9) ────────────────────────────────────────────────────
+
+def _media_path_for_render(content_id: uuid.UUID, language: str, fmt: str, short_order: int | None) -> str:
+    from app.config import settings
+    if fmt == "short":
+        return f"{settings.media_path}/video/{content_id}/{language}_short_{short_order}.mp4"
+    return f"{settings.media_path}/video/{content_id}/{language}_main.mp4"
+
+
+def _summary_row(content, channel, db) -> dict:
+    from app.models import AudioFile, Channel, ChannelLanguage, Script, VideoRender
+
+    scripts = db.query(Script).filter(Script.content_id == content.id).all()
+    by_lang: dict[str, Script] = {}
+    for s in scripts:
+        if s.language not in by_lang or s.version > by_lang[s.language].version:
+            by_lang[s.language] = s
+    required = [
+        cl.language for cl in db.query(ChannelLanguage).filter(ChannelLanguage.channel_id == channel.id).all()
+    ]
+    if content.source_language not in required:
+        required = [content.source_language] + required
+
+    audio_n = _audio_exists(content.id, db)
+    sections_n = _visual_sections_count(content.id, db)
+    renders = db.query(VideoRender).filter(VideoRender.content_id == content.id).all()
+
+    return {
+        "content_id": str(content.id),
+        "type": "parent" if not content.is_short_episode else f"child part {content.short_part_number}/{content.short_total_parts}",
+        "status": content.status,
+        "source_script": "validated" if by_lang.get(content.source_language) and by_lang[content.source_language].validated else (
+            "exists" if content.source_language in by_lang else "missing"
+        ),
+        "multilingual": f"{sum(1 for s in by_lang.values() if s.validated)}/{len(required)} validated",
+        "audio_files": audio_n,
+        "video_sections": sections_n,
+        "video_renders": len(renders),
+        "render_paths": [
+            _media_path_for_render(content.id, r.language, r.format, r.short_order) for r in renders
+        ],
+    }
+
+
+def _print_final_summary(parent, children, channel, db) -> None:
+    print(STEP("STEP 9: Final summary"))
+
+    rows = [_summary_row(parent, channel, db)] + [_summary_row(c, channel, db) for c in children]
+
+    print(f"\n  {'Type':<22} {'Status':<24} {'Src script':<10} {'Multilingual':<16} {'Audio':>5} {'Sections':>8} {'Renders':>7}")
+    for r in rows:
+        print(
+            f"  {r['type']:<22} {r['status']:<24} {r['source_script']:<10} {r['multilingual']:<16} "
+            f"{r['audio_files']:>5} {r['video_sections']:>8} {r['video_renders']:>7}"
+        )
+
+    print("\n  Content IDs:")
+    for r in rows:
+        print(f"    {r['type']:<22} {r['content_id']}")
+        for p in r["render_paths"]:
+            print(f"      → {p}")
+
+    print()
+    print(SEP)
+    all_rendered = all(r["status"] == "RENDERED" for r in rows) if rows else False
+    if all_rendered:
+        print("  ✅  COMPLETE — parent and all child Shorts are RENDERED")
+    else:
+        not_done = [r for r in rows if r["status"] != "RENDERED"]
+        print(f"  ⚠   {len(not_done)}/{len(rows)} row(s) not yet RENDERED")
+    print(SEP)
+
+    print("\n  Resume commands for the parent:")
+    print(f"    python test_full_pipeline.py --confirm --from-content  {parent.id}")
+    print(f"    python test_full_pipeline.py --confirm --from-validation {parent.id}")
+    print(f"    python test_full_pipeline.py --confirm --from-audio    {parent.id}")
+    print(f"    python test_full_pipeline.py --confirm --from-visuals  {parent.id}")
+    print(f"    python test_full_pipeline.py --confirm --from-render   {parent.id}")
+    if children:
+        print("\n  Each child can be targeted individually with the same flags and its own content_id above.")
+
+    print(
+        "\n  Note: per-beat media-asset validation issue counts (validate_media_assets()) are "
+        "observability-only log output, not a persisted DB column — check application logs for "
+        "MAJOR findings; they are not summarized here because there is nothing to query."
+    )
+
+
+# ── Resume-point dispatch (Part 3 entrypoints) ───────────────────────────────
+
+def _load_content_channel_config(content_id: uuid.UUID, db):
+    from app.models import Channel, ChannelConfig, Content
+    content = db.get(Content, content_id)
+    if not content:
+        return None, None, None
+    channel = db.get(Channel, content.channel_id)
+    config = db.get(ChannelConfig, channel.id) if channel else None
+    return content, channel, config
+
+
+def _execute_audio_through_render(parent, children, channel, db, force_audio, force_visuals, force_render) -> None:
+    print(STEP("STEP 5: Parent + child audio"))
+    _run_step_audio(parent, db, force=force_audio)
+    for c in children:
+        _run_step_audio(c, db, force=force_audio)
+
+    print(STEP("STEP 6: Parent visuals"))
+    _run_step_visuals(parent, db, force=force_visuals)
+
+    print(STEP("STEP 7: Child visuals"))
+    for c in children:
+        _run_step_visuals(c, db, force=force_visuals)
+
+    print(STEP("STEP 8: Parent + child render"))
+    _run_step_render(parent, db, force=force_render)
+    for c in children:
+        _run_step_render(c, db, force=force_render)
+
+    _print_final_summary(parent, children, channel, db)
+
+
+# ── Main pipeline ─────────────────────────────────────────────────────────────
+
+def run(args: argparse.Namespace) -> None:
+    print(SEP)
+    print("  FULL PIPELINE — Agent 2 -> Agent 3 -> Agent 4 -> Agent 5")
+    print(SEP)
+
+    print(STEP("STEP 0: Preflight"))
+    env_ok = _print_env_check()
+    _print_db_target()
+    print(f"\n  Mode: {'DRY RUN (no paid calls, no DB writes)' if args.dry_run else 'REAL RUN'}")
+
+    if not args.dry_run and not args.confirm:
+        print(
+            "\n  ❌ Refusing to run for real without --confirm. "
+            "This run may call Claude, a TTS provider, Whisper, fal.ai, and Remotion, "
+            "all of which can cost money. Re-run with --confirm, or use --dry-run first."
+        )
+        sys.exit(1)
+
+    if not env_ok and not args.dry_run:
+        print("\n  ❌ Required environment variable(s) missing — aborting before any paid call.")
+        sys.exit(1)
+
+    # ── Resume entrypoints that skip straight past discovery/scripts ─────────
+    if args.from_render:
+        content_id = uuid.UUID(args.from_render)
+        if args.dry_run:
+            _dry_run_report(content_id)
+            return
+        db = _db()
+        content, channel, config = _load_content_channel_config(content_id, db)
+        if not content:
+            print(f"\nERROR: Content not found: {content_id}")
+            db.close()
+            return
+        from app.models import Content
+        parent = content if not content.is_short_episode else db.get(Content, content.parent_content_id)
+        children = _existing_children(parent.id, db) if not content.is_short_episode else []
+        print(STEP("STEP 8: Parent + child render"))
+        _run_step_render(parent, db, force=args.force_render)
+        for c in children:
+            _run_step_render(c, db, force=args.force_render)
+        _print_final_summary(parent, children, channel, db)
+        db.close()
         return
 
-    # ── STEP 5: Script validation (det checks + auto-correction) ─────────────
-    passed   = _run_script_validation(content_id)
+    if args.from_visuals:
+        content_id = uuid.UUID(args.from_visuals)
+        if args.dry_run:
+            _dry_run_report(content_id)
+            return
+        db = _db()
+        from app.models import Content
+        content, channel, config = _load_content_channel_config(content_id, db)
+        if not content:
+            print(f"\nERROR: Content not found: {content_id}")
+            db.close()
+            return
+        parent = content if not content.is_short_episode else db.get(Content, content.parent_content_id)
+        children = _existing_children(parent.id, db) if not content.is_short_episode else []
+        print(STEP("STEP 6: Parent visuals"))
+        _run_step_visuals(parent, db, force=args.force_visuals)
+        print(STEP("STEP 7: Child visuals"))
+        for c in children:
+            _run_step_visuals(c, db, force=args.force_visuals)
+        print(STEP("STEP 8: Parent + child render"))
+        _run_step_render(parent, db, force=args.force_render)
+        for c in children:
+            _run_step_render(c, db, force=args.force_render)
+        _print_final_summary(parent, children, channel, db)
+        db.close()
+        return
 
-    # ── STEP 6: Agent 4 ───────────────────────────────────────────────────────
-    audio_ok = False
-    if passed:
-        audio_ok = _run_agent4(content_id)
+    if args.from_audio:
+        content_id = uuid.UUID(args.from_audio)
+        if args.dry_run:
+            _dry_run_report(content_id)
+            return
+        db = _db()
+        from app.models import Content
+        content, channel, config = _load_content_channel_config(content_id, db)
+        if not content:
+            print(f"\nERROR: Content not found: {content_id}")
+            db.close()
+            return
+        parent = content if not content.is_short_episode else db.get(Content, content.parent_content_id)
+        children = _existing_children(parent.id, db) if not content.is_short_episode else []
+        _execute_audio_through_render(
+            parent, children, channel, db, args.force_audio, args.force_visuals, args.force_render
+        )
+        db.close()
+        return
+
+    # ── --from-validation: resume after parent source script, before/at multilingual ──
+    if args.from_validation:
+        content_id = uuid.UUID(args.from_validation)
+        if args.dry_run:
+            _dry_run_report(content_id)
+            return
+        db = _db()
+        content, channel, config = _load_content_channel_config(content_id, db)
+        if not content:
+            print(f"\nERROR: Content not found: {content_id}")
+            db.close()
+            return
+        passed = _run_step_scripts(content, channel, config, db, force=args.force_scripts)
+        children = []
+        if passed:
+            children = _run_step_shorts_planning(content, channel, config, db, force=args.force_scripts)
+            _execute_audio_through_render(content, children, channel, db, args.force_audio, args.force_visuals, args.force_render)
+        else:
+            print("\n  ⚠ Skipping shorts planning + Agents 3/4/5 — script set is incomplete.")
+            _print_final_summary(content, children, channel, db)
+        db.close()
+        return
+
+    # ── --from-content / fresh discovery ──────────────────────────────────────
+    if args.dry_run and args.from_content:
+        _dry_run_report(uuid.UUID(args.from_content))
+        return
+    if args.dry_run and not args.from_content:
+        _dry_run_report_fresh(args.channel_id)
+        return
+
+    db = _db()
+    from app.models import Channel, ChannelConfig, ChannelLanguage, ChannelSource, Content, ContentValidation
+    from app.agents.agent2_discovery.services.discovery import run_discovery
+    from app.agents.agent2_discovery.services.validation import send_for_validation
+
+    story = None
+    if args.from_content:
+        content_id = uuid.UUID(args.from_content)
+        content = db.get(Content, content_id)
+        if not content:
+            print(f"\nERROR: Content not found: {content_id}")
+            db.close()
+            return
+        channel = db.get(Channel, content.channel_id)
+        print(STEP("STEP 1: Existing content load"))
+        print(f"  Reusing content {content_id}  status={content.status}")
+        if content.status == "PENDING_APPROVAL":
+            print(STEP("STEP 2: Approval (Telegram)"))
+            content, channel = _run_telegram_approval(content, channel, db)
+        else:
+            print(STEP("STEP 2: Approval (Telegram)"))
+            print(f"  REUSED — status is already {content.status!r}, skipping Telegram gate")
     else:
-        print("  ⚠ Skipping Agents 4+5 — validation did not pass")
+        print(STEP("STEP 1: Discovery"))
+        channel = (
+            db.get(Channel, uuid.UUID(args.channel_id)) if args.channel_id
+            else db.query(Channel).filter(Channel.active.is_(True)).first()
+        )
+        if not channel:
+            print("\nERROR: No active channel found. Activate one via the UI first.")
+            db.close()
+            return
+        config = db.get(ChannelConfig, channel.id)
+        sources = db.query(ChannelSource).filter(ChannelSource.channel_id == channel.id).all()
+        print(f"  Channel : {channel.name}")
+        print(f"  Niche   : {channel.niche}")
+        print(f"  Sources : {[(s.source_type, s.source_value[:50]) for s in sources]}")
 
-    # ── STEP 6b: Child Short TTS + Whisper ────────────────────────────────────
-    if audio_ok:
-        _run_child_shorts_agent4(content_id)
+        result = run_discovery(channel.id, db)
+        if not result:
+            print("  ❌ No story found. Check: is the channel active? Are sources configured?")
+            db.close()
+            return
+        content, story, assessment = result
+        print(f"  Story   : {content.title[:70]}")
+        print(f"  Score   : {assessment.get('overall_score', '?') if assessment else '?'}")
 
-    # ── STEP 7: Agent 5 ───────────────────────────────────────────────────────
-    video_ok = False
-    if audio_ok:
-        video_ok = _run_agent5(content_id)
-    elif passed:
-        print("  ⚠ Skipping Agent 5 — Agent 4 produced no audio")
+        print(STEP("STEP 2: Approval (Telegram)"))
+        content, channel = _run_telegram_approval(content, channel, db, assessment=assessment)
 
-    # ── STEP 8: Final summary ─────────────────────────────────────────────────
-    print(STEP("STEP 8: Final state"))
-    _print_final_summary(content_id, audio_ok, video_ok, passed, multilingual_ok)
+    config = db.get(ChannelConfig, channel.id)
+    content_reloaded = db.get(Content, content.id)
+    if content_reloaded.status != "APPROVED":
+        print(f"\n  ❌ Content is {content_reloaded.status!r}, not APPROVED — stopping before script generation.")
+        db.close()
+        return
+
+    passed = _run_step_scripts(content_reloaded, channel, config, db, story=story, force=args.force_scripts)
+    children = []
+    if passed:
+        children = _run_step_shorts_planning(content_reloaded, channel, config, db, force=args.force_scripts)
+        _execute_audio_through_render(
+            content_reloaded, children, channel, db, args.force_audio, args.force_visuals, args.force_render
+        )
+    else:
+        print("\n  ⚠ Skipping shorts planning + Agents 3/4/5 — script set is incomplete.")
+        _print_final_summary(content_reloaded, children, channel, db)
+    db.close()
+
+
+def _run_telegram_approval(content, channel, db, assessment: dict | None = None):
+    from app.config import settings
+    from app.models import Channel, ChannelLanguage, Content, ContentValidation
+    from app.agents.agent2_discovery.services.validation import send_for_validation
+
+    target_languages = [
+        cl.language for cl in db.query(ChannelLanguage).filter(ChannelLanguage.channel_id == channel.id).all()
+    ]
+    send_for_validation(content, channel, db, assessment=assessment, target_languages=target_languages)
+    val = db.query(ContentValidation).filter(ContentValidation.content_id == content.id).first()
+    msg_id = val.telegram_message_id if val else None
+
+    if not msg_id:
+        print("  ❌ Telegram send failed — check TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID in .env")
+        print(f"     When fixed, re-run: python test_full_pipeline.py --confirm --from-content {content.id}")
+        return content, channel
+
+    print(f"  ✅ Sent (message_id={msg_id})")
+    decision, from_user = poll_telegram(settings.telegram_bot_token, msg_id, timeout_sec=300)
+    reason = f"approved by @{from_user}" if from_user != "timeout" else "auto-approved (timeout)"
+
+    content = db.get(Content, content.id)
+    val = db.query(ContentValidation).filter(ContentValidation.content_id == content.id).first()
+    if val:
+        val.status = "APPROVED"
+        val.approved_at = datetime.now(timezone.utc)
+    content.status = "APPROVED"
+    db.commit()
+    print(f"  ✅ Content {reason}")
+    return content, channel
+
+
+# ── Dry-run reporting (no paid calls, no DB writes) ──────────────────────────
+
+def _dry_run_report_fresh(channel_id_str: str | None) -> None:
+    from app.models import Channel, ChannelConfig, ChannelSource
+
+    db = _db()
+    channel = (
+        db.get(Channel, uuid.UUID(channel_id_str)) if channel_id_str
+        else db.query(Channel).filter(Channel.active.is_(True)).first()
+    )
+    if not channel:
+        print("\n  DRY RUN: no active channel found — nothing to plan.")
+        db.close()
+        return
+    sources = db.query(ChannelSource).filter(ChannelSource.channel_id == channel.id).all()
+    print(f"\n  DRY RUN would run for channel: {channel.name} (niche={channel.niche})")
+    print(f"  Sources configured: {[(s.source_type, s.source_value[:50]) for s in sources]}")
+    print("  Would call: run_discovery() [paid: Claude] -> Telegram approval -> "
+          "Agent 2 scripts [paid: Claude] -> Agent 3 audio [paid: Cartesia/Whisper] -> "
+          "Agent 4 visuals [paid: Claude/fal.ai] -> Agent 5 render [Remotion, local].")
+    db.close()
+
+
+def _dry_run_report(content_id: uuid.UUID) -> None:
+    from app.models import Channel, ChannelConfig, Content
+
+    db = _db()
+    content, channel, config = _load_content_channel_config(content_id, db)
+    if not content:
+        print(f"\n  DRY RUN: content {content_id} not found.")
+        db.close()
+        return
+
+    parent = content if not content.is_short_episode else db.get(Content, content.parent_content_id)
+    children = _existing_children(parent.id, db) if not content.is_short_episode else []
+
+    print(f"\n  DRY RUN report for content {content_id}")
+    print(f"  Status: {content.status}")
+
+    state = _script_state(parent, channel, db)
+    print(f"\n  Parent script state: source={'validated' if state.source_validated else 'pending'} "
+          f"required={state.required_languages} validated={sorted(state.validated_languages)}")
+    print(f"  {'REUSE' if state.complete else 'WOULD GENERATE'} parent scripts")
+
+    print(f"  Existing child rows: {len(children)}")
+    for c in children:
+        cstate = _script_state(c, channel, db)
+        print(f"    part {c.short_part_number}: status={c.status} scripts_complete={cstate.complete}")
+
+    for c in [parent] + children:
+        n_audio = _audio_exists(c.id, db)
+        n_sections = _visual_sections_count(c.id, db)
+        n_renders = _render_count(c.id, db)
+        label = _label(c)
+        print(f"\n  [{label}]")
+        print(f"    audio files: {n_audio}   {'REUSE' if n_audio else 'WOULD GENERATE'}")
+        print(f"    video sections: {n_sections}   {'REUSE' if n_sections else 'WOULD GENERATE'}")
+        print(f"    video renders: {n_renders}   {'REUSE' if n_renders else 'WOULD GENERATE'}")
+
+    print("\n  No paid API was called. No DB row was written.")
+    db.close()
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    import argparse
-
     parser = argparse.ArgumentParser(
-        description="Full Agent 2 → Agent 4 → Agent 5 end-to-end test.",
+        description="Full Agent 2 -> Agent 3 -> Agent 4 -> Agent 5 operator entrypoint.",
     )
+    parser.add_argument("channel_id", nargs="?", help="Optional channel UUID. If omitted, first active channel is used.")
 
-    parser.add_argument(
-        "channel_id",
-        nargs="?",
-        help="Optional channel UUID. If omitted, first active channel is used.",
-    )
-    parser.add_argument(
-        "--from-content",
-        dest="from_content_id",
-        metavar="CONTENT_ID",
-        help="Skip discovery + Telegram. Content must exist in DB (already approved). Restarts from script generation (Step 3).",
-    )
-    parser.add_argument(
-        "--from-multilingual",
-        dest="from_multilingual_id",
-        metavar="CONTENT_ID",
-        help="Skip Telegram. Restart multilingual generation (Step 4).",
-    )
-    parser.add_argument(
-        "--from-agent3",
-        dest="from_agent3_id",
-        metavar="CONTENT_ID",
-        help="Skip Telegram + multilingual. Jump to validation step (det checks + auto-correction, Step 5).",
-    )
-    parser.add_argument(
-        "--from-audio",
-        dest="from_audio_id",
-        metavar="CONTENT_ID",
-        help="Skip to Agent 4 TTS+Whisper (Step 6). Content must be SCRIPTS_VALIDATED.",
-    )
-    parser.add_argument(
-        "--from-video",
-        dest="from_video_id",
-        metavar="CONTENT_ID",
-        help="Skip to Agent 5 Remotion render (Step 7). Content must be AUDIO_DONE.",
-    )
+    parser.add_argument("--dry-run", action="store_true", help="Inspect DB/config/env and print planned actions. No paid API calls, no DB writes.")
+    parser.add_argument("--confirm", action="store_true", help="Required for any real (non-dry-run) run, since it may call paid APIs.")
 
-    args = parser.parse_args()
+    parser.add_argument("--from-content", dest="from_content", metavar="CONTENT_ID", help="Resume from an existing parent content row.")
+    parser.add_argument("--from-validation", dest="from_validation", metavar="CONTENT_ID", help="Resume after parent source script generation, at multilingual + SCRIPTS_VALIDATED + shorts planning.")
+    parser.add_argument("--from-audio", dest="from_audio", metavar="CONTENT_ID", help="Resume at Agent 3 audio. Requires/checks SCRIPTS_VALIDATED.")
+    parser.add_argument("--from-visuals", dest="from_visuals", metavar="CONTENT_ID", help="Resume at Agent 4 visuals. Requires/checks AUDIO_DONE.")
+    parser.add_argument("--from-render", dest="from_render", metavar="CONTENT_ID", help="Resume at Agent 5 render. Requires/checks PARENT_VISUALS_DONE or CHILD_SHORT_VISUALS_DONE.")
 
-    run(
-        channel_id_str=args.channel_id,
-        from_content_id_str=args.from_content_id,
-        from_multilingual_id_str=args.from_multilingual_id,
-        from_agent3_id_str=args.from_agent3_id,
-        from_audio_id_str=args.from_audio_id,
-        from_video_id_str=args.from_video_id,
-    )
+    parser.add_argument("--force-scripts", action="store_true", help="Regenerate scripts even if valid scripts exist. Never deletes existing rows.")
+    parser.add_argument("--force-audio", action="store_true", help="Regenerate audio even if AudioFile exists. Never deletes existing rows.")
+    parser.add_argument("--force-visuals", action="store_true", help="Regenerate visuals even if VideoSections/status exist. Never deletes existing rows.")
+    parser.add_argument("--force-render", action="store_true", help="Rerender even if VideoRender exists. Never deletes existing rows.")
+
+    run(parser.parse_args())
