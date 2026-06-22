@@ -36,8 +36,12 @@ from sqlalchemy.orm import Session
 
 from app.models import AudioFile, Channel, ChannelConfig, Content, Script, VideoSection
 from app.agents.agent4_visuals.subagents.section_splitter import split_into_sections
-from app.agents.agent4_visuals.subagents.storyboard import split_into_beats, remap_beats_for_short
-from app.agents.agent4_visuals.subagents.storyboard_validator import validate_storyboard
+from app.agents.agent4_visuals.subagents.storyboard import (
+    split_into_beats, remap_beats_for_short, generate_pending_beat_images,
+)
+from app.agents.agent4_visuals.subagents.storyboard_validator import (
+    validate_storyboard, validate_media_assets,
+)
 from app.agents.agent4_visuals.services.flux_generator import generate_all_beat_images
 from app.agents.agent4_visuals.system_prompt import (
     STORYBOARD_SCHEMA_VERSION as _STORYBOARD_SCHEMA_VERSION,
@@ -254,6 +258,7 @@ def _run_parent_visuals(
         )
         _save_video_sections(content_id, language, beats_for_lang, db)
         db.commit()
+        _check_media_assets(content_id, language, beats_for_lang, db)
         beats_by_lang[language] = beats_for_lang
 
     return {"status": "PARENT_VISUALS_DONE", "beats_by_lang": beats_by_lang}
@@ -393,6 +398,119 @@ def _run_visual_pass(
     return beats, source_duration_ms
 
 
+def _check_storyboard_issues(beats: list[dict]) -> list[dict]:
+    """Run validate_storyboard() and log MINOR findings; return the MAJOR ones.
+
+    This is the single call site for ``validate_storyboard()`` shared by both
+    the parent storyboard path and the child remap path — neither caller
+    forks or re-implements the validator itself, only what happens after a
+    MAJOR finding differs (parent can retry via a full storyboard re-run;
+    child remap has no equivalent regeneration primitive and logs/proceeds
+    immediately, the same terminal behavior the parent falls back to when its
+    own retry still leaves MAJOR issues).
+
+    Returns:
+        The MAJOR issues found (empty list if the storyboard is clean).
+    """
+    issues = validate_storyboard(beats)
+    minor_issues = [i for i in issues if i["severity"] == "MINOR"]
+    major_issues = [i for i in issues if i["severity"] == "MAJOR"]
+
+    for issue in minor_issues:
+        logger.warning(
+            "Storyboard MINOR: beat=%d check=%s — %s",
+            issue["beat_order"], issue["check"], issue["description"][:200],
+        )
+
+    return major_issues
+
+
+def _check_media_assets(
+    content_id: uuid.UUID,
+    language: str,
+    beats: list[dict],
+    db: Session,
+) -> list[dict]:
+    """Run media existence/integrity/reuse checks, plus a persistence
+    round-trip comparison, AFTER `_save_video_sections()` has already
+    committed for this language. The single call site for
+    `validate_media_assets()`, shared by both the parent and child paths —
+    neither caller forks or re-implements it.
+
+    Unlike `_check_storyboard_issues()`, this runs post-persistence, not
+    pre-generation: a file's existence cannot be checked before it exists,
+    and a persistence round-trip cannot be checked before the row is saved.
+
+    All findings are MAJOR and all are logged at ERROR; none block the
+    pipeline — there is no retry/regeneration mechanism for a missing or
+    corrupt media file (Phase 4E-E's remediation classification covers the
+    future-work options, none implemented). This call is observability only.
+
+    Returns:
+        The MAJOR issues found (empty list if every beat's media reference
+        is present, well-formed, exists on disk, and survived persistence
+        unchanged).
+    """
+    issues = list(validate_media_assets(beats, str(content_id)))
+
+    # Persistence round-trip: reload from the DB and compare media_url/
+    # media_type against what was just saved. This is the regression guard
+    # for a future _build_beat_section()-style bug (Phase 4E-E/4D-E0) —
+    # it runs every time, in production, not just in a smoke test.
+    reloaded_by_order = {
+        s["section_order"]: s for s in _load_sections_from_db(content_id, language, db)
+    }
+    for beat in beats:
+        order = beat.get("section_order", beat.get("beat_order", 0))
+        reloaded = reloaded_by_order.get(order)
+        if reloaded is None:
+            issues.append({
+                "severity": "MAJOR",
+                "beat_order": order,
+                "check": "persistence_row_missing",
+                "description": (
+                    f"beat_order={order} was saved but no matching VideoSection "
+                    f"row was found on reload (content={content_id} language={language})."
+                ),
+            })
+            continue
+        expected_url = beat.get("media_url", "")
+        actual_url = reloaded.get("media_url", "")
+        if expected_url != actual_url:
+            issues.append({
+                "severity": "MAJOR",
+                "beat_order": order,
+                "check": "persistence_media_url_mismatch",
+                "description": (
+                    f"beat_order={order} media_url changed across persistence: "
+                    f"saved={expected_url!r} but reloaded={actual_url!r} "
+                    f"(content={content_id} language={language})."
+                ),
+            })
+        expected_type = beat.get("media_type", "image")
+        actual_type = reloaded.get("media_type", "image")
+        if expected_type != actual_type:
+            issues.append({
+                "severity": "MAJOR",
+                "beat_order": order,
+                "check": "persistence_media_type_mismatch",
+                "description": (
+                    f"beat_order={order} media_type changed across persistence: "
+                    f"saved={expected_type!r} but reloaded={actual_type!r} "
+                    f"(content={content_id} language={language})."
+                ),
+            })
+
+    if issues:
+        logger.error(
+            "MediaAsset MAJOR issue(s) found — observability only, not blocking. "
+            "content=%s language=%s MAJOR_count=%d checks=%s",
+            content_id, language, len(issues), [i["check"] for i in issues],
+        )
+
+    return issues
+
+
 def _run_storyboard_validation(
     beats: list[dict],
     voice_script: str,
@@ -413,15 +531,7 @@ def _run_storyboard_validation(
     validation failure (only when allow_legacy_fallback=False and storyboard
     retry also fails to produce any beats).
     """
-    issues = validate_storyboard(beats)
-    minor_issues = [i for i in issues if i["severity"] == "MINOR"]
-    major_issues = [i for i in issues if i["severity"] == "MAJOR"]
-
-    for issue in minor_issues:
-        logger.warning(
-            "Storyboard MINOR: beat=%d check=%s — %s",
-            issue["beat_order"], issue["check"], issue["description"][:200],
-        )
+    major_issues = _check_storyboard_issues(beats)
 
     if not major_issues:
         return beats
@@ -714,8 +824,33 @@ def _run_child_short_visuals(
             )
             continue
 
+        # Same storyboard validation gate the parent path runs (§ "Parent visual
+        # readiness" above), applied to the remapped child beats. Child remap has
+        # no regeneration primitive to retry against (unlike split_into_beats()),
+        # so a MAJOR finding here is logged and the pipeline proceeds — the same
+        # terminal behavior the parent falls back to when its own retry still
+        # leaves MAJOR issues. Coverage only; no new rule, threshold, or status.
+        major_issues = _check_storyboard_issues(beats)
+        if major_issues:
+            logger.error(
+                "Storyboard MAJOR issue(s) found in child short remap — no retry "
+                "primitive for remap, proceeding (pipeline not blocked per spec). "
+                "content=%s language=%s MAJOR_count=%d checks=%s",
+                content_id, language, len(major_issues),
+                [i["check"] for i in major_issues],
+            )
+
+        # Generation happens AFTER validation, not before (Phase 4E-E ordering
+        # alignment) — the remap step above deliberately left any
+        # below-threshold beat's media_url empty so the validation gate above
+        # ran before any fal.ai call, mirroring the parent path's
+        # validate-then-generate order. This call fills in those pending
+        # images; it is not a retry of the remap itself.
+        beats = generate_pending_beat_images(beats, str(content_id))
+
         _save_video_sections(content_id, language, beats, db)
         db.commit()
+        _check_media_assets(content_id, language, beats, db)
         logger.info(
             "CHILD_SHORT_VISUALS_DONE content_id=%s language=%s beats=%d",
             content_id, language, len(beats),

@@ -1130,6 +1130,8 @@ Agent 4 owns:
 - Media cache/reuse.
 - Standalone child-short visual remapping.
 - Visual quality diagnostics.
+- Media asset validation (existence, integrity, reuse, persistence
+  round-trip — post-generation, observability only).
 
 Agent 4 must not:
 
@@ -1244,6 +1246,194 @@ Rules:
 - Allow fallback only when explicitly intended.
 - Log fallback rate.
 
+#### `validate_storyboard`
+
+File:
+
+```text
+app/agents/agent4_visuals/subagents/storyboard_validator.py
+```
+
+Responsibilities:
+
+- Run deterministic, Python-only checks on a merged beat list. No Claude
+  calls, no I/O.
+- Return every issue found (`MAJOR` and `MINOR`), letting the caller decide
+  what to do with them.
+
+There is exactly one implementation, called from exactly one shared call
+site — `_check_storyboard_issues()` in
+`app/agents/agent4_visuals/services/visual_orchestrator.py` — used by both
+the parent storyboard path and the child short remap path. Neither path
+forks or re-implements the validator.
+
+Checks (current full inventory):
+
+| # | Check | Severity |
+|---|---|---|
+| 1 | `cover_frame_dark_contrast` — beat 0 must not use `color_grade="dark_contrast"` | MAJOR |
+| 2 | `cover_frame_text_card` — beat 0 must not be a `remotion_text_card` | MAJOR |
+| 3 | `opening_text_card_pair` — beats 0 and 1 must not both be `remotion_text_card` | MAJOR |
+| 4 | `forbidden_flux_word` — `flux_prompt` must not contain a forbidden mood word | MAJOR |
+| 5 | `environment_over_saturation` — no `environment` value may exceed 35% of all beats | MINOR |
+| 6 | `consecutive_same_environment` — no 3 consecutive beats may share one `environment` | MINOR |
+| 7 | `text_card_saturation` — `remotion_text_card` beats may not exceed 30% of all beats | MINOR |
+| 8 | `low_intensity_run` — no 3 consecutive beats may all be `beat_intensity="low"` | MINOR |
+| 9 | `motif_repetition_in_window` — no `motif` may repeat more than 2 times in any 10-beat sliding window | MINOR |
+| 10 | `near_duplicate_beat` — two beats within 2 positions sharing `environment`, `motif`, and `effect` simultaneously | MINOR |
+| 11 | `ai_slideshow_risk` — 5+ consecutive beats sharing one value for `environment`, `motif`, or `effect` | MINOR |
+| 12 | `subject_presence` — `flux_prompt` has fewer than 2 concrete-subject words after removing style/filler/technical boilerplate | MINOR |
+| 13 | `environment_presence` — `flux_prompt` contains none of its declared `environment`'s expected keywords | MINOR |
+| 14 | `low_information_prompt` — `flux_prompt` is under 4 words, or ≥50% generic filler words | MINOR |
+| 15 | `flux_prompt_exact_duplicate` — `flux_prompt` is character-identical to an earlier beat's in the same storyboard | MINOR |
+| 16 | `flux_prompt_near_duplicate` — `flux_prompt`'s word-token set overlaps ≥80% (Jaccard) with an earlier beat's | MINOR |
+| 17 | `reuse_clustering` — 3+ consecutive beats reuse the identical `media_url` | MINOR |
+| 18 | `excessive_reuse_ratio` — ≥70% of `flux_generated` beats already have a non-empty `media_url` at validation time | MINOR |
+
+Checks 12–16 validate `flux_prompt` *text quality* (subject/environment/
+information clarity, exact/near duplication) — distinct from check 4, which
+only catches an explicit forbidden mood word. Checks 17–18 validate *image
+reuse patterns* (Phase 4E-E) — only ever observable on the child remap path:
+parent beats never have a `media_url` set at the point `validate_storyboard()`
+runs (Flux hasn't generated yet — see the Ordering rule under
+`remap_beats_for_short` above), so these two checks are naturally always
+zero/LOW for parents with no child-specific branch required. All checks live
+in the same function; none is a second validator.
+
+Rules:
+
+- MAJOR issues never hard-block the pipeline directly — the caller decides
+  what to do (parent: retry once via full storyboard regeneration, then
+  proceed regardless; child: no regeneration primitive, logs and proceeds
+  immediately).
+- MINOR issues are always logged at WARNING and never trigger a retry.
+- Every `validate_storyboard()` call logs `VISUAL_REPEAT_RATE`,
+  `AI_SLIDESHOW_RISK`, `FLUX_PROMPT_QUALITY`, `FLUX_DUPLICATE_RATE`,
+  `CHILD_SHORT_REUSE_RATE`, and `CHILD_SHORT_REUSE_CLUSTERING` (all always,
+  even when zero) as summary diagnostics — see §29.
+- Do not add a second validator module for child-only, parent-only, or
+  Flux-prompt-only checks — extend this function and its check list instead.
+- Checks 12–18 are deterministic keyword/length/overlap/run-length
+  heuristics — no Claude or fal.ai call. Checks 12–16 will have false
+  positives/negatives on vocabulary outside their keyword lists; that is an
+  accepted tradeoff for staying deterministic, not a defect to silently
+  "fix" by adding an AI call.
+- No retry or regeneration exists for checks 17–18 (or any child-path
+  finding) — a finding is observability only. See the Remediation
+  Classification note under `remap_beats_for_short` history in
+  `code_report/phase4e_e_child_remap_validator.md` if/when retry or
+  regeneration is ever scoped as a real phase.
+
+#### `validate_media_assets`
+
+File:
+
+```text
+app/agents/agent4_visuals/subagents/storyboard_validator.py
+```
+
+Responsibilities:
+
+- Run deterministic media existence/integrity/reuse checks on beats whose
+  `media_url` has already been resolved (post-generation). Local filesystem
+  reads only (`Path.is_file()`/`stat()`) — no image decoding, no AI/Claude/
+  fal.ai call.
+
+This is the second, and only other, public `validate_*` function in this
+file — it does not duplicate or fork `validate_storyboard()`; the two cover
+different pipeline stages (`validate_storyboard()` runs *before*
+generation, on prompt/structure fields; `validate_media_assets()` runs
+*after* generation, on the resulting file references) and are called from a
+single shared site each
+(`visual_orchestrator._check_storyboard_issues()` and
+`visual_orchestrator._check_media_assets()` respectively), shared by both
+parent and child paths.
+
+Ordering rule (mandatory, not just a convention):
+
+```text
+_save_video_sections()
+↓
+db.commit()
+↓
+_check_media_assets()  [validate_media_assets() + the persistence round-trip]
+```
+
+`_check_media_assets()` must run strictly **after**
+`_save_video_sections()` + `db.commit()` for that language, never before.
+Two of its checks are meaningless in the other order: the persistence
+round-trip check (`persistence_media_url_mismatch`/
+`persistence_media_type_mismatch`/`persistence_row_missing`) has nothing
+committed to compare against until the row exists in the database, and a
+beat that is correctly still pending generation would otherwise be
+misreported as `media_file_missing_on_disk` on every single run. Do not
+document, or implement, media validation as a pre-persistence step.
+
+Per-language scope (deliberate, not an oversight): `_check_media_assets()`
+runs once per render language, immediately after that language's own
+`_save_video_sections()` call — not once per content item against the
+shared `language="__visual__"` cache row. This is intentional: Agent 5's
+render path (`_load_video_sections()` in
+`app/agents/agent5_render/services/video.py`) reads only the
+language-specific `VideoSection` rows (`VideoSection.language == language`,
+e.g. `"en"`) — it never reads the `"__visual__"` row. The media validator
+therefore validates exactly the rows Agent 5 actually renders from, for
+every language that gets persisted, rather than validating the shared cache
+row as a separate, redundant pass.
+
+Checks (all MAJOR — there are no MINOR media-asset findings):
+
+| Check | Detects |
+|---|---|
+| `media_url_missing` / `media_url_empty` | A non-text-card beat has no `media_url` at the point media validation runs (generation should already be complete by then) |
+| `media_url_malformed` | `media_url` is neither a `cache/`-prefixed local path nor the `__text_card__` sentinel — looks like a remote URL or other invalid reference |
+| `media_type_unsupported` | `media_type` is not in the currently-supported set (`{"image"}`) |
+| `media_file_missing_on_disk` / `reused_media_missing` | The referenced local file does not exist; named `reused_*` when the path's content-id segment differs from the beat's own content (a reused parent asset gone missing) vs. the beat's own freshly-generated asset |
+| `media_file_empty` / `reused_media_empty` | The referenced local file exists but is zero bytes — same own-vs-reused distinction |
+| `media_file_unreadable` | The file exists but could not be `stat()`-ed (permissions, race condition) |
+| `persistence_media_url_mismatch` / `persistence_media_type_mismatch` | The `media_url`/`media_type` just saved does not match what a fresh reload from the DB returns — the regression guard for a future `_build_beat_section()`-style bug (Phase 4E-E/4D-E0) |
+| `persistence_row_missing` | A beat was saved but no matching `VideoSection` row was found on reload |
+
+Rules:
+
+- All findings are MAJOR severity, logged at ERROR, and never block the
+  pipeline — there is no retry/regeneration mechanism for a missing or
+  corrupt media file (same remediation-classification reference as above).
+  This call is observability only.
+- **Bug Candidate 1 (self-contained explanation — do not rely on a
+  phase-report cross-reference to understand this):** the child remap beat
+  dict built by `remap_beats_for_short()` never explicitly sets either
+  `media_strategy` or `text_card_style`. Both fields are instead silently
+  defaulted by `_build_beat_section()` (`media_strategy` defaults to
+  `"flux_generated"`, `text_card_style` defaults to `"default"`) when the
+  beat is later passed through `map_storyboard_beats_to_timestamps()`. This
+  default is currently always correct, because child remap never
+  intentionally produces a real `remotion_text_card` beat — every beat it
+  returns is either a reused parent image or a freshly-generated Flux
+  image, both `"flux_generated"` in substance even though the field is
+  never set explicitly to say so. **This known gap remains deliberately
+  deferred, not fixed** (decided in Phase 4E-F; originally identified as
+  "Bug Candidate 1" in the Phase 4D-E0 data-flow audit). Because of this,
+  `validate_media_assets()` must not, and does not, trust a child beat's
+  `media_strategy == "flux_generated"` as a confirmed producer claim — it
+  gates every check on `media_strategy != "remotion_text_card"` instead.
+  This is safe specifically because the gate only needs "this beat is not a
+  text card" to be true, and that holds whether the field's value is real
+  or defaulted; it would stop holding only if child remap were changed to
+  intentionally produce text-card beats without also fixing this field to
+  be set explicitly — which is exactly why the gap is tracked instead of
+  ignored. (Further phase-report detail, if wanted: see
+  `code_report/phase4e_f_media_validator.md` §1 and
+  `code_report/phase4d_e0_data_flow_persistence_audit.md` §6 — but the
+  paragraph above is sufficient on its own.)
+- The persistence round-trip check requires a `db: Session` and therefore
+  cannot live inside this (otherwise DB-free) module — the comparison logic
+  lives in `visual_orchestrator._check_media_assets()`, which calls this
+  function for the existence/integrity/reuse checks and then separately
+  reloads via `_load_sections_from_db()` to compare. Both halves return the
+  same `StoryboardIssue`-shaped dict so the output is indistinguishable to
+  any caller/log reader regardless of which half produced it.
+
 #### `generate_all_beat_images`
 
 File:
@@ -1277,8 +1467,8 @@ Responsibilities:
 
 - Load parent visual beats.
 - Ask Claude to map short narration phrases to parent beats.
-- Reuse parent images when relevant.
-- Generate new images when needed.
+- Decide reuse vs. new-image-needed per beat (does **not** call Flux itself —
+  see Ordering rule below).
 - Map beats to child Whisper timestamps.
 - Return child short beats.
 
@@ -1291,6 +1481,25 @@ Rules:
 - Threshold is enforced in Python, not prompt.
 - Log reuse stats.
 
+Ordering rule (Phase 4E-E):
+
+- `remap_beats_for_short()` does **not** call `generate_beat_image()` itself.
+  A beat below the reuse threshold is returned with `media_url=""`
+  (pending) instead. `generate_pending_beat_images()` (below) fills in
+  pending beats' `media_url` afterward.
+- The caller (`_run_child_short_visuals()` in `visual_orchestrator.py`) runs
+  `_check_storyboard_issues()` — the same shared `validate_storyboard()` gate
+  the parent path uses — on the result **before** calling
+  `generate_pending_beat_images()`. This mirrors the parent path's order
+  exactly: `_run_visual_pass()` runs `_run_storyboard_validation()` before
+  `generate_all_beat_images()`.
+- `_build_beat_section()` (the per-beat dict builder used by
+  `map_storyboard_beats_to_timestamps()`, shared by both the parent
+  storyboard path and this function) propagates `media_url`/`media_type`
+  through unchanged. This matters only for the child path — the parent
+  never has a `media_url` set at this point — but dropping the field here
+  would silently erase every reuse-vs-pending decision this function makes.
+
 Preferred log names when touched:
 
 ```text
@@ -1300,6 +1509,30 @@ SHORT_EPISODE_RENDER_DONE
 ```
 
 Avoid phase-labeled names in new code.
+
+#### `generate_pending_beat_images`
+
+File:
+
+```text
+app/agents/agent4_visuals/subagents/storyboard.py
+```
+
+Responsibilities:
+
+- Generate a Flux image for every beat `remap_beats_for_short()` left
+  pending (`media_strategy="flux_generated"` and `media_url=""`).
+- Leave already-reused beats (non-empty `media_url`) untouched — never
+  regenerates a beat that already has a real image.
+
+Rules:
+
+- Must run **after** `_check_storyboard_issues()`, never before — this is
+  the entire point of the Phase 4E-E ordering alignment.
+- Is not a retry or regeneration mechanism: it fills in exactly the beats
+  that were always going to need a new image, once, regardless of what
+  `validate_storyboard()` found. A MAJOR/MINOR validator finding on a
+  child beat does not change which beats this function generates.
 
 ---
 
@@ -1960,6 +2193,83 @@ scripts/smoke_storyboard_cost_logging.py
 
 Avoid development phase names in new tests unless preserving old historical tests.
 
+### 19.4 Runtime-Proof Requirements
+
+Static/AST-based smoke checks confirm a change's *shape* — the right
+functions exist, the right names are called in the right order, the right
+import boundaries hold. They do not confirm a change's *data-flow
+correctness* across more than one function. A real bug shipped past every
+static smoke check for several phases this way: `_build_beat_section()`
+silently dropped a beat's `media_url` during timestamp mapping, so every
+child short silently regenerated a Flux image instead of reusing the
+parent's — correct call graph, wrong data, undetected until a runtime
+harness was actually run (see `code_report/phase4e_e_child_remap_validator.md`
+§11 and `code_report/phase4e_e1_cost_bug_validation_addendum.md`).
+
+This is now a mandatory development rule, not a suggestion: **runtime proof
+is required**, in addition to static/AST smoke checks, whenever a phase
+changes or depends on any of the following:
+
+- data flowing through more than one function before being persisted or
+  consumed (a field set in function A, read in function C, with an
+  intermediate function B the change doesn't visibly touch);
+- fields being preserved through a mapping, building, or persistence step
+  (any `_build_*_section()`-style dict reconstruction, or any DB
+  save-then-reload round trip);
+- reuse, caching, or cost-sensitive behavior (anything where a "skip
+  redundant work" decision could be silently defeated downstream);
+- parent–child media or data inheritance (anything the child path expects
+  to receive correctly from a parent-owned artifact);
+- a "validate before generate" (or otherwise explicitly ordered)
+  sequencing claim — ordering claims are easy to assert correctly in
+  source and easy to silently break in a downstream function the change
+  didn't touch;
+- an async pickup/status handoff between two independently-scheduled
+  Celery tasks (Agent N → Agent N+1 status polling, etc.).
+
+A runtime proof must:
+
+- use local/dev execution — a real local database and real application
+  code for the entire internal chain under test, not a mocked-out version
+  of the logic being proven;
+- stub **only** paid external APIs (Claude, fal.ai, ElevenLabs, Cartesia,
+  OpenAI Whisper, Remotion render execution, etc.) — never the internal
+  functions whose data-flow correctness is being proven;
+- capture the actual persisted or observed values (e.g. the real
+  `VideoSection.media_url` after a save-and-reload, the real call count and
+  arguments of a generation function, the real order two log lines were
+  emitted in) — not merely that a function was called;
+- prove the specific field/order/reuse/handoff behavior the phase depends
+  on, not just that the code runs without raising.
+
+A static/AST check that confirms "the right functions are called, in the
+right order, with no forbidden import" is necessary but never sufficient on
+its own for any item in the list above — pair it with a runtime proof.
+
+Worked examples already in this codebase (use these as the template, not
+just as historical record):
+
+- **Child remap `media_url` propagation through `_build_beat_section()`** —
+  `code_report/phase4e_e1_cost_bug_validation_addendum.md` Parts 1–2: real
+  DB-backed fixtures, real `run_visual_generation_for_content()` calls, only
+  Claude/Flux stubbed, asserting the actual persisted `media_url` values
+  match the expected reuse/generate split.
+- **Validate-before-generate ordering in child remap** —
+  `code_report/phase4e_e_child_remap_validator.md` §7: a call-order recorder
+  wrapping the real `validate_storyboard()` and `generate_beat_image()`,
+  proving the actual invocation order rather than inferring it from source.
+- **Persistence round-trip checks for media validation** —
+  `code_report/phase4e_f_media_validator.md` §6: a real save-then-reload,
+  plus a deliberately-injected, immediately-reverted regression to prove the
+  detector fires when persistence actually breaks, not just that it stays
+  silent when nothing is wrong.
+
+This rule does not relax or replace any existing Testing Rule in §19.1/§19.2
+— a runtime proof under this section must still avoid live external API
+calls (stub them, exactly as the worked examples above do) and must still
+be safe to run repeatedly (clean up every fixture row it creates, exactly as
+the worked examples above do).
+
 ---
 
 ## 20. Claude Code / Codex Work Rules
@@ -2377,15 +2687,46 @@ Required qualities:
 - strong subject framing
 - readable, purposeful text cards
 
-Diagnostics to maintain:
+Diagnostics implemented (emitted by `validate_storyboard()` on every call,
+parent and child alike — see §11.4):
 
 ```text
-VISUAL_REPEAT_RATE
-ENVIRONMENT_DIVERSITY
-OBJECT_SHOT_RATE
-AI_SLIDESHOW_RISK
-CHARACTER_CONSISTENCY_WARN
-STANDALONE_SHORT_REUSE_STATS
+VISUAL_REPEAT_RATE     — always logged; % of beats flagged by
+                          motif_repetition_in_window or near_duplicate_beat
+AI_SLIDESHOW_RISK      — always logged; risk=HIGH if any ai_slideshow_risk
+                          issue fired, else risk=LOW
+FLUX_PROMPT_QUALITY    — always logged; % of flux_generated beats flagged by
+                          subject_presence, environment_presence, or
+                          low_information_prompt
+FLUX_DUPLICATE_RATE    — always logged; % of flux_generated beats flagged by
+                          flux_prompt_exact_duplicate or
+                          flux_prompt_near_duplicate
+CHILD_SHORT_REUSE_RATE — always logged; % of flux_generated beats that already
+                          have a real (non-empty) media_url at validation time
+                          — naturally always 0% for parents (see §11.4
+                          remap_beats_for_short Ordering rule)
+CHILD_SHORT_REUSE_CLUSTERING — always logged; risk=HIGH if any reuse_clustering
+                          issue fired, else risk=LOW
+CHILD_SHORT_REUSE_STATS — child remap reuse/generate stats (storyboard.py,
+                          remap_beats_for_short); not a storyboard-validator
+                          output, listed here only to correct prior drift —
+                          this was previously mis-documented in this section
+                          as STANDALONE_SHORT_REUSE_STATS, a name that was
+                          never implemented under that spelling
+```
+
+Diagnostics not yet implemented (future work — do not assume these exist):
+
+```text
+ENVIRONMENT_DIVERSITY      — underlying checks exist (environment_over_saturation,
+                              consecutive_same_environment) but are not exposed
+                              under this specific log name
+OBJECT_SHOT_RATE           — no check measures the proportion of object-category
+                              beats; would require a new validate_storyboard()
+                              rule, not yet written
+CHARACTER_CONSISTENCY_WARN — no beat field captures character/identity continuity;
+                              requires new capability (a new beat field or image
+                              analysis), not just a new validator rule
 ```
 
 Do not optimize visual diversity by forcing random locations. Story logic wins.

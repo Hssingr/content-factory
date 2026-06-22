@@ -931,7 +931,13 @@ def _build_beat_section(beat: dict, index: int, start_ms: int, end_ms: int, scri
     ``section_order`` mirrors ``beat_order`` so downstream pipeline stages
     (persistence and Remotion builder) work unchanged on storyboard beats.
     ``flux_prompt`` is passed through unchanged — Flux Schnell will use it to
-    generate the image for this beat.
+    generate the image for this beat. ``media_url``/``media_type`` are also
+    passed through unchanged — for the parent storyboard path these are
+    always absent at this point (Flux hasn't run yet), but the child remap
+    path (`remap_beats_for_short()`) sets `media_url` *before* calling
+    timestamp mapping so `validate_storyboard()` can run before any Flux
+    call (Phase 4E-E ordering alignment); dropping the field here would
+    silently erase every reuse-vs-pending decision the child path makes.
     """
     beat_order = beat.get("beat_order", index)
 
@@ -991,6 +997,8 @@ def _build_beat_section(beat: dict, index: int, start_ms: int, end_ms: int, scri
         "text_card_style":      _safe_enum(
             beat.get("text_card_style"), _VALID_TEXT_CARD_STYLES, _DEFAULT_TEXT_CARD_STYLE
         ),
+        "media_url":            beat.get("media_url", ""),
+        "media_type":           beat.get("media_type", "image"),
     }
 
 
@@ -1050,8 +1058,15 @@ def remap_beats_for_short(
     Loads the parent video's shared visual beats (language="__visual__"), asks Haiku
     to assign the most thematically relevant parent beat to each narration phrase, then
     applies a match_score threshold: scores >= ``_MATCH_SCORE_THRESHOLD`` reuse the
-    parent's Flux image; lower scores trigger new Flux generation. Missing or text_card
-    ``media_url`` values also trigger new generation regardless of score.
+    parent's Flux image; lower scores require a new Flux image. Missing or text_card
+    ``media_url`` values also require a new image regardless of score.
+
+    Does NOT call Flux/fal.ai itself for beats that need a new image — those are
+    left with ``media_url=""`` (pending) so the caller can run
+    ``validate_storyboard()`` against the beat list before any generation
+    happens (Phase 4E-E ordering alignment, mirroring the parent path's
+    validate-then-generate order). Call ``generate_pending_beat_images()``
+    afterward to fill in the pending beats' ``media_url``.
 
     Timestamps are resolved via ``map_storyboard_beats_to_timestamps()`` on the Short's
     own Whisper transcript with ``allow_legacy_fallback=True`` — short episodes always
@@ -1065,7 +1080,9 @@ def remap_beats_for_short(
         db:                 SQLAlchemy session.
 
     Returns:
-        List of renderable beat-section dicts with ``media_url`` set, or ``[]`` on failure.
+        List of renderable beat-section dicts. Reused beats have ``media_url``
+        set; beats needing a new image have ``media_url=""`` until
+        ``generate_pending_beat_images()`` runs. Empty list on failure.
     """
     content_id_str = str(short_content.id)
 
@@ -1161,6 +1178,16 @@ def remap_beats_for_short(
         parent_row, extras = parent_by_order.get(long_order, (None, {}))
         parent_media: str = extras.get("media_url", "") if extras else ""
 
+        # Phase 4E-E ordering alignment: decide reuse-vs-new here, but do NOT
+        # call generate_beat_image() yet — image generation for beats that
+        # need a new image is deferred to generate_pending_beat_images(),
+        # which the caller (_run_child_short_visuals) runs AFTER
+        # validate_storyboard() has had a chance to fire, mirroring the
+        # parent path's validate-then-generate ordering
+        # (_run_visual_pass: _run_storyboard_validation() before
+        # generate_all_beat_images()). A beat needing a new image is left
+        # with media_url="" (pending) here; generate_pending_beat_images()
+        # fills it in afterward using this same beat dict's flux_prompt.
         if (
             match_score >= _MATCH_SCORE_THRESHOLD
             and parent_media
@@ -1170,22 +1197,12 @@ def remap_beats_for_short(
             media_url = parent_media
             reuse_count += 1
         else:
-            # Below threshold OR missing/text_card media_url → generate new Flux image
-            flux_prompt = (parent_row.flux_prompt if parent_row else "") or narration_phrase
-            environment = extras.get("environment", "other") if extras else "other"
-            new_url = generate_beat_image(
-                flux_prompt=flux_prompt,
-                beat_index=i,
-                content_id=content_id_str,
-                environment=environment,
-            )
-            media_url = new_url if new_url else _TEXT_CARD_SENTINEL
+            # Below threshold OR missing/text_card media_url → needs a new
+            # Flux image, generated later by generate_pending_beat_images().
+            media_url = ""
             generate_count += 1
-            logger.debug(
-                "remap_beats_for_short: beat=%d score=%d threshold=%d — new image: %s",
-                i, match_score, _MATCH_SCORE_THRESHOLD,
-                "OK" if new_url else "text_card fallback",
-            )
+
+        flux_prompt = (parent_row.flux_prompt if parent_row else "") or narration_phrase
 
         beat: dict = {
             "beat_order":             i,
@@ -1198,7 +1215,7 @@ def remap_beats_for_short(
             "visual_type":            _safe_enum(extras.get("visual_type") if extras else None, _VALID_VISUAL_TYPES, _DEFAULT_VISUAL_TYPE),
             "visual_category":        _safe_enum(extras.get("visual_category") if extras else None, _VALID_VISUAL_CATEGORIES, _DEFAULT_VISUAL_CATEGORY),
             "environment":            _safe_enum(extras.get("environment") if extras else None, _VALID_ENVIRONMENTS, _DEFAULT_ENVIRONMENT),
-            "flux_prompt":            (parent_row.flux_prompt if parent_row else "") or "",
+            "flux_prompt":            flux_prompt,
             "effect":                 _safe_enum(getattr(parent_row, "effect", None) if parent_row else None, _VALID_EFFECTS, _DEFAULT_EFFECT),
             "color_grade":            _safe_enum(getattr(parent_row, "color_grade", None) if parent_row else None, _VALID_GRADES, _DEFAULT_GRADE),
             "transition_to_next":     _safe_enum(extras.get("transition_to_next") if extras else None, _VALID_TRANSITIONS, _DEFAULT_TRANSITION),
@@ -1215,7 +1232,7 @@ def remap_beats_for_short(
     total_beats = len(beats)
     reuse_rate = (reuse_count / total_beats * 100) if total_beats > 0 else 0.0
     logger.info(
-        "remap_beats_for_short: content=%s beats=%d reuse=%d generate=%d",
+        "remap_beats_for_short: content=%s beats=%d reuse=%d pending_generation=%d",
         content_id_str, total_beats, reuse_count, generate_count,
     )
     logger.info(
@@ -1243,3 +1260,52 @@ def remap_beats_for_short(
         language=language,
     )
     return mapped or []
+
+
+def generate_pending_beat_images(beats: list[dict], content_id: str) -> list[dict]:
+    """Generate Flux images for beats `remap_beats_for_short()` left pending.
+
+    A beat is "pending" when its `media_strategy` is `flux_generated` and its
+    `media_url` is still empty — `remap_beats_for_short()` deliberately defers
+    the actual fal.ai call for any beat below the reuse threshold so that
+    `validate_storyboard()` runs against the beat list *before* any
+    generation happens, mirroring the parent path's validate-then-generate
+    ordering. Beats that already have a reused parent `media_url` are left
+    untouched (not re-generated).
+
+    Mutates each pending beat in-place (mirrors `generate_all_beat_images()`'s
+    contract):
+      - Success: sets ``beat["media_url"]`` to a local cache path.
+      - Failure: sets ``beat["visual_type"] = "text_card"``,
+        ``beat["media_url"] = "__text_card__"``.
+
+    Args:
+        beats:      Beat dicts returned by `remap_beats_for_short()`.
+        content_id: Content UUID string for logging.
+
+    Returns:
+        The same list, with every pending beat's `media_url` filled in.
+    """
+    pending = [
+        b for b in beats
+        if b.get("media_strategy", "flux_generated") == "flux_generated" and not b.get("media_url")
+    ]
+    if not pending:
+        return beats
+
+    logger.info(
+        "generate_pending_beat_images: content=%s pending=%d/%d beats",
+        content_id, len(pending), len(beats),
+    )
+
+    for beat in pending:
+        new_url = generate_beat_image(
+            flux_prompt=beat.get("flux_prompt", ""),
+            beat_index=beat.get("beat_order", 0),
+            content_id=content_id,
+            environment=beat.get("environment", "other"),
+        )
+        beat["media_url"] = new_url if new_url else _TEXT_CARD_SENTINEL
+        beat["media_type"] = "image"
+
+    return beats
