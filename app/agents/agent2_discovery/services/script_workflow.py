@@ -197,7 +197,6 @@ def _persist_source_script(content: Content, scripts: dict, db: Session) -> str:
     script_record = Script(
         content_id=content.id,
         language=content.source_language,
-        video_script=scripts["video_script"],
         voice_script=src_voice_script,
         version=1,
         validated=True,

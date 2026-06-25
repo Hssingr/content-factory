@@ -1,4 +1,4 @@
-"""Section Splitter — divides a video script into timed visual sections.
+"""Section Splitter — divides a voice script into timed visual sections.
 
 Python handles parsing and timing. Claude handles creative decisions (search query, visual type).
 
@@ -9,10 +9,12 @@ Timing strategy (in priority order):
   2. Equal splits: fallback when marker count does not match section count. Each section
      receives an equal share of the total duration.
 
-NOTE: _refine_with_whisper is intentionally removed. It used video_script word counts
-(visual direction notes, ~40 words/section) as a proxy for voice_script word counts
-(~150 words/section), causing all sections to map to the first ~27% of the audio and
-producing a black screen for the remaining 73% of the video.
+NOTE: _refine_with_whisper is intentionally removed. It used the legacy video_script
+field's word counts (visual direction notes, ~40 words/section) as a proxy for
+voice_script word counts (~150 words/section), causing all sections to map to the
+first ~27% of the audio and producing a black screen for the remaining 73% of the
+video. video_script was removed entirely in Phase 9E-0 (it was always assembled
+identically to voice_script) — section parsing now reads voice_script directly.
 """
 
 import logging
@@ -29,24 +31,22 @@ _SECTION_MARKER = re.compile(
 
 
 def split_into_sections(
-    video_script: str,
     voice_script: str,
     duration_ms: int,
     channel_niche: str,
     channel_tone: str,
     whisper_transcript: list[dict] | None = None,
 ) -> list[dict]:
-    """Split a video script into timed visual sections enriched with search queries.
+    """Split a voice script into timed visual sections enriched with search queries.
 
     Steps:
-      1. Parse [INTRO] / [SECTION N] / [OUTRO] markers from video_script (Python)
-      2. Calculate audio_start_ms / audio_end_ms — uses voice_script section word counts
-         when voice_script has matching markers, otherwise equal splits (Python)
+      1. Parse [INTRO] / [SECTION N] / [OUTRO] markers from voice_script (Python)
+      2. Calculate audio_start_ms / audio_end_ms from voice_script section word counts
+         when markers are present and match the section count, otherwise equal splits (Python)
       3. Ask Claude to enrich each section with search_query + suggested_visual
 
     Args:
-        video_script:       Structured script with [INTRO], [SECTION N: ...], [OUTRO] markers.
-        voice_script:       Narrator text — may include [SECTION N] markers for timing.
+        voice_script:       Narrator text with [INTRO], [SECTION N], [OUTRO] markers.
         duration_ms:        Exact audio duration from Agent 3 (mutagen).
         channel_niche:      Channel niche passed as context to Claude.
         channel_tone:       Channel tone passed as context to Claude.
@@ -57,10 +57,10 @@ def split_into_sections(
         {section_order, script_text, audio_start_ms, audio_end_ms,
          duration_sec, search_query, suggested_visual}
     """
-    raw_sections = _parse_sections(video_script)
+    raw_sections = _parse_sections(voice_script)
     if not raw_sections:
         logger.warning("No section markers found — treating entire script as one section")
-        raw_sections = [{"order": 0, "label": "FULL", "text": video_script.strip()}]
+        raw_sections = [{"order": 0, "label": "FULL", "text": voice_script.strip()}]
 
     timed = _assign_timings(raw_sections, voice_script, duration_ms)
 
@@ -77,9 +77,9 @@ def split_into_sections(
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
-def _parse_sections(video_script: str) -> list[dict]:
+def _parse_sections(voice_script: str) -> list[dict]:
     """Extract text blocks between [SECTION] / [INTRO] / [OUTRO] markers."""
-    splits = _SECTION_MARKER.split(video_script)
+    splits = _SECTION_MARKER.split(voice_script)
     sections = []
     i = 1
     order = 0
@@ -132,7 +132,7 @@ def _assign_timings(
     markers. Falls back to equal splits otherwise.
 
     Args:
-        sections:     Parsed video_script sections (order, label, text).
+        sections:     Parsed voice_script sections (order, label, text).
         voice_script: Narrator text — may include [SECTION N] markers.
         duration_ms:  Total audio duration in milliseconds.
 

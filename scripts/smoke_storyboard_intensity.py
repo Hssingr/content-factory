@@ -3,11 +3,13 @@
 Verifies:
   1. _build_beat_section, _cleanup_micro_beats, INTENSITY_FLOOR_MS importable.
   2. _BEAT_SCHEMA contains beat_intensity and suggested_duration_sec.
-  3. STORYBOARD_SCHEMA_VERSION is "6.0".
+  3. STORYBOARD_SCHEMA_VERSION is "6.1".
   4. _cleanup_micro_beats raises a below-floor high-intensity beat to its 1000ms floor.
   5. _cleanup_micro_beats raises a below-floor low-intensity beat to its 3000ms floor.
   6. _cleanup_micro_beats leaves a beat already at/above floor untouched.
   7. _build_beat_section produces beat_intensity and suggested_duration_sec fields.
+  8. why_this_visual / story_progression_role removed from _BEAT_SCHEMA and
+     _STORYBOARD_SYSTEM_PROMPT (Phase 6D-1B).
 
 Run: python scripts/smoke_storyboard_intensity.py
 Expected output: all lines prefixed with PASS, then SMOKE PASS
@@ -69,12 +71,40 @@ assert_ok(
     f"required: {required}",
 )
 
-# ── 3. STORYBOARD_SCHEMA_VERSION == "6.0" ────────────────────────────────────
+# ── 3. STORYBOARD_SCHEMA_VERSION == "6.1" ────────────────────────────────────
 
 assert_ok(
-    "STORYBOARD_SCHEMA_VERSION=6.0",
-    STORYBOARD_SCHEMA_VERSION == "6.0",
+    "STORYBOARD_SCHEMA_VERSION=6.1",
+    STORYBOARD_SCHEMA_VERSION == "6.1",
     f"got {STORYBOARD_SCHEMA_VERSION!r}",
+)
+
+# ── 8. Phase 6D-1B: why_this_visual / story_progression_role removed ─────────
+
+assert_ok(
+    "_BEAT_SCHEMA no longer has why_this_visual property",
+    "why_this_visual" not in props,
+)
+assert_ok(
+    "_BEAT_SCHEMA no longer has story_progression_role property",
+    "story_progression_role" not in props,
+)
+assert_ok(
+    "why_this_visual not in required",
+    "why_this_visual" not in required,
+)
+assert_ok(
+    "story_progression_role not in required",
+    "story_progression_role" not in required,
+)
+from app.agents.agent4_visuals.system_prompt import _STORYBOARD_SYSTEM_PROMPT
+assert_ok(
+    "_STORYBOARD_SYSTEM_PROMPT no longer mentions why_this_visual",
+    "why_this_visual" not in _STORYBOARD_SYSTEM_PROMPT,
+)
+assert_ok(
+    "_STORYBOARD_SYSTEM_PROMPT no longer mentions story_progression_role",
+    "story_progression_role" not in _STORYBOARD_SYSTEM_PROMPT,
 )
 
 # ── 4. _cleanup_micro_beats: high beat below 1000ms floor is raised ───────────
@@ -120,7 +150,6 @@ assert_ok(
 fixture_beat = {
     "beat_order":           0,
     "visual_intent":        "A worn wooden door in an empty hallway.",
-    "why_this_visual":      "Establishes the setting before the reveal.",
     "visual_type":          "b-roll",
     "visual_category":      "place",
     "environment":          "corridor_interior",
@@ -131,7 +160,6 @@ fixture_beat = {
     "overlay_text":         "",
     "overlay_position":     "none",
     "motif":                "doorway",
-    "story_progression_role": "setup",
     "beat_intensity":       "high",
     "suggested_duration_sec": 1.5,
 }

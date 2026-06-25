@@ -362,7 +362,7 @@ def _run_step_scripts(content, channel, config, db, *, story=None, force: bool =
 
         db.add(Script(
             content_id=content.id, language=content.source_language,
-            video_script=scripts["video_script"], voice_script=voice_script,
+            voice_script=voice_script,
             estimated_duration_sec=dur_sec, version=next_version, validated=True,
         ))
         db.commit()

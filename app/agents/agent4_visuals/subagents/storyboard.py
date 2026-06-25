@@ -124,6 +124,19 @@ _TEXT_CARD_SENTINEL = "__text_card__"
 # below this threshold a new image is generated.
 _MATCH_SCORE_THRESHOLD = 70
 
+# Word-count window for child remap alignment hints — mirrors the parent
+# storyboard schema's own start_hint/end_hint convention (system_prompt.py
+# "Exact first/last 6-10 verbatim words"), so map_storyboard_beats_to_timestamps()
+# sees the same shape of hint on both paths.
+_CHILD_HINT_MIN_WORDS = 6
+_CHILD_HINT_MAX_WORDS = 10
+
+# If more than this fraction of assignments in one remap response lack a usable
+# narration_phrase, treat it as a systemic Haiku response defect (fail loud)
+# rather than silently letting every affected beat fall back to proportional
+# timing one by one.
+_CHILD_REMAP_HINT_MISSING_FAIL_RATIO = 0.3
+
 # ── Short episode storyboard remap (Haiku) ─────────────────────────────────────
 
 _SHORT_REMAP_SYSTEM_PROMPT = (
@@ -1048,6 +1061,30 @@ def _safe_enum(value, valid: set, default: str) -> str:
 
 # ── Short episode storyboard remap ─────────────────────────────────────────────
 
+def _derive_child_alignment_hints(narration_phrase: str) -> tuple[str, str]:
+    """Derive start_hint/end_hint for a child remap beat from its verbatim narration_phrase.
+
+    Mirrors the parent storyboard schema's start_hint/end_hint convention (first/last
+    6-10 verbatim words) so ``map_storyboard_beats_to_timestamps()`` has the same shape
+    of input to align against on both the parent and child paths. Word-based slicing
+    only — no rewriting, summarizing, or punctuation invented beyond whitespace
+    normalization. Phrases shorter than ``_CHILD_HINT_MIN_WORDS`` words use the full
+    phrase for both hints; medium phrases may have overlapping start/end windows,
+    which is allowed since neither hint needs to be invented to avoid overlap.
+
+    Returns:
+        ``("", "")`` if ``narration_phrase`` is empty/whitespace-only.
+    """
+    words = narration_phrase.split()
+    if not words:
+        return "", ""
+    if len(words) < _CHILD_HINT_MIN_WORDS:
+        full = " ".join(words)
+        return full, full
+    n = min(_CHILD_HINT_MAX_WORDS, len(words))
+    return " ".join(words[:n]), " ".join(words[-n:])
+
+
 def remap_beats_for_short(
     short_content,
     short_voice_script: str,
@@ -1206,12 +1243,23 @@ def remap_beats_for_short(
     beats: list[dict] = []
     reuse_count = 0
     generate_count = 0
+    missing_hint_count = 0
 
     for i, assignment in enumerate(assignments):
         long_order       = int(assignment.get("long_beat_order", -1))
         match_score      = int(assignment.get("match_score", 0))
         beat_intensity   = _safe_enum(assignment.get("beat_intensity"), {"high", "medium", "low"}, "medium")
-        narration_phrase = str(assignment.get("narration_phrase", ""))
+        narration_phrase = str(assignment.get("narration_phrase", "")).strip()
+
+        if not narration_phrase:
+            missing_hint_count += 1
+            logger.warning(
+                "CHILD_REMAP_HINT_MISSING content_id=%s assignment_index=%d long_beat_order=%d "
+                "— assignment has no narration_phrase, alignment hints will be empty for this beat",
+                content_id_str, i, long_order,
+            )
+
+        start_hint, end_hint = _derive_child_alignment_hints(narration_phrase)
 
         parent_row, extras = parent_by_order.get(long_order, (None, {}))
         parent_media: str = extras.get("media_url", "") if extras else ""
@@ -1264,10 +1312,22 @@ def remap_beats_for_short(
             "suggested_duration_sec": 3.0,
             "media_url":              media_url,
             "media_type":             "image",
+            "start_hint":             start_hint,
+            "end_hint":               end_hint,
         }
         beats.append(beat)
 
     total_beats = len(beats)
+    missing_hint_ratio = (missing_hint_count / total_beats) if total_beats > 0 else 0.0
+    if missing_hint_ratio > _CHILD_REMAP_HINT_MISSING_FAIL_RATIO:
+        logger.error(
+            "remap_beats_for_short: content=%s %d/%d assignments (%.0f%%) had no "
+            "narration_phrase — exceeds %.0f%% fail threshold, treating as a "
+            "systemic remap response defect rather than per-beat fallback",
+            content_id_str, missing_hint_count, total_beats,
+            100 * missing_hint_ratio, 100 * _CHILD_REMAP_HINT_MISSING_FAIL_RATIO,
+        )
+        return []
     reuse_rate = (reuse_count / total_beats * 100) if total_beats > 0 else 0.0
     logger.info(
         "remap_beats_for_short: content=%s beats=%d reuse=%d pending_generation=%d",

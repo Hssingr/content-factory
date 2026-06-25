@@ -13,7 +13,6 @@ class Script(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     content_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("content.id", ondelete="CASCADE"), nullable=False)
     language: Mapped[str] = mapped_column(String(10), nullable=False)
-    video_script: Mapped[str] = mapped_column(Text, nullable=False)
     voice_script: Mapped[str] = mapped_column(Text, nullable=False)
     estimated_duration_sec: Mapped[float | None] = mapped_column(Float, nullable=True)
     validated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)

@@ -170,12 +170,11 @@ sections = [
     {"label": "SECTION 2", "script_text": "Body of section two."},
     {"label": "OUTRO",     "script_text": "Final resolution."},
 ]
-voice_script, video_script = assemble_script(sections)
+voice_script = assemble_script(sections)
 
 assert_ok(
-    "assemble_script markers and voice==video",
+    "assemble_script produces markers and full content",
     all(m in voice_script for m in ("[INTRO]", "[SECTION 1]", "[SECTION 2]", "[OUTRO]"))
-    and voice_script == video_script
     and "First sentence of intro." in voice_script
     and "Final resolution." in voice_script,
     f"voice_script excerpt: {voice_script[:120]!r}",

@@ -282,11 +282,10 @@ def normalize_tts_chars(text: str) -> str:
 
 # ── Individual check functions ────────────────────────────────────────────────
 
-def check_completeness(video_script: str, voice_script: str, language: str) -> list[dict]:
+def check_completeness(voice_script: str, language: str) -> list[dict]:
     """Check structural completeness: markers, section numbering, empty bodies, terminal punctuation.
 
     Args:
-        video_script: The video script text.
         voice_script: The voice script text.
         language:     BCP-47 language code used to tag issues.
 
@@ -295,28 +294,28 @@ def check_completeness(video_script: str, voice_script: str, language: str) -> l
     """
     issues: list[dict] = []
 
-    has_intro = bool(_INTRO_LINE_RE.search(video_script))
-    has_outro = bool(_OUTRO_LINE_RE.search(video_script))
-    section_nums = [int(m) for m in _SECTION_NUM_RE.findall(video_script)]
+    has_intro = bool(_INTRO_LINE_RE.search(voice_script))
+    has_outro = bool(_OUTRO_LINE_RE.search(voice_script))
+    section_nums = [int(m) for m in _SECTION_NUM_RE.findall(voice_script)]
 
     if not has_intro:
         issues.append({
             "language": language, "severity": "MAJOR", "category": "completeness",
-            "description": "[INTRO] marker missing from video_script",
-            "suggestion": "Add [INTRO] on its own line at the beginning of the video_script.",
+            "description": "[INTRO] marker missing from voice_script",
+            "suggestion": "Add [INTRO] on its own line at the beginning of the voice_script.",
             "offending_text": None,
         })
     if not has_outro:
         issues.append({
             "language": language, "severity": "MAJOR", "category": "completeness",
-            "description": "[OUTRO] marker missing from video_script",
-            "suggestion": "Add [OUTRO] on its own line at the end of the video_script.",
+            "description": "[OUTRO] marker missing from voice_script",
+            "suggestion": "Add [OUTRO] on its own line at the end of the voice_script.",
             "offending_text": None,
         })
     if not section_nums:
         issues.append({
             "language": language, "severity": "MAJOR", "category": "completeness",
-            "description": "No [SECTION N] markers found in video_script",
+            "description": "No [SECTION N] markers found in voice_script",
             "suggestion": "Add at least one [SECTION 1] marker between [INTRO] and [OUTRO].",
             "offending_text": None,
         })
@@ -328,19 +327,19 @@ def check_completeness(video_script: str, voice_script: str, language: str) -> l
             "offending_text": None,
         })
 
-    # Check for empty section bodies in video_script
-    section_positions = list(_SECTION_MARKER_RE.finditer(video_script))
-    outro_pos = _OUTRO_LINE_RE.search(video_script)
-    vs_end = outro_pos.start() if outro_pos else len(video_script)
+    # Check for empty section bodies in voice_script
+    section_positions = list(_SECTION_MARKER_RE.finditer(voice_script))
+    outro_pos = _OUTRO_LINE_RE.search(voice_script)
+    vs_end = outro_pos.start() if outro_pos else len(voice_script)
     for i, m in enumerate(section_positions):
         body_end = (
             section_positions[i + 1].start() if i + 1 < len(section_positions) else vs_end
         )
-        body = video_script[m.end():body_end].strip()
+        body = voice_script[m.end():body_end].strip()
         if not body:
             issues.append({
                 "language": language, "severity": "MAJOR", "category": "completeness",
-                "description": f"Empty body for {m.group(1).strip()} in video_script",
+                "description": f"Empty body for {m.group(1).strip()} in voice_script",
                 "suggestion": f"Add scene description / script content after {m.group(1).strip()}.",
                 "offending_text": None,
             })
@@ -402,7 +401,7 @@ def check_length_coherence(scripts_by_lang: dict[str, dict]) -> list[dict]:
     is invoked from generate_multilingual_scripts() after all Script rows are persisted.
 
     Args:
-        scripts_by_lang: Dict mapping language code → {"video_script": str, "voice_script": str}.
+        scripts_by_lang: Dict mapping language code → {"voice_script": str}.
 
     Returns:
         List of MAJOR Issue dicts for each outlier language found.
@@ -764,7 +763,7 @@ def run_deterministic_checks(
     (length_coherence) on every language simultaneously.
 
     Args:
-        scripts_by_lang: Dict mapping language code → {"video_script": str, "voice_script": str}.
+        scripts_by_lang: Dict mapping language code → {"voice_script": str}.
         script_format:   Format key from channel_config (default "youtube_long").
 
     Returns:
@@ -775,10 +774,9 @@ def run_deterministic_checks(
 
     # ── Per-language checks ───────────────────────────────────────────────────
     for lang, scripts in scripts_by_lang.items():
-        video_script = scripts.get("video_script", "")
         voice_script = scripts.get("voice_script", "")
 
-        issues_by_lang[lang].extend(check_completeness(video_script, voice_script, lang))
+        issues_by_lang[lang].extend(check_completeness(voice_script, lang))
         issues_by_lang[lang].extend(check_minimum_length(voice_script, lang, script_format))
         issues_by_lang[lang].extend(check_hook_quality(voice_script, lang))
         issues_by_lang[lang].extend(check_tts_compliance(voice_script, lang))

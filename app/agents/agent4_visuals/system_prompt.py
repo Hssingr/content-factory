@@ -11,7 +11,12 @@ from app.services.claude_client import (
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "3.0"  # v3.0: Replaced stock-fetcher / media-scoring infrastructure with
+PROMPT_VERSION = "3.1"  # v3.1: Removed why_this_visual and story_progression_role
+                        #        per-beat instructions (Phase 6D-1: live A/B proof found
+                        #        no measurable quality regression on visual_intent/flux_prompt
+                        #        specificity, validator findings, or image subject fidelity;
+                        #        see code_report/phase6d1_reasoning_scaffolding_ab_proof.md).
+                        # v3.0: Replaced stock-fetcher / media-scoring infrastructure with
                         #        Flux Schnell image generation. Beat schema: removed stock_query,
                         #        search_query, broad_query, fallback_query, query_style; added
                         #        flux_prompt (rich Flux-optimized generation prompt per beat).
@@ -27,7 +32,12 @@ PROMPT_VERSION = "3.0"  # v3.0: Replaced stock-fetcher / media-scoring infrastru
 # and maps the merged beats onto Whisper timestamps. Flux Schnell then generates
 # one image per beat from the flux_prompt Claude wrote.
 
-STORYBOARD_SCHEMA_VERSION = "6.0"  # v6.0: media_strategy (flux_generated | remotion_text_card |
+STORYBOARD_SCHEMA_VERSION = "6.1"  # v6.1: removed why_this_visual and story_progression_role —
+                                   #        confirmed zero downstream consumers (Phase 6B-1) and,
+                                   #        per a live A/B proof (Phase 6D-1), zero measurable
+                                   #        quality regression; ~17.6% lower storyboard output
+                                   #        payload on the tested segment.
+                                   # v6.0: media_strategy (flux_generated | remotion_text_card |
                                    #        stock_video | stock_image), stock_queries [],
                                    #        fallback_flux_prompt "", text_card_style per beat.
                                    #        stock_video / stock_image overridden to flux_generated
@@ -240,8 +250,6 @@ Bad examples (forbidden):
    words of the narration THIS BEAT covers, verbatim from the segment text given to
    you. These are used to locate the beat in the audio — they MUST match word-for-word.
 2. visual_intent — one sentence describing what the viewer should see and feel.
-2b. why_this_visual — one sentence explaining WHY this specific visual was chosen for
-    this moment in the narrative.
 3. visual_type — b-roll | action | text_overlay | document | map | screenshot | generated_visual
 4. visual_category — person | place | object | document | screen | map | abstract | text
 5. environment — fixed SETTING label, choose the closest honest match:
@@ -257,9 +265,6 @@ Bad examples (forbidden):
 12. motif — dominant visual motif this beat shows:
       doorway | corridor | face | hands | object | clock | phone | photo | exterior |
       text | screen | reflection | document | room | other
-13. story_progression_role — narrative function:
-      setup | evidence | escalation | contradiction | emotional_reaction |
-      context | transition | payoff | comment_prompt
 
 == Hard rules ==
 - Never invent names, dates, places, facts, people, URLs, or statistics.
@@ -273,8 +278,7 @@ Strict rules:
    starting at 0, in narration order. Aim for the target_beat_count provided (±2).
 2. Every beat's start_hint/end_hint must be copied EXACTLY from the segment text you
    received — never paraphrased, and never including the marker label.
-3. Every beat must include a ``motif`` field chosen from the allowed list.
-4. Every beat must include ``story_progression_role``.\
+3. Every beat must include a ``motif`` field chosen from the allowed list.\
 """
 
 # Per-batch ceiling — raised to 8192 to accommodate 50-80 word flux_prompts.
@@ -294,7 +298,6 @@ _BEAT_SCHEMA: dict = {
         "start_hint":              {"type": "string", "description": "Exact first 6–10 verbatim words of the narration this beat covers, no digits."},
         "end_hint":                {"type": "string", "description": "Exact last 6–10 verbatim words of the narration this beat covers, no digits."},
         "visual_intent":           {"type": "string"},
-        "why_this_visual":         {"type": "string"},
         "visual_type":             {"type": "string", "enum": ["b-roll", "action", "text_overlay", "document", "map", "screenshot", "generated_visual"]},
         "visual_category":         {"type": "string", "enum": ["person", "place", "object", "document", "screen", "map", "abstract", "text"]},
         "environment":             {"type": "string", "enum": ["underwater", "indoor_office", "indoor_domestic", "forest_nature", "urban_street", "corridor_interior", "abstract_dark", "open_landscape", "laboratory", "industrial", "vehicle", "other"]},
@@ -305,7 +308,6 @@ _BEAT_SCHEMA: dict = {
         "overlay_text":            {"type": "string"},
         "overlay_position":        {"type": "string", "enum": ["center", "lower_third", "top_left", "top_right", "none"]},
         "motif":                   {"type": "string", "enum": ["doorway", "corridor", "face", "hands", "object", "clock", "phone", "photo", "exterior", "text", "screen", "reflection", "document", "room", "other"]},
-        "story_progression_role":  {"type": "string", "enum": ["setup", "evidence", "escalation", "contradiction", "emotional_reaction", "context", "transition", "payoff", "comment_prompt"]},
         "beat_intensity":          {"type": "string", "enum": ["high", "medium", "low"], "description": "Narrative intensity at this moment: high=reveal/shock (1–2.5s), medium=progression (2.5–4s), low=establishing/pause (4–6s)."},
         "suggested_duration_sec":  {"type": "number", "description": "Suggested display duration in seconds. Must fall within the intensity tier range."},
         "media_strategy":          {"type": "string", "enum": ["flux_generated", "stock_video", "stock_image", "remotion_text_card"], "description": "How this beat's visual will be sourced. stock_video and stock_image are reserved for a future release — use flux_generated or remotion_text_card only."},
@@ -314,10 +316,10 @@ _BEAT_SCHEMA: dict = {
         "text_card_style":         {"type": "string", "enum": ["chat", "document", "statistic", "quote", "default"], "description": "Required when media_strategy is remotion_text_card. Ignored otherwise."},
     },
     "required": [
-        "beat_order", "start_hint", "end_hint", "visual_intent", "why_this_visual",
+        "beat_order", "start_hint", "end_hint", "visual_intent",
         "visual_type", "visual_category", "environment", "flux_prompt",
         "effect", "color_grade", "transition_to_next",
-        "overlay_text", "overlay_position", "motif", "story_progression_role",
+        "overlay_text", "overlay_position", "motif",
         "beat_intensity", "suggested_duration_sec",
         "media_strategy", "stock_queries", "fallback_flux_prompt", "text_card_style",
     ],

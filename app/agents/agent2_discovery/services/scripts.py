@@ -239,7 +239,7 @@ def _apply_final_tts_backstop(current: dict) -> dict:
         over_before, over_after,
     )
     if cleaned != voice_script:
-        return {**current, "voice_script": cleaned, "video_script": cleaned}
+        return {**current, "voice_script": cleaned}
     return current
 
 
@@ -346,7 +346,7 @@ def _apply_tts_only_quality_cleanup(
     voice_script = current.get("voice_script", "")
     cleaned = split_long_sentences(normalize_tts_chars(voice_script))
     if cleaned != voice_script:
-        current = {**current, "voice_script": cleaned, "video_script": cleaned}
+        current = {**current, "voice_script": cleaned}
         logger.info("QUALITY_REWRITE_SKIPPED: deterministic cleanup applied")
     _script_trace(f"quality_gate_tts_only_cleanup_{attempt}", current.get("voice_script", ""))
     return current
@@ -356,7 +356,7 @@ def _apply_post_rewrite_cleanup(current: dict, attempt: int) -> dict:
     voice_script = current.get("voice_script", "")
     cleaned = split_long_sentences(normalize_tts_chars(voice_script))
     if cleaned != voice_script:
-        current = {**current, "voice_script": cleaned, "video_script": cleaned}
+        current = {**current, "voice_script": cleaned}
         logger.info(
             "Script Quality Gate: deterministic cleanup applied after rewrite (attempt %d)",
             attempt,
@@ -368,7 +368,7 @@ def _apply_final_quality_cleanup(current: dict) -> dict:
     voice_script = current.get("voice_script", "")
     cleaned = split_long_sentences(normalize_tts_chars(voice_script))
     if cleaned != voice_script:
-        current = {**current, "voice_script": cleaned, "video_script": cleaned}
+        current = {**current, "voice_script": cleaned}
         logger.info("Script Quality Gate: final deterministic cleanup applied before returning")
     return current
 
@@ -486,7 +486,6 @@ def generate_multilingual_scripts(
         logger.info("Generating %s script for content %s…", lang, content.id)
         try:
             adapted = generate_native_script(
-                video_script=source_script.video_script,
                 voice_script=source_script.voice_script,
                 target_language=lang,
                 niche=channel.niche,
@@ -507,7 +506,6 @@ def generate_multilingual_scripts(
         script = Script(
             content_id=content.id,
             language=lang,
-            video_script=adapted["video_script"],
             voice_script=adapted["voice_script"],
             version=1,
             validated=True,
@@ -950,24 +948,20 @@ def _generate_section_with_retry(
     return None
 
 
-def assemble_script(sections: list[dict]) -> tuple[str, str]:
-    """Assemble section dicts into a marked voice_script and video_script.
-
-    voice_script and video_script are identical: Agent 4 visuals generate their own visual
-    decisions via the storyboard and does not depend on video_script content.
+def assemble_script(sections: list[dict]) -> str:
+    """Assemble section dicts into a marked voice_script.
 
     Args:
         sections: List of dicts with keys ``label`` and ``script_text``, in order.
 
     Returns:
-        Tuple of (voice_script, video_script) — both are the same assembled text.
+        The assembled voice_script text, with [LABEL] markers on their own line.
     """
     parts: list[str] = []
     for s in sections:
         parts.append(f"[{s['label']}]")
         parts.append(s["script_text"])
-    assembled = "\n\n".join(parts)
-    return assembled, assembled
+    return "\n\n".join(parts)
 
 
 def check_narrative_completeness(
@@ -1407,10 +1401,10 @@ def _assemble_sections_with_diagnostics(
     channel: Channel,
     script_format: str,
     context: dict,
-) -> tuple[str, str]:
+) -> str:
     sections = state["sections"]
     diagnose_section_repetition(sections)
-    voice_script, video_script = assemble_script(sections)
+    voice_script = assemble_script(sections)
     _script_trace("after_section_assembly", voice_script)
 
     _phrase_hits = detect_generic_documentary_phrases(voice_script)
@@ -1420,7 +1414,7 @@ def _assemble_sections_with_diagnostics(
             _hit["phrase"], _hit["sentence"],
         )
 
-    completeness_issues = check_completeness(video_script, voice_script, "source")
+    completeness_issues = check_completeness(voice_script, "source")
     length_issues = check_minimum_length(voice_script, "source", script_format)
 
     if completeness_issues:
@@ -1431,9 +1425,8 @@ def _assemble_sections_with_diagnostics(
 
     length_majors = [i for i in length_issues if i.get("severity") == "MAJOR"]
     if length_majors:
-        voice_script, video_script = _apply_length_correction(
+        voice_script = _apply_length_correction(
             voice_script=voice_script,
-            video_script=video_script,
             length_majors=length_majors,
             story=story,
             channel=channel,
@@ -1442,18 +1435,17 @@ def _assemble_sections_with_diagnostics(
         )
 
     _run_global_script_validation(voice_script, blueprint)
-    return voice_script, video_script
+    return voice_script
 
 
 def _apply_length_correction(
     voice_script: str,
-    video_script: str,
     length_majors: list[dict],
     story,
     channel: Channel,
     script_format: str,
     context: dict,
-) -> tuple[str, str]:
+) -> str:
     wc_before = len(voice_script.split())
     logger.warning(
         "generate_script_sections: voice_script under minimum length (%d words) — "
@@ -1462,7 +1454,7 @@ def _apply_length_correction(
     )
     try:
         corrected = auto_correct_script(
-            current_scripts={"video_script": video_script, "voice_script": voice_script},
+            current_scripts={"voice_script": voice_script},
             issues=length_majors,
             language=story.language,
             channel=channel,
@@ -1471,7 +1463,6 @@ def _apply_length_correction(
             tts_model=context["tts_model"],
             tts_provider=context["tts_provider"],
         )
-        video_script = corrected.get("video_script", video_script)
         voice_script = corrected.get("voice_script", voice_script)
         wc_after = len(voice_script.split())
         logger.info(
@@ -1482,7 +1473,7 @@ def _apply_length_correction(
         logger.debug(
             "generate_script_sections: length correction failed (non-blocking): %s", exc
         )
-    return voice_script, video_script
+    return voice_script
 
 
 def _run_global_script_validation(voice_script: str, blueprint: dict) -> None:
@@ -1700,7 +1691,6 @@ def _log_post_retry_narrative_result(
 
 def _run_narrative_completeness_retry(
     voice_script: str,
-    video_script: str,
     state: dict,
     story,
     blueprint: dict,
@@ -1708,7 +1698,7 @@ def _run_narrative_completeness_retry(
     script_format: str,
     audio_tags_enabled: bool,
     context: dict,
-) -> tuple[str, str]:
+) -> str:
     major_turns = context["major_turns"]
     covered_turns = state["covered_turns"]
     _log_turn_coverage_alignment(voice_script, major_turns, covered_turns)
@@ -1717,7 +1707,7 @@ def _run_narrative_completeness_retry(
         voice_script, blueprint, already_covered=covered_turns
     )
     if not nc_issues:
-        return voice_script, video_script
+        return voice_script
 
     logger.info(
         "generate_script_sections: narrative completeness issues before retry: %s", nc_issues
@@ -1736,10 +1726,10 @@ def _run_narrative_completeness_retry(
             context=context,
         )
 
-    voice_script, video_script = assemble_script(state["sections"])
+    voice_script = assemble_script(state["sections"])
     _script_trace("after_narrative_retry", voice_script)
     _log_post_retry_narrative_result(voice_script, blueprint, major_turns, covered_turns)
-    return voice_script, video_script
+    return voice_script
 
 
 def generate_script_sections(
@@ -1776,12 +1766,11 @@ def generate_script_sections(
     _generate_outro_section(
         story, blueprint, channel, script_format, audio_tags_enabled, context, state
     )
-    voice_script, video_script = _assemble_sections_with_diagnostics(
+    voice_script = _assemble_sections_with_diagnostics(
         state, story, blueprint, channel, script_format, context
     )
-    voice_script, video_script = _run_narrative_completeness_retry(
+    voice_script = _run_narrative_completeness_retry(
         voice_script=voice_script,
-        video_script=video_script,
         state=state,
         story=story,
         blueprint=blueprint,
@@ -1794,7 +1783,6 @@ def generate_script_sections(
     _script_trace("generate_script_sections_returning", voice_script)
     return {
         "title": blueprint.get("suggested_title", story.title),
-        "video_script": video_script,
         "voice_script": voice_script,
         "visual_intent_history": state["visual_intent_history"],
         "_section_calls": state["section_calls"],
@@ -2136,7 +2124,6 @@ def _persist_child_short_script(
     short_script = Script(
         content_id=short_content.id,
         language=source_language,
-        video_script=generated.get("voice_script", ""),
         voice_script=generated.get("voice_script", ""),
         version=1,
         validated=True,

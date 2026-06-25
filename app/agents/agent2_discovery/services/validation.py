@@ -393,7 +393,6 @@ def _handle_change(
     try:
         current = {
             "title":        content.title,
-            "video_script": script.video_script,
             "voice_script": script.voice_script,
         }
         revised = generate_revised_scripts(current, feedback, channel)
@@ -422,7 +421,6 @@ def _handle_change(
     new_script = Script(
         content_id=content.id,
         language=content.source_language,
-        video_script=revised["video_script"],
         voice_script=revised["voice_script"],
         version=script.version + 1,
         validated=False,

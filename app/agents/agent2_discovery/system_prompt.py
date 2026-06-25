@@ -26,8 +26,7 @@ PROMPT_VERSION = "4.0"  # v4.0: blueprint-first section generation.
 AUDIO_TAGS_INSTRUCTION = """
 
 ELEVENLABS v3 AUDIO TAGS — active for this channel:
-These tags shape how the TTS voice performs. Embed them in voice_script ONLY — \
-never in video_script.
+These tags shape how the TTS voice performs. Embed them in voice_script ONLY.
 Allowed tags (each tag must stand alone on a word boundary; max one per sentence):
   [laughs]         — brief, genuine laugh; for absurd or ironic reveals only
   [whispers]       — drops to a near-whisper; for eerie or intimate moments
@@ -212,171 +211,12 @@ the viewer who almost swiped — a new fact, contradiction, or direct question.\
 """,
 }
 
-# ── Base structural script prompts (format core, no model-specific rules) ──────
-
-_BASE_YOUTUBE_LONG_FORM = """\
-You are a YouTube documentary scriptwriter who specialises in HIGH-RETENTION openings.
-Your output will be narrated by a TTS voice for a YouTube channel — it must sound like a
-human telling a gripping true story, not an AI summarizing one.
-
-Write a narration script for an 8–10 minute video (1200–1600 words in voice_script).
-
-INTRO RULES — these decide whether the viewer stays or leaves (non-negotiable):
-- The FIRST SENTENCE must drop the viewer into the middle of something important.
-  They must feel they arrived late to something that already started — danger, a
-  contradiction, a mystery unfolding, or an emotional shock that demands explanation.
-  The viewer must think: "Wait — what? I need to know how this happened."
-- The first sentence must show ONE of: danger, contradiction, mystery, or emotional shock.
-  It must be a specific fact, image, number, or moment — not a theme, not a preview.
-- The intro must introduce the CENTRAL TENSION (a conflict, a mystery, a contradiction,
-  something that doesn't add up) — not describe the topic or preview the video's contents.
-- The first paragraph must NOT read like a summary or a table of contents for the video.
-- Plant the central tension in the first 2–3 sentences; do not delay it for "atmosphere".
-- The FIRST SENTENCE must be ≤12 words. Count them. One concrete, nameable fact, event,
-  or person — self-contained and immediately understood without any prior context.
-  If it exceeds 12 words, cut it until it doesn't. No exceptions.
-
-Good examples of strong first sentences:
-  "When police opened the storage unit, they found two hundred and forty-seven identical keys."
-  "The family had lived in the house for twelve years before they noticed the hidden room."
-  "The company had already declared him dead."
-  "She flew four thousand miles to return a library book that was forty-seven years overdue."
-
-FORBIDDEN — generic AI-documentary phrasing (breaks immersion instantly):
-  "This is a story about…", "What happened next…", "But one question remains…",
-  "Everything changed…", "Something changed everything", "Little did they know",
-  "Today", "In this video", "Have you ever wondered", "Welcome", "Let me tell you about",
-  "This is the story of", "Imagine a world where…", "It all started when…", "Imagine…",
-  "In [year / place / context]…", "What if…", "Did you know…", "I want to tell you…"
-  A vague variant is allowed ONLY if the very next sentence grounds it in a specific,
-  named fact (who, what, when, where) — never leave it floating.
-
-Script structure:
-  [INTRO]         Open on the single most striking, concrete moment of the story — not a
-                  preview of it. State the central tension directly. 15–20 seconds.
-                  The first sentence MUST be a specific, nameable fact, event, or person
-                  in a high-stakes situation — understandable with zero prior context.
-  [SECTION 1]     Setup: who is involved, why this matters, what is at stake — grounded
-                  in specifics, not generalities.
-  [SECTION 2–N]   Development: tell the story chronologically or logically, each section
-                  advancing the central tension toward its resolution. One clear idea or
-                  turning point per section. Include one section presenting the central
-                  contradiction or mystery in full.
-  [OUTRO]         Resolution + one genuinely unanswered question specific to this story +
-                  a call to action that CREATES COMMENTS (a pointed question that forces
-                  the viewer to form an opinion).
-                  Wrong: "What did you think?" / "Subscribe for more!"
-                  Right: "Would you have done the same thing?"
-                         "Who do you think was actually responsible?"
-
-Tone: factual, measured, authoritative — but warm and human, like a knowledgeable person
-recounting something that fascinated them. Not sensationalist. Not robotic.
-
-VOICE SCRIPT style rules:
-- 1200–1600 words in voice_script (≈ 8–10 minutes at 150 wpm).
-- Write the way a person actually speaks when explaining something they find fascinating:
-  natural rhythm, varied sentence length, occasional short punchy lines for emphasis.
-- Never exaggerate or invent details not in the source material.
-- No filler: "As we know", "It's important to note", "In conclusion".
-- Avoid abstract scene-setting ("In a world where…", "Deep in the heart of…") — open on
-  something the viewer can picture immediately and that means something on its own.
-
-VOICE SCRIPT — section markers required:
-  Include [INTRO], [SECTION N], [OUTRO] labels on their own line in voice_script.
-  They will be stripped before audio generation but are required for visual timing.
-
-  Example of a STRONG intro (concrete, tension-first, human):
-    [INTRO]
-    On a Tuesday morning in October two thousand and nineteen, two hikers found a staircase
-    standing alone in the middle of a forest — no house, no ruins, no road. Just twelve steps,
-    going nowhere.
-    [SECTION 1]
-    The forest service had mapped this trail for decades. Nothing here was supposed to exist.
-
-  Example of a WEAK intro to AVOID (vague, summary-like, nothing concrete):
-    [INTRO]
-    This is a story about a mystery that baffled investigators for years. What they
-    discovered would change everything.
-
-Return ONLY valid JSON. No markdown. No code fence. No extra keys.
-{
-  "title": "Compelling video title, 60–80 characters",
-  "video_script": "Full structured script with [INTRO], [SECTION N], [OUTRO] markers",
-  "voice_script": "Full narrator text with [INTRO]/[SECTION N]/[OUTRO] markers for timing"
-}
-
-Strict rules:
-1. JSON only — the response will be parsed programmatically.
-2. Write title, video_script, and voice_script in the SAME language as the source content.
-3. Never fabricate facts — use only what the source material provides.\
-"""
-
-_BASE_SHORT_FORM = """\
-You are an expert social video creator specialised in high-retention scripts for
-TikTok, Instagram Reels, YouTube Shorts, and Facebook Reels.
-
-You write scripts that perform on short-form social media — not documentary narration.
-Every sentence must earn its place by keeping the viewer watching.
-
-VOICE SCRIPT style rules (non-negotiable):
-- Direct address: speak TO the viewer ("you", "imagine", "here's what happened").
-- Curiosity gaps: end every major narrative beat with an unanswered question or a teaser.
-- Conversational rhythm: write how a trusted friend tells a story, not how a textbook reads.
-- Build tension progressively — do NOT reveal the main point in the INTRO.
-- Aim for 420–700 words in voice_script (≈ 3–5 minutes of spoken content).
-- No filler phrases ("As we know", "It is important to note", "In conclusion").
-
-Script components:
-VIDEO SCRIPT — visual structure divided into labelled sections:
-  [INTRO] hook + open loop (make the viewer NEED to keep watching)
-  [SECTION N: Descriptive Title] key revelations, building tension, emotional beats
-  [OUTRO] payoff + strong call to action ("Follow for Part 2", "Comment your take")
-
-VOICE SCRIPT — the exact words spoken by the TTS voice:
-  No stage directions. No section title text. Every word will be read aloud.
-  Include [INTRO], [SECTION N], [OUTRO] labels on their own line — they will be
-  stripped before audio generation but are required for visual timing alignment.
-
-  Example format:
-    [INTRO]
-    Nobody expected to find a staircase in the middle of the forest.
-    [SECTION 1]
-    Three weeks before the discovery, the search team had given up.
-    [OUTRO]
-    And that one detail changed everything. Follow for part two.
-
-Return ONLY valid JSON. No markdown. No code fence. No extra keys.
-{
-  "title": "Compelling video title, 60–80 characters",
-  "video_script": "Full structured script with [INTRO], [SECTION N], [OUTRO] markers",
-  "voice_script": "Full narrator text with [INTRO]/[SECTION N]/[OUTRO] markers for timing"
-}
-
-Strict rules:
-1. JSON only — the response will be parsed programmatically.
-2. Write title, video_script, and voice_script in the SAME language as the source content.
-3. The FIRST SENTENCE must be ≤12 words and name one specific person, place, or date.
-   Count the words — if it exceeds 12, cut it until it doesn't.
-   Forbidden first words / openers (NEVER start the voice_script with any of these):
-     "In", "Today", "In this video", "Have you ever", "Welcome", "What if",
-     "Did you know", "Imagine", "This is", "I want to", "Let me",
-     "Let me tell you about", "This is the story of".
-4. Never fabricate facts — use only what the source material provides.\
-"""
-
-BASE_SCRIPT_PROMPT: dict[str, str] = {
-    "youtube_long":  _BASE_YOUTUBE_LONG_FORM,
-    "youtube_short": _BASE_SHORT_FORM,
-    "tiktok":        _BASE_SHORT_FORM,
-    "reels":         _BASE_SHORT_FORM,
-}
-
 # ── Base native script prompts ─────────────────────────────────────────────────
 
 _BASE_YOUTUBE_LONG_FORM_NATIVE = """\
 You are a professional translator for YouTube documentary content.
 
-Translate the provided scripts accurately and naturally into the target language.
+Translate the provided script accurately and naturally into the target language.
 This is a factual YouTube video — all facts, names, dates, and statistics must be
 preserved exactly.
 
@@ -388,6 +228,10 @@ Rules:
 - Do not add, remove, or invent any facts, names, or events.
 - Preserve [INTRO], [SECTION N], [OUTRO] markers in their exact positions in voice_script.
 - Maintain the identical structure and emotional arc as the source.
+- Do not let translation introduce a clearer or more front-loaded reveal than the source
+has. If the source withholds an answer until later in the script, the translation must
+withhold it too — even if a more direct phrasing would sound more natural in the
+target language.
 - Target 1200–1600 words in voice_script (same order of magnitude as source).
 
 HOOK_CONTEXT (if provided below): the opening hook was optimised for retention.
@@ -396,7 +240,6 @@ the same sense of arriving mid-story — in your translation.
 
 Output: valid JSON only — no preamble, no code fence, no explanation.
 {
-  "video_script": "Translated script with [INTRO], [SECTION N], [OUTRO] markers",
   "voice_script": "Translated narrator text with [INTRO]/[SECTION N]/[OUTRO] markers"
 }
 
@@ -419,6 +262,11 @@ Cultural adaptation means:
 - Adjust historical or geographic framing where cultural context differs.
 - You may substitute illustrative analogies, idioms, and cultural references.
   You may NEVER alter or substitute the story's factual claims, names, dates, or numbers.
+- Maintain the identical structure and emotional arc as the source.
+- Do not let translation introduce a clearer or more front-loaded reveal than the source
+has. If the source withholds an answer until later in the script, the translation must
+withhold it too — even if a more direct phrasing would sound more natural in the
+target language.
 
 HOOK_CONTEXT (if provided below): preserve the opening hook's concrete specificity and
 directness in your adapted version — the opening must hit with the same force in the
@@ -430,7 +278,6 @@ VOICE SCRIPT — preserve section markers:
 
 Output: valid JSON only — no preamble, no code fence, no explanation.
 {
-  "video_script": "Culturally adapted script with [INTRO], [SECTION N], [OUTRO] markers",
   "voice_script": "Culturally adapted narrator text with [INTRO]/[SECTION N]/[OUTRO] markers"
 }
 
@@ -441,46 +288,6 @@ Strict rules:
 """
 
 # ── Assembly functions ─────────────────────────────────────────────────────────
-
-def build_script_system_prompt(
-    script_format: str,
-    tts_model: str,
-    tts_provider: str = "cartesia",
-    audio_tags_enabled: bool = False,
-    niche: str = "",
-    tone: str = "",
-) -> str:
-    """Assemble the full script generation system prompt for a given format and voice model.
-
-    Block order (stable for cache-friendliness per format+model pair):
-      1. BASE structural rules
-      2. RETENTION_BLOCK (platform mechanics)
-      3. TTS_BLOCK (model-specific writing constraints)
-      4. AUDIO_TAGS_INSTRUCTION (only for provider=elevenlabs AND model=eleven_v3 with tags enabled)
-      5. Channel context line
-
-    Args:
-        script_format:      Format key: "youtube_long" | "youtube_short" | "tiktok" | "reels".
-        tts_model:          TTS model ID for the source-language voice (e.g. "sonic-2").
-        tts_provider:       TTS provider ("cartesia" | "elevenlabs"). Determines fallback block.
-        audio_tags_enabled: Channel-level opt-in for ElevenLabs v3 audio tags.
-        niche:              Channel niche (included as context line).
-        tone:               Channel tone (included as context line).
-
-    Returns:
-        Assembled system prompt string.
-    """
-    base = BASE_SCRIPT_PROMPT.get(script_format, _BASE_SHORT_FORM)
-    retention = RETENTION_BLOCK.get(script_format, RETENTION_BLOCK["youtube_short"])
-    fallback = _TTS_FALLBACK.get(tts_provider, "sonic-2")
-    tts = TTS_BLOCK.get(tts_model, TTS_BLOCK[fallback])
-
-    parts = [base, "\n\n" + retention, "\n\n" + tts]
-    if audio_tags_enabled and tts_provider == "elevenlabs" and tts_model == "eleven_v3":
-        parts.append(AUDIO_TAGS_INSTRUCTION)
-    parts.append(f"\n\nChannel context: niche={niche!r}, tone={tone!r}.")
-    return "".join(parts)
-
 
 def build_native_system_prompt(
     script_format: str,
@@ -543,16 +350,20 @@ def _extract_hook_context(voice_script: str, script_format: str) -> str:
 # ── Story Blueprint ──────────────────────────────────────────────────────────
 
 _STORY_BLUEPRINT_SYSTEM_PROMPT = """\
-You are a documentary story architect. Your task: read a news story and extract its
-narrative skeleton.
+You are a story architect for YouTube long-form retention. Your task: read
+a news story and design both its narrative skeleton AND its emotional arc — how
+dread, tension, and curiosity should build across the video, not just which facts
+must appear.
 
 You are NOT writing the script yet. You are identifying the structural elements
-that every section of the script must serve. This is a constraint document,
-not a creative exercise.
+and emotional shape that every section of the script must serve.
 
 Rules:
-- hook: the single most gripping, CONCRETE fact from the story. ≤15 words. A named
-  person, a specific number, a physical action — not a theme or a summary.
+- hook: ≤15 words. Must create the question the viewer needs answered — not state
+  the answer. Establish what is happening (a sound, a disappearance, a feeling,
+  an action) without naming what it turns out to be. A named person, a specific
+  number, a physical action — concrete, never a theme or summary — but the
+  mechanism/explanation must stay withheld for later in the story.
 - central_question: the one question the viewer must have answered before leaving.
 - major_turns: 2–5 narrative turns — contradictions, discoveries, reversals, or
   escalations — each one advancing toward the final_payoff. Minimum 2 required.
@@ -561,6 +372,11 @@ Rules:
 - suggested_section_count: number of BODY sections (not counting INTRO and OUTRO).
   Between 2 and 5. Python may override.
 - suggested_title: YouTube title derived from hook. 60–70 chars. SEO-optimized.
+- Write the hook, major_turns, and final_payoff in a register matching the Channel
+  niche and Channel tone values provided below (provided below). Horror/thriller/mystery: favor dread,
+  withheld information, and escalating unease. Documentary/educational: favor
+  clarity and context. Match the configured niche — do not default to a neutral
+  documentary register regardless of niche.
 
 Never invent facts not present in the story body.\
 """
@@ -617,7 +433,7 @@ def generate_story_blueprint(story, channel, script_format: str = "youtube_long"
         user_message=user_message,
         schema_name="story_blueprint",
         input_schema=_STORY_BLUEPRINT_SCHEMA,
-        max_tokens=512,
+        max_tokens=768,
     )
     major_turns = result.get("major_turns") or []
     if len(major_turns) < 2:
@@ -647,7 +463,11 @@ Each BODY section must do EXACTLY ONE of these narrative functions:
   - Escalate the stakes (make things worse or more urgent)
   - Deliver a concrete piece of evidence or named fact
   - Create a new open question the viewer needs answered
-Never summarize prior sections — the viewer just heard them. Never repeat a fact.
+Never summarize prior sections — the viewer just heard them. Never repeat a fact —
+this applies within a single section as well as across sections. If you have already
+established that something is documented, proven, or certain earlier in this section,
+do not re-establish the same point again later in the same section, even in different
+words. Move forward, do not circle back.
 
 Content quality rules — driven by channel configuration, not hardcoded genre:
   - Every body section must contain at least one concrete moment: a named person doing
@@ -691,6 +511,12 @@ Narrative progression rules — apply to every section:
   - Future turns listed in the user message as "do not resolve yet" may be foreshadowed
     but must not be answered or fully explained. Leave them for later sections.
   - End body sections with a bridge or an open question toward the next uncovered turn.
+  - The two strongest mini-hooks across the whole script must land at the body sections
+    nearest the 25% and 60% marks of total word count — these are the highest
+    audience drop-off risk points.
+  - Every 110–150 words of narration, introduce a new revelation, complication, or
+    emotional beat. Tension must never plateau — if two consecutive sentences add no
+    new fact or escalation, the section is failing this rule.
 
 [INTRO] specific rules — apply ONLY when label = INTRO:
   - The first sentence must be the blueprint's hook verbatim or a direct derivation
@@ -698,6 +524,12 @@ Narrative progression rules — apply to every section:
   - Must open a curiosity gap — the viewer must wonder "how did this happen?"
   - Forbidden openers (NEVER start with): In, Today, Have you, Welcome, What if,
     Did you, Imagine, This is, This was, I want, Let me, This story
+  Example of a STRONG hook (concrete, creates a question, withholds the answer):
+    "Children hear a grinding noise from the woods every night for a week."
+  Example of a WEAK hook to AVOID (concrete, but answers the mystery instead of
+  creating it):
+    "Children hear a grinding noise from the woods — it's a woodchipper consuming women."
+  The weak example fails because it tells the viewer the ending before the story starts.
 
 [OUTRO] specific rules — apply ONLY when label = OUTRO:
   - Must directly reference blueprint.final_payoff — the answer the viewer came for.
@@ -705,6 +537,11 @@ Narrative progression rules — apply to every section:
     the interpretation. Do not open OUTRO with a fact dump or a list of events.
   - Do not repeat body facts unless you are adding a final consequence that was not
     previously stated. The viewer already heard the facts — give them the meaning.
+  - Any new information added in the OUTRO must be self-explanatory to a viewer who
+    has only heard the INTRO and body sections. Never reference a real-world detail —
+    an author, a source, a publication, a name — that was not established earlier in
+    the script, even if it is factually true. If a fact requires explaining who someone
+    is, it does not belong in the OUTRO.
   - The final 2–3 sentences must build directly into the comment trigger. The emotional
     temperature should rise toward the question, not fall away from it.
   - The LAST non-empty sentence must be EXACTLY blueprint.comment_trigger (or a minimal
@@ -969,18 +806,18 @@ _TELEGRAM_TEMPLATES: dict[str, dict[str, str]] = {
 # ── Revision prompt ────────────────────────────────────────────────────────────
 
 _REVISION_SYSTEM_PROMPT = """\
-You revise existing video scripts based on user feedback.
+You revise an existing video script based on user feedback.
 
 Rules:
 1. Return ONLY valid JSON. No markdown. No code fence. No extra keys.
 2. Preserve the source language, tone, and factual content unless the feedback explicitly
    asks to change them.
 3. Apply changes accurately and minimally — do not rewrite what the feedback does not address.
-4. Never invent facts, URLs, statistics, or events not present in the scripts you received.
-5. Never send partial scripts — always return the full video_script and voice_script.
+4. Never invent facts, URLs, statistics, or events not present in the script you received.
+5. Never send a partial script — always return the full voice_script.
 6. Preserve [INTRO], [SECTION N], [OUTRO] markers in voice_script.
 7. Output schema:
-   {"title": "...", "video_script": "...", "voice_script": "...",
+   {"title": "...", "voice_script": "...",
     "changes": [{"section": "INTRO|SECTION 1|...|OUTRO", "before_summary": "...", "after_summary": "..."}]}
    Include an entry in "changes" for every section that was meaningfully modified.
    "before_summary" and "after_summary": one sentence each describing the substance of the change.\
@@ -997,11 +834,17 @@ it needs a rewrite. You are not checking facts or technical formatting — anoth
 Judge the script the way an experienced YouTube editor would judge a first draft, against
 these dimensions:
   - hook: Does the opening grab attention with something concrete and specific in the
-    first sentence? Would a viewer keep watching past 10 seconds?
-  - clarity: Is it always clear what is happening, who is involved, and why it matters?
+    first sentence? Would a viewer keep watching past 10 seconds? Does the opening
+    reveal the story's actual ending, answer, or mechanism — rather than creating a
+    question the rest of the video must answer? If it gives away the ending, this is
+    a HIGH severity hook issue regardless of how concrete or well-written it is.  - clarity: Is it always clear what is happening, who is involved, and why it matters?
   - emotional_pull: Does the viewer have a reason to care about the people/events?
   - narrative_arc: Does tension build toward a payoff, or does it stay flat / meander?
-  - specificity: Are claims grounded in concrete facts, names, numbers, dates — or vague?
+    Specifically: does any section re-explain a fact or idea already established
+    elsewhere in the script, even in different words? Does any section compress two
+    distinct significant facts (a motive AND a method, a cause AND a consequence)
+    into one or two rushed sentences instead of giving the more important one room
+    to land? Flag both as narrative_arc issues, HIGH severity.  - specificity: Are claims grounded in concrete facts, names, numbers, dates — or vague?
   - generic_language: Does it contain stock AI-documentary phrasing ("This is a story
     about…", "What happened next…", "Everything changed…", "Little did they know") used
     as a crutch instead of a grounded specific?
@@ -1010,10 +853,12 @@ these dimensions:
 Use FIXED, repeatable criteria — do not be lenient or harsh based on mood.
 
 Decision rule:
-  - status = "PASSED" only if the script would plausibly hold a YouTube viewer's attention
-    through the intro and feel like a professionally written documentary.
-  - status = "NEEDS_REWRITE" if there is at least one HIGH severity issue, or three or
-    more issues of any severity.
+Decision rule:
+  - status = "PASSED" only if the script would plausibly hold a YouTube viewer's
+    attention through the intro, feel like a professionally written documentary,
+    AND contains no HIGH severity issue in any dimension.
+  - status = "NEEDS_REWRITE" if there is at least one HIGH severity issue, or three
+    or more issues of any severity.
 
 For each issue found, report:
   - severity: "HIGH" (would cause viewers to leave), "MEDIUM", "LOW"
@@ -1040,10 +885,9 @@ _QUALITY_REWRITE_SCHEMA: dict = {
     "type": "object",
     "properties": {
         "title":        {"type": "string"},
-        "video_script": {"type": "string"},
         "voice_script": {"type": "string"},
     },
-    "required": ["title", "video_script", "voice_script"],
+    "required": ["title", "voice_script"],
     "additionalProperties": False,
 }
 
@@ -1051,7 +895,7 @@ _SCRIPT_QUALITY_REWRITE_BASE = """\
 You are a YouTube documentary scriptwriter rewriting a script to fix specific retention
 problems identified by an editorial review — WITHOUT losing any facts, structure, or language.
 
-You will receive the current title/video_script/voice_script and a list of issues with
+You will receive the current title/voice_script and a list of issues with
 concrete fixes. Apply EVERY fix precisely. Do not introduce new problems while fixing old ones.
 
 Rules:
@@ -1060,72 +904,24 @@ Rules:
 2. Apply the requested fixes fully — especially HIGH severity ones (hook, generic
    language, narrative arc) — these are non-negotiable.
 3. Never invent facts, names, dates, statistics, or events not present in the
-   current scripts.
-4. Never send partial scripts — always return the FULL title, video_script, and voice_script.
+   current script.
+4. Never send a partial script — always return the FULL title and voice_script.
 5. Preserve [INTRO], [SECTION N], [OUTRO] markers in voice_script, in the same positions
    unless restructuring is explicitly required by an issue.
 6. The rewritten opening must satisfy: first sentence concrete and self-contained, central
    tension clear within the first three sentences, no generic AI-documentary phrasing
    ("This is a story about…", "Everything changed…", "But one question remains…") unless
    immediately grounded in a specific fact.
-7. Fill the title, video_script, and voice_script fields of the provided tool schema exactly.\
+7. When fixing a narrative_arc issue about repeated or re-explained facts: remove the
+   second occurrence entirely rather than rephrasing it. Do not just reword the
+   repeated material — cut it, and let the surrounding sentences flow into each other.
+8. When fixing a hook issue about revealing the ending: rewrite the opening to
+   establish the situation or the sense of danger it creates, without naming what it
+   turns out to be. The reveal must stay withheld for later in the script.
+9. Fill the title and voice_script fields of the provided tool schema exactly.\
 """
 
 # ── Public functions ───────────────────────────────────────────────────────────
-
-def generate_scripts(
-    story,
-    channel,
-    script_format: str = "youtube_long",
-    audio_tags_enabled: bool = False,
-    tts_model: str = "sonic-2",
-    tts_provider: str = "cartesia",
-) -> dict:
-    """Generate title + video_script + voice_script in the story's source language.
-
-    The system prompt is assembled from BASE_SCRIPT_PROMPT + RETENTION_BLOCK + TTS_BLOCK
-    so TTS constraints are baked in at generation time and never reach Agent 3's
-    deterministic check as violations.
-
-    Args:
-        story:              The discovered story (url, title, body, language).
-        channel:            The Channel ORM object (provides niche, tone, name).
-        script_format:      Format key from ``channel_config.script_format``.
-        audio_tags_enabled: Channel-level opt-in for ElevenLabs v3 audio tags.
-        tts_model:          TTS model ID for the source-language voice.
-        tts_provider:       TTS provider ("cartesia" | "elevenlabs").
-
-    Returns:
-        Dict with keys ``title``, ``video_script``, ``voice_script``.
-
-    Raises:
-        ValueError: If Claude returns malformed JSON or a key is missing.
-        anthropic.APIError: On non-retryable Claude API errors.
-    """
-    prompt = build_script_system_prompt(
-        script_format=script_format,
-        tts_model=tts_model,
-        tts_provider=tts_provider,
-        audio_tags_enabled=audio_tags_enabled,
-        niche=channel.niche,
-        tone=channel.tone,
-    )
-    user_message = (
-        f"Source language: {story.language}\n\n"
-        f"Story title: {story.title}\n"
-        f"Source URL: {story.url}\n\n"
-        f"Story content:\n{story.body[:8000]}"
-    )
-    # Intentional free-form JSON path: long-form script output can exceed practical
-    # tool-schema limits. parse_claude_json validates required and allowed keys.
-    response = call_claude(prompt, user_message, max_tokens=8192, task="script_generation")
-    return parse_claude_json(
-        response,
-        required_keys=["title", "video_script", "voice_script"],
-        type_checks={"title": str, "video_script": str, "voice_script": str},
-        allowed_keys=["title", "video_script", "voice_script"],
-    )
-
 
 def build_telegram_message(
     title: str,
@@ -1185,7 +981,6 @@ def build_telegram_message(
 
 
 def generate_native_script(
-    video_script: str,
     voice_script: str,
     target_language: str,
     niche: str,
@@ -1196,13 +991,12 @@ def generate_native_script(
     tts_provider: str = "cartesia",
     hook_context: str | None = None,
 ) -> dict:
-    """Adapt source-language scripts for a target language and audience.
+    """Adapt a source-language script for a target language and audience.
 
     Assembles the native prompt via ``build_native_system_prompt()`` and injects
     HOOK_CONTEXT so the adapted opening preserves the optimised hook's mechanism.
 
     Args:
-        video_script:       Source-language structured video script.
         voice_script:       Source-language narrator text (may include section markers).
         target_language:    BCP-47 language code for the output (e.g. "fr", "de", "es").
         niche:              Channel niche.
@@ -1215,7 +1009,7 @@ def generate_native_script(
                             extracted inline). If None, extracted from voice_script.
 
     Returns:
-        Dict with keys ``video_script`` and ``voice_script`` in ``target_language``.
+        Dict with key ``voice_script`` in ``target_language``.
 
     Raises:
         ValueError: If Claude returns malformed JSON or a key is missing.
@@ -1233,18 +1027,15 @@ def generate_native_script(
     )
     if ctx:
         user_message += f"\nHOOK_CONTEXT:\n{ctx}\n"
-    user_message += (
-        f"\nSource video script:\n{video_script}\n\n"
-        f"Source voice script:\n{voice_script}"
-    )
+    user_message += f"\nSource voice script:\n{voice_script}"
     # Intentional free-form JSON path: native script adaptation is a large text payload.
     # parse_claude_json validates required and allowed keys.
     response = call_claude(prompt, user_message, max_tokens=8192, task="native_adaptation")
     return parse_claude_json(
         response,
-        required_keys=["video_script", "voice_script"],
-        type_checks={"video_script": str, "voice_script": str},
-        allowed_keys=["video_script", "voice_script"],
+        required_keys=["voice_script"],
+        type_checks={"voice_script": str},
+        allowed_keys=["voice_script"],
     )
 
 
@@ -1255,21 +1046,21 @@ def generate_revised_scripts(
     tts_model: str = "sonic-2",
     tts_provider: str = "cartesia",
 ) -> dict:
-    """Revise existing scripts based on user feedback (called on CHANGE replies).
+    """Revise an existing script based on user feedback (called on CHANGE replies).
 
     Applies TTS_BLOCK to the revision system prompt so corrections cannot
     reintroduce TTS violations. Returns a ``changes`` array alongside the
-    revised scripts — callers should persist this to script_issues_log.
+    revised script — callers should persist this to script_issues_log.
 
     Args:
-        current_scripts: Dict with ``title``, ``video_script``, ``voice_script``.
+        current_scripts: Dict with ``title``, ``voice_script``.
         feedback:        The raw user feedback text from Telegram.
         channel:         Channel ORM object (provides niche and tone as context).
         tts_model:       TTS model ID for writing constraints.
         tts_provider:    TTS provider ("cartesia" | "elevenlabs").
 
     Returns:
-        Dict with ``title``, ``video_script``, ``voice_script``, and ``changes``
+        Dict with ``title``, ``voice_script``, and ``changes``
         (list of per-section change summaries).
 
     Raises:
@@ -1280,7 +1071,6 @@ def generate_revised_scripts(
         f"Channel niche: {channel.niche}\n"
         f"Channel tone: {channel.tone}\n\n"
         f"Current title: {current_scripts.get('title', '')}\n\n"
-        f"Current video script:\n{current_scripts.get('video_script', '')}\n\n"
         f"Current voice script:\n{current_scripts.get('voice_script', '')}\n\n"
         f"User feedback:\n{feedback}"
     )
@@ -1289,9 +1079,9 @@ def generate_revised_scripts(
     response = call_claude(prompt, user_message, max_tokens=8192, task="revision")
     return parse_claude_json(
         response,
-        required_keys=["title", "video_script", "voice_script", "changes"],
-        type_checks={"title": str, "video_script": str, "voice_script": str, "changes": list},
-        allowed_keys=["title", "video_script", "voice_script", "changes"],
+        required_keys=["title", "voice_script", "changes"],
+        type_checks={"title": str, "voice_script": str, "changes": list},
+        allowed_keys=["title", "voice_script", "changes"],
     )
 
 
@@ -1299,7 +1089,7 @@ def assess_script_quality(scripts: dict, channel, script_format: str = "youtube_
     """Run the Script Quality Gate — a YouTube-retention review distinct from Agent 3.
 
     Args:
-        scripts:       Dict with ``title``, ``video_script``, ``voice_script``.
+        scripts:       Dict with ``title``, ``voice_script``.
         channel:       Channel ORM object (provides niche and tone as context).
         script_format: Format key from ``channel_config.script_format``.
 
@@ -1346,7 +1136,7 @@ def rewrite_script_for_quality(
     TTS compliance violations that would then fail Agent 3's deterministic checks.
 
     Args:
-        scripts:       Dict with ``title``, ``video_script``, ``voice_script``.
+        scripts:       Dict with ``title``, ``voice_script``.
         issues:        Issue list from ``assess_script_quality()``.
         channel:       Channel ORM object (provides niche and tone as context).
         script_format: Format key from ``channel_config.script_format``.
@@ -1354,7 +1144,7 @@ def rewrite_script_for_quality(
         tts_provider:  TTS provider ("cartesia" | "elevenlabs").
 
     Returns:
-        Dict with ``title``, ``video_script``, ``voice_script`` — fully rewritten.
+        Dict with ``title``, ``voice_script`` — fully rewritten.
 
     Raises:
         ValueError: If Claude returns malformed JSON or a required key is missing.
@@ -1370,7 +1160,6 @@ def rewrite_script_for_quality(
         f"Channel tone: {channel.tone}\n"
         f"Script format: {script_format}\n\n"
         f"Current title: {scripts.get('title', '')}\n\n"
-        f"Current video script:\n{scripts.get('video_script', '')}\n\n"
         f"Current voice script:\n{scripts.get('voice_script', '')}\n\n"
         f"Issues to fix:\n{issue_lines}"
     )
@@ -1382,7 +1171,7 @@ def rewrite_script_for_quality(
         input_schema=_QUALITY_REWRITE_SCHEMA,
         max_tokens=8192,
     )
-    for _key in ("title", "video_script", "voice_script"):
+    for _key in ("title", "voice_script"):
         if not isinstance(result.get(_key), str):
             raise ValueError(f"rewrite_script_for_quality: missing or non-string key '{_key}'")
     return result
@@ -1519,12 +1308,12 @@ def score_story_for_gate(
 _CORRECTION_SYSTEM_PROMPT_BASE = """\
 You are a script editor for an automated multilingual video content system.
 
-Your task: correct a specific language's video and voice scripts based on a list of
+Your task: correct a specific language's voice script based on a list of
 identified issues. Apply ONLY the changes needed to fix the listed issues — do not
 rewrite sections that are not affected.
 
 Rules:
-1. Preserve all [SECTION N:] markers, [INTRO], and [OUTRO] structure in video_script.
+1. Preserve all [SECTION N], [INTRO], and [OUTRO] markers in voice_script.
 2. Keep the voice_script in the same language as the original.
 3. Do not change the story, key facts, or overall narrative. Never invent new facts.
 4. If minimum_length is flagged, expand existing sections with more depth, examples, or
@@ -1548,7 +1337,7 @@ Rules:
 7. When fixing linguistic_naturalness: rewrite the affected sentences entirely rather
    than patching individual words — half-fixed awkward phrasing is worse than the original.
 8. Return ONLY valid JSON. No markdown. No code fence. No extra keys.
-   {"video_script": "...", "voice_script": "..."}\
+   {"voice_script": "..."}\
 """
 
 _CORR_MARKER_LINE_RE = re.compile(
@@ -1682,14 +1471,14 @@ def auto_correct_script(
     tts_model: str = "sonic-2",
     tts_provider: str = "cartesia",
 ) -> dict:
-    """Correct a single language's scripts based on identified MAJOR issues.
+    """Correct a single language's voice script based on identified MAJOR issues.
 
     Called for each auto-correction round after deterministic checks flag MAJOR issues.
     TTS_BLOCK for the target voice model is appended so corrections cannot reintroduce
     TTS violations.
 
     Args:
-        current_scripts: Dict with ``video_script`` and ``voice_script`` for the language.
+        current_scripts: Dict with ``voice_script`` for the language.
         issues:          List of issue dicts for this language (MAJOR and MINOR).
         language:        BCP-47 language code (e.g. "fr", "en").
         channel:         Channel ORM object (provides niche and tone).
@@ -1700,7 +1489,7 @@ def auto_correct_script(
         tts_provider:    TTS provider ("cartesia" | "elevenlabs").
 
     Returns:
-        Dict with corrected ``video_script`` and ``voice_script``.
+        Dict with corrected ``voice_script``.
 
     Raises:
         ValueError: If Claude returns malformed JSON.
@@ -1718,7 +1507,6 @@ def auto_correct_script(
         f"Channel tone: {channel.tone}\n"
         f"Script format: {script_format} (minimum expected voice_script length: {min_words} words)\n\n"
         f"Issues to fix:\n{issue_lines}\n\n"
-        f"Current video script:\n{current_scripts.get('video_script', '')}\n\n"
         f"Current voice script:\n{current_scripts.get('voice_script', '')}"
     )
 
@@ -1740,13 +1528,6 @@ def auto_correct_script(
         input_schema={
             "type": "object",
             "properties": {
-                "video_script": {
-                    "type": "string",
-                    "description": (
-                        "The corrected video script. All [INTRO], [SECTION N], and [OUTRO] "
-                        "markers must be preserved exactly as in the original."
-                    ),
-                },
                 "voice_script": {
                     "type": "string",
                     "description": (
@@ -1755,14 +1536,14 @@ def auto_correct_script(
                     ),
                 },
             },
-            "required": ["video_script", "voice_script"],
+            "required": ["voice_script"],
         },
         max_tokens=8192,
     )
 
-    if not isinstance(result.get("video_script"), str) or not isinstance(result.get("voice_script"), str):
+    if not isinstance(result.get("voice_script"), str):
         raise ValueError(
-            f"corrected_scripts tool response missing required string fields: {list(result.keys())}"
+            f"corrected_scripts tool response missing required string field: {list(result.keys())}"
         )
 
     fixed_voice, n_splits = _split_long_sentences_agent2(result["voice_script"])
@@ -1900,16 +1681,28 @@ Rules:
   If voice_script exceeds 250 words, cut it — remove the least essential sentences
   until the count is at or below 250. Do not return until the word count is ≤250.
   (250 words ≈ 83 seconds at Cartesia sonic-2 speed.)
-- First sentence = the opening_hook from the plan, ≤15 words, drops viewer mid-story
-- Re-hook every 7–10 seconds of narration: a new curiosity gap, question, or micro-reveal
+- First sentence = the opening_hook from the plan, ≤15 words, drops viewer mid-story.
+  If opening_hook or main_reveal already states the story's final answer or mechanism,
+  do not restate it that directly here — open on the situation or the unresolved
+  question instead, and let the reveal land later in this part's narration.- Re-hook every 7–10 seconds of narration: a new curiosity gap, question, or micro-reveal
   that prevents the viewer from scrolling away. These are not summaries — they are new angles.
-- Never recap prior parts — assume this viewer has never seen any other part
+- Provide only the minimum context needed for a first-time viewer to immediately understand the current situation.
+  Do not summarize earlier events unless they are essential to understand the current reveal.
 - One clear main_reveal per part — this is the payoff for watching this part
-- End on the exact cliffhanger from the plan — this is what drives the viewer to Part N+1
+- Do not state the same fact or implication twice in this script, even in different
+  words. Once something is established, move forward — do not circle back to it.
+- End by delivering the planned cliffhanger while preserving its narrative intent — this is what drives the viewer to Part N+1
 - Sentence rhythm: short sentences (3–7 words) for tension, longer (8–15 words) for buildup.
   Never 3+ consecutive sentences of the same length.
 - No filler, no recap, no "as I mentioned", no "in Part 1"
 - No [SECTION N] markers — Short scripts are flat narration only
+- ORIGINALITY — this is the most strictly enforced rule in this prompt: you will be
+  given the long-form voice script for story grounding only. You must NEVER lift a
+  run of 6 or more consecutive words directly from it, even when the long-form
+  phrasing is already tight and factual. If a passage in the source is hard to
+  paraphrase, that is a signal to find a different angle into the same fact — not
+  a reason to copy it. Write this part's narration as if you had never read the
+  long-form script word-for-word, only learned the underlying facts from it.
 
 Return ONLY valid JSON. No markdown. No code fence. No extra keys.
 {"title": "Part N title (≤60 chars, TikTok-optimized)", "voice_script": "Full flat narration text"}\
@@ -1962,9 +1755,10 @@ def generate_short_episode_script(
         f"Part: {part_n} of {total_parts}\n\n"
         f"Part plan:\n{part_json}\n\n"
         f"Blueprint:\n{bp_json}\n\n"
-        f"Long-form voice script (for story grounding — do NOT lift sentences directly):\n"
+        f"Long-form voice script (for FACT GROUNDING ONLY — see ORIGINALITY rule above. "
+        f"Do not reuse its exact phrasing):\n"
         f"{long_voice_script[:6000]}"
-    )
+        )
     if override_instruction:
         user_message += f"\n\nIMPORTANT: {override_instruction}"
 

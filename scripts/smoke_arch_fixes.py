@@ -112,9 +112,8 @@ from app.agents.agent2_discovery.services.scripts import run_script_quality_gate
 check("B1: _QUALITY_REWRITE_SCHEMA is a dict", isinstance(_QUALITY_REWRITE_SCHEMA, dict))
 check("B2: schema type is 'object'", _QUALITY_REWRITE_SCHEMA.get("type") == "object")
 check("B3: schema has 'title' property", "title" in _QUALITY_REWRITE_SCHEMA.get("properties", {}))
-check("B4: schema has 'video_script' property", "video_script" in _QUALITY_REWRITE_SCHEMA.get("properties", {}))
 check("B5: schema has 'voice_script' property", "voice_script" in _QUALITY_REWRITE_SCHEMA.get("properties", {}))
-check("B6: schema required includes all 3 keys", set(_QUALITY_REWRITE_SCHEMA.get("required", [])) == {"title", "video_script", "voice_script"})
+check("B6: schema required includes both keys", set(_QUALITY_REWRITE_SCHEMA.get("required", [])) == {"title", "voice_script"})
 check("B7: additionalProperties is False", _QUALITY_REWRITE_SCHEMA.get("additionalProperties") is False)
 
 # rewrite_script_for_quality uses call_claude_structured (not call_claude)

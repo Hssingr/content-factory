@@ -612,7 +612,6 @@ def _legacy_section_fallback(
     """
     try:
         sections = split_into_sections(
-            video_script=script.video_script,
             voice_script=script.voice_script,
             duration_ms=audio.duration_ms,
             channel_niche=channel.niche or "",

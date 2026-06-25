@@ -1245,6 +1245,40 @@ one retry path):
   caller in `storyboard.py`) if the retry is also malformed — there is no
   third attempt and no repair/coercion of the malformed value.
 
+Removed fields (Phase 6D-1, `STORYBOARD_SCHEMA_VERSION` 6.0 → 6.1):
+
+- `why_this_visual` and `story_progression_role` were removed from
+  `_BEAT_SCHEMA`, `_STORYBOARD_BATCH_SCHEMA`, and their corresponding
+  per-beat instructions (`_STORYBOARD_SYSTEM_PROMPT` step 2b, step 13, and
+  strict rule 4) — Claude no longer generates either field.
+- Rationale: Phase 6B-0/6B-1 (`code_report/phase6b0_storyboard_cost_trace.md`,
+  `code_report/phase6b1_storyboard_quality_proof.md`) found zero downstream
+  consumers for either field across generation, persistence, validation, and
+  rendering — both were generated and paid for on every beat, then silently
+  discarded by `_build_beat_section()`. Phase 6D-1
+  (`code_report/phase6d1_reasoning_scaffolding_ab_proof.md`) then ran a live
+  A/B proof (real Claude calls, current schema vs. the same schema minus
+  these two fields, same segment, same model) to directly test the one open
+  question those phases left unresolved — whether generating the two fields
+  acts as reasoning scaffolding that improves `visual_intent`/`flux_prompt`
+  quality even though the fields themselves are discarded. Result: no
+  measurable regression on visual_intent specificity, flux_prompt
+  specificity, validator findings (which *decreased*), or image subject
+  fidelity, against a real ~17.6% lower storyboard output payload on the
+  tested segment.
+- This is reported as single-trial evidence, not a statistically exhaustive
+  proof (see the Phase 6D-1 report's confidence caveats) — if a future real
+  production run surfaces a quality regression this removal did not predict,
+  treat it as new evidence to act on, not as a reason to silently revert
+  without updating this section.
+- `_check_shape()` only validates the four top-level `storyboard_batch`
+  keys (`storyboard_status`, `overall_style`, `beats`, `global_notes`), never
+  per-beat field completeness — removing two `_BEAT_SCHEMA` properties
+  required no change to that function, to `_build_beat_section()` (which
+  already read every beat field via `.get()` with a default, never assumed
+  required-key presence), or to `storyboard_validator.py` (confirmed, again,
+  to reference neither field anywhere).
+
 #### `map_storyboard_beats_to_timestamps`
 
 File:
@@ -1498,6 +1532,41 @@ Rules:
 - Reuse parent images only when match score threshold passes.
 - Threshold is enforced in Python, not prompt.
 - Log reuse stats.
+
+Alignment-hint rule (Phase 6A-1):
+
+- `map_storyboard_beats_to_timestamps()` aligns every beat — parent and
+  child alike — exclusively via `beat["start_hint"]`/`beat["end_hint"]`. It
+  has no fallback alignment path; a beat with empty hints always falls back
+  to proportional timing.
+- Child remap beats must carry `start_hint`/`end_hint` derived from
+  `narration_phrase` before the beat list is passed to
+  `map_storyboard_beats_to_timestamps()`. `remap_beats_for_short()` derives
+  them with `_derive_child_alignment_hints()` — first/last 6-10 verbatim
+  words of `narration_phrase`, word-sliced only (no rewriting, no
+  punctuation invented, overlap allowed for short/medium phrases) — mirroring
+  the parent storyboard schema's own `start_hint`/`end_hint` convention
+  (`system_prompt.py`, "exact first/last 6-10 verbatim words").
+- An assignment with a missing/empty `narration_phrase` is never given an
+  invented hint (never derived from `visual_intent`, `flux_prompt`, or any
+  parent visual metadata). It is logged (`CHILD_REMAP_HINT_MISSING`,
+  including content_id/assignment index/long_beat_order) and tolerated in
+  isolation. If missing-phrase assignments exceed
+  `_CHILD_REMAP_HINT_MISSING_FAIL_RATIO` (30%) of one remap response, the
+  whole call fails loud and returns `[]` (the same convention as the
+  truncation/no-assignments failure paths below) rather than persisting a
+  storyboard built mostly from un-alignable beats.
+- This fixes the root cause traced in
+  `code_report/phase6a0_child_timestamp_mapping_trace.md`: child beats
+  previously had no `start_hint`/`end_hint` at all, so every child short
+  hit 100% proportional fallback, and the boundary resolver's
+  fallback-handling let one beat (typically the last) absorb all leftover
+  duration — the frozen-image symptom. See
+  `code_report/phase6a1_child_timestamp_hint_fix.md` for the runtime proof.
+  The boundary-resolver behavior itself (`_resolve_boundaries()`/
+  `_cleanup_micro_beats()`) was deliberately left unchanged in this phase —
+  this fix addresses the data-flow gap that caused 100% fallback in the
+  first place, not the resolver's handling of fallback in general.
 
 Ordering rule (Phase 4E-E):
 
