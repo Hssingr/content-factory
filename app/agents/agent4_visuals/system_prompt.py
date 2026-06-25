@@ -11,7 +11,15 @@ from app.services.claude_client import (
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "3.1"  # v3.1: Removed why_this_visual and story_progression_role
+PROMPT_VERSION = "3.2"  # v3.2: Added hard rules forbidding literal quotation marks in any
+                        #        field value and forbidding 'beats'/'global_notes' as a
+                        #        JSON-encoded string — a real, recurring production failure
+                        #        (json.JSONDecodeError "Expecting ',' delimiter" at a
+                        #        consistent offset, across repeated calls on the same
+                        #        segment) traced to the model embedding an unescaped literal
+                        #        quote from quoted narration dialogue while manually
+                        #        stringifying the beats array.
+                        # v3.1: Removed why_this_visual and story_progression_role
                         #        per-beat instructions (Phase 6D-1: live A/B proof found
                         #        no measurable quality regression on visual_intent/flux_prompt
                         #        specificity, validator findings, or image subject fidelity;
@@ -269,9 +277,19 @@ Bad examples (forbidden):
 == Hard rules ==
 - Never invent names, dates, places, facts, people, URLs, or statistics.
 - Do not repeat the same visual idea on consecutive beats.
-- start_hint and end_hint must be copied EXACTLY from the segment text, in order.
+- start_hint and end_hint must be copied EXACTLY from the segment text, in
+  order, EXCEPT: omit any literal quotation mark character (") that appears
+  in the segment text — copy the surrounding words exactly, just drop the
+  quote mark itself. (Matching ignores punctuation already, so this does
+  not affect timestamp alignment.)
 - Never copy a [INTRO]/[SECTION N]/[OUTRO] marker into start_hint or end_hint.
 - Hints must contain no digits — write out any number in words.
+- The `beats` field of your tool call must be a native JSON array of beat
+  objects — never a JSON-encoded string containing array text. No field
+  value (start_hint, end_hint, visual_intent, flux_prompt, overlay_text,
+  etc.) may itself contain a literal quotation mark character (") — if the
+  segment narration contains quoted dialogue or a written note, describe or
+  paraphrase it without the surrounding quote marks instead of copying them.
 
 Strict rules:
 1. Generate ONLY beats for THIS segment. beat_order values must be sequential integers
@@ -412,8 +430,74 @@ def generate_storyboard_batch(
             max_tokens=STORYBOARD_BATCH_MAX_TOKENS,
         )
 
+    def _coerce_string_to_expected_type(raw: str, expected_type: type) -> tuple[object, str]:
+        """Try to recover ``expected_type`` from a string Claude should have returned natively.
+
+        Handles three observed shapes, in order:
+          1. The string IS the JSON value, verbatim (most common quirk).
+          2. The string wraps the JSON value in a markdown code fence
+             (```` ```json ... ``` ````/```` ``` ... ``` ````) — stripped before parsing.
+          3. The string contains a valid JSON value followed by trailing
+             non-JSON content (e.g. commentary after the array) — recovered
+             with ``json.JSONDecoder.raw_decode``, which parses only the
+             leading value and ignores what follows.
+
+        Returns:
+            ``(parsed_value_or_None, diagnostic)`` — ``diagnostic`` is ``""``
+            on success, otherwise a short human-readable reason suitable for
+            logging (the exact ``JSONDecodeError`` message/position, or which
+            stage failed) so a failure is debuggable from the log alone.
+        """
+        candidate = raw.strip()
+        fence_match = re.match(r"^```(?:json)?\s*\n?(.*?)\n?```$", candidate, re.DOTALL)
+        if fence_match:
+            candidate = fence_match.group(1).strip()
+
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, expected_type):
+                return parsed, ""
+            return None, f"parsed but wrong type ({type(parsed).__name__})"
+        except json.JSONDecodeError as exc:
+            full_error = str(exc)
+
+        # Fall back to raw_decode: tolerates trailing non-JSON content after
+        # an otherwise-valid value (e.g. the model appended commentary).
+        try:
+            parsed, end_idx = json.JSONDecoder().raw_decode(candidate)
+        except json.JSONDecodeError:
+            return None, full_error
+
+        if not isinstance(parsed, expected_type):
+            return None, f"raw_decode parsed but wrong type ({type(parsed).__name__})"
+
+        trailing = candidate[end_idx:].strip()
+        if trailing:
+            logger.warning(
+                "STORYBOARD_SHAPE_COERCED_TRAILING_DATA — %d trailing char(s) after the "
+                "parsed value were discarded: %r",
+                len(trailing), trailing[:120],
+            )
+        return parsed, ""
+
     def _check_shape(storyboard: dict) -> None:
         """Raise ValueError on the first required key that is missing or wrong-typed.
+
+        Before treating a wrong-typed value as a failure, attempt one narrow
+        coercion via ``_coerce_string_to_expected_type``: a real, observed
+        model quirk returns ``beats`` (or another array/object field) as a
+        JSON-encoded string instead of a native list/dict, on an otherwise
+        complete, non-truncated response (e.g.
+        ``'[\\n  {"beat_order": 0, ...}\\n]'`` instead of the parsed array) —
+        sometimes wrapped in a markdown code fence, or followed by trailing
+        non-JSON commentary. If recovery succeeds, the parsed value is
+        substituted in place and logged as ``STORYBOARD_SHAPE_COERCED`` — this
+        is deterministic JSON re-parsing of a value Claude already produced,
+        not blind trust of unvalidated content: the coerced value still has
+        to pass every later beat-level enum/type check in
+        ``_build_beat_section()``. A string that still fails to recover is
+        logged with the specific parse failure reason (not just "wrong
+        type") before falling through to the existing failure path unchanged.
 
         Logs the actual malformed value (truncated) before raising — earlier
         runs raised the same ValueError with no record of what Claude actually
@@ -430,8 +514,27 @@ def generate_storyboard_batch(
                     segment_label, key, sorted(storyboard.keys()),
                 )
                 raise ValueError(f"storyboard_batch response missing required key '{key}'")
-            if not isinstance(storyboard[key], expected_type):
-                actual = storyboard[key]
+
+            actual = storyboard[key]
+            if not isinstance(actual, expected_type):
+                coercion_failure_reason = ""
+                if expected_type is not str and isinstance(actual, str):
+                    parsed, coercion_failure_reason = _coerce_string_to_expected_type(actual, expected_type)
+                    if parsed is not None:
+                        logger.warning(
+                            "STORYBOARD_SHAPE_COERCED segment=%s key=%s — value was a "
+                            "JSON-encoded string instead of a native %s; parsed and "
+                            "substituted in place",
+                            segment_label, key, expected_type.__name__,
+                        )
+                        storyboard[key] = parsed
+                        continue
+                    logger.error(
+                        "STORYBOARD_SHAPE_COERCION_FAILED segment=%s key=%s reason=%s "
+                        "value_length=%d",
+                        segment_label, key, coercion_failure_reason, len(actual),
+                    )
+
                 logger.error(
                     "STORYBOARD_SHAPE_INVALID segment=%s key=%s issue=wrong_type "
                     "expected=%s got=%s value=%r",

@@ -22,10 +22,17 @@ Fail-loud chain (per Recommended Fix BLOCKER #2 — no silent quality degradatio
                                                           True  → fall back to section_splitter
                                                           False → stop language generation, explicit error
   a beat's start_hint/end_hint can't be located      → proportional timing + logged warning
+
+A segment whose own target_beat_count exceeds _MAX_BEATS_PER_BATCH is split
+into multiple sub-calls in Python BEFORE any Claude call is made (see
+_split_segment_for_batching) — this is a preventive size check, distinct from
+generate_storyboard_batch()'s reactive truncation retry, which only reduces
+beat count by 3 and is not enough to recover a genuinely oversized segment.
 """
 
 import json
 import logging
+import math
 import re
 import unicodedata
 import uuid
@@ -202,6 +209,17 @@ _WORDS_PER_MINUTE = 150
 # tokens" figure alongside the real ``total_output_tokens`` for comparison.
 _STORYBOARD_TOKENS_PER_BEAT_LOG = 154
 
+# Maximum target_beat_count for a single storyboard batch call, checked in
+# Python BEFORE any Claude call is made. A segment above this is split into
+# multiple sub-calls (see _split_segment_for_batching). Chosen from observed
+# production behavior: a 21-beat segment used 7286/8192 output tokens (89%,
+# the closest successful call on record); a 27-beat segment truncated at
+# max_tokens=8192 on the first attempt AND on the in-call retry (reduced to
+# 24 beats) — the fixed -3-beat retry in generate_storyboard_batch() is not
+# enough to recover an oversized segment. 20 stays safely under the observed
+# failure point while only rarely triggering a split for normal segments.
+_MAX_BEATS_PER_BATCH = 20
+
 
 def split_into_beats(
     voice_script: str,
@@ -292,62 +310,72 @@ def split_into_beats(
         seg_duration_sec = (seg_words / total_words) * (duration_ms / 1000)
         target_beat_count = max(1, round(seg_duration_sec / beat_seconds))
 
-        try:
-            storyboard, usage, diag = generate_storyboard_batch(
-                segment_label=label,
-                segment_text=text,
-                segment_index=index,
-                segment_count=len(segments),
-                channel=channel,
-                script_format=script_format,
-                previous_segment_summary=previous_summary,
-                target_beat_count=target_beat_count,
-                override_instructions=storyboard_constraints,
+        # Oversized segments are split into multiple sub-calls BEFORE any Claude
+        # call — see _split_segment_for_batching for why the in-call truncation
+        # retry alone isn't sufficient. Normal-sized segments get back a single
+        # (label, text, target_beat_count) tuple, so this loop is a no-op change
+        # in shape for the common case.
+        for sub_label, sub_text, sub_target_beat_count in _split_segment_for_batching(
+            label, text, target_beat_count
+        ):
+            try:
+                storyboard, usage, diag = generate_storyboard_batch(
+                    segment_label=sub_label,
+                    segment_text=sub_text,
+                    segment_index=index,
+                    segment_count=len(segments),
+                    channel=channel,
+                    script_format=script_format,
+                    previous_segment_summary=previous_summary,
+                    target_beat_count=sub_target_beat_count,
+                    override_instructions=storyboard_constraints,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Storyboard batch failed for segment %s (%d/%d) — aborting storyboard "
+                    "generation entirely (fail-loud: a partial storyboard would leave gaps "
+                    "in the narration with no designed visuals): %s",
+                    sub_label, index, len(segments), exc,
+                )
+                return None
+
+            total_output_tokens      += usage.get("output_tokens", 0)
+            total_input_tokens       += diag.get("input_tokens", 0)
+            total_generation_time_ms += diag.get("elapsed_ms", 0)
+            total_claude_calls       += diag.get("attempt_count", 1)
+            if diag.get("was_truncated"):
+                _truncation_count += 1
+                _retry_count      += 1
+            _requested_beats += sub_target_beat_count
+            beats = storyboard.get("beats") or []
+            if not beats:
+                logger.warning(
+                    "Storyboard batch for segment %s (%d/%d) returned no beats — aborting "
+                    "storyboard generation entirely",
+                    sub_label, index, len(segments),
+                )
+                return None
+
+            # Hint hardening: fix any hints that are out-of-range or contain digits
+            beats, _seg_hint_stats = _harden_hints(beats, sub_text)
+            _hint_total   += _seg_hint_stats["total_hints"]
+            _hint_valid   += _seg_hint_stats["valid_hints"]
+            _hint_invalid += _seg_hint_stats["invalid_hints"]
+
+            logger.info(
+                "Storyboard batch ok: segment=%s (%d/%d) target_beats=%d actual_beats=%d output_tokens=%d/%d",
+                sub_label, index, len(segments), sub_target_beat_count, len(beats),
+                usage.get("output_tokens", 0), _STORYBOARD_BATCH_MAX_TOKENS_LOG,
             )
-        except Exception as exc:
-            logger.error(
-                "Storyboard batch failed for segment %s (%d/%d) — aborting storyboard "
-                "generation entirely (fail-loud: a partial storyboard would leave gaps "
-                "in the narration with no designed visuals): %s",
-                label, index, len(segments), exc,
-            )
-            return None
 
-        total_output_tokens      += usage.get("output_tokens", 0)
-        total_input_tokens       += diag.get("input_tokens", 0)
-        total_generation_time_ms += diag.get("elapsed_ms", 0)
-        total_claude_calls       += diag.get("attempt_count", 1)
-        if diag.get("was_truncated"):
-            _truncation_count += 1
-            _retry_count      += 1
-        _requested_beats += target_beat_count
-        beats = storyboard.get("beats") or []
-        if not beats:
-            logger.warning(
-                "Storyboard batch for segment %s (%d/%d) returned no beats — aborting "
-                "storyboard generation entirely",
-                label, index, len(segments),
-            )
-            return None
+            raw_batches.append(beats)
+            overall_style = overall_style or storyboard.get("overall_style", "")
 
-        # Hint hardening: fix any hints that are out-of-range or contain digits
-        beats, _seg_hint_stats = _harden_hints(beats, text)
-        _hint_total   += _seg_hint_stats["total_hints"]
-        _hint_valid   += _seg_hint_stats["valid_hints"]
-        _hint_invalid += _seg_hint_stats["invalid_hints"]
-
-        logger.info(
-            "Storyboard batch ok: segment=%s (%d/%d) target_beats=%d actual_beats=%d output_tokens=%d/%d",
-            label, index, len(segments), target_beat_count, len(beats),
-            usage.get("output_tokens", 0), _STORYBOARD_BATCH_MAX_TOKENS_LOG,
-        )
-
-        raw_batches.append(beats)
-        overall_style = overall_style or storyboard.get("overall_style", "")
-
-        # Update ledger then build the next segment's continuity summary
-        _update_ledger(ledger, beats)
-        previous_summary = _summarize_batch_for_continuity(label, beats, ledger)
+            # Update ledger then build the next sub-call's (or next segment's)
+            # continuity summary — sub-calls of one oversized segment get the
+            # same continuity treatment as separate segments.
+            _update_ledger(ledger, beats)
+            previous_summary = _summarize_batch_for_continuity(sub_label, beats, ledger)
 
     beats = _merge_batches(raw_batches)
 
@@ -424,6 +452,69 @@ def _split_voice_script_into_segments(voice_script: str) -> list[tuple[str, str]
         if text:
             segments.append((label, text))
     return segments
+
+
+def _split_segment_for_batching(
+    label: str, text: str, target_beat_count: int
+) -> list[tuple[str, str, int]]:
+    """Split an oversized segment into sub-calls before any Claude call is made.
+
+    A segment whose ``target_beat_count`` exceeds ``_MAX_BEATS_PER_BATCH`` is
+    split into roughly equal word-count chunks, snapped to sentence boundaries
+    where possible, so each sub-call's own target beat count stays comfortably
+    under ``STORYBOARD_BATCH_MAX_TOKENS``. This is a preventive Python check,
+    not a reaction to truncation — ``generate_storyboard_batch()``'s in-call
+    retry only reduces beat count by 3, which was not enough for a real
+    production segment (target_beat_count=27 truncated at max_tokens=8192 both
+    on the first attempt and on the reduced retry at 24).
+
+    Each returned sub-segment's text is a verbatim contiguous substring of
+    ``text`` (same guarantee as ``_split_voice_script_into_segments``), so
+    start_hint/end_hint generated from it remain valid forward-search targets
+    against the full Whisper transcript.
+
+    Returns:
+        Ordered list of ``(sub_label, sub_text, sub_target_beat_count)``
+        tuples. Returns ``[(label, text, target_beat_count)]`` unchanged when
+        no split is needed.
+    """
+    if target_beat_count <= _MAX_BEATS_PER_BATCH:
+        return [(label, text, target_beat_count)]
+
+    num_parts = math.ceil(target_beat_count / _MAX_BEATS_PER_BATCH)
+    words = text.split()
+    total_words = max(len(words), 1)
+    chunk_words = math.ceil(total_words / num_parts)
+
+    # Sentence-end positions (character offsets right after ". "/"! "/"? ") to
+    # snap split points to, so beats are never designed around a cut sentence.
+    sentence_ends = [m.end() for m in re.finditer(r"[.!?]\s+", text)]
+
+    parts: list[tuple[str, str, int]] = []
+    start_char = 0
+    for part_index in range(num_parts):
+        if part_index == num_parts - 1:
+            sub_text = text[start_char:].strip()
+        else:
+            target_word_count = chunk_words * (part_index + 1)
+            approx_char = len(" ".join(words[:target_word_count]))
+            snap = next((p for p in sentence_ends if p >= approx_char), None)
+            split_at = snap if snap is not None else approx_char
+            split_at = max(split_at, start_char + 1)  # guarantee forward progress
+            sub_text = text[start_char:split_at].strip()
+            start_char = split_at
+        if not sub_text:
+            continue
+        sub_words = max(len(sub_text.split()), 1)
+        sub_target = max(1, round(target_beat_count * sub_words / total_words))
+        parts.append((f"{label} (part {part_index + 1}/{num_parts})", sub_text, sub_target))
+
+    logger.warning(
+        "STORYBOARD_SEGMENT_SPLIT segment=%s target_beat_count=%d > max_per_batch=%d "
+        "— splitting into %d sub-calls before any Claude call",
+        label, target_beat_count, _MAX_BEATS_PER_BATCH, len(parts),
+    )
+    return parts
 
 
 def _estimate_beat_count(voice_script: str, script_format: str) -> int:

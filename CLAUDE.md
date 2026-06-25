@@ -1238,12 +1238,53 @@ one retry path):
   string instead of a list on an otherwise complete, non-truncated response;
   a real model quirk observed in production) — retries the same segment once
   with the same `target_beat_count`, no reduction, since this is not a
-  token-budget problem. Logs `STORYBOARD_SHAPE_INVALID` (the actual malformed
-  value, truncated to 200 chars, every time the shape check fails — this is
-  the diagnostic capture that earlier runs lacked) and `STORYBOARD_SHAPE_RETRY`
-  before retrying. Raises (fail-loud, aborts the entire storyboard via the
-  caller in `storyboard.py`) if the retry is also malformed — there is no
-  third attempt and no repair/coercion of the malformed value.
+  token-budget problem. Before treating a wrong-typed value as a failure,
+  `_check_shape()` calls `_coerce_string_to_expected_type()`, which tries
+  three recovery shapes in order on a non-`str`-typed field (`beats`,
+  `global_notes`) that came back as a string: (1) the string is the JSON
+  value verbatim; (2) the JSON value is wrapped in a markdown code fence
+  (```` ```json ... ``` ````) — stripped before parsing; (3) a valid JSON
+  value is followed by trailing non-JSON content (e.g. model commentary
+  after the array) — recovered via `json.JSONDecoder.raw_decode`, which
+  parses only the leading value; any discarded trailing content is logged as
+  `STORYBOARD_SHAPE_COERCED_TRAILING_DATA`. If any of the three recovers the
+  expected type, the value is substituted in place, logged as
+  `STORYBOARD_SHAPE_COERCED`, and the response is treated as valid — no
+  retry needed. This is deterministic re-parsing of a value Claude already
+  produced, not blind trust: the coerced value still has to pass every later
+  beat-level enum/type check in `_build_beat_section()`. If none of the three
+  recoveries succeed, the real reason (the `JSONDecodeError` detail, or
+  "parsed but wrong type") is logged as `STORYBOARD_SHAPE_COERCION_FAILED`
+  before falling through to the existing failure path unchanged — this
+  diagnostic exists specifically because the original coercion attempt
+  swallowed the parse error with no record of why it failed, making a real
+  production failure undiagnosable from the log alone. Logs
+  `STORYBOARD_SHAPE_INVALID` (the actual malformed value, truncated to 200
+  chars, every time the shape check fails on a value that could not be
+  coerced) and `STORYBOARD_SHAPE_RETRY` before retrying. Raises (fail-loud,
+  aborts the entire storyboard via the caller in `storyboard.py`) if the
+  retry is also malformed and not coercible — there is no third attempt.
+
+Quote-escaping prompt rule (`PROMPT_VERSION` 3.1 → 3.2): a real, recurring
+production failure traced the "beats returned as a string" quirk above to a
+specific cause — when the narration segment itself contains quoted dialogue
+or a written note, the model sometimes embeds a literal, unescaped `"`
+character from that quote inside a field value while manually stringifying
+the `beats` array, breaking the JSON at that exact point. This is consistent,
+not random (repeated calls on the same segment content failed at
+nearly-identical character offsets), so it cannot be safely auto-repaired
+after the fact — a heuristic re-escaping pass risks silently corrupting beat
+content, which conflicts with the "no silent fallbacks" / "no unvalidated AI
+output" rules in §15/§25. The fix is preventive, in `_STORYBOARD_SYSTEM_PROMPT`'s
+hard rules: (1) no field value may contain a literal quotation mark character
+— quoted narration content must be described or paraphrased without the
+surrounding quote marks; (2) `beats` must always be a native JSON array, never
+a JSON-encoded string. The existing hint exact-copy rule
+(start_hint/end_hint "copied EXACTLY from the segment text") carries an
+explicit documented exception for quotation marks specifically, since
+matching already strips punctuation (`_normalize_phrase`/`_normalize_word` in
+`storyboard.py`) and dropping a quote character from a hint does not affect
+timestamp alignment.
 
 Removed fields (Phase 6D-1, `STORYBOARD_SCHEMA_VERSION` 6.0 → 6.1):
 
