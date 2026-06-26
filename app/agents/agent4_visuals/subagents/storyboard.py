@@ -580,8 +580,8 @@ def _harden_hints(beats: list[dict], segment_text: str) -> tuple[list[dict], dic
       - no marker text (INTRO/OUTRO/SECTION)
 
     When a hint violates these rules we log a WARNING and leave it unchanged.
-    The matching pipeline (_locate_phrase / _fill_gaps) handles unmatched beats
-    via real anchor timestamps from adjacent matched beats — proportional text
+    The matching pipeline (_locate_phrase) handles unmatched beats via real
+    anchor timestamps from adjacent matched beats — proportional text
     substitution here inflated the fallback rate by replacing valid short phrases
     with wrong-position text that couldn't match the Whisper transcript.
 
@@ -919,9 +919,11 @@ def _resolve_boundaries(
         for match in matches
     ]
 
-    # _fill_gaps is intentionally not called here. None anchors fall through to
-    # the `prev` path in the loop below, anchoring unmatched beats to the nearest
-    # prior real timestamp instead of a proportional guess.
+    # None anchors fall through to the `prev` path in the loop below, anchoring
+    # unmatched beats to the nearest prior real timestamp instead of a
+    # proportional guess (the proportional-interpolation approach this module
+    # used previously — _fill_gaps — was removed in Phase 10A-0 as dead code;
+    # it had no caller left after this anchoring approach replaced it).
 
     starts = [0] * n
     prev = 0
@@ -998,37 +1000,6 @@ def _cleanup_micro_beats(
             "Storyboard timestamp mapping: %d beat(s) below intensity floor corrected",
             zero_width_corrected,
         )
-
-
-def _fill_gaps(anchors: list[int | None], beats: list[dict], duration_ms: int) -> None:
-    """Interpolate start_ms for unmatched beats between their matched neighbours.
-
-    Distributes the span between two known anchors with equal weight across each
-    unmatched beat in the run (the per-beat ``duration_target_sec`` weight this used
-    was a write-only schema field, removed in schema v2.0 — see Storyboard Schema
-    Reduction). Edge runs fall back to ``0`` / ``duration_ms`` as their bounding anchors.
-    """
-    n = len(anchors)
-    i = 0
-    while i < n:
-        if anchors[i] is not None:
-            i += 1
-            continue
-
-        j = i
-        while j < n and anchors[j] is None:
-            j += 1
-
-        left_ms  = anchors[i - 1] if i > 0 else 0
-        right_ms = anchors[j] if j < n else duration_ms
-        span = max(right_ms - left_ms, 0)
-
-        run = list(range(i, j))
-        step = span / len(run)
-        for offset, k in enumerate(run):
-            anchors[k] = int(left_ms + step * offset)
-
-        i = j
 
 
 def _build_beat_section(beat: dict, index: int, start_ms: int, end_ms: int, script_text: str) -> dict:

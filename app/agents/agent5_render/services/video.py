@@ -972,11 +972,3 @@ def _run_renders(
     )
 
 
-def _props_contain_uhd_url(props_file: Path) -> bool:
-    """Return True if any URL in the props JSON exceeds FHD resolution."""
-    try:
-        raw = props_file.read_text()
-        uhd_markers = ("_4096_", "_2160_", "_3840_", "_uhd_", "_4k_", "2160p", "4096p")
-        return any(m in raw for m in uhd_markers)
-    except Exception:
-        return False

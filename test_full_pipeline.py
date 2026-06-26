@@ -336,7 +336,8 @@ def _run_step_scripts(content, channel, config, db, *, story=None, force: bool =
             script_format=script_format, audio_tags_enabled=audio_tags_enabled,
         )
         scripts = run_script_quality_gate(
-            scripts, channel, script_format=script_format, language=content.source_language,
+            scripts, channel, content=content, db=db, blueprint=blueprint,
+            script_format=script_format, language=content.source_language,
             tts_model=tts_model, tts_provider=tts_provider,
         )
 

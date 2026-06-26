@@ -148,42 +148,6 @@ def call_claude(
     return text
 
 
-def call_claude_with_usage(
-    system_prompt: str,
-    user_message: str,
-    max_tokens: int = 1024,
-    *,
-    task: str,
-    model_override: str | None = None,
-) -> tuple[str, dict]:
-    """Make a single-turn Claude API call and also return token-usage diagnostics.
-
-    Identical to ``call_claude`` but additionally returns the usage dict so callers
-    that need to reason about output size (e.g. detecting truncation against
-    ``max_tokens``) don't have to re-implement the retry/caching plumbing.
-
-    Args:
-        system_prompt:  The system prompt text for this call.
-        user_message:   The user turn content.
-        max_tokens:     Maximum tokens in the response (default 1024).
-        task:           Canonical task key — used for model routing and logging.
-        model_override: Explicit model ID; bypasses routing (discouraged).
-
-    Returns:
-        ``(text, usage)`` — ``text`` is the stripped response content; ``usage`` is
-        ``{"input_tokens": int, "output_tokens": int, "cache_read_input_tokens": int}``
-        from the LAST successful attempt.
-
-    Raises:
-        ValueError: If the response block is not text, the response is empty,
-                    or ``task`` is not in MODEL_ROUTING.
-        anthropic.RateLimitError: If all retry attempts are exhausted.
-        anthropic.APIConnectionError: On network or config errors (not retried).
-        anthropic.APIError: On any other non-retryable API error.
-    """
-    return _call_claude_core(system_prompt, user_message, max_tokens, task, model_override)
-
-
 def _call_claude_core(
     system_prompt: str,
     user_message: str,
@@ -191,10 +155,12 @@ def _call_claude_core(
     task: str,
     model_override: str | None = None,
 ) -> tuple[str, dict]:
-    """Shared retry/caching/logging core for ``call_claude`` and ``call_claude_with_usage``.
+    """Shared retry/caching/logging core for ``call_claude``.
 
     Returns:
-        ``(text, usage)`` — see ``call_claude_with_usage``.
+        ``(text, usage)`` — ``text`` is the stripped response content; ``usage`` is
+        ``{"input_tokens": int, "output_tokens": int, "cache_read_input_tokens": int}``
+        from the last successful attempt.
     """
     model = resolve_model(task, model_override)
     system = _make_system(system_prompt)

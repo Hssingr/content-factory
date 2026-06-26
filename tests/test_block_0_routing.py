@@ -42,7 +42,7 @@ class TestResolveModel(unittest.TestCase):
         for task in (
             "script_quality_check", "script_validation", "media_scoring",
             "telegram_summary",
-            "content_reformat", "section_validation", "section_splitting",
+            "content_reformat", "section_splitting",
             "visual_reinterpretation",
         ):
             with self.subTest(task=task):

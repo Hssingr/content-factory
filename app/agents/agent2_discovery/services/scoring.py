@@ -9,16 +9,19 @@ no reject path) with a deterministic scoring gate:
   Claude never decides ACCEPTED/REJECTED directly (CLAUDE.md determinism rules:
   business rules belong in Python, prompts only generate/classify content).
 
-Up to ``_MAX_CANDIDATES_PER_RUN`` candidates are fetched and scored per run.
 Rejected candidates are never persisted as ``Content`` and never sent to
 Telegram — only a story that clears every gate proceeds to script generation.
+
+Fetch + score + gate orchestration for one candidate at a time lives in
+``run_discovery()`` (``discovery.py``), which calls ``score_story_for_gate()``
+directly and then the two functions below. The standalone single-candidate
+fetch+score+gate wrapper that used to live in this module
+(``run_story_scoring_gate()``) was removed in Phase 10A-0 as dead code — it
+had no callers; ``run_discovery()``'s own dedup-retry/nuclear-retry/manual-
+fallback fetch flow fully supersedes the simple single-fetch path it used.
 """
 
 import logging
-
-from app.agents.agent2_discovery.services.fetcher import fetch_batch
-from app.agents.agent2_discovery.services.story import Story
-from app.agents.agent2_discovery.system_prompt import score_story_for_gate
 
 logger = logging.getLogger(__name__)
 
@@ -170,92 +173,3 @@ def decide_story_acceptance(story_score: dict) -> tuple[bool, str]:
     return False, "failed: " + "; ".join(failed_gates)
 
 
-def run_story_scoring_gate(
-    sources: list[tuple[str, str, float]],
-    niche: str,
-    channel,
-    script_format: str = "youtube_long",
-) -> tuple[Story, dict] | None:
-    """Fetch the highest-engagement story then score and gate it in two Claude calls.
-
-    Fetch step: ``fetch_batch`` runs one web_search pass (story_research / Sonnet)
-    and returns the single most engaged, highest-signal story from the configured sources.
-
-    Score step: ``score_story_for_gate`` calls Claude once (story_gate_scoring /
-    Sonnet, structured schema) to produce 18 dimension scores. No comparative scoring —
-    there is only one candidate.
-
-    Gate step: Python applies the weighted threshold and all hard floors.
-
-    The gate fails closed: if either the fetch or the scoring call fails, ``None`` is
-    returned and nothing is persisted.
-
-    Args:
-        sources:       List of ``(source_value, source_type, trust_score)`` tuples.
-        niche:         Channel niche description, passed to the fetcher.
-        channel:       Channel ORM object (provides niche/tone context to the scorer).
-        script_format: Format key from ``channel_config.script_format``.
-
-    Returns:
-        ``(story, assessment)`` where ``story`` is the accepted ``Story`` and
-        ``assessment`` is its scoring dict (for downstream Telegram message).
-        Returns ``None`` if the story didn't clear the gate or no story was fetched.
-    """
-    # Fetch the single highest-engagement story
-    stories: list[Story] = fetch_batch(sources, niche=niche)
-    if not stories:
-        logger.info(
-            "Story Scoring Gate: fetch returned no story — exiting cleanly, "
-            "no Content created, no Telegram message sent"
-        )
-        return None
-    story = stories[0]
-    logger.info(
-        "Story Scoring Gate: fetched story (title=%r url=%s)", story.title[:80], story.url
-    )
-
-    # Score the single story
-    try:
-        assessment = score_story_for_gate(
-            story=story,
-            channel=channel,
-            script_format=script_format,
-        )
-    except Exception as exc:
-        logger.error(
-            "Story Scoring Gate: scoring failed for %r: %s — "
-            "exiting cleanly, no Content created",
-            story.title[:80], exc,
-        )
-        return None
-
-    # Apply the gate
-    try:
-        story_score = score_story_assessment(assessment)
-    except Exception as exc:
-        logger.error(
-            "Story Scoring Gate: score_story_assessment failed for %r — skipping: %s",
-            story.title[:80], exc,
-        )
-        return None
-
-    accepted, reason = decide_story_acceptance(story_score)
-    decision = "ACCEPTED" if accepted else "REJECTED"
-
-    logger.info(
-        "Story Scoring Gate: title=%r url=%s overall_score=%.1f decision=%s reason=%s",
-        story.title[:80], story.url, story_score["overall_score"], decision, reason,
-    )
-    top5 = dict(
-        sorted(story_score["dimension_scores"].items(), key=lambda x: x[1], reverse=True)[:5]
-    )
-    logger.info("Story Scoring Gate top-5 dimensions: %s", top5)
-
-    if accepted:
-        return story, assessment
-
-    logger.warning(
-        "Story Scoring Gate: story rejected (title=%r) — exiting cleanly, no Content created",
-        story.title[:80],
-    )
-    return None

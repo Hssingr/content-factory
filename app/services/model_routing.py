@@ -37,7 +37,6 @@ MODEL_ROUTING: dict[str, str] = {
     "script_validation":       HAIKU,
     "media_scoring":           HAIKU,
     "content_reformat":        HAIKU,   # reformatting prose discovery output to JSON
-    "section_validation":      HAIKU,   # Agent 4 section quality check
     "section_splitting":       HAIKU,   # Agent 4 legacy section splitter
     "visual_reinterpretation": HAIKU,   # Agent 4 alternative visual query generation
     "global_validation":       HAIKU,   # Narrative coherence check after assembly

@@ -43,6 +43,7 @@ gate_src = inspect.getsource(scripts.run_script_quality_gate)
 module_src = inspect.getsource(scripts)
 helper_names = [
     "_apply_final_tts_backstop",
+    "_run_global_script_validation",
     "_log_quality_gate_input",
     "_collect_quality_gate_issues",
     "_log_quality_gate_review",
@@ -59,6 +60,7 @@ check("run_script_quality_gate still exists", callable(scripts.run_script_qualit
 check("run_script_quality_gate remains below 100 lines", function_line_count(scripts_file, "run_script_quality_gate") < 100)
 check("run_script_quality_gate delegates to helpers", all(name in gate_src for name in [
     "_apply_final_tts_backstop",
+    "_run_global_script_validation",
     "_log_quality_gate_input",
     "_collect_quality_gate_issues",
     "_log_quality_gate_review",
@@ -77,6 +79,13 @@ check("TTS deterministic check remains", "check_tts_compliance(" in combined_src
 check("hook deterministic check remains", "check_hook_quality(" in combined_src)
 check("deterministic MAJOR issues convert to HIGH", '"severity": "HIGH"' in combined_src and '"fix": issue["suggestion"]' in combined_src)
 check("pass condition preserved", 'issue_group["status"] == "PASSED"' in gate_src and 'not issue_group["converted_det"]' in gate_src)
+check("pass condition also requires no global-validation issues (Phase 10A-0)", 'not issue_group["global"]' in gate_src)
+
+print("\n-- Global validation wiring (Phase 10A-0) --")
+check("global validation moved here from generate_script_sections", "validate_script_globally(" in combined_src)
+check("global validation runs once, fed only into attempt 1", "global_issues if attempt == 1 else []" in gate_src)
+check("global validation result persisted to ContentValidation", "script_validation_status" in helper_src and "script_issues_log" in helper_src)
+check("global-validation issues tagged for the rewrite merge", '"category": "global_narrative"' in helper_src)
 
 print("\n-- Correction and retry path preserved --")
 check("rewrite path exists", "rewrite_script_for_quality(" in gate_src)

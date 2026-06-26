@@ -57,7 +57,6 @@ helper_names = [
     "_log_outro_overlap",
     "_assemble_sections_with_diagnostics",
     "_apply_length_correction",
-    "_run_global_script_validation",
     "_log_turn_coverage_alignment",
     "_group_narrative_retry_instructions",
     "_run_single_narrative_retry",
@@ -107,7 +106,10 @@ print("\n-- Post assembly validation path --")
 check("repetition diagnostics remain", "diagnose_section_repetition(" in section_src)
 check("generic phrase scan remains", "detect_generic_documentary_phrases(" in section_src)
 check("minimum length check remains", "check_minimum_length(" in section_src)
-check("global validation remains", "validate_script_globally(" in section_src)
+check(
+    "global validation moved to run_script_quality_gate (Phase 10A-0) — no longer called here",
+    "validate_script_globally(" not in section_src,
+)
 check("narrative completeness remains", "check_narrative_completeness(" in section_src)
 
 print("\n-- Prompt ownership --")

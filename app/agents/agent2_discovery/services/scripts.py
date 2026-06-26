@@ -5,7 +5,7 @@ import uuid
 
 from sqlalchemy.orm import Session
 
-from app.models import Channel, ChannelConfig, ChannelLanguage, ChannelVoice, Content, Script
+from app.models import Channel, ChannelConfig, ChannelLanguage, ChannelVoice, Content, ContentValidation, Script
 from app.services.script_estimator import estimate_duration_sec
 from app.agents.agent2_discovery.system_prompt import (
     assess_script_quality,
@@ -149,14 +149,25 @@ def _emit_script_cost_estimate(scripts: dict, rewrite_calls: int) -> None:
 def run_script_quality_gate(
     scripts: dict,
     channel: Channel,
+    content: Content,
+    db: Session,
+    blueprint: dict,
     script_format: str = "youtube_long",
     language: str = "source",
     tts_model: str = "sonic-2",
     tts_provider: str = "cartesia",
 ) -> dict:
-    """Run the Script Quality Gate — assess retention quality, rewrite if needed."""
+    """Run the Script Quality Gate — assess retention quality, rewrite if needed.
+
+    Also runs global narrative-coherence validation once (attempt 1 only) and
+    folds its issues into the same rewrite mechanism (Phase 10A-0) — see
+    ``_run_global_script_validation``.
+    """
     current = _apply_final_tts_backstop(scripts)
     rewrite_calls = 0
+    global_issues = _run_global_script_validation(
+        current.get("voice_script", ""), blueprint, content, db
+    )
 
     for attempt in range(1, _MAX_QUALITY_REWRITES + 1):
         _script_trace(f"quality_gate_input_{attempt}", current.get("voice_script", ""))
@@ -176,10 +187,15 @@ def run_script_quality_gate(
             review=review,
             current=current,
             language=language,
+            extra_issues=global_issues if attempt == 1 else [],
         )
         _log_quality_gate_review(issue_group, attempt)
 
-        if issue_group["status"] == "PASSED" and not issue_group["converted_det"]:
+        if (
+            issue_group["status"] == "PASSED"
+            and not issue_group["converted_det"]
+            and not issue_group["global"]
+        ):
             _script_trace(f"quality_gate_passed_attempt_{attempt}", current.get("voice_script", ""))
             _emit_script_cost_estimate(scripts, rewrite_calls)
             return current
@@ -275,6 +291,7 @@ def _collect_quality_gate_issues(
     review: dict,
     current: dict,
     language: str,
+    extra_issues: list[dict] | None = None,
 ) -> dict:
     status = review.get("status", "PASSED")
     claude_issues: list[dict] = review.get("issues", [])
@@ -291,12 +308,14 @@ def _collect_quality_gate_issues(
         }
         for issue in det_majors
     ]
-    all_issues = claude_issues + converted_det
+    global_issues: list[dict] = list(extra_issues or [])
+    all_issues = claude_issues + converted_det + global_issues
     return {
         "status": status,
         "tts_det": tts_det,
         "hook_det": hook_det,
         "converted_det": converted_det,
+        "global": global_issues,
         "all_issues": all_issues,
     }
 
@@ -1434,7 +1453,6 @@ def _assemble_sections_with_diagnostics(
             context=context,
         )
 
-    _run_global_script_validation(voice_script, blueprint)
     return voice_script
 
 
@@ -1476,17 +1494,70 @@ def _apply_length_correction(
     return voice_script
 
 
-def _run_global_script_validation(voice_script: str, blueprint: dict) -> None:
+def _run_global_script_validation(
+    voice_script: str,
+    blueprint: dict,
+    content: Content,
+    db: Session,
+) -> list[dict]:
+    """Run global narrative-coherence validation once and persist the result.
+
+    Called once per quality-gate pass (attempt 1 only — see ``run_script_quality_gate``).
+    Persists status + raw issues to ``ContentValidation`` (Phase 10A-0) so the
+    finding survives past a log line, and returns the issues converted into the
+    rewrite-issue shape (``severity``/``category``/``description``/``fix``) so they
+    can be merged into the same ``rewrite_script_for_quality()`` call the quality
+    gate already runs for Claude-judged and deterministic issues — no second,
+    parallel rewrite mechanism.
+
+    Non-blocking: a failed Claude call persists ``NEEDS_REVIEW`` and returns no
+    issues rather than raising, matching this validator's pre-existing behavior.
+    """
+    validation = (
+        db.query(ContentValidation)
+        .filter(ContentValidation.content_id == content.id)
+        .first()
+    )
     try:
         gv = validate_script_globally(voice_script, blueprint)
-        if gv.get("status") == "NEEDS_FIX":
-            for issue in gv.get("issues", []):
-                logger.info(
-                    "Global validation [%s]: %s — %s",
-                    issue.get("section"), issue.get("description"), issue.get("suggestion"),
-                )
     except Exception as exc:
         logger.debug("Global validation failed (non-blocking): %s", exc)
+        if validation:
+            validation.script_validation_status = "NEEDS_REVIEW"
+            db.commit()
+        return []
+
+    raw_issues: list[dict] = gv.get("issues", [])
+    if gv.get("status") == "NEEDS_FIX":
+        for issue in raw_issues:
+            logger.info(
+                "Global validation [%s]: %s — %s",
+                issue.get("section"), issue.get("description"), issue.get("suggestion"),
+            )
+        status = "AUTO_CORRECTED"
+    else:
+        status = "PASSED"
+
+    if validation:
+        validation.script_validation_status = status
+        validation.script_issues_log = raw_issues
+        db.commit()
+    else:
+        logger.warning(
+            "_run_global_script_validation: no ContentValidation row for content %s — "
+            "result not persisted",
+            content.id,
+        )
+
+    return [
+        {
+            "severity": "HIGH",
+            "category": "global_narrative",
+            "description": issue.get("description", ""),
+            "fix": issue.get("suggestion", ""),
+        }
+        for issue in raw_issues
+    ]
 
 
 def _log_turn_coverage_alignment(
@@ -1749,9 +1820,15 @@ def generate_script_sections(
     Post-assembly:
     - check_completeness + check_minimum_length are run; issues logged as WARNING
       (non-blocking — per-section TTS enforcement makes assembly-level issues rare).
-    - validate_script_globally (Haiku) checks narrative coherence; issues logged only.
     - check_narrative_completeness (pure Python) is blocking: failing sections are
       regenerated once with targeted override instructions before proceeding.
+
+    Global narrative-coherence validation (Haiku, ``validate_script_globally``) is
+    no longer run here — it now runs once inside ``run_script_quality_gate()``,
+    where its result is persisted to ``ContentValidation`` and its issues feed the
+    same rewrite mechanism the quality gate already uses (Phase 10A-0). Running it
+    here was redundant: this function returns before the quality gate ever sees the
+    script, so the result had nowhere to go but a log line.
     """
     context = _build_section_generation_context(channel_voice, blueprint)
     state = _create_section_loop_state()

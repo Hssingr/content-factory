@@ -490,10 +490,16 @@ Public call helpers:
 
 ```text
 call_claude()
-call_claude_with_usage()
 call_claude_structured()
 call_claude_with_tools()
 ```
+
+`call_claude_with_usage()` was removed in Phase 10A-0 as confirmed-dead code
+(zero callers anywhere in the repo) — it duplicated `call_claude()`'s shared
+`_call_claude_core()` retry/caching/logging path with no caller ever using
+the extra usage-dict return value. If a future caller needs token-usage
+diagnostics from a free-form (non-structured) call, reintroduce it deliberately
+rather than assuming it still exists from this section.
 
 Rules:
 
@@ -834,6 +840,8 @@ Responsibilities:
 
 - Run final deterministic cleanup.
 - Run quality assessment.
+- Run global narrative-coherence validation (`validate_script_globally`,
+  Haiku) exactly once per quality-gate pass, on attempt 1 only.
 - Skip expensive rewrite when issues are TTS-only and fixable in Python.
 - Log cost estimates.
 
@@ -842,6 +850,40 @@ Rules:
 - Do not call expensive rewrite for cheap deterministic issues.
 - Clean before assessment and before final return.
 - Log hash/trace when scripts move across stages.
+
+Global validation wiring (Phase 10A-0):
+
+- `validate_script_globally()` used to run inside `generate_script_sections()`
+  (before the quality gate ever saw the script) with its result only logged,
+  never persisted, never acted on. It now runs once inside
+  `run_script_quality_gate()` itself, via `_run_global_script_validation()`,
+  which:
+  - persists the result to the content's existing `ContentValidation` row —
+    `script_validation_status` (`"PASSED"` | `"AUTO_CORRECTED"` |
+    `"NEEDS_REVIEW"`) and `script_issues_log` (the raw issues list) — fields
+    that existed on the model but were unused for this purpose before this
+    phase;
+  - returns its issues converted to the rewrite-issue shape
+    (`severity="HIGH"`, `category="global_narrative"`), merged into the
+    *same* `all_issues` list `_collect_quality_gate_issues()` already builds
+    from Claude's quality-gate review and converted deterministic MAJORs —
+    there is no second, parallel rewrite mechanism and no second retry
+    counter; the existing `_MAX_QUALITY_REWRITES` cap bounds both issue
+    sources together.
+- `status_validation_status` mapping: `"PASSED"` when
+  `validate_script_globally()` returns `status="PASS"`; `"AUTO_CORRECTED"`
+  when it returns `status="NEEDS_FIX"` (since those issues are
+  unconditionally forwarded into this same gate pass's rewrite mechanism,
+  regardless of whether that specific rewrite attempt later succeeds);
+  `"NEEDS_REVIEW"` if the Claude call itself fails (non-blocking — the gate
+  continues with the script as-is, exactly as before this phase).
+- Global-validation issues are folded into the rewrite issue list on attempt
+  1 only — they are not re-added on subsequent attempts within the same
+  gate pass, since the underlying global-coherence check is not re-run
+  per attempt.
+- A `ContentValidation` row is expected to already exist for the content by
+  this point (created at discovery time, `run_discovery()`) — if missing,
+  the result is logged and not persisted, but the gate does not fail.
 
 #### `generate_multilingual_scripts`
 

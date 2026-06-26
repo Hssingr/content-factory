@@ -71,6 +71,9 @@ def run_script_workflow(content: Content, db: Session) -> None:
     scripts = run_script_quality_gate(
         scripts,
         context.channel,
+        content=content,
+        db=db,
+        blueprint=blueprint,
         script_format=context.script_format,
         language=content.source_language,
         tts_model=context.tts_model,
