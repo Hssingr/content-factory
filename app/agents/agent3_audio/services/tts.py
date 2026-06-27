@@ -4,6 +4,7 @@ import re
 from elevenlabs.types import VoiceSettings
 
 from app.services.elevenlabs_client import get_client
+from app.services.claude_client import call_claude
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,8 @@ _TRAILING_SPACE_RE = re.compile(r"[ \t]+\n")
 # ── Sentence-length limiter ───────────────────────────────────────────────────
 _LONG_SENTENCE_RE  = re.compile(r"(?<=[.!?])\s+")
 _MAX_SENTENCE_WORDS = 18
+_WORD_TOKEN_RE = re.compile(r"[A-Za-z0-9]+(?:['][A-Za-z0-9]+)?")
+_PAUSE_TAG_RE = re.compile(r"\[\s*dramatic\s+pause\s*\]", re.IGNORECASE)
 
 # Natural split points inside a long sentence — tried in order of preference.
 _SPLIT_CANDIDATES = re.compile(
@@ -50,6 +53,8 @@ _MODEL_CHAR_LIMITS: dict[str, int] = {
     "eleven_flash_v2_5":     39_000,
     # Cartesia
     "sonic-2":                9_500,
+    "sonic-3":                9_500,
+    "sonic-3.5":              9_500,
 }
 
 _ELEVENLABS_OUTPUT_FORMAT = "mp3_44100_128"   # 44 100 Hz stereo, 128 kbps
@@ -67,6 +72,8 @@ _CARTESIA_SPEED_MAP: dict[str, str] = {
     "fast":      "fast",
     "very_fast": "fastest",
 }
+_CARTESIA_NUMERIC_SPEED_MIN = 0.6
+_CARTESIA_NUMERIC_SPEED_MAX = 1.5
 
 # ── Cartesia emotion mapping ───────────────────────────────────────────────────
 # Maps channel_voice.emotion → Cartesia _experimental_voice_controls emotion list.
@@ -79,7 +86,26 @@ _CARTESIA_EMOTION_MAP: dict[str, list[str]] = {
     "authoritative": ["anger:low", "curiosity:low"],
     "enthusiastic":  ["positivity:high"],
     "dramatic":      ["sadness:low", "surprise:low"],
+    "curious":       ["curiosity:medium"],
+    "tense":         ["curiosity:high", "surprise:low"],
+    "scared":        ["surprise:high", "sadness:medium"],
+    "somber":        ["sadness:medium"],
 }
+_CARTESIA_SONIC3_EMOTION_MAP: dict[str, str] = {
+    "neutral": "neutral",
+    "calm": "calm",
+    "warm": "content",
+    "authoritative": "confident",
+    "enthusiastic": "enthusiastic",
+    "dramatic": "scared",
+    "curious": "curious",
+    "tense": "scared",
+    "scared": "scared",
+    "somber": "sad",
+}
+_CARTESIA_LEGACY_MODELS = {"sonic-2"}
+_CARTESIA_GENERATION_CONFIG_MODELS = {"sonic-3", "sonic-3.5"}
+_CLIMAX_SECTION_WORDS = {"reveal", "climax", "truth", "answer", "found", "discovered", "discovery", "horror", "vanished", "missing"}
 
 # ── Emotion VoiceSettings presets ────────────────────────────────────────────
 # stability        : 0–1  (higher = more consistent; lower = more expressive)
@@ -165,6 +191,93 @@ def _split_long_sentence(sentence: str) -> str:
 
 
 _MAX_PAUSE_INSERTIONS = 6   # hard cap — never insert more than 6 pause markers per script
+_CHUNK_BOUNDARY_SILENCE_SECONDS = 0.08
+
+_REVEAL_SENTENCE_RE = re.compile(
+    r"([\.\!\?]\s+)((?:That|Then|But|And then|Until|Except|Until then|"
+    r"What they found|What he found|What she found|"
+    r"The answer|The truth|The result|It turned out)\b)",
+    re.IGNORECASE,
+)
+_REVEAL_DISCOVERY_RE = re.compile(
+    r"\b("
+    r"found|discovered|uncovered|revealed|learned|realized|realised|noticed|"
+    r"recognized|recognised|identified|opened|heard|saw|recorded"
+    r")\b",
+    re.IGNORECASE,
+)
+_REVEAL_SECRET_RE = re.compile(
+    r"\b("
+    r"truth|secret|answer|explanation|proof|evidence|report|recording|tape|"
+    r"photo|photograph|letter|message|drawer|envelope|file|name|voice|body|"
+    r"door|room|house|key|lock|police"
+    r")\b",
+    re.IGNORECASE,
+)
+_REVEAL_REVERSAL_RE = re.compile(
+    r"\b("
+    r"was mine|were mine|my name|had never|never left|never been|"
+    r"had been locked|locked from the outside|from the outside|inside the|"
+    r"had been a lie|was a lie|was not|wasn't|weren't|could not have|"
+    r"had already|was already|all along|the whole story"
+    r")\b",
+    re.IGNORECASE,
+)
+_REVEAL_CONSEQUENCE_RE = re.compile(
+    r"\b("
+    r"missing|vanished|dead|buried|hidden|locked|impossible|impossibly|"
+    r"wrong|same|someone else|no one|nobody|nothing|every night"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_PAUSE_MARKER_REVIEW_PROMPT_VERSION = "1.0"
+_PAUSE_MARKER_REVIEW_SYSTEM_PROMPT = f"""
+PROMPT_VERSION {_PAUSE_MARKER_REVIEW_PROMPT_VERSION}
+
+You are reviewing pause-marker placement only.
+
+Hard rules:
+- Keep every word exactly the same.
+- Do not rewrite the narration.
+- Do not improve style, rhythm, clarity, or emotion.
+- Do not add, remove, replace, reorder, or paraphrase any narration words.
+- Do not change sentence order.
+- Do not change meaning.
+- Only remove, move, or adjust punctuation/pause markers when clearly misplaced.
+- Pause markers include ellipses ("..."), em-dashes, bracketed dramatic-pause tags,
+  or similar punctuation-only pause cues.
+- Return only the corrected narration text.
+""".strip()
+
+
+def _candidate_sentence_from_reveal_match(match: re.Match) -> str:
+    """Return the full candidate sentence without consuming it in the regex."""
+    remainder = match.string[match.start(2):]
+    sentence_end = re.search(r"[.!?](?:\s|$)", remainder)
+    if sentence_end:
+        return remainder[: sentence_end.end()].strip()
+    return remainder.strip()
+
+
+def _is_reveal_beat_sentence(sentence: str) -> bool:
+    """Return True when a trigger sentence contains concrete reveal evidence."""
+    cleaned = sentence.strip()
+    if not cleaned:
+        return False
+
+    score = 0
+    if _REVEAL_DISCOVERY_RE.search(cleaned):
+        score += 1
+    if _REVEAL_SECRET_RE.search(cleaned):
+        score += 1
+    if _REVEAL_REVERSAL_RE.search(cleaned):
+        score += 2
+    if _REVEAL_CONSEQUENCE_RE.search(cleaned):
+        score += 1
+
+    return score >= 2
+
 
 def _apply_pacing_markers(
     text: str,
@@ -186,8 +299,17 @@ def _apply_pacing_markers(
         cues within a 60–90 s window.
 
     Applied to ALL tones:
-      - Insert a pause marker before sentences that open with a narrative reveal
-        phrase (That / Then / But / And then / The truth / It turned out …).
+      - A sentence opening with a narrative reveal phrase (That / Then / But /
+        And then / The truth / It turned out …) is only a *candidate* — matching
+        the opener alone is not sufficient (Phase 11.5). The candidate sentence
+        is additionally scored by ``_is_reveal_beat_sentence()`` against four
+        deterministic evidence categories — discovery verbs, secret/evidence
+        nouns, reversal phrases (weighted x2), and consequence words — and a
+        pause marker is inserted only when the combined score is >= 2. This
+        gate exists because the opener alone over-triggered on ordinary
+        sentences that merely continue the narrative ("Then she walked into
+        the room") rather than deliver an actual reveal — the gate requires
+        concrete reveal evidence in the same sentence, not just a transition word.
 
     Applied only to dramatic / suspense / horror / tense tones (long-form only):
       - ellipsis path: replace the first short sentence's terminal period with ``"..."``.
@@ -208,23 +330,18 @@ def _apply_pacing_markers(
     use_v3 = tts_model == "eleven_v3"
     insertion_count = 0
 
-    reveal_re = re.compile(
-        r"([\.\!\?]\s+)((?:That|Then|But|And then|Until|Except|Until then|"
-        r"What they found|What he found|What she found|"
-        r"The answer|The truth|The result|It turned out)\b)",
-        re.IGNORECASE,
-    )
-
     def _insert_pause(match: re.Match) -> str:
         nonlocal insertion_count
         if insertion_count >= max_pause:
+            return match.group(0)
+        if not _is_reveal_beat_sentence(_candidate_sentence_from_reveal_match(match)):
             return match.group(0)
         insertion_count += 1
         if use_v3:
             return match.group(1) + "[dramatic pause] " + match.group(2)
         return match.group(1) + "... " + match.group(2)
 
-    text = reveal_re.sub(_insert_pause, text)
+    text = _REVEAL_SENTENCE_RE.sub(_insert_pause, text)
 
     # Slow-open for high-drama tones — skipped for Short episodes (immediate energy needed)
     if (
@@ -242,6 +359,56 @@ def _apply_pacing_markers(
                 insertion_count += 1
 
     return text
+
+
+def _narration_word_sequence(text: str) -> list[str]:
+    """Return narration words only, ignoring pause-marker syntax."""
+    without_pause_tags = _PAUSE_TAG_RE.sub(" ", text)
+    return _WORD_TOKEN_RE.findall(without_pause_tags)
+
+
+def _has_same_narration_words(before: str, after: str) -> bool:
+    """True only when the reviewed text keeps the exact narration word sequence."""
+    return _narration_word_sequence(before) == _narration_word_sequence(after)
+
+
+def _review_pause_marker_placement(text: str) -> str:
+    """Optionally let Haiku adjust pause punctuation, guarded by a word-sequence check."""
+    if not text.strip():
+        return text
+
+    try:
+        reviewed = call_claude(
+            _PAUSE_MARKER_REVIEW_SYSTEM_PROMPT,
+            text,
+            max_tokens=2048,
+            task="pause_marker_review",
+        )
+    except Exception as exc:
+        logger.warning(
+            "TTS_PAUSE_REVIEW_FALLBACK: Claude review failed; using deterministic text. error=%s",
+            type(exc).__name__,
+        )
+        return text
+
+    if not isinstance(reviewed, str) or not reviewed.strip():
+        logger.warning(
+            "TTS_PAUSE_REVIEW_FALLBACK: invalid Claude review output; using deterministic text."
+        )
+        return text
+
+    reviewed = reviewed.strip()
+    if not _has_same_narration_words(text, reviewed):
+        logger.warning(
+            "TTS_PAUSE_REVIEW_FALLBACK: Claude review changed narration words; using deterministic text."
+        )
+        return text
+
+    if reviewed != text:
+        logger.info(
+            "TTS_PAUSE_REVIEW_ACCEPTED: punctuation-only pause-marker adjustment accepted."
+        )
+    return reviewed
 
 
 def _normalize_voice_script(text: str) -> str:
@@ -301,6 +468,166 @@ def _chunk_script_at_sections(text: str, max_chars: int) -> list[str]:
         chunks.append(current.rstrip())
 
     return chunks or [text]
+
+
+def _parse_section_context(section_text: str) -> dict:
+    """Extract section metadata from a section-marked narration chunk."""
+    match = _MARKER_RE.search(section_text)
+    if not match:
+        return {"section_type": None, "section_index": None, "section_label": None, "section_title": None}
+
+    label = match.group(1).strip()
+    label_upper = label.upper()
+    if label_upper == "INTRO":
+        return {"section_type": "intro", "section_index": None, "section_label": label, "section_title": None}
+    if label_upper == "OUTRO":
+        return {"section_type": "outro", "section_index": None, "section_label": label, "section_title": None}
+
+    index_match = re.search(r"SECTION\s+(\d+)", label, re.IGNORECASE)
+    title_match = re.search(r":\s*(.+)$", label)
+    return {
+        "section_type": "body",
+        "section_index": int(index_match.group(1)) if index_match else None,
+        "section_label": label,
+        "section_title": title_match.group(1).strip() if title_match else None,
+    }
+
+
+def _split_script_into_section_units(text: str) -> list[dict]:
+    """Return one TTS unit per script section when section markers exist."""
+    segments = [s for s in _SECTION_SPLIT_RE.split(text) if s.strip()]
+    if not segments:
+        return [{"text": text, **_parse_section_context(text)}]
+    return [{"text": segment.rstrip(), **_parse_section_context(segment)} for segment in segments]
+
+
+def _select_section_delivery(section_context: dict, channel_emotion: str, channel_speed_profile: str, *, is_short_episode: bool) -> dict:
+    """Choose deterministic section-level Cartesia delivery, with safe channel fallback."""
+    fallback = {
+        "emotion": channel_emotion,
+        "speed_profile": channel_speed_profile,
+        "source": "fallback",
+        "reason": "section_metadata_missing",
+    }
+    section_type = section_context.get("section_type")
+    if is_short_episode:
+        fallback["reason"] = "short_episode_static_policy"
+        return fallback
+    if not section_type:
+        return fallback
+
+    if section_type == "intro":
+        return {"emotion": "curious", "speed_profile": "slow", "source": "section", "reason": "intro"}
+    if section_type == "outro":
+        return {"emotion": "somber", "speed_profile": "slow", "source": "section", "reason": "outro"}
+    if section_type == "body":
+        title = (section_context.get("section_title") or "").lower()
+        title_words = set(re.findall(r"[a-z]+", title))
+        if title_words & _CLIMAX_SECTION_WORDS:
+            return {"emotion": "scared", "speed_profile": "fast", "source": "section", "reason": "climax_title"}
+        index = section_context.get("section_index")
+        if index is not None and index <= 2:
+            return {"emotion": "tense", "speed_profile": "normal", "source": "section", "reason": "early_buildup"}
+        return {"emotion": "tense", "speed_profile": "fast", "source": "section", "reason": "late_buildup"}
+
+    fallback["reason"] = "section_type_unknown"
+    return fallback
+
+
+def _log_section_delivery(section_context: dict, delivery: dict, channel_emotion: str, *, is_short_episode: bool) -> None:
+    label = section_context.get("section_label") or "unmarked"
+    if delivery["source"] == "section":
+        logger.info(
+            "TTS_SECTION_DELIVERY_SELECTED: section=%s reason=%s emotion=%s speed_profile=%s base_emotion=%s",
+            label, delivery["reason"], delivery["emotion"], delivery["speed_profile"], channel_emotion,
+        )
+        return
+    logger.warning(
+        "TTS_SECTION_DELIVERY_FALLBACK: section=%s reason=%s emotion=%s speed_profile=%s is_short_episode=%s",
+        label, delivery["reason"], delivery["emotion"], delivery["speed_profile"], is_short_episode,
+    )
+
+
+def _cartesia_model_generation(tts_model: str) -> str:
+    """Return the supported Cartesia request generation for a model id."""
+    if tts_model in _CARTESIA_LEGACY_MODELS:
+        return "legacy"
+    if tts_model in _CARTESIA_GENERATION_CONFIG_MODELS:
+        return "generation_config"
+    logger.error(
+        "CARTESIA_UNSUPPORTED_MODEL: model=%s is not mapped to a known request format",
+        tts_model,
+    )
+    raise ValueError(f"Unsupported Cartesia TTS model for request formatting: {tts_model}")
+
+
+def _resolve_cartesia_numeric_speed(channel_voice, speed_profile: str | None = None) -> float:
+    """Resolve Sonic 3/3.5 numeric speed, preserving explicit voice overrides."""
+    if getattr(channel_voice, "speed_override", None) is not None:
+        raw_speed = float(channel_voice.speed_override)
+    else:
+        profile = speed_profile or getattr(channel_voice, "speed_profile", None) or "normal"
+        raw_speed = _SPEED_PROFILE_BASE.get(profile, _SPEED_PROFILE_BASE["normal"])
+    return max(_CARTESIA_NUMERIC_SPEED_MIN, min(_CARTESIA_NUMERIC_SPEED_MAX, raw_speed))
+
+
+def _resolve_cartesia_sonic3_emotion(emotion: str) -> str:
+    """Map project emotion labels to Cartesia Sonic 3/3.5 single emotion values."""
+    emotion_key = (emotion or _DEFAULT_EMOTION).lower()
+    return _CARTESIA_SONIC3_EMOTION_MAP.get(emotion_key, "neutral")
+
+
+def _resolve_cartesia_pronunciation_dict_id(channel_voice) -> str | None:
+    """Return an optional configured Cartesia pronunciation dictionary id."""
+    value = getattr(channel_voice, "cartesia_pronunciation_dict_id", None)
+    if value is None:
+        return None
+    value = str(value).strip()
+    return value or None
+
+
+def _build_cartesia_tts_kwargs(
+    *,
+    tts_model: str,
+    transcript: str,
+    voice_id: str,
+    channel_voice,
+    emotion: str,
+    speed_profile: str | None = None,
+) -> dict:
+    """Build Cartesia SDK kwargs with model-generation-aware request formatting."""
+    generation = _cartesia_model_generation(tts_model)
+    if generation == "legacy":
+        profile = speed_profile or getattr(channel_voice, "speed_profile", None) or "normal"
+        speed_str = _CARTESIA_SPEED_MAP.get(profile, "normal")
+        emotion_key = (emotion or _DEFAULT_EMOTION).lower()
+        if emotion_key not in _CARTESIA_EMOTION_MAP:
+            emotion_key = _DEFAULT_EMOTION
+        return {
+            "model_id": tts_model,
+            "transcript": transcript,
+            "voice_id": voice_id,
+            "output_format": _CARTESIA_OUTPUT_FORMAT,
+            "_experimental_voice_controls": {
+                "speed": speed_str,
+                "emotion": _CARTESIA_EMOTION_MAP[emotion_key],
+            },
+        }
+
+    payload = {
+        "model_id": tts_model,
+        "transcript": transcript,
+        "voice": {"mode": "id", "id": voice_id},
+        "output_format": _CARTESIA_OUTPUT_FORMAT,
+        "generation_config": {
+            "speed": _resolve_cartesia_numeric_speed(channel_voice, speed_profile),
+            "emotion": _resolve_cartesia_sonic3_emotion(emotion),
+        },
+    }
+    pronunciation_dict_id = _resolve_cartesia_pronunciation_dict_id(channel_voice)
+    if pronunciation_dict_id:
+        payload["pronunciation_dict_id"] = pronunciation_dict_id
+    return payload
 
 
 def _resolve_voice_settings(channel_voice) -> dict:
@@ -410,7 +737,10 @@ def prepare_script_for_tts(
     # 4. Pacing cues — reveal pauses for all tones, slow-open for long-form dramatic tones
     text = _apply_pacing_markers(text, tone=tone or "", tts_model=tts_model, is_short_episode=is_short_episode)
 
-    # 5. Diagnostic log
+    # 5. Optional Haiku review; Python accepts only punctuation/pause-marker-only changes
+    text = _review_pause_marker_placement(text)
+
+    # 6. Diagnostic log
     original_words = len(voice_script.split())
     prepared_words = len(text.split())
     sentences_out  = _LONG_SENTENCE_RE.split(text)
@@ -432,10 +762,11 @@ def prepare_script_for_tts(
 
 
 def _concat_mp3_chunks(chunk_bytes_list: list[bytes]) -> bytes:
-    """Concatenate multiple mp3 byte blobs into one gapless mp3 stream via ffmpeg.
+    """Concatenate multiple mp3 byte blobs into one normalized mp3 stream via ffmpeg.
 
     Uses ffmpeg's concat demuxer with re-encoding at 192 kbps to avoid click
-    artifacts and prosody discontinuities from raw byte concatenation.
+    artifacts from raw byte concatenation. Inserts a tiny deterministic silence
+    pad between chunks to avoid abrupt section-to-section joins.
     Falls back to raw concat if ffmpeg is unavailable (no Remotion environment).
 
     Args:
@@ -468,11 +799,30 @@ def _concat_mp3_chunks(chunk_bytes_list: list[bytes]) -> bytes:
                 f.write(blob)
             input_paths.append(p)
 
-        # Build ffmpeg concat list file
+        # Build ffmpeg concat list file with a short generated pause between chunks.
+        silence_path = os.path.join(tmp, "boundary_silence.mp3")
+        silence_cmd = [
+            "ffmpeg", "-y",
+            "-f", "lavfi",
+            "-i", "anullsrc=r=44100:cl=mono",
+            "-t", f"{_CHUNK_BOUNDARY_SILENCE_SECONDS:.3f}",
+            "-c:a", "libmp3lame", "-b:a", "192k",
+            silence_path,
+        ]
+        silence_proc = subprocess.run(silence_cmd, capture_output=True)
+        if silence_proc.returncode != 0:
+            logger.warning(
+                "ffmpeg silence pad generation failed (rc=%d) — using raw byte concat. stderr: %s",
+                silence_proc.returncode, silence_proc.stderr[-200:].decode(errors="replace"),
+            )
+            return b"".join(chunk_bytes_list)
+
         list_file = os.path.join(tmp, "concat.txt")
         with open(list_file, "w") as f:
-            for p in input_paths:
+            for i, p in enumerate(input_paths):
                 f.write(f"file '{p}'\n")
+                if i < len(input_paths) - 1:
+                    f.write(f"file '{silence_path}'\n")
 
         out_file = os.path.join(tmp, "combined.mp3")
         cmd = [
@@ -492,8 +842,9 @@ def _concat_mp3_chunks(chunk_bytes_list: list[bytes]) -> bytes:
 
         result = open(out_file, "rb").read()
         logger.debug(
-            "Concat: ffmpeg re-encode %d chunks → %d bytes (%.1f KB)",
-            len(chunk_bytes_list), len(result), len(result) / 1024,
+            "Concat: ffmpeg re-encode %d chunks with %.0f ms boundary silence → %d bytes (%.1f KB)",
+            len(chunk_bytes_list), _CHUNK_BOUNDARY_SILENCE_SECONDS * 1000,
+            len(result), len(result) / 1024,
         )
         return result
 
@@ -533,9 +884,10 @@ def _wav_to_mp3(wav_bytes: bytes) -> bytes:
 def _generate_cartesia_audio(voice_script: str, channel_voice, is_short_episode: bool = False) -> bytes:
     """Generate MP3 audio via Cartesia TTS (provider='cartesia').
 
-    Chunks the script at [SECTION N] boundaries, calls client.tts.bytes() for
-    each chunk (WAV format), converts each WAV to MP3 via ffmpeg, then
-    concatenates. No text-conditioning stitching — each chunk is standalone.
+    Sends long-form section-marked scripts as one Cartesia request per section
+    so deterministic section delivery can vary across the narrative arc. Flat
+    narration, including child shorts, remains a single static-delivery unit.
+    Converts each WAV to MP3 via ffmpeg, then concatenates.
 
     Args:
         voice_script:     Full narrator text (may include section markers).
@@ -555,50 +907,65 @@ def _generate_cartesia_audio(voice_script: str, channel_voice, is_short_episode:
 
     tts_model = getattr(channel_voice, "tts_model", None) or "sonic-2"
     voice_id  = channel_voice.voice_id
-    profile   = getattr(channel_voice, "speed_profile", None) or "normal"
-    speed_str = _CARTESIA_SPEED_MAP.get(profile, "normal")
     emotion   = (getattr(channel_voice, "emotion", None) or _DEFAULT_EMOTION).lower()
-    if emotion not in _CARTESIA_EMOTION_MAP:
-        emotion = _DEFAULT_EMOTION
-    emotion_list = _CARTESIA_EMOTION_MAP[emotion]
+    _cartesia_model_generation(tts_model)
 
-    max_chars = _MODEL_CHAR_LIMITS.get(tts_model, 9_500)
-    chunks    = _chunk_script_at_sections(voice_script, max_chars)
+    section_units = _split_script_into_section_units(voice_script)
     client    = Cartesia(api_key=settings.cartesia_api_key)
+    channel_speed_profile = getattr(channel_voice, "speed_profile", None) or "normal"
 
-    prepared_chunks: list[str] = []
-    for chunk in chunks:
-        p = prepare_script_for_tts(chunk, language="", tone=emotion, tts_model=tts_model, is_short_episode=is_short_episode)
-        prepared_chunks.append(p)
+    prepared_units: list[dict] = []
+    for unit in section_units:
+        delivery = _select_section_delivery(
+            unit, emotion, channel_speed_profile, is_short_episode=is_short_episode
+        )
+        _log_section_delivery(unit, delivery, emotion, is_short_episode=is_short_episode)
+        p = prepare_script_for_tts(
+            unit["text"], language="", tone=delivery["emotion"],
+            tts_model=tts_model, is_short_episode=is_short_episode,
+        )
+        prepared_units.append({**unit, "prepared": p, "delivery": delivery})
 
     logger.debug(
-        "Cartesia TTS: voice_id=%s model=%s speed=%s emotion=%s cartesia_emotion=%s chunks=%d is_short_episode=%s",
-        voice_id, tts_model, speed_str, emotion, emotion_list, len(prepared_chunks), is_short_episode,
+        "Cartesia TTS: voice_id=%s model=%s request_generation=%s base_emotion=%s units=%d is_short_episode=%s pronunciation_dict=%s",
+        voice_id, tts_model, _cartesia_model_generation(tts_model), emotion, len(prepared_units),
+        is_short_episode, bool(_resolve_cartesia_pronunciation_dict_id(channel_voice)),
     )
 
     all_bytes: list[bytes] = []
-    for i, prepared in enumerate(prepared_chunks):
+    for i, unit in enumerate(prepared_units):
+        prepared = unit["prepared"]
         if not prepared.strip():
             continue
 
         logger.debug(
-            "Cartesia chunk %d/%d: words=%d chars=%d",
-            i + 1, len(prepared_chunks), len(prepared.split()), len(prepared),
+            "Cartesia chunk %d/%d: section=%s words=%d chars=%d emotion=%s speed_profile=%s",
+            i + 1, len(prepared_units), unit.get("section_label") or "unmarked",
+            len(prepared.split()), len(prepared), unit["delivery"]["emotion"], unit["delivery"]["speed_profile"],
         )
 
-        wav_bytes = client.tts.bytes(
-            model_id=tts_model,
+        request_kwargs = _build_cartesia_tts_kwargs(
+            tts_model=tts_model,
             transcript=prepared,
             voice_id=voice_id,
-            output_format=_CARTESIA_OUTPUT_FORMAT,
-            _experimental_voice_controls={"speed": speed_str, "emotion": emotion_list},
+            channel_voice=channel_voice,
+            emotion=unit["delivery"]["emotion"],
+            speed_profile=unit["delivery"]["speed_profile"],
         )
+        try:
+            wav_bytes = client.tts.bytes(**request_kwargs)
+        except TypeError:
+            logger.exception(
+                "CARTESIA_REQUEST_FORMAT_UNSUPPORTED: model=%s request_generation=%s",
+                tts_model, _cartesia_model_generation(tts_model),
+            )
+            raise
         all_bytes.append(_wav_to_mp3(wav_bytes))
 
     audio_bytes = _concat_mp3_chunks(all_bytes) if all_bytes else b""
     logger.debug(
         "Cartesia TTS complete: %d chunk(s) → %d bytes (%.1f KB)",
-        len(prepared_chunks), len(audio_bytes), len(audio_bytes) / 1024,
+        len(prepared_units), len(audio_bytes), len(audio_bytes) / 1024,
     )
     return audio_bytes
 
@@ -608,14 +975,37 @@ def generate_audio(voice_script: str, channel_voice, is_short_episode: bool = Fa
 
     Routes to Cartesia or ElevenLabs based on ``channel_voice.provider``.
 
-    Cartesia path (provider="cartesia"):
-      Each chunk is a standalone call — no text-conditioning stitching.
-      WAV bytes from Cartesia are converted to MP3 per chunk via ffmpeg.
+    Cartesia path (provider="cartesia") — Phase 11.2-11.6:
+      Long-form, section-marked scripts are split into one TTS unit per
+      ``[INTRO]``/``[SECTION N]``/``[OUTRO]`` section (flat narration, including
+      child shorts, is a single unit). Each unit's deterministic delivery
+      (emotion + speed profile) is selected from section metadata alone —
+      INTRO/early-body/climax-titled/OUTRO sections get different delivery;
+      missing metadata falls back to the channel-level emotion/speed_profile.
+      Each unit's text is run through ``prepare_script_for_tts()`` — which
+      itself applies deterministic pacing (gated by reveal-beat evidence,
+      Phase 11.5) followed by one optional Haiku pause-marker review pass
+      that Python accepts only if it changes no narration words (Phase 11.2)
+      — before being sent as its own Cartesia request. The request payload
+      shape is chosen per ``tts_model``: the legacy shape for ``sonic-2``, or
+      the ``generation_config`` shape (numeric speed, single emotion value,
+      optional pronunciation dictionary id) for ``sonic-3``/``sonic-3.5``
+      (Phase 11.3). WAV bytes from each unit are converted to MP3 via ffmpeg,
+      then all units are concatenated with a short deterministic silence pad
+      between them to avoid abrupt section-boundary joins (Phase 11.6).
 
     ElevenLabs path (provider="elevenlabs"):
-      Model, VoiceSettings, and chunking derived from ``channel_voice``.
-      Text-conditioning (``previous_text`` / ``next_text``) applied for
-      v2/flash models; skipped for ``eleven_v3`` (not supported).
+      Model, VoiceSettings, and chunking (char-limit-based, not section-unit)
+      derived from ``channel_voice``. Each chunk still passes through
+      ``prepare_script_for_tts()``, so Phase 11.5's reveal-gated pacing and
+      Phase 11.2's optional Haiku pause review apply here too — Phase 11.3's
+      Cartesia request-shape branching and Phase 11.4's section-aware delivery
+      selection do not, since this path has no Cartesia request to build and
+      uses ElevenLabs's own native text-conditioning (``previous_text`` /
+      ``next_text``) for cross-chunk continuity instead (skipped for
+      ``eleven_v3`` — not supported). Final concatenation still goes through
+      the same ffmpeg re-encode + silence-pad step as the Cartesia path
+      (Phase 11.6) when more than one chunk exists.
 
     Args:
         voice_script:     Full narrator text (may include [INTRO]/[SECTION N]/[OUTRO]

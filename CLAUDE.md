@@ -546,9 +546,14 @@ Responsibilities:
 - TTS compliance checks.
 - Hook checks.
 - Section transition checks.
+- Sentence rhythm variance checks (Phase 11.1).
 - Completeness checks.
 - Length checks.
 - Deterministic cleanup utilities.
+
+This file has no per-function check inventory table (unlike Agent 4's
+`validate_storyboard()` table in §11.4) — its checks are documented only as
+the responsibility bullets above and via each function's own docstring.
 
 Rules:
 
@@ -1121,8 +1126,45 @@ Rules:
 
 - Provider-specific behavior must be behind a clear provider abstraction.
 - Cartesia default model is `sonic-2`.
+- Cartesia `sonic-2` uses the legacy request shape: `voice_id` plus
+  `_experimental_voice_controls` with string speed labels and weighted emotion lists.
+- Cartesia `sonic-3` and `sonic-3.5` use the generation-config request shape:
+  `voice={"mode":"id","id":...}`, numeric `generation_config.speed`, and a
+  single `generation_config.emotion` value. Unknown Cartesia model generations
+  must fail clearly instead of silently reusing the wrong request format.
+- Cartesia pronunciation dictionaries are configured per `ChannelVoice` with
+  `cartesia_pronunciation_dict_id`; when unset, no pronunciation dictionary
+  field is sent.
+- Cartesia long-form scripts with `[INTRO]`, `[SECTION N]`, and `[OUTRO]`
+  markers are sent as one TTS request per section so deterministic section
+  delivery can vary emotion/intensity across the narrative arc.
+- Multi-chunk TTS audio stitching uses ffmpeg re-encoding and inserts a short
+  deterministic silence pad between chunks to avoid abrupt section-boundary joins.
+- Section delivery is selected in Python from section metadata only: INTRO uses
+  a restrained curious delivery; early body sections use tense buildup;
+  reveal/climax-titled sections use scared/faster delivery; OUTRO uses a
+  slower somber delivery.
+- Missing/unknown section metadata and child-short flat narration fall back to
+  the configured channel-level emotion and speed profile; audio generation must
+  not fail solely because section delivery cannot be inferred.
 - ElevenLabs remains supported only as configured provider/legacy path.
-- Voice and model choices come from `channel_voices`.
+- Voice, model, pronunciation dictionary, and fallback delivery choices come from `channel_voices`.
+
+#### `ChannelVoice.cartesia_pronunciation_dict_id`
+
+File:
+
+```text
+app/models/channel_voices.py
+```
+
+Rules:
+
+- Nullable per-language Cartesia pronunciation dictionary id.
+- Used only by Cartesia Sonic 3 / Sonic 3.5 request formatting.
+- Allows unusual or invented words to be forced through a configured Cartesia
+  pronunciation dictionary without hardcoding story-specific words in code.
+- Existing `NULL` values mean omit the pronunciation dictionary field entirely.
 
 #### `prepare_script_for_tts`
 
@@ -1136,7 +1178,18 @@ Rules:
 
 - Strip unsupported markers.
 - Normalize TTS text.
-- Add pacing markers deterministically.
+- Add pacing markers deterministically before any AI review.
+- Reveal-pause insertion must require deterministic reveal-beat evidence; broad
+  sentence starters such as "Then", "But", "The truth", or "It turned out" are
+  insufficient by themselves.
+- Run at most one optional Haiku pause-marker review after deterministic pacing.
+- The Haiku pause-marker reviewer may only remove, move, or adjust punctuation
+  and pause markers; it must not rewrite narration words, sentence order,
+  content, style, rhythm, clarity, emotion, or meaning.
+- Accept Haiku-reviewed TTS text only when Python confirms the exact narration
+  word sequence is unchanged; otherwise fall back to the deterministic text and log.
+- If the Haiku review fails, times out, returns invalid output, or violates the
+  word-sequence check, fall back to the deterministic text and log.
 - Short episodes may use different pacing caps.
 - Never insert pauses that corrupt meaning.
 
@@ -1153,6 +1206,144 @@ Rules:
 - Use actual generated audio.
 - Store word-level timestamps.
 - Captions must derive from Whisper, not script text.
+
+### 10.4 Phase 11 — Agent 3 TTS Pipeline Architecture Contract
+
+This section is the ownership and execution-flow contract established by
+Phase 11 (sub-phases 11.1-11.6). It exists so that a future phase touching
+either Agent 2 (script wording) or Agent 3 (TTS preparation/delivery) can
+tell, without re-reading every function body, exactly which agent owns a
+given decision.
+
+#### Ownership boundary
+
+**Agent 2 owns** (`app/agents/agent2_discovery/`):
+
+- Story wording and sentence construction.
+- Sentence-rhythm generation (alternating short/long sentences, Phase 11.1).
+- Narration content — facts, structure, section boundaries, what the
+  narrator says.
+
+**Agent 3 owns** (`app/agents/agent3_audio/`):
+
+- TTS preparation (`prepare_script_for_tts()` — normalization, sentence
+  length limiting).
+- Deterministic pacing (`_apply_pacing_markers()`).
+- Reveal-pause evidence logic (`_is_reveal_beat_sentence()`, Phase 11.5).
+- The optional Haiku pause-marker review pass (`_review_pause_marker_placement()`,
+  Phase 11.2) and its word-sequence safety check.
+- Section-unit delivery selection (`_select_section_delivery()`, Phase 11.4).
+- Provider request-payload construction (`_build_cartesia_tts_kwargs()` and
+  the ElevenLabs equivalent in `generate_audio()`, Phase 11.3).
+- Pronunciation dictionaries (`ChannelVoice.cartesia_pronunciation_dict_id`).
+- Audio generation and chunk stitching (`_concat_mp3_chunks()`, Phase 11.6).
+
+Agent 3 never rewrites narration words, reorders sentences, or changes
+story content — every Phase 11 mechanism that touches text (the
+deterministic pacing gate, the Haiku review) is constrained to
+punctuation/pause-marker placement only, enforced in Python, not by prompt
+alone (the Haiku review's output is discarded and replaced with the
+deterministic text whenever the exact narration word sequence does not
+match — see `_has_same_narration_words()`).
+
+**Future phases must not move ownership across this boundary without
+updating this section first.** If a future phase needs Agent 3 to influence
+narration wording (or Agent 2 to influence audio delivery), that is an
+ownership-boundary change and requires an explicit CLAUDE.md update in the
+same change set, per §32 — not a silent expansion of what either agent's
+existing functions already do.
+
+#### Real Agent 3 TTS runtime flow (Cartesia path, the default)
+
+```text
+voice_script (full narrator text, may carry [INTRO]/[SECTION N]/[OUTRO] markers)
+↓
+_split_script_into_section_units()   — one unit per section; flat narration
+                                        (and all child shorts) is a single unit  (11.4)
+↓ (per unit)
+_select_section_delivery()           — deterministic emotion + speed_profile from
+                                        section type/title; channel-level fallback
+                                        when section metadata is missing            (11.4)
+↓
+prepare_script_for_tts(unit_text, tone=delivery.emotion, ...):
+    1. strip section markers
+    2. normalize_voice_script()            — punctuation/whitespace cleanup
+    3. sentence-length limiter             — split sentences over the TTS word cap
+    4. _apply_pacing_markers()             — deterministic reveal-pause insertion,
+                                              gated by _is_reveal_beat_sentence()
+                                              evidence scoring, not opener-matching
+                                              alone                                  (11.5)
+    5. _review_pause_marker_placement()    — at most one optional Haiku review of
+                                              pause-marker placement only; accepted
+                                              only if the exact narration word
+                                              sequence is unchanged, else falls back
+                                              to the deterministic text              (11.2)
+↓
+_build_cartesia_tts_kwargs()         — legacy request shape for sonic-2, or the
+                                        generation_config shape (numeric speed,
+                                        single emotion, optional pronunciation
+                                        dictionary id) for sonic-3/sonic-3.5         (11.3)
+↓
+client.tts.bytes()                   — Cartesia provider call, one per section unit
+↓
+WAV → MP3 per unit
+↓ (after all units)
+_concat_mp3_chunks()                 — ffmpeg re-encode + a short deterministic
+                                        silence pad between chunks, to avoid abrupt
+                                        section-boundary joins                       (11.6)
+↓
+final MP3 audio bytes
+```
+
+The ElevenLabs path (`provider="elevenlabs"`) differs: it chunks by character
+limit (`_chunk_script_at_sections()`), not section units, so Phase 11.4's
+per-section delivery selection and Phase 11.3's Cartesia request-shape
+branching do not apply to it. It still runs every chunk through
+`prepare_script_for_tts()` (so Phase 11.5's reveal-gated pacing and Phase
+11.2's optional Haiku review apply identically), uses ElevenLabs's own
+native text-conditioning (`previous_text`/`next_text`) for cross-chunk
+continuity instead of a silence pad, and still passes through
+`_concat_mp3_chunks()` (Phase 11.6) for final concatenation when more than
+one chunk exists.
+
+#### Phase 11 Deliverables
+
+Real implementation status, verified directly against the code in this
+repository as of this section's last update (not copied from an earlier,
+non-existent audit — see the Phase 11 close-out report,
+`code_report/phase_11_closeout_documentation.md`, for how this was verified):
+
+```text
+✓ 11.1  Sentence rhythm improvements (Agent 2)
+✓ 11.2  Haiku pause-marker reviewer (Agent 3)
+✓ 11.3  Cartesia Sonic 3 / Sonic 3.5 migration (Agent 3)
+✓ 11.4  Section emotion/intensity variation (Agent 3)
+✓ 11.5  Reveal-beat deterministic pause logic (Agent 3)
+✓ 11.6  Chunk-boundary stitching mitigation (Agent 3)
+```
+
+Status: **COMPLETE** at the code level. One operational item remains open
+and is tracked here rather than silently assumed done: the Phase 11.3
+migration (`alembic/versions/003_add_cartesia_pronunciation_dict_id.py`) had
+not been applied to the local dev database as of this section's last
+update — `channel_voices.cartesia_pronunciation_dict_id` will not exist
+until that migration is run. This does not block any other Phase 11
+sub-phase (the column is read via `getattr(..., None)` and treated as
+absent/optional everywhere it's used).
+
+#### Future Phase Safety
+
+Phases after 11 are expected to stay inside their own layer:
+
+- A future prompt-focused phase modifies prompts only.
+- A future validation-focused phase modifies validation only.
+- A future visuals-focused phase modifies Agent 4 visuals only.
+
+None of those should change the Agent 3 ownership boundary established
+above without updating this section first. If a future phase's scope
+already has a number assigned by the time it starts, name it explicitly
+here rather than leaving this list to go stale — but do not pre-assign
+numbers or scope to phases that have not been defined yet.
 
 ---
 
@@ -2678,12 +2869,13 @@ High-quality/complex tasks:
 - quality rewrite
 - storyboard generation
 
-Fast/cheap structured tasks:
+Fast/cheap tasks:
 
 - global validation
 - script quality check
 - shorts planner
 - short storyboard remap
+- pause-marker placement review
 - content reformat
 - simple suggestions
 
@@ -2735,6 +2927,10 @@ STANDALONE_SHORT_REUSE_STATS
 STANDALONE_SHORT_RENDER
 STANDALONE_SHORT_RENDER_DONE
 PRE_RENDER_ASSET_AUDIT
+TTS_PAUSE_REVIEW_ACCEPTED
+TTS_PAUSE_REVIEW_FALLBACK
+TTS_SECTION_DELIVERY_SELECTED
+TTS_SECTION_DELIVERY_FALLBACK
 ```
 
 Rules:

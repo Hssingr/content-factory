@@ -5,7 +5,12 @@ from app.services.claude_client import call_claude, call_claude_structured, pars
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "4.0"  # v4.0: blueprint-first section generation.
+PROMPT_VERSION = "4.1"  # v4.1: [INTRO] block gains a sentence-rhythm reminder + worked
+                        # example (alternate short 3-7 word / long 12-18 word sentences) —
+                        # Phase 11.1, reinforcing TTS_BLOCK's existing rhythm rule locally
+                        # at the one section type where flat rhythm was confirmed in
+                        # production. No other prompt text changed.
+                        # v4.0: blueprint-first section generation.
                         # generate_scripts() → generate_story_blueprint() + generate_section().
                         # optimize_intro() removed — INTRO is a dedicated section with
                         # built-in quality constraints. global_validation added (Haiku).
@@ -530,6 +535,13 @@ Narrative progression rules — apply to every section:
   creating it):
     "Children hear a grinding noise from the woods — it's a woodchipper consuming women."
   The weak example fails because it tells the viewer the ending before the story starts.
+  - Alternate short (3–7 word) punchy sentences with longer (12–18 word) buildup
+    sentences across the INTRO. Do not write four or more sentences of similar
+    length in a row — same-length sentences read as flat, monotone narration.
+  Example of correct rhythm (short, then long, then short — same alternation
+  pattern continues through the rest of the INTRO):
+    "He filed it away. The sound returned almost every night for nearly a week
+    before anyone else noticed it. Then his sister vanished too."
 
 [OUTRO] specific rules — apply ONLY when label = OUTRO:
   - Must directly reference blueprint.final_payoff — the answer the viewer came for.

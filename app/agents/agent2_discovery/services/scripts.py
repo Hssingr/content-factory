@@ -25,6 +25,7 @@ from app.services.script_checks import (
     check_completeness,
     check_minimum_length,
     check_section_transition,
+    check_sentence_rhythm_variance,
     split_long_sentences,
     normalize_tts_chars,
     detect_generic_documentary_phrases,
@@ -813,11 +814,13 @@ def _collect_section_retry_issues(
         check_section_transition(script_text, prior_summary_text)
         if prior_summary_text else []
     )
+    rhythm_issues = check_sentence_rhythm_variance(script_text, "source")
     majors = [issue for issue in tts_issues + hook_issues if issue["severity"] == "MAJOR"]
     return {
         "tts_issues": tts_issues,
         "hook_issues": hook_issues,
         "transition_issues": transition_issues,
+        "rhythm_issues": rhythm_issues,
         "majors": majors,
     }
 
@@ -849,6 +852,15 @@ def _log_section_transition_issues(label: str, transition_issues: list[dict]) ->
             "Section %s transition check [MINOR]: %s",
             label,
             transition_issue["description"],
+        )
+
+
+def _log_section_rhythm_issues(label: str, rhythm_issues: list[dict]) -> None:
+    for rhythm_issue in rhythm_issues:
+        logger.info(
+            "Section %s rhythm check [MINOR]: %s",
+            label,
+            rhythm_issue["description"],
         )
 
 
@@ -889,10 +901,13 @@ def _finalize_section_after_retry_limit(
 def _build_section_retry_instruction(
     majors: list[dict],
     transition_issues: list[dict],
+    rhythm_issues: list[dict],
 ) -> str:
     feedback_parts = [issue["description"] for issue in majors[:3]]
     if transition_issues:
         feedback_parts.append(transition_issues[0]["description"])
+    if rhythm_issues:
+        feedback_parts.append(rhythm_issues[0]["description"])
     return f"Fix these issues from the previous attempt: {'; '.join(feedback_parts)}"
 
 
@@ -950,6 +965,7 @@ def _generate_section_with_retry(
             label, attempt, backstop_changed, raw_metrics, script_text, issue_group
         )
         _log_section_transition_issues(label, issue_group["transition_issues"])
+        _log_section_rhythm_issues(label, issue_group["rhythm_issues"])
 
         if not issue_group["majors"]:
             return result
@@ -960,7 +976,7 @@ def _generate_section_with_retry(
             )
 
         override = _build_section_retry_instruction(
-            issue_group["majors"], issue_group["transition_issues"]
+            issue_group["majors"], issue_group["transition_issues"], issue_group["rhythm_issues"]
         )
         logger.info("Section %s retry %d — issues: %s", label, attempt, override)
 

@@ -50,8 +50,8 @@ from app.agents.agent2_discovery.system_prompt import (
 )
 
 assert_ok(
-    "imports and PROMPT_VERSION=4.0",
-    PROMPT_VERSION == "4.0",
+    "imports and PROMPT_VERSION=4.1",
+    PROMPT_VERSION == "4.1",
     f"got {PROMPT_VERSION!r}",
 )
 

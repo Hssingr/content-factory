@@ -33,8 +33,11 @@ def assert_ok(name: str, cond: bool, detail: str = "") -> None:
 
 import inspect
 
+from app.agents.agent3_audio.services import tts as tts_module
 from app.agents.agent3_audio.services.tts import prepare_script_for_tts, generate_audio
 from app.agents.agent3_audio.services.audio import run_audio_generation
+
+tts_module.call_claude = lambda _system_prompt, user_message, **_kwargs: user_message
 
 assert_ok("imports", True)
 
@@ -48,22 +51,21 @@ assert_ok(
 )
 
 # ── 3. Pause cap raised for Short episodes ────────────────────────────────────
-# Script has 8 reveal-trigger phrases. Long-form cap = 6 → 6 '...' max.
-# Short episode cap = 10 → all 8 triggers fire → 8 '...' markers.
-# Also: long-form adds 1 slow-open '...' for dramatic tone (total = 6, already at cap).
+# Script has 8 genuine reveal-beat phrases. Long-form cap = 6 -> 6 '...' max.
+# Short episode cap = 10 -> all 8 reveal beats fire -> 8 '...' markers.
+# Also: long-form adds 1 slow-open '...' for dramatic tone only if still under cap.
 # Short-form: no slow-open, 8 reveal '...' markers.
 
 _TRIGGER_SCRIPT = (
     "She disappeared without a trace. "
-    "That changed everything for the family. "
-    "Then the letter arrived at the police station. "
-    "But nobody believed it at first. "
+    "That recording revealed her name in the police file. "
+    "Then the missing letter arrived at the police station. "
+    "But the voice on the tape was mine. "
     "Until the detective opened the second envelope. "
     "What they found inside was beyond explanation. "
-    "The answer had been sitting there the entire time. "
-    "Then the final piece clicked into place. "
-    "The truth shocked everyone in the room. "
-    "It turned out the whole story had been a lie."
+    "The answer was hidden in the locked room. "
+    "Then I discovered the final photo in the drawer. "
+    "The truth was that she had never left the house."
 )
 
 normal_out = prepare_script_for_tts(_TRIGGER_SCRIPT, "en", "dramatic", is_short_episode=False)

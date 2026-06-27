@@ -13,6 +13,13 @@ class ChannelVoice(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     channel_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("channels.id", ondelete="CASCADE"), nullable=False)
     language: Mapped[str] = mapped_column(String(10), nullable=False)
+    # TTS provider for this language's voice ("cartesia" | "elevenlabs").
+    # The column-level default ("elevenlabs") is a legacy value never exercised
+    # in practice — Agent 1 (replace_voices()) always sets this explicitly per
+    # voice entry at channel-setup time. The project's actual runtime default,
+    # used whenever a row's provider is unset/falsy, is Cartesia
+    # (generate_audio(): `provider = ... or "cartesia"`) — see CLAUDE.md §2/§10.3.
+    # ElevenLabs remains supported only as a configured legacy/provider option.
     provider: Mapped[str] = mapped_column(String(32), nullable=False, default="elevenlabs")
     voice_id: Mapped[str] = mapped_column(String(128), nullable=False)
     emotion: Mapped[str] = mapped_column(String(64), nullable=True)
@@ -20,8 +27,12 @@ class ChannelVoice(Base):
     use_case: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     # TTS model — provider-specific model identifier.
-    # Cartesia (default): "sonic-2"  |  ElevenLabs (legacy): "eleven_v3" | "eleven_multilingual_v2"
+    # Cartesia (default): "sonic-2" | "sonic-3" | "sonic-3.5" (Phase 11.3 — sonic-3/3.5 use the
+    #   generation_config request shape; sonic-2 uses the legacy _experimental_voice_controls shape)
+    # ElevenLabs (legacy): "eleven_v3" | "eleven_multilingual_v2"
     tts_model: Mapped[str] = mapped_column(String(64), nullable=False, server_default="sonic-2")
+    # Optional Cartesia pronunciation dictionary id. Used only by Sonic 3+ request formatting.
+    cartesia_pronunciation_dict_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     # Per-voice overrides for ElevenLabs VoiceSettings (ignored when provider="cartesia").
     # When set, these take full precedence over the emotion preset defaults in tts.py.

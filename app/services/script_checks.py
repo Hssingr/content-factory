@@ -725,6 +725,94 @@ def check_section_transition(
     return []
 
 
+# Sentence-length bands for check_sentence_rhythm_variance — mirrors
+# TTS_BLOCK["sonic-2"]'s rhythm rule (short 3-7 word punchy sentences
+# alternating with longer 12-18 word buildup sentences). "long" uses the
+# existing 18-word TTS ceiling as its upper reference point, not a new constant.
+_RHYTHM_SHORT_MAX_WORDS  = 7    # <= 7 words: short
+_RHYTHM_MEDIUM_MAX_WORDS = 11   # 8-11 words: medium
+# >= 12 words: long
+
+# A run of this many or more consecutive sentences in the same length band
+# is flagged — matches the real defect found: 4 consecutive 12-18 word
+# sentences in one INTRO, with no short sentences anywhere in it.
+_RHYTHM_RUN_LENGTH = 3
+
+
+def _rhythm_band(word_count: int) -> str:
+    if word_count <= _RHYTHM_SHORT_MAX_WORDS:
+        return "short"
+    if word_count <= _RHYTHM_MEDIUM_MAX_WORDS:
+        return "medium"
+    return "long"
+
+
+def check_sentence_rhythm_variance(section_text: str, language: str = "source") -> list[dict]:
+    """Detect a run of 3+ consecutive sentences in the same length band (flat rhythm).
+
+    Pure Python — no I/O, no Claude calls. Deterministic backstop for
+    TTS_BLOCK["sonic-2"]'s rhythm rule (alternate short punchy sentences with
+    longer buildup sentences) for the cases where that prompt instruction is
+    not followed consistently within one section — an execution-consistency
+    gap, not a missing-instruction gap (the instruction already exists in
+    every script-producing prompt via TTS_BLOCK; this only catches it when
+    reinforcement isn't enough).
+
+    Bands: short (<=7 words), medium (8-11 words), long (>=12 words).
+
+    Always MINOR — advisory only, same as check_retention_structure() and
+    check_section_transition(). Never hard-blocks section acceptance on its
+    own; the caller folds a finding into the next retry's
+    override_instruction only when a MAJOR from another check has already
+    triggered that retry (see _build_section_retry_instruction()).
+
+    Args:
+        section_text: Narration text for one section (markers, if present,
+                      are stripped before splitting).
+        language:     BCP-47 code used to tag the issue.
+
+    Returns:
+        List with one MINOR Issue dict for the first same-band run of
+        length >= _RHYTHM_RUN_LENGTH found, else empty list — same
+        single-issue return shape as check_section_transition().
+    """
+    sentences = _split_sentences(_strip_markers(section_text))
+    if len(sentences) < _RHYTHM_RUN_LENGTH:
+        return []
+
+    bands = [_rhythm_band(len(s.split())) for s in sentences]
+
+    run_band = bands[0]
+    run_start = 0
+    for i in range(1, len(bands) + 1):
+        if i < len(bands) and bands[i] == run_band:
+            continue
+        run_length = i - run_start
+        if run_length >= _RHYTHM_RUN_LENGTH:
+            offending = " ".join(sentences[run_start:i])
+            return [{
+                "language":      language,
+                "severity":      "MINOR",
+                "category":      "sentence_rhythm_variance",
+                "description": (
+                    f"{run_length} consecutive sentences are all '{run_band}' length "
+                    f"— flat narration rhythm, no short/long alternation"
+                ),
+                "suggestion": (
+                    "Break up this run by rewriting one sentence as a short (3-7 word) "
+                    "punchy sentence or a longer (12-18 word) buildup sentence, matching "
+                    "the TTS rhythm rule (alternate short and long, never 3+ in a row "
+                    "the same length)."
+                ),
+                "offending_text": offending[:150],
+            }]
+        if i < len(bands):
+            run_band = bands[i]
+            run_start = i
+
+    return []
+
+
 def detect_generic_documentary_phrases(voice_script: str) -> list[dict]:
     """Scan an assembled voice_script for banned generic AI-documentary phrases.
 

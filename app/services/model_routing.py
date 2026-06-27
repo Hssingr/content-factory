@@ -42,6 +42,7 @@ MODEL_ROUTING: dict[str, str] = {
     "global_validation":       HAIKU,   # Narrative coherence check after assembly
     "shorts_planner":          HAIKU,   # Standalone short planning: structural planning for Short episodes
     "short_storyboard_remap":  HAIKU,   # Child short visual remap: remap parent beats to Short narration timing
+    "pause_marker_review":     HAIKU,   # Agent 3 TTS pause-marker placement review; Python validates word sequence
 }
 
 
