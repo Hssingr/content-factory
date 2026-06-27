@@ -9,6 +9,7 @@ from app.models import Channel, ChannelConfig, ChannelLanguage, ChannelVoice, Co
 from app.services.script_estimator import estimate_duration_sec
 from app.agents.agent2_discovery.system_prompt import (
     assess_script_quality,
+    assess_short_script_quality,
     auto_correct_script,
     generate_native_script,
     rewrite_script_for_quality,
@@ -24,11 +25,13 @@ from app.services.script_checks import (
     check_tts_compliance,
     check_completeness,
     check_minimum_length,
+    check_length_coherence,
     check_section_transition,
     check_sentence_rhythm_variance,
     split_long_sentences,
     normalize_tts_chars,
     detect_generic_documentary_phrases,
+    _SECTION_NUM_RE,
 )
 
 logger = logging.getLogger(__name__)
@@ -452,6 +455,13 @@ def generate_multilingual_scripts(
     )
     script_format = config.script_format if config else "youtube_long"
 
+    # content_kind drives native-prompt selection (Phase 12.4) — child Standalone
+    # Short episodes always use the dedicated flat-narration native prompt,
+    # regardless of the channel-wide script_format value (which only ever varies
+    # per channel, not per content row, and historically defaulted every child
+    # Short to the long-form/sectioned native base — see CLAUDE.md §9.3).
+    content_kind = "child_short" if content.is_short_episode else "parent_long_form"
+
     # ── Build voice map: language → ChannelVoice (for tts_model + provider) ──
     voice_map: dict[str, ChannelVoice] = {
         v.language: v
@@ -503,23 +513,46 @@ def generate_multilingual_scripts(
                 lang, channel.id,
             )
 
-        logger.info("Generating %s script for content %s…", lang, content.id)
+        logger.info(
+            "Generating %s script for content %s (content_kind=%s)…",
+            lang, content.id, content_kind,
+        )
         try:
-            adapted = generate_native_script(
-                voice_script=source_script.voice_script,
-                target_language=lang,
-                niche=channel.niche,
-                tone=channel.tone,
-                script_format=script_format,
-                audio_tags_enabled=audio_tags_enabled,
-                tts_model=lang_model,
-                tts_provider=lang_provider,
-                hook_context=hook_context,
-            )
+            if content_kind == "child_short":
+                adapted = _generate_validated_translated_short_script(
+                    source_voice_script=source_script.voice_script,
+                    target_language=lang,
+                    channel=channel,
+                    script_format=script_format,
+                    audio_tags_enabled=audio_tags_enabled,
+                    tts_model=lang_model,
+                    tts_provider=lang_provider,
+                    hook_context=hook_context,
+                    content_id=content.id,
+                )
+                if adapted is None:
+                    raise ValueError("child Short translation failed after retries")
+            else:
+                # Phase 13.4: parent long-form translations now go through the same
+                # deterministic-validation-with-retry pattern Phase 12.4 already
+                # established for child Shorts, instead of being persisted unchecked.
+                adapted = _generate_validated_translated_parent_script(
+                    source_voice_script=source_script.voice_script,
+                    target_language=lang,
+                    channel=channel,
+                    script_format=script_format,
+                    audio_tags_enabled=audio_tags_enabled,
+                    tts_model=lang_model,
+                    tts_provider=lang_provider,
+                    hook_context=hook_context,
+                    content_id=content.id,
+                )
+                if adapted is None:
+                    raise ValueError("parent translation failed after retries")
         except Exception as exc:
             logger.error(
-                "Native script generation failed (lang=%s, content=%s): %s",
-                lang, content.id, exc,
+                "Native script generation failed (lang=%s, content=%s, content_kind=%s): %s",
+                lang, content.id, content_kind, exc,
             )
             continue
 
@@ -557,7 +590,205 @@ def generate_multilingual_scripts(
         "Multilingual scripts validated for content %s — %d language(s): %s",
         content.id, len(result), languages,
     )
+
+    # Cross-language length-coherence diagnostic (Phase 13.4) — observability only,
+    # never blocking and never retried. check_length_coherence() requires every
+    # language to already exist (its own docstring: "must only be called after ALL
+    # language scripts ... are fully assembled"), so unlike the per-language checks
+    # above it cannot run during a single language's generation/retry loop. An
+    # outlier here does not necessarily mean any one language is wrong — fixing it
+    # could require touching an already-accepted sibling language, which is out of
+    # scope for this content row's generation pass. Logged so a real drift is
+    # visible, not silently dropped.
+    coherence_issues = check_length_coherence(
+        {s.language: {"voice_script": s.voice_script} for s in result}
+    )
+    if coherence_issues:
+        logger.warning(
+            "MULTILINGUAL_LENGTH_COHERENCE_FAIL content=%s outliers=%s",
+            content.id,
+            [(i["language"], i["description"]) for i in coherence_issues],
+        )
+    else:
+        logger.info(
+            "MULTILINGUAL_LENGTH_COHERENCE_PASS content=%s languages=%d",
+            content.id, len(result),
+        )
     return result
+
+
+# ── Parent translated-script validation (Phase 13.4) ─────────────────────────
+# Closes the multilingual validation gap for parent long-form translations:
+# generate_multilingual_scripts() previously persisted a parent translation's
+# voice_script directly as validated=True with zero deterministic check — the
+# same defect class Phase 12.4 already fixed for child Shorts, but never
+# closed for the parent path (confirmed by direct code reading, not assumed:
+# the parent branch called generate_native_script() and persisted its result
+# with no validation call of any kind in between).
+#
+# Reuses check_completeness() and check_tts_compliance() exactly as
+# run_deterministic_checks() already does for the source-language script
+# (app/services/script_checks.py) — no structural-check logic is duplicated
+# here. Only two new source-comparison checks are added below, since those
+# require the source script as a second input that no existing per-language
+# check function takes.
+
+_MAX_PARENT_TRANSLATION_CORRECTION_ROUNDS = 2
+
+# Reasonable word-count parity allowance vs. the source long-form script.
+# _BASE_YOUTUBE_LONG_FORM_NATIVE's own prompt text already asks for "the same
+# order of magnitude as source" — generous enough for normal cross-language
+# expansion/contraction (e.g. German routinely runs longer than English for
+# the same content), tight enough to catch a translation that silently
+# truncated or padded the script.
+_PARENT_TRANSLATION_LENGTH_RATIO_MIN = 0.6
+_PARENT_TRANSLATION_LENGTH_RATIO_MAX = 1.6
+
+
+def _collect_translated_parent_script_issues(
+    voice_script: str,
+    language: str,
+    source_voice_script: str,
+) -> list[dict]:
+    """Validate a translated/adapted parent long-form script (Phase 13.4).
+
+    Reuses ``check_completeness()`` (section markers present, consecutive
+    numbering — catches missing/duplicated/malformed [INTRO]/[SECTION N]/
+    [OUTRO] headers) and ``check_tts_compliance()``, exactly as
+    ``run_deterministic_checks()`` already runs for the source-language
+    script. Adds two source-comparison checks no existing function covers:
+
+    - section-count parity: the translation must have the same number of
+      [SECTION N] markers as the source — catches a section silently
+      dropped and the remainder renumbered consecutively, which would
+      otherwise still pass ``check_completeness()``'s internal-only
+      consecutive-numbering check.
+    - word-count parity vs. the source script specifically — distinct from
+      ``check_length_coherence()``'s cross-language median (which requires
+      every language to already exist); this check runs immediately,
+      per-language, during generation, before any other language exists.
+
+    Returns:
+        List of MAJOR issue dicts. Empty list means the translation is valid.
+    """
+    issues: list[dict] = list(check_completeness(voice_script, language))
+    issues.extend(
+        i for i in check_tts_compliance(voice_script, language) if i["severity"] == "MAJOR"
+    )
+
+    source_sections = len(_SECTION_NUM_RE.findall(source_voice_script))
+    translated_sections = len(_SECTION_NUM_RE.findall(voice_script))
+    if source_sections and translated_sections != source_sections:
+        issues.append({
+            "language": language, "severity": "MAJOR", "category": "section_loss",
+            "description": (
+                f"Translated voice_script has {translated_sections} [SECTION N] "
+                f"marker(s) — source has {source_sections}. A section was lost, "
+                f"merged, or duplicated during translation."
+            ),
+            "suggestion": (
+                f"Produce exactly {source_sections} [SECTION N] sections, numbered "
+                f"1 through {source_sections} with no gaps and no duplicates, "
+                f"matching the source script's structure."
+            ),
+        })
+
+    source_wc = len(source_voice_script.split())
+    translated_wc = len(voice_script.split())
+    if source_wc:
+        ratio = translated_wc / source_wc
+        if ratio < _PARENT_TRANSLATION_LENGTH_RATIO_MIN or ratio > _PARENT_TRANSLATION_LENGTH_RATIO_MAX:
+            issues.append({
+                "language": language, "severity": "MAJOR", "category": "length_parity",
+                "description": (
+                    f"Translated voice_script is {translated_wc} words vs. {source_wc} "
+                    f"words in the source language — ratio {ratio:.2f}x is outside the "
+                    f"{_PARENT_TRANSLATION_LENGTH_RATIO_MIN}x-{_PARENT_TRANSLATION_LENGTH_RATIO_MAX}x "
+                    f"allowed parity range."
+                ),
+                "suggestion": "Match the source script's approximate length and detail level.",
+            })
+
+    return [i for i in issues if i.get("severity") == "MAJOR"]
+
+
+def _generate_validated_translated_parent_script(
+    source_voice_script: str,
+    target_language: str,
+    channel: Channel,
+    script_format: str,
+    audio_tags_enabled: bool,
+    tts_model: str,
+    tts_provider: str,
+    hook_context: str | None,
+    content_id: uuid.UUID,
+) -> dict | None:
+    """Generate and validate one translated/adapted parent long-form script (Phase 13.4).
+
+    Mirrors ``_generate_validated_translated_short_script()``'s (Phase 12.4)
+    retry-on-MAJOR-issue loop — same structure, but its own separate retry
+    budget (``_MAX_PARENT_TRANSLATION_CORRECTION_ROUNDS``), so neither phase's
+    retry budget or behavior is shared with or changed by the other.
+
+    Returns:
+        Dict with key ``voice_script``, or ``None`` if ``generate_native_script()``
+        itself raised (as opposed to merely failing validation).
+    """
+    override_instruction = ""
+    adapted: dict | None = None
+
+    for correction_round in range(1, _MAX_PARENT_TRANSLATION_CORRECTION_ROUNDS + 2):
+        try:
+            adapted = generate_native_script(
+                voice_script=source_voice_script,
+                target_language=target_language,
+                niche=channel.niche,
+                tone=channel.tone,
+                script_format=script_format,
+                audio_tags_enabled=audio_tags_enabled,
+                tts_model=tts_model,
+                tts_provider=tts_provider,
+                hook_context=hook_context,
+                content_kind="parent_long_form",
+                override_instruction=override_instruction,
+            )
+        except Exception as exc:
+            logger.error(
+                "PARENT_TRANSLATION_VALIDATION_FAIL content=%s lang=%s round=%d "
+                "reason=generation_error error=%s",
+                content_id, target_language, correction_round, exc,
+            )
+            return None
+
+        issues = _collect_translated_parent_script_issues(
+            adapted["voice_script"], target_language, source_voice_script,
+        )
+        if not issues:
+            logger.info(
+                "PARENT_TRANSLATION_VALIDATION_PASS content=%s lang=%s round=%d",
+                content_id, target_language, correction_round,
+            )
+            return adapted
+
+        if correction_round > _MAX_PARENT_TRANSLATION_CORRECTION_ROUNDS:
+            logger.warning(
+                "PARENT_TRANSLATION_VALIDATION_FAIL content=%s lang=%s round=%d "
+                "status=FAIL_USING_LATEST remaining_issues=%s",
+                content_id, target_language, correction_round,
+                [i["category"] for i in issues],
+            )
+            return adapted
+
+        logger.info(
+            "PARENT_TRANSLATION_VALIDATION_RETRY content=%s lang=%s round=%d issues=%s",
+            content_id, target_language, correction_round, [i["category"] for i in issues],
+        )
+        override_instruction = (
+            "Fix these issues from the previous attempt: "
+            + "; ".join(i["description"] for i in issues[:3])
+        )
+
+    return adapted
 
 
 def _required_script_languages(
@@ -1888,6 +2119,162 @@ def generate_script_sections(
 _MAX_SHORT_CORRECTION_ROUNDS = 2
 _MAX_SHORT_WORDS = 250  # 83 s at Cartesia sonic-2 ~3 words/s
 
+# Section markers must never appear in a child Short's narration — flat narration only
+# (CLAUDE.md §5.2). Catches [INTRO], [SECTION N], [OUTRO], or any other bracketed label
+# either source-language generation or native adaptation might otherwise reintroduce.
+# Shared by _collect_short_script_major_issues() (source-language, Phase 13.2) and
+# _collect_translated_short_script_issues() (translated/adapted, Phase 12.4).
+_SHORT_TRANSLATION_MARKER_RE = re.compile(r"\[[A-Z][A-Z0-9 ]*\]")
+
+# ── Parent/child word-sequence overlap detector (Phase 13.3) ────────────────────
+# Real production data showed some generated Shorts reused 21-24% of exact word
+# sequences from the parent long-form script despite _SHORT_EPISODE_SYSTEM_PROMPT's
+# existing ORIGINALITY rule ("never lift a run of 6 or more consecutive words
+# directly from it") — prompt-only guidance was insufficient. This is the
+# deterministic Python-side enforcement of that same rule (CLAUDE.md §15:
+# "Business rules live in Python. Prompts generate; code decides.").
+
+# Consecutive-word window size for exact-match detection. Matches
+# _SHORT_EPISODE_SYSTEM_PROMPT's own ORIGINALITY rule's threshold exactly, so the
+# deterministic check enforces precisely what the prompt already asks for.
+_OVERLAP_NGRAM_LENGTH = 6
+
+# Fraction of the child Short's own word count that may be covered by exact
+# parent n-gram matches before this is treated as a MAJOR issue. Set well below
+# the 21-24% range the real-world defect this detector targets actually produced,
+# and well above the overlap a few shared names/places/common short phrases would
+# ever produce on their own (an isolated shared name is 1-2 words — far short of
+# a full 6-word verbatim run, and would not register as a span at all).
+_OVERLAP_MAX_RATIO = 0.15
+
+# How many concrete overlapping excerpts to surface in logs and correction
+# instructions — enough to be actionable, short enough to keep the
+# override_instruction concise (mirrors the existing `issues_for_retry[:3]` cap).
+_OVERLAP_MAX_EXCERPTS = 3
+
+_OVERLAP_WORD_TOKEN_RE = re.compile(r"[a-z0-9']+")
+
+
+def _normalize_overlap_tokens(text: str) -> list[str]:
+    """Lowercase, punctuation-stripped word tokens for overlap comparison."""
+    return _OVERLAP_WORD_TOKEN_RE.findall(text.lower())
+
+
+def _find_overlap_spans(
+    child_tokens: list[str],
+    parent_ngrams: set[tuple[str, ...]],
+    ngram_length: int = _OVERLAP_NGRAM_LENGTH,
+) -> list[tuple[int, int]]:
+    """Return merged (start, end) token-index spans (end exclusive) of every
+    position in ``child_tokens`` that participates in an exact n-gram match
+    against ``parent_ngrams``. Overlapping/adjacent matching windows are merged
+    into a single longer span, so a 12-word verbatim run produces one span of
+    length 12, not seven overlapping 6-word spans.
+    """
+    n = len(child_tokens)
+    overlap_mask = [False] * n
+    for i in range(n - ngram_length + 1):
+        if tuple(child_tokens[i:i + ngram_length]) in parent_ngrams:
+            for j in range(i, i + ngram_length):
+                overlap_mask[j] = True
+
+    spans: list[tuple[int, int]] = []
+    start: int | None = None
+    for i, flagged in enumerate(overlap_mask + [False]):
+        if flagged and start is None:
+            start = i
+        elif not flagged and start is not None:
+            spans.append((start, i))
+            start = None
+    return spans
+
+
+def detect_parent_child_overlap(
+    child_voice_script: str,
+    parent_voice_script: str | None,
+    part_n: int,
+    correction_round: int,
+) -> dict | None:
+    """Deterministic exact word-sequence overlap check (Phase 13.3).
+
+    Compares a child Short's narration against its parent long-form
+    ``voice_script`` using normalized (lowercased, punctuation-stripped) word
+    tokens and ``_OVERLAP_NGRAM_LENGTH``-word sliding windows — case and
+    punctuation differences never affect the result, and only genuine
+    consecutive-word reuse counts (a handful of shared names/places scattered
+    through different sentences will not form a 6-word verbatim run and will
+    not be flagged).
+
+    Args:
+        child_voice_script:  The generated Short's flat narration text.
+        parent_voice_script: The parent long-form ``voice_script``, or falsy/
+                             ``None`` if unavailable.
+        part_n:              Short part number, for logging.
+        correction_round:    Current correction attempt, for logging.
+
+    Returns:
+        ``None`` if ``parent_voice_script`` is missing/empty — the check is
+        skipped entirely rather than crashing or treating "no parent text" as
+        either a pass or a fail. Otherwise a dict with ``overlap_ratio``
+        (float 0-1), ``spans`` (token-index tuples), ``excerpts`` (readable
+        strings, capped at ``_OVERLAP_MAX_EXCERPTS``), and ``issues`` (empty
+        list if within the normal-reuse allowance, else one MAJOR issue dict
+        in the same shape every other Short validator already uses).
+    """
+    if not parent_voice_script or not parent_voice_script.strip():
+        logger.info(
+            "PARENT_CHILD_OVERLAP_SKIPPED part=%d round=%d reason=parent_script_unavailable",
+            part_n, correction_round,
+        )
+        return None
+
+    child_tokens = _normalize_overlap_tokens(child_voice_script)
+    parent_tokens = _normalize_overlap_tokens(parent_voice_script)
+
+    if len(child_tokens) < _OVERLAP_NGRAM_LENGTH or len(parent_tokens) < _OVERLAP_NGRAM_LENGTH:
+        logger.info(
+            "PARENT_CHILD_OVERLAP_PASS part=%d round=%d ratio=0.0%% reason=too_short_to_compare",
+            part_n, correction_round,
+        )
+        return {"overlap_ratio": 0.0, "spans": [], "excerpts": [], "issues": []}
+
+    parent_ngrams = {
+        tuple(parent_tokens[i:i + _OVERLAP_NGRAM_LENGTH])
+        for i in range(len(parent_tokens) - _OVERLAP_NGRAM_LENGTH + 1)
+    }
+    spans = _find_overlap_spans(child_tokens, parent_ngrams)
+    overlapping_word_count = sum(end - start for start, end in spans)
+    overlap_ratio = overlapping_word_count / len(child_tokens)
+    excerpts = [
+        " ".join(child_tokens[start:end])
+        for start, end in spans[:_OVERLAP_MAX_EXCERPTS]
+    ]
+
+    if overlap_ratio < _OVERLAP_MAX_RATIO:
+        logger.info(
+            "PARENT_CHILD_OVERLAP_PASS part=%d round=%d ratio=%.1f%% spans=%d",
+            part_n, correction_round, overlap_ratio * 100, len(spans),
+        )
+        return {"overlap_ratio": overlap_ratio, "spans": spans, "excerpts": excerpts, "issues": []}
+
+    excerpt_text = "; ".join(f'"{e}"' for e in excerpts)
+    issue = {
+        "severity": "MAJOR",
+        "category": "parent_child_overlap",
+        "description": (
+            f"voice_script reuses {overlap_ratio:.0%} of its word sequences verbatim "
+            f"from the parent long-form script (allowed up to {_OVERLAP_MAX_RATIO:.0%}), "
+            f"across {len(spans)} span(s) of {_OVERLAP_NGRAM_LENGTH}+ consecutive words. "
+            f"Overlapping excerpts — rewrite these in your own words, do not just "
+            f"rephrase: {excerpt_text}."
+        ),
+    }
+    logger.warning(
+        "PARENT_CHILD_OVERLAP_FAIL part=%d round=%d ratio=%.1f%% spans=%d excerpts=%s",
+        part_n, correction_round, overlap_ratio * 100, len(spans), excerpts,
+    )
+    return {"overlap_ratio": overlap_ratio, "spans": spans, "excerpts": excerpts, "issues": [issue]}
+
 
 def run_shorts_planner(
     long_content_id: "uuid.UUID",
@@ -2102,8 +2489,29 @@ def _generate_validated_short_script(
     channel_voice: ChannelVoice | None,
     source_language: str,
 ) -> dict | None:
+    """Generate one child Short script, structurally and AI-quality validated.
+
+    Three gates run in order, within the same ``_MAX_SHORT_CORRECTION_ROUNDS``
+    retry budget (Phase 13.2/13.3 — no new/expanded retry counter):
+
+    1. Deterministic structural checks (``_collect_short_script_major_issues``)
+       — word cap, TTS compliance, hook opener, no section markers.
+    2. Deterministic parent/child overlap check (``detect_parent_child_overlap``,
+       Phase 13.3) — exact word-sequence reuse from the parent long-form script.
+    3. The AI Short Quality Gate (``_run_short_quality_gate``, Phase 13.2) —
+       holistic retention review.
+
+    Each gate only runs once every earlier gate has passed for that attempt —
+    the AI quality gate in particular is never charged a Claude call for a
+    draft that's already going to be regenerated for a structural or overlap
+    reason. Whichever gate produced issues most recently feeds the same
+    override_instruction mechanism for the next attempt.
+    """
     generated: dict | None = None
-    tts_majors: list[dict] = []
+    issues_for_retry: list[dict] = []
+    total_parts = part_plan.get("_total_parts")
+    is_final_part = total_parts is not None and part_n == total_parts
+
     for correction_round in range(1, _MAX_SHORT_CORRECTION_ROUNDS + 2):
         try:
             result = generate_short_episode_script(
@@ -2114,7 +2522,7 @@ def _generate_validated_short_script(
                 channel_voice=channel_voice,
                 override_instruction="" if correction_round == 1 else (
                     f"Fix these issues from the previous attempt: "
-                    f"{'; '.join(i['description'] for i in tts_majors[:3])}"
+                    f"{'; '.join(i['description'] for i in issues_for_retry[:3])}"
                 ),
             )
         except Exception as exc:
@@ -2133,14 +2541,73 @@ def _generate_validated_short_script(
             part_n=part_n,
             correction_round=correction_round,
         )
-        if not tts_majors:
+        if tts_majors:
+            issues_for_retry = tts_majors
+            if correction_round > _MAX_SHORT_CORRECTION_ROUNDS:
+                logger.warning(
+                    "run_shorts_planner: part %d still has structural MAJOR issues "
+                    "after %d round(s) — using latest version",
+                    part_n,
+                    _MAX_SHORT_CORRECTION_ROUNDS,
+                )
+                generated = result
+                break
+            logger.info(
+                "run_shorts_planner: part %d retry %d — %d structural MAJOR issue(s): %s",
+                part_n,
+                correction_round,
+                len(tts_majors),
+                [i["category"] for i in tts_majors],
+            )
+            continue
+
+        # Structural checks passed — run the parent/child overlap detector (Phase 13.3)
+        # before the AI Short Quality Gate, so an overlap-rejected draft never spends
+        # an AI quality call.
+        overlap_result = detect_parent_child_overlap(
+            child_voice_script=ep_voice_script,
+            parent_voice_script=voice_script,
+            part_n=part_n,
+            correction_round=correction_round,
+        )
+        overlap_issues = overlap_result["issues"] if overlap_result is not None else []
+        if overlap_issues:
+            issues_for_retry = overlap_issues
+            if correction_round > _MAX_SHORT_CORRECTION_ROUNDS:
+                logger.warning(
+                    "run_shorts_planner: part %d still has parent/child overlap "
+                    "(ratio=%.1f%%) after %d round(s) — using latest version",
+                    part_n,
+                    overlap_result["overlap_ratio"] * 100,
+                    _MAX_SHORT_CORRECTION_ROUNDS,
+                )
+                generated = result
+                break
+            logger.info(
+                "run_shorts_planner: part %d retry %d — parent/child overlap ratio=%.1f%%",
+                part_n,
+                correction_round,
+                overlap_result["overlap_ratio"] * 100,
+            )
+            continue
+
+        # Structural + overlap checks passed — run the AI Short Quality Gate (Phase 13.2).
+        quality_issues = _run_short_quality_gate(
+            ep_voice_script=ep_voice_script,
+            channel=channel,
+            part_n=part_n,
+            correction_round=correction_round,
+            is_final_part=is_final_part,
+        )
+        if not quality_issues:
             generated = result
             break
 
+        issues_for_retry = quality_issues
         if correction_round > _MAX_SHORT_CORRECTION_ROUNDS:
             logger.warning(
-                "run_shorts_planner: part %d still has MAJOR issues after %d round(s) — "
-                "using latest version",
+                "run_shorts_planner: part %d still has AI quality issues after %d "
+                "round(s) — using latest version",
                 part_n,
                 _MAX_SHORT_CORRECTION_ROUNDS,
             )
@@ -2148,13 +2615,58 @@ def _generate_validated_short_script(
             break
 
         logger.info(
-            "run_shorts_planner: part %d retry %d — %d MAJOR issue(s): %s",
+            "run_shorts_planner: part %d retry %d — %d AI quality issue(s): %s",
             part_n,
             correction_round,
-            len(tts_majors),
-            [i["category"] for i in tts_majors],
+            len(quality_issues),
+            [i["category"] for i in quality_issues],
         )
     return generated
+
+
+def _run_short_quality_gate(
+    ep_voice_script: str,
+    channel: Channel,
+    part_n: int,
+    correction_round: int,
+    is_final_part: bool,
+) -> list[dict]:
+    """Run the AI Short Quality Gate on one structurally-valid Short draft (Phase 13.2).
+
+    Mirrors ``run_script_quality_gate()``'s fail-safe convention: if the assessment
+    call itself fails (bad JSON, API error, unexpected status), log it clearly and
+    treat the draft as accepted — rewriting based on a failed assessment would be
+    meaningless, and a flaky assessor must never block or loop the pipeline.
+
+    Returns:
+        List of issue dicts if the gate returned NEEDS_REWRITE (non-empty means
+        "retry needed"). Empty list means PASSED, or the assessment call failed
+        and the draft is accepted as-is.
+    """
+    try:
+        review = assess_short_script_quality(ep_voice_script, channel, is_final_part=is_final_part)
+    except Exception as exc:
+        logger.error(
+            "SHORT_AI_QUALITY_VALIDATION_FAIL part=%d round=%d reason=assessment_error error=%s "
+            "— accepting structurally-valid draft as-is",
+            part_n, correction_round, exc,
+        )
+        return []
+
+    issues: list[dict] = review.get("issues", [])
+    if review.get("status") == "PASSED" and not issues:
+        logger.info(
+            "SHORT_AI_QUALITY_VALIDATION_PASS part=%d round=%d",
+            part_n, correction_round,
+        )
+        return []
+
+    logger.info(
+        "SHORT_AI_QUALITY_VALIDATION_FAIL part=%d round=%d status=%s issues=%d categories=%s",
+        part_n, correction_round, review.get("status"), len(issues),
+        [i.get("category") for i in issues],
+    )
+    return issues
 
 
 def _collect_short_script_major_issues(
@@ -2173,6 +2685,31 @@ def _collect_short_script_major_issues(
         issue for issue in tts_issues + hook_issues
         if issue["severity"] == "MAJOR"
     ]
+
+    # Section markers must never appear in source-language Short narration either —
+    # flat narration only (CLAUDE.md §5.2). Reuses the same generic bracket-marker
+    # regex the Phase 12.4 translation path already validates against
+    # (_SHORT_TRANSLATION_MARKER_RE, defined above) — this is a new call site, not
+    # a change to that function or constant. Phase 13.2: this structural check did
+    # not previously exist for freshly-generated source-language Short scripts
+    # (only for translated/adapted ones), so a stray marker was never caught before
+    # reaching the AI quality gate. Checked deterministically, before any AI call,
+    # consistent with §15 "business rules live in Python."
+    marker_match = _SHORT_TRANSLATION_MARKER_RE.search(ep_voice_script)
+    if marker_match:
+        tts_majors.append({
+            "severity": "MAJOR",
+            "category": "section_markers_in_short_script",
+            "description": (
+                f"voice_script contains a bracketed structural marker "
+                f"({marker_match.group(0)!r}) — child Short scripts are flat "
+                f"narration, never [INTRO]/[SECTION N]/[OUTRO] structured (CLAUDE.md §5.2)."
+            ),
+        })
+        logger.warning(
+            "run_shorts_planner: part %d attempt %d contains section marker %r — will retry",
+            part_n, correction_round, marker_match.group(0),
+        )
 
     ep_wc = len(ep_voice_script.split())
     if ep_wc > _MAX_SHORT_WORDS:
@@ -2193,6 +2730,151 @@ def _collect_short_script_major_issues(
             _MAX_SHORT_WORDS,
         )
     return tts_majors
+
+
+# Generous cross-language expansion allowance for translated/adapted child Short
+# narration — some target languages are naturally wordier than the source. Anything
+# beyond this ratio (on top of the absolute _MAX_SHORT_WORDS cap below) indicates the
+# adaptation drifted toward long-form structure rather than staying a flat, short
+# translation of the source narration.
+_TRANSLATED_SHORT_LENGTH_RATIO_MAX = 1.6
+
+
+def _collect_translated_short_script_issues(
+    voice_script: str,
+    language: str,
+    source_word_count: int,
+) -> list[dict]:
+    """Validate a translated/adapted child Short script (Phase 12.4).
+
+    Mirrors ``_collect_short_script_major_issues()``'s TTS-compliance and word-cap
+    checks, plus two checks specific to native adaptation of a Short: section
+    markers must never be introduced by translation, and translated length must
+    stay within the same order of magnitude as the validated source-language Short.
+
+    Returns:
+        List of MAJOR issue dicts. Empty list means the translated script is valid.
+    """
+    issues: list[dict] = []
+
+    marker_match = _SHORT_TRANSLATION_MARKER_RE.search(voice_script)
+    if marker_match:
+        issues.append({
+            "language": language, "severity": "MAJOR", "category": "section_markers_in_short_translation",
+            "description": (
+                f"Translated Short voice_script contains a bracketed structural marker "
+                f"({marker_match.group(0)!r}) — child Short scripts are flat narration, "
+                f"never [INTRO]/[SECTION N]/[OUTRO] structured (CLAUDE.md §5.2)."
+            ),
+            "suggestion": "Remove all bracketed markers; output a single flat narration block.",
+        })
+
+    tts_majors = [i for i in check_tts_compliance(voice_script, language) if i["severity"] == "MAJOR"]
+    issues.extend(tts_majors)
+
+    wc = len(voice_script.split())
+    if wc > _MAX_SHORT_WORDS:
+        issues.append({
+            "language": language, "severity": "MAJOR", "category": "translated_short_too_long",
+            "description": (
+                f"Translated voice_script is {wc} words — exceeds the {_MAX_SHORT_WORDS}-word "
+                f"hard cap shared with the source-language Short script."
+            ),
+            "suggestion": f"Cut {wc - _MAX_SHORT_WORDS} words by removing the least essential sentences.",
+        })
+    elif source_word_count and wc > source_word_count * _TRANSLATED_SHORT_LENGTH_RATIO_MAX:
+        issues.append({
+            "language": language, "severity": "MAJOR", "category": "translated_short_length_mismatch",
+            "description": (
+                f"Translated voice_script is {wc} words vs. {source_word_count} words in the "
+                f"source language — exceeds the {_TRANSLATED_SHORT_LENGTH_RATIO_MAX}x parity "
+                f"allowance. Adaptation must stay the same approximate length as the source, "
+                f"not expand toward long-form structure."
+            ),
+            "suggestion": "Match the source narration's length — do not pad or add material.",
+        })
+
+    return issues
+
+
+def _generate_validated_translated_short_script(
+    source_voice_script: str,
+    target_language: str,
+    channel: Channel,
+    script_format: str,
+    audio_tags_enabled: bool,
+    tts_model: str,
+    tts_provider: str,
+    hook_context: str | None,
+    content_id: uuid.UUID,
+) -> dict | None:
+    """Generate and validate one translated/adapted child Short script (Phase 12.4).
+
+    Mirrors ``_generate_validated_short_script()``'s retry-on-MAJOR-issue loop:
+    up to ``_MAX_SHORT_CORRECTION_ROUNDS`` retries with a corrective instruction
+    appended, then the latest attempt is used non-blocking (logged), matching this
+    codebase's existing short-script correction convention — never silently, always
+    logged either PASS or FAIL_USING_LATEST.
+
+    Returns:
+        Dict with key ``voice_script``, or ``None`` if generation itself raised
+        (as opposed to merely failing validation).
+    """
+    source_word_count = len(source_voice_script.split())
+    override_instruction = ""
+    adapted: dict | None = None
+
+    for correction_round in range(1, _MAX_SHORT_CORRECTION_ROUNDS + 2):
+        try:
+            adapted = generate_native_script(
+                voice_script=source_voice_script,
+                target_language=target_language,
+                niche=channel.niche,
+                tone=channel.tone,
+                script_format=script_format,
+                audio_tags_enabled=audio_tags_enabled,
+                tts_model=tts_model,
+                tts_provider=tts_provider,
+                hook_context=hook_context,
+                content_kind="child_short",
+                override_instruction=override_instruction,
+            )
+        except Exception as exc:
+            logger.error(
+                "CHILD_SHORT_TRANSLATION_FAILED content=%s lang=%s round=%d: %s",
+                content_id, target_language, correction_round, exc,
+            )
+            return None
+
+        issues = _collect_translated_short_script_issues(
+            adapted["voice_script"], target_language, source_word_count,
+        )
+        if not issues:
+            logger.info(
+                "CHILD_SHORT_TRANSLATION_VALIDATED content=%s lang=%s round=%d status=PASS",
+                content_id, target_language, correction_round,
+            )
+            return adapted
+
+        if correction_round > _MAX_SHORT_CORRECTION_ROUNDS:
+            logger.warning(
+                "CHILD_SHORT_TRANSLATION_VALIDATED content=%s lang=%s round=%d "
+                "status=FAIL_USING_LATEST remaining_issues=%s",
+                content_id, target_language, correction_round,
+                [i["category"] for i in issues],
+            )
+            return adapted
+
+        logger.info(
+            "CHILD_SHORT_TRANSLATION_RETRY content=%s lang=%s round=%d issues=%s",
+            content_id, target_language, correction_round, [i["category"] for i in issues],
+        )
+        override_instruction = (
+            "Fix these issues from the previous attempt: "
+            + "; ".join(i["description"] for i in issues[:3])
+        )
+
+    return adapted
 
 
 def _remove_failed_short_content(short_content: Content, part_n: int, db: Session) -> None:

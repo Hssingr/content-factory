@@ -141,10 +141,10 @@ Rules:
 2. Never invent timezone strings — use only valid IANA identifiers (e.g. "Europe/Paris").
 3. `optimal_days` must be a JSON array of lowercase weekday names
    (e.g. ["friday", "saturday"]). Length must equal videos_per_week.
-3. `optimal_hour_start` and `optimal_hour_end` are integers 0–23 in the LOCAL timezone.
-4. `timezone` must be a valid IANA timezone string matching the language audience
+4. `optimal_hour_start` and `optimal_hour_end` are integers 0–23 in the LOCAL timezone.
+5. `timezone` must be a valid IANA timezone string matching the language audience
    (e.g. "Europe/Paris" for French, "America/New_York" for English US).
-5. `shorts_spread_hours` is the delay between the main video and Shorts uploads (default 6).
+6. `shorts_spread_hours` is the delay between the main video and Shorts uploads (default 6).
 
 Output format:
 {"timezone":"...","optimal_days":[...],"optimal_hour_start":18,"optimal_hour_end":20,"shorts_spread_hours":6}\

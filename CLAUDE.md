@@ -914,6 +914,99 @@ Rules:
 - Must fail the script step rather than allowing `SCRIPTS_VALIDATED` when any
   required configured language is missing or unvalidated.
 
+Parent vs. child native-adaptation prompt selection (Phase 12.4):
+
+- `generate_multilingual_scripts()` derives `content_kind` directly from
+  `Content.is_short_episode` (`"parent_long_form"` or `"child_short"`) and
+  passes it to `generate_native_script()` → `build_native_system_prompt()`.
+  `content_kind` is the selector for which native-adaptation base prompt is
+  used — it is independent of `ChannelConfig.script_format`, which is a
+  channel-wide setting that does not vary per content row and must not be
+  used to distinguish parent vs. child content.
+- `content_kind="parent_long_form"` (default) preserves all pre-existing
+  behavior unchanged: `script_format == "youtube_long"` selects
+  `_BASE_YOUTUBE_LONG_FORM_NATIVE` (1200-1600 words, `[INTRO]`/`[SECTION N]`/
+  `[OUTRO]` markers preserved); any other `script_format` selects
+  `_BASE_SHORT_FORM_NATIVE` (420-700 words, sectioned short-form-platform
+  format — distinct from a standalone child Short, see below).
+- `content_kind="child_short"` always selects the dedicated
+  `_BASE_CHILD_SHORT_NATIVE` prompt, regardless of `script_format`. This
+  prompt requires flat, unsectioned narration; forbids `[INTRO]`,
+  `[SECTION N]`, `[OUTRO]`, or any bracketed structural marker; requires
+  matching the source Short's approximate length; and requires preserving
+  the source's cliffhanger/forward-tease intent and its minimum-necessary-context
+  framing (the same standalone-clarity rules `_SHORT_EPISODE_SYSTEM_PROMPT`
+  already enforces on the source-language Short, per §16/§9.4's
+  `generate_short_episode_script`).
+- Translated/adapted child Short scripts are validated by
+  `_collect_translated_short_script_issues()` (section-marker presence,
+  `check_tts_compliance()`, the shared `_MAX_SHORT_WORDS` hard cap, and a
+  length-parity ratio against the source word count) and generated through
+  `_generate_validated_translated_short_script()`, which retries up to
+  `_MAX_SHORT_CORRECTION_ROUNDS` times with a corrective
+  `override_instruction` on MAJOR findings — the same retry-and-log
+  convention `_generate_validated_short_script()` already uses for the
+  source-language Short script. On retry exhaustion the latest attempt is
+  used non-blocking (logged `FAIL_USING_LATEST`), never silently dropped.
+  This closes the gap where, before Phase 12.4, a translated child Short's
+  output was persisted as `validated=True` with no length or
+  section-marker check of any kind.
+- Fixes the Phase 12.3-identified defect: before this phase, every child
+  Short's multilingual adaptation used `_BASE_YOUTUBE_LONG_FORM_NATIVE` in
+  real operation (no code path ever set `ChannelConfig.script_format` to
+  anything but its `"youtube_long"` default), directly contradicting
+  `Content.is_short_episode`'s flat-narration contract in §5.2.
+
+Parent translated-script validation (Phase 13.4):
+
+- Phase 12.4 closed the multilingual validation gap for child Shorts only.
+  The parent branch of `generate_multilingual_scripts()` still called
+  `generate_native_script()` directly and persisted its result as
+  `validated=True` with **zero** deterministic check — confirmed by direct
+  code reading, not assumed. Phase 13.4 closes this remaining gap with
+  `_generate_validated_translated_parent_script()`, mirroring Phase 12.4's
+  retry-and-validate pattern exactly, with its own separate retry budget
+  (`_MAX_PARENT_TRANSLATION_CORRECTION_ROUNDS`, independent of
+  `_MAX_SHORT_CORRECTION_ROUNDS`).
+- `_collect_translated_parent_script_issues()` reuses `check_completeness()`
+  and `check_tts_compliance()` from `app/services/script_checks.py` exactly
+  as `run_deterministic_checks()` already runs them for the source-language
+  script — no structural-check logic is duplicated. `check_completeness()`
+  alone covers required-marker presence, consecutive `[SECTION N]`
+  numbering (catching most duplicated/malformed headers), non-empty section
+  bodies, and terminal punctuation.
+- Two source-comparison checks were added because no existing per-language
+  check function takes the source script as a second input:
+  - **`section_loss`** — the translation's `[SECTION N]` marker count must
+    equal the source's. This catches a section silently dropped and the
+    remainder renumbered consecutively, which `check_completeness()`'s
+    purely-internal numbering check cannot detect on its own.
+  - **`length_parity`** — translated word count must stay within
+    `_PARENT_TRANSLATION_LENGTH_RATIO_MIN`-`_PARENT_TRANSLATION_LENGTH_RATIO_MAX`
+    (0.6x-1.6x) of the source word count, checked immediately per-language
+    during generation (distinct from the cross-language check below, which
+    requires every language to already exist).
+- `check_length_coherence()` (`script_checks.py`) was previously dead code:
+  defined, with its own docstring claiming "the caller is
+  `run_deterministic_checks()` which is invoked from
+  `generate_multilingual_scripts()`," but never actually called from
+  anywhere — confirmed by a repo-wide grep returning zero call sites before
+  this phase. It is now wired into `generate_multilingual_scripts()`,
+  called once after every language's `Script` row is persisted, exactly per
+  its own documented placement constraint. It runs as an **observability-only
+  diagnostic** (`MULTILINGUAL_LENGTH_COHERENCE_PASS`/`_FAIL`, logged, never
+  retried) rather than a blocking gate — an outlier here may require
+  touching an already-accepted sibling language to fix, which is out of
+  scope for a single language's generation/retry pass.
+- Logs: `PARENT_TRANSLATION_VALIDATION_PASS`,
+  `PARENT_TRANSLATION_VALIDATION_RETRY`, `PARENT_TRANSLATION_VALIDATION_FAIL`
+  (both the `FAIL_USING_LATEST` exhaustion case and the
+  `reason=generation_error` case), `MULTILINGUAL_LENGTH_COHERENCE_PASS`/`_FAIL`.
+- Does not touch Phase 12.4's child Short translation path
+  (`_generate_validated_translated_short_script()`,
+  `_collect_translated_short_script_issues()`) or Phase 13.2/13.3's child
+  Short generation gates — confirmed unchanged.
+
 ### 9.4 Standalone Short Planning
 
 #### `run_shorts_planner`
@@ -955,6 +1048,81 @@ Rules:
 - If child short rows already exist, do not create duplicates.
 - Existing child rows in `SCRIPTS_VALIDATED` are picked up by normal Agent 3 audio pickup.
 - No child with MAJOR deterministic script issues may be marked ready.
+
+Short Quality Gate (Phase 13.2) and Parent/Child Overlap Detector (Phase 13.3):
+
+- `_generate_validated_short_script()` (`scripts.py`) runs three gates per
+  generation attempt, in order, sharing one `_MAX_SHORT_CORRECTION_ROUNDS`
+  retry budget — no separate or expanded retry counter exists for either
+  the overlap detector or the AI gate:
+  1. **Structural** (`_collect_short_script_major_issues()`): word cap, TTS
+     compliance, hook opener, and — as of Phase 13.2 — section-marker
+     presence (`_SHORT_TRANSLATION_MARKER_RE`, shared with the translated-Short
+     check below). A structural MAJOR retries immediately; neither later
+     gate is reached for that attempt.
+  2. **Parent/child overlap** (`detect_parent_child_overlap()`, Phase 13.3):
+     deterministic exact word-sequence reuse check between the child
+     Short's narration and the parent long-form `voice_script`. Real
+     production data showed some Shorts reused 21-24% of exact word
+     sequences from the parent despite `_SHORT_EPISODE_SYSTEM_PROMPT`'s
+     existing ORIGINALITY rule ("never lift a run of 6 or more consecutive
+     words directly from it") — this is that same rule's deterministic
+     Python-side enforcement (CLAUDE.md §15: business rules live in
+     Python). Compares normalized (lowercased, punctuation-stripped) word
+     tokens using `_OVERLAP_NGRAM_LENGTH`-word (6) sliding windows; any
+     child-token position covered by an exact-match window against the
+     parent is flagged, adjacent/overlapping matches are merged into one
+     span, and `overlap_ratio = (total flagged child words) / (total child
+     words)`. A ratio at or above `_OVERLAP_MAX_RATIO` (15% — comfortably
+     below the 21-24% real-defect range, comfortably above what a few
+     shared names/places could ever produce on their own) is one MAJOR
+     `parent_child_overlap` issue, with up to `_OVERLAP_MAX_EXCERPTS` (3)
+     concrete overlapping excerpts quoted directly in the issue description
+     fed into `override_instruction`. An overlap MAJOR retries immediately;
+     the AI quality gate is never reached for that attempt. If the parent
+     `voice_script` is missing/empty, the check is skipped entirely
+     (`PARENT_CHILD_OVERLAP_SKIPPED`, logged) — never crashes, never counts
+     as a pass or a fail. Applies only to source-language Short generation
+     against the parent long-form script — not to parent long-form
+     generation itself, and not to Phase 12.4's multilingual child-Short
+     translation/adaptation path (which compares a Short against its own
+     source-language version in a different language, an unrelated
+     comparison this detector does not apply to).
+  3. **AI quality** (`_run_short_quality_gate()` →
+     `assess_short_script_quality()`, `system_prompt.py`): a holistic,
+     Haiku-judged retention review for flat short-form narration — hook
+     strength in the first 1-2 sentences, clarity for a first-time viewer,
+     emotional pull/curiosity gap, exactly one clear main reveal,
+     cliffhanger intent preserved (skipped for the final part, which ends on
+     a comment-trigger question instead), no over-recapping, no generic
+     filler, TTS readability, and short-form retention pacing (re-hook every
+     7-10 seconds). Only reached once a draft is structurally clean AND has
+     passed the overlap detector — the same ordering `run_script_quality_gate()`
+     already uses for parent scripts (deterministic checks before the
+     holistic AI pass), extended one step further for Shorts.
+- The Short quality prompt (`_SHORT_QUALITY_SYSTEM_PROMPT`) explicitly
+  forbids requiring or suggesting `[INTRO]`/`[SECTION N]`/`[OUTRO]` markers
+  or a long-form word arc — it judges 160-250 word flat narration on its own
+  terms, not as a short documentary section.
+- On `NEEDS_REWRITE`, the AI gate's issues feed the same
+  `override_instruction` mechanism the structural retry loop already uses —
+  there is no separate rewrite-from-scratch call (unlike the parent gate's
+  `rewrite_script_for_quality()`); the next attempt simply regenerates via
+  `generate_short_episode_script()` with the issues appended.
+- If the AI assessment call itself fails (malformed JSON, API error), the
+  structurally-valid draft is accepted as-is and logged
+  (`SHORT_AI_QUALITY_VALIDATION_FAIL reason=assessment_error`) — mirrors
+  `run_script_quality_gate()`'s own fail-safe convention of never retrying
+  against a failed assessment.
+- On retry exhaustion, the latest attempt is used non-blocking, logged at
+  WARNING — never silently dropped, never raises.
+- Logs: `SHORT_AI_QUALITY_VALIDATION_PASS`, `SHORT_AI_QUALITY_VALIDATION_FAIL`
+  (both the assessment-error and the NEEDS_REWRITE case).
+- Parent long-form quality validation (`run_script_quality_gate`,
+  `assess_script_quality`, `rewrite_script_for_quality`) is untouched by this
+  gate — it is a separate function, separate prompt, separate task key
+  (`short_quality_check`, Haiku — see `model_routing.py`), reusing no part of
+  the parent gate's rewrite mechanism.
 
 Naming rule:
 

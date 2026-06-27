@@ -5,7 +5,22 @@ from app.services.claude_client import call_claude, call_claude_structured, pars
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "4.1"  # v4.1: [INTRO] block gains a sentence-rhythm reminder + worked
+PROMPT_VERSION = "4.3"  # v4.3: removed RETENTION_BLOCK (dead since v4.0 — zero callers,
+                        # confirmed by Phase 12.3 audit and re-verified by Phase 12.5's
+                        # repo-wide reference sweep). Its "youtube_long" mini-hook/tension
+                        # guidance was already duplicated, in substance, inline in
+                        # _SECTION_GENERATION_SYSTEM_PROMPT (see that prompt's mini-hook
+                        # placement and tension-escalation rules); its "tiktok" guidance
+                        # was already duplicated inline in _SHORT_EPISODE_SYSTEM_PROMPT's
+                        # re-hook rule. No prompt text reachable by any live call path
+                        # changed — only unreachable dead code was removed.
+                        # v4.2: child Short multilingual adaptation now uses a dedicated
+                        # flat-narration native prompt (_BASE_CHILD_SHORT_NATIVE) selected
+                        # via content_kind="child_short", instead of the long-form/sectioned
+                        # native bases — Phase 12.4, fixing the Phase 12.3-identified defect
+                        # where every child Short translation used the long-form documentary
+                        # translation prompt (1200-1600 words, [SECTION N] markers preserved).
+                        # v4.1: [INTRO] block gains a sentence-rhythm reminder + worked
                         # example (alternate short 3-7 word / long 12-18 word sentences) —
                         # Phase 11.1, reinforcing TTS_BLOCK's existing rhythm rule locally
                         # at the one section type where flat rhythm was confirmed in
@@ -160,62 +175,6 @@ def with_tts_block(prompt: str, tts_provider: str, tts_model: str) -> str:
     return prompt + "\n\n" + block
 
 
-# ── Retention mechanics (platform-specific, injected after structural base) ────
-
-RETENTION_BLOCK: dict[str, str] = {
-    "youtube_long": """\
-RETENTION MECHANICS — youtube_long:
-MINI-HOOKS: the last sentence of every [SECTION N] (except the last before [OUTRO]) must
-either reveal something surprising OR tease the next section with a specific, factual,
-unanswered question. Never end a section with a summary sentence ("So that explains…",
-"As we have seen…", "This shows that…").
-PLACEMENT: the two strongest mini-hooks must appear at the sections nearest the 25% and 60%
-marks of total word count — these are the highest audience drop-off risk points.
-TENSION ESCALATION: every 45–60 seconds of narration (≈ 110–150 words), introduce a new
-revelation, complication, or emotional beat. The middle must never plateau.
-
-Exemplar mini-hooks (end of a section):
-  "But that's when the lab results came back — and they showed something nobody expected."
-  "The records had been sealed for thirty years. What was inside them changed the entire case."
-
-Exemplar outro question (specific to the story, not generic):
-  "Was this the right decision — or did they sacrifice the wrong thing for the right reason?"\
-""",
-
-    "youtube_short": """\
-RETENTION MECHANICS — youtube_short:
-The sentence spanning approximately second 3 of narration (roughly the 8th–12th word of
-the script) must either complete the open question raised in sentence 1 OR raise a sharper,
-more specific question. Never let the second beat feel anticlimactic.
-RE-HOOK: the opening sentence of every [SECTION N] must re-earn the viewer's attention —
-a new fact, twist, or unanswered question in ≤10 words.
-FINAL SENTENCE: a forward tease anticipating Part N+1 — a specific unresolved element the
-viewer will want answered, not a generic "follow for more" or closing summary.\
-""",
-
-    "tiktok": """\
-RETENTION MECHANICS — tiktok:
-RE-HOOK every 7–10 seconds of speech (≈ every 20–25 words): a new concrete fact, twist, or
-mini-revelation that earns continued attention. No plateau anywhere.
-FIRST 1.5 SECONDS (≈ first 5 words): must contain a concrete noun — a specific person,
-place, or object. Zero throat-clearing, zero setup, zero greeting.
-FINAL 5 SECONDS: one comment-bait line addressed directly to the viewer
-("Comment if you think…" / "Which side are you on?" / "Tell me in the comments.").
-Zero tolerance for filler — every sentence must either reveal or tease.\
-""",
-
-    "reels": """\
-RETENTION MECHANICS — reels:
-LOOP ENDING: write the final sentence last. Then read it followed by the first sentence of
-[INTRO]. They must flow naturally as if the content loops. The final sentence is the hook
-that pulls the viewer back to the beginning.
-CADENCE: slightly slower than TikTok — allow 12–15 second beats (≈ 30–40 words) before
-each re-hook. Do not rush every sentence.
-ONE RE-HOOK PER [SECTION N]: the opening sentence of each section must explicitly re-earn
-the viewer who almost swiped — a new fact, contradiction, or direct question.\
-""",
-}
-
 # ── Base native script prompts ─────────────────────────────────────────────────
 
 _BASE_YOUTUBE_LONG_FORM_NATIVE = """\
@@ -292,6 +251,65 @@ Strict rules:
 3. Keep similar length to the source scripts (420–700 words in voice_script).\
 """
 
+# Dedicated native-adaptation base for standalone child Short episodes (Phase 12.4).
+# Distinct from _BASE_SHORT_FORM_NATIVE above, which targets the older sectioned
+# short-form-platform architecture ([INTRO]/[SECTION N]/[OUTRO] markers, 420-700
+# words) — child Shorts under the current standalone-Short architecture are flat,
+# unsectioned narration capped at _MAX_SHORT_WORDS (see scripts.py). Using either
+# _BASE_YOUTUBE_LONG_FORM_NATIVE or _BASE_SHORT_FORM_NATIVE for a child Short
+# adaptation was the Phase 12.3-identified defect this prompt fixes.
+_BASE_CHILD_SHORT_NATIVE = """\
+You are an expert multilingual adapter for standalone short-form video narration.
+
+This is a single Short episode — a self-contained narration block derived from a
+longer parent story but spoken and watched entirely on its own. Your task: produce
+a culturally adapted version of this Short's narration in a new target language.
+This is NOT pure translation — it is cultural adaptation, exactly as you would do
+for a long-form script, but the output shape is completely different: a Short is
+flat, unsectioned narration, not a structured multi-section script.
+
+Cultural adaptation means:
+- Replace culture-specific illustrative analogies, idioms, and cultural references with
+  target-culture equivalents that carry the same emotional weight.
+- Use expressions and references that feel native to the target audience.
+- You may substitute illustrative analogies, idioms, and cultural references.
+  You may NEVER alter or substitute the story's factual claims, names, dates, or numbers.
+- Do not let the adaptation introduce a clearer or more front-loaded reveal than the
+  source has. If the source withholds an answer, the adaptation must withhold it too —
+  even if a more direct phrasing would sound more natural in the target language.
+
+Standalone Short rules — apply strictly, this is NOT a long-form script:
+- voice_script must be ONE flat block of narration. Do NOT add, keep, or invent any
+  [INTRO], [SECTION N], [OUTRO], or other bracketed structural marker anywhere in the
+  output — the source has none, and the adaptation must not introduce any.
+- Preserve standalone clarity: a viewer who has never seen any other part of this
+  story must be able to follow the adapted narration on its own, with no assumed context.
+- Preserve only the minimum context the source narration itself includes to orient a
+  first-time viewer. Do not add extra recap, setup, or background beyond what the
+  source narration already contains — do not summarize earlier parts.
+- If the source narration ends on a cliffhanger or a forward tease, preserve its exact
+  narrative intent in the adaptation — do not resolve it, soften it, or drop it.
+- Match the source narration's approximate length. Do not pad, expand, or add material
+  to make the adaptation feel longer or more "complete" — a short, punchy source must
+  stay short and punchy in the target language.
+
+HOOK_CONTEXT (if provided below): preserve the opening hook's concrete specificity and
+directness in your adapted version — the opening must hit with the same force in the
+target language.
+
+Output: valid JSON only — no preamble, no code fence, no explanation.
+{
+  "voice_script": "Adapted flat narration text — no section markers of any kind"
+}
+
+Strict rules:
+1. Return ONLY valid JSON. No markdown. No code fence. No extra keys.
+2. Never invent or substitute the story's factual claims, names, dates, or statistics.
+3. voice_script must contain zero bracketed structural markers ([INTRO], [SECTION N],
+   [OUTRO], or any other bracketed label) anywhere in the text.
+4. Keep the same approximate length as the source narration — do not expand it.\
+"""
+
 # ── Assembly functions ─────────────────────────────────────────────────────────
 
 def build_native_system_prompt(
@@ -299,6 +317,7 @@ def build_native_system_prompt(
     tts_model: str,
     tts_provider: str = "cartesia",
     audio_tags_enabled: bool = False,
+    content_kind: str = "parent_long_form",
 ) -> str:
     """Assemble the native adaptation system prompt for a given format and voice model.
 
@@ -306,18 +325,35 @@ def build_native_system_prompt(
     adaptations cannot reintroduce TTS violations.
 
     Args:
-        script_format:      Format key for the target language's output.
+        script_format:      Format key for the target language's output. Only consulted
+                            for ``content_kind="parent_long_form"`` — see content_kind.
         tts_model:          TTS model ID for the target-language voice.
         tts_provider:       TTS provider ("cartesia" | "elevenlabs").
         audio_tags_enabled: Channel-level opt-in for ElevenLabs v3 audio tags.
+        content_kind:       "parent_long_form" (default) or "child_short" (Phase 12.4).
+                            ``content_kind="child_short"`` always selects the dedicated
+                            flat-narration native prompt regardless of ``script_format``
+                            — child Standalone Short episodes are never sectioned
+                            long-form scripts (CLAUDE.md §5.2), and ``script_format`` is
+                            a channel-wide setting that does not vary per content row.
 
     Returns:
         Assembled native system prompt string.
     """
-    if script_format == "youtube_long":
+    if content_kind == "child_short":
+        base = _BASE_CHILD_SHORT_NATIVE
+        base_name = "child_short_standalone"
+    elif script_format == "youtube_long":
         base = _BASE_YOUTUBE_LONG_FORM_NATIVE
+        base_name = "parent_long_form_documentary"
     else:
         base = _BASE_SHORT_FORM_NATIVE
+        base_name = "parent_short_form_sectioned"
+
+    logger.info(
+        "NATIVE_ADAPTATION_PROMPT_SELECTED content_kind=%s script_format=%s base=%s",
+        content_kind, script_format, base_name,
+    )
 
     fallback = _TTS_FALLBACK.get(tts_provider, "sonic-2")
     tts = TTS_BLOCK.get(tts_model, TTS_BLOCK[fallback])
@@ -849,14 +885,16 @@ these dimensions:
     first sentence? Would a viewer keep watching past 10 seconds? Does the opening
     reveal the story's actual ending, answer, or mechanism — rather than creating a
     question the rest of the video must answer? If it gives away the ending, this is
-    a HIGH severity hook issue regardless of how concrete or well-written it is.  - clarity: Is it always clear what is happening, who is involved, and why it matters?
+    a HIGH severity hook issue regardless of how concrete or well-written it is.
+  - clarity: Is it always clear what is happening, who is involved, and why it matters?
   - emotional_pull: Does the viewer have a reason to care about the people/events?
   - narrative_arc: Does tension build toward a payoff, or does it stay flat / meander?
     Specifically: does any section re-explain a fact or idea already established
     elsewhere in the script, even in different words? Does any section compress two
     distinct significant facts (a motive AND a method, a cause AND a consequence)
     into one or two rushed sentences instead of giving the more important one room
-    to land? Flag both as narrative_arc issues, HIGH severity.  - specificity: Are claims grounded in concrete facts, names, numbers, dates — or vague?
+    to land? Flag both as narrative_arc issues, HIGH severity.
+  - specificity: Are claims grounded in concrete facts, names, numbers, dates — or vague?
   - generic_language: Does it contain stock AI-documentary phrasing ("This is a story
     about…", "What happened next…", "Everything changed…", "Little did they know") used
     as a crutch instead of a grounded specific?
@@ -864,7 +902,6 @@ these dimensions:
 
 Use FIXED, repeatable criteria — do not be lenient or harsh based on mood.
 
-Decision rule:
 Decision rule:
   - status = "PASSED" only if the script would plausibly hold a YouTube viewer's
     attention through the intro, feel like a professionally written documentary,
@@ -1002,6 +1039,8 @@ def generate_native_script(
     tts_model: str = "sonic-2",
     tts_provider: str = "cartesia",
     hook_context: str | None = None,
+    content_kind: str = "parent_long_form",
+    override_instruction: str = "",
 ) -> dict:
     """Adapt a source-language script for a target language and audience.
 
@@ -1009,16 +1048,27 @@ def generate_native_script(
     HOOK_CONTEXT so the adapted opening preserves the optimised hook's mechanism.
 
     Args:
-        voice_script:       Source-language narrator text (may include section markers).
+        voice_script:       Source-language narrator text (may include section markers
+                            for ``content_kind="parent_long_form"``, or none at all for
+                            ``content_kind="child_short"``).
         target_language:    BCP-47 language code for the output (e.g. "fr", "de", "es").
         niche:              Channel niche.
         tone:               Channel tone.
-        script_format:      Format key from ``channel_config.script_format``.
+        script_format:      Format key from ``channel_config.script_format``. Only
+                            consulted when ``content_kind="parent_long_form"``.
         audio_tags_enabled: Channel-level opt-in for ElevenLabs v3 audio tags.
         tts_model:          TTS model ID for the target-language voice.
         tts_provider:       TTS provider ("cartesia" | "elevenlabs").
         hook_context:       Optional pre-built HOOK_CONTEXT string (from optimize_intro or
                             extracted inline). If None, extracted from voice_script.
+        content_kind:       "parent_long_form" (default) or "child_short" (Phase 12.4).
+                            Selects the dedicated flat-narration native prompt for
+                            standalone child Short episodes — see
+                            ``build_native_system_prompt()``.
+        override_instruction: Optional correction instruction appended to the user
+                            message (used by the child-Short translation retry loop
+                            in ``scripts.py``, mirroring ``generate_short_episode_script``'s
+                            existing correction-round pattern).
 
     Returns:
         Dict with key ``voice_script`` in ``target_language``.
@@ -1027,7 +1077,9 @@ def generate_native_script(
         ValueError: If Claude returns malformed JSON or a key is missing.
         anthropic.APIError: On non-retryable Claude API errors.
     """
-    prompt = build_native_system_prompt(script_format, tts_model, tts_provider, audio_tags_enabled)
+    prompt = build_native_system_prompt(
+        script_format, tts_model, tts_provider, audio_tags_enabled, content_kind=content_kind,
+    )
 
     # Resolve hook context from source voice_script when not provided by caller
     ctx = hook_context if hook_context is not None else _extract_hook_context(voice_script, script_format)
@@ -1040,6 +1092,8 @@ def generate_native_script(
     if ctx:
         user_message += f"\nHOOK_CONTEXT:\n{ctx}\n"
     user_message += f"\nSource voice script:\n{voice_script}"
+    if override_instruction:
+        user_message += f"\n\n{override_instruction}"
     # Intentional free-form JSON path: native script adaptation is a large text payload.
     # parse_claude_json validates required and allowed keys.
     response = call_claude(prompt, user_message, max_tokens=8192, task="native_adaptation")
@@ -1696,7 +1750,8 @@ Rules:
 - First sentence = the opening_hook from the plan, ≤15 words, drops viewer mid-story.
   If opening_hook or main_reveal already states the story's final answer or mechanism,
   do not restate it that directly here — open on the situation or the unresolved
-  question instead, and let the reveal land later in this part's narration.- Re-hook every 7–10 seconds of narration: a new curiosity gap, question, or micro-reveal
+  question instead, and let the reveal land later in this part's narration.
+- Re-hook every 7–10 seconds of narration: a new curiosity gap, question, or micro-reveal
   that prevents the viewer from scrolling away. These are not summaries — they are new angles.
 - Provide only the minimum context needed for a first-time viewer to immediately understand the current situation.
   Do not summarize earlier events unless they are essential to understand the current reveal.
@@ -1785,3 +1840,158 @@ def generate_short_episode_script(
         type_checks={"title": str, "voice_script": str},
         allowed_keys=["title", "voice_script"],
     )
+
+
+# ── Short Quality Gate (Phase 13.2) ─────────────────────────────────────────────
+# Holistic AI-judged quality review for standalone child Short narration —
+# the Short-shaped counterpart to _SCRIPT_QUALITY_SYSTEM_PROMPT above. Runs only
+# after a Short draft has already passed deterministic structural checks
+# (_collect_short_script_major_issues — word cap, TTS compliance, hook opener,
+# no section markers); this gate judges retention/narrative quality on a
+# structurally-valid draft, exactly mirroring how run_script_quality_gate() only
+# judges a parent script after its own section-level structural checks pass.
+
+_SHORT_QUALITY_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "status": {"type": "string", "enum": ["PASSED", "NEEDS_REWRITE"]},
+        "issues": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "severity":    {"type": "string", "enum": ["HIGH", "MEDIUM", "LOW"]},
+                    "category":    {"type": "string"},
+                    "description": {"type": "string"},
+                    "fix":         {"type": "string"},
+                },
+                "required": ["severity", "category", "description", "fix"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["status", "issues"],
+    "additionalProperties": False,
+}
+
+_SHORT_QUALITY_SYSTEM_PROMPT = """\
+You are a short-form retention editor reviewing a standalone TikTok/Reels/Shorts episode
+script BEFORE production. This is flat, unsectioned narration for a vertical short video —
+NOT a long-form documentary script. Do not judge it as one, and do not expect or require
+[INTRO], [SECTION N], [OUTRO] markers, or a 1200-1600 word arc. A complete, well-made Short
+is 160-250 words of flat narration.
+
+Your only job: decide whether a first-time viewer, with no knowledge of any other part of
+this story, would watch this Short all the way through — or whether it needs a rewrite.
+You are not checking facts or technical formatting — another system does that.
+
+Judge the script against these dimensions, all specific to short-form vertical video:
+  - hook: Does the first 1-2 sentences immediately grab attention with something concrete
+    and specific? Would a viewer keep watching past 3 seconds? Does the opening already
+    state the part's final answer or mechanism instead of creating a question the rest of
+    the Short must answer? If it gives away the reveal early, this is a HIGH severity hook
+    issue regardless of how concrete or well-written it is.
+  - clarity: Could a viewer who has never seen any other part of this story follow what is
+    happening, who is involved, and why it matters, using only this Short's own narration?
+  - emotional_pull: Does the viewer have a concrete reason to care, and does the narration
+    open a curiosity gap (an unanswered question) rather than just stating facts in order?
+  - main_reveal: Is there exactly one clear reveal or payoff in this Short? Flag it as a
+    HIGH severity narrative_arc issue if there is no clear reveal, or if two unrelated
+    reveals are both compressed into one or two rushed sentences instead of giving the
+    more important one room to land.
+  - cliffhanger_intent: If this is not the final part, does the ending preserve a genuine
+    forward-pulling cliffhanger (a specific unresolved element), rather than resolving
+    everything or trailing off on a flat summary? (Only the literal wording may differ
+    from the plan — the narrative intent of the cliffhanger must survive.)
+  - recap: Does the narration over-explain or summarize events beyond the minimum context
+    a first-time viewer needs for this part's own reveal to land? Re-stating an established
+    fact, even in different words, is a HIGH severity recap issue.
+  - generic_language: Does it contain stock AI-narration filler ("This is a story about…",
+    "What happened next…", "Everything changed…", "Little did they know", "But that's not
+    all") used as a crutch instead of a grounded specific?
+  - tts_readability: Will this sound natural and human when read aloud by a TTS voice in
+    roughly 80-90 seconds?
+  - retention_suitability: Does the narration re-hook the viewer every 7-10 seconds with a
+    new fact, twist, or micro-reveal, or does any stretch of the script plateau with no new
+    information?
+
+Use FIXED, repeatable criteria — do not be lenient or harsh based on mood.
+
+Decision rule:
+  - status = "PASSED" only if a first-time viewer would plausibly watch this Short to the
+    end on its own, with no other context, AND contains no HIGH severity issue in any
+    dimension.
+  - status = "NEEDS_REWRITE" if there is at least one HIGH severity issue, or three or
+    more issues of any severity.
+
+For each issue found, report:
+  - severity: "HIGH" (would cause viewers to scroll away), "MEDIUM", "LOW"
+  - category: "hook" | "clarity" | "emotional_pull" | "main_reveal" | "cliffhanger_intent" |
+    "recap" | "generic_language" | "tts_readability" | "retention_suitability"
+  - description: the specific problem, quoting the offending text where useful
+  - fix: a concrete, actionable instruction for how to fix it
+
+Return ONLY valid JSON. No markdown. No code fence. No extra keys.
+{
+  "status": "PASSED" | "NEEDS_REWRITE",
+  "issues": [
+    {"severity": "HIGH" | "MEDIUM" | "LOW", "category": "...", "description": "...", "fix": "..."}
+  ]
+}
+
+Strict rules:
+1. JSON only — the response will be parsed programmatically.
+2. If the script genuinely passes, return an empty issues array.
+3. Be specific — quote the actual sentence and say why it fails.
+4. Never require or suggest adding [INTRO], [SECTION N], [OUTRO], or any other bracketed
+   structural marker — flat narration is correct for a Short, not a defect.\
+"""
+
+
+def assess_short_script_quality(voice_script: str, channel, is_final_part: bool = True) -> dict:
+    """Run the Short Quality Gate — a short-form retention review for one child Short.
+
+    The flat-narration counterpart to ``assess_script_quality()``. Runs only after a
+    Short draft has already passed deterministic structural checks (word cap, TTS
+    compliance, hook opener, no section markers) — see ``_collect_short_script_major_issues()``
+    in ``scripts.py``.
+
+    Args:
+        voice_script:  The Short's flat narration text (no section markers).
+        channel:       Channel ORM object (provides niche and tone as context).
+        is_final_part: Whether this is the last part of the standalone-Short series.
+                      When True, the cliffhanger_intent dimension is not scored — the
+                      final part replaces its cliffhanger with a comment-trigger
+                      question (see ``generate_shorts_plan()``'s schema), so there is
+                      no forward-pulling cliffhanger to judge.
+
+    Returns:
+        Dict with ``status`` ("PASSED" | "NEEDS_REWRITE") and ``issues``.
+
+    Raises:
+        ValueError: If Claude returns malformed JSON or a required key is missing.
+    """
+    cliffhanger_note = (
+        "This is the FINAL part — it ends on a comment-trigger question, not a "
+        "cliffhanger. Do not score cliffhanger_intent for this part."
+        if is_final_part else
+        "This is NOT the final part — it must end on a genuine forward-pulling "
+        "cliffhanger. Score cliffhanger_intent normally."
+    )
+    user_message = (
+        f"Channel niche: {channel.niche}\n"
+        f"Channel tone: {channel.tone}\n"
+        f"{cliffhanger_note}\n\n"
+        f"Voice script:\n{voice_script}"
+    )
+    result = call_claude_structured(
+        task="short_quality_check",
+        system_prompt=_SHORT_QUALITY_SYSTEM_PROMPT,
+        user_message=user_message,
+        schema_name="short_quality_check",
+        input_schema=_SHORT_QUALITY_SCHEMA,
+        max_tokens=1024,
+    )
+    if result["status"] not in {"PASSED", "NEEDS_REWRITE"}:
+        raise ValueError(f"assess_short_script_quality: unexpected status {result['status']!r}")
+    return result

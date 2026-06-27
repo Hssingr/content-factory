@@ -34,6 +34,7 @@ MODEL_ROUTING: dict[str, str] = {
     "short_script":            SONNET,  # Standalone short planning: TikTok-optimised episode script
     # ── Fast / cheap (Haiku) ─────────────────────────────────────────────
     "script_quality_check":    HAIKU,
+    "short_quality_check":     HAIKU,   # Phase 13.2: Short-form retention review, mirrors script_quality_check
     "script_validation":       HAIKU,
     "media_scoring":           HAIKU,
     "content_reformat":        HAIKU,   # reformatting prose discovery output to JSON

@@ -11,7 +11,17 @@ from app.services.claude_client import (
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "3.2"  # v3.2: Added hard rules forbidding literal quotation marks in any
+PROMPT_VERSION = "3.3"  # v3.3: _SPLITTER_SYSTEM_PROMPT (legacy section-splitter fallback,
+                        #        reachable only via ChannelConfig.allow_legacy_fallback) had
+                        #        "atmospheric", "cinematic", and "dramatic" wording that
+                        #        directly contradicted FORBIDDEN_FLUX_WORDS — replaced with
+                        #        concrete subject/place/action guidance. The synthesized
+                        #        flux_prompt template in enrich_sections_with_visuals() also
+                        #        hardcoded "cinematic" into every legacy beat unconditionally
+                        #        — replaced with "documentary photography style". No other
+                        #        prompt text changed; _STORYBOARD_SYSTEM_PROMPT (below) was
+                        #        already compliant. Phase 12.6.
+                        # v3.2: Added hard rules forbidding literal quotation marks in any
                         #        field value and forbidding 'beats'/'global_notes' as a
                         #        JSON-encoded string — a real, recurring production failure
                         #        (json.JSONDecodeError "Expecting ',' delimiter" at a
@@ -646,13 +656,14 @@ For each section you must decide:
    - Always write in English, regardless of the script language.
    - Be specific and descriptive (e.g. "abandoned dark hospital hallway" not "hospital").
    - Avoid people's faces unless the section explicitly calls for human presence.
-   - Prefer atmospheric, cinematic compositions.
+   - Name a concrete subject, place, or object from the section text — not a mood or
+     feeling. Answer "what exact thing would the camera be pointing at?"
    - Never invent places, people, or events — base the query on the section text only.
 
 2. SUGGESTED VISUAL — the type of visual that fits the section:
-   - "b-roll"       : atmospheric footage or photos (most sections)
+   - "b-roll"       : footage or photos of a concrete place, object, or setting (most sections)
    - "text_overlay" : black/dark background with text (intro hooks, statistics, key phrases)
-   - "action"       : dynamic movement footage (chase scenes, dramatic events)
+   - "action"       : footage of visible physical movement (a chase, a struggle, a collapse)
 
 Return ONLY valid JSON. No markdown. No code fence. No extra keys.
 Output format — a JSON array, one object per section, in the same order received:
@@ -708,12 +719,14 @@ def enrich_sections_with_visuals(sections: list[dict], channel_niche: str, chann
     for s in sections:
         order = s["section_order"]
         enrichment = by_order.get(order, {})
-        sq = enrichment.get("search_query", f"{channel_niche} cinematic")
+        sq = enrichment.get("search_query", f"{channel_niche} stock footage")
         s["search_query"]     = sq
         s["suggested_visual"] = enrichment.get("suggested_visual", "b-roll")
-        # Synthesize a basic flux_prompt for Flux generation (legacy path only)
+        # Synthesize a basic flux_prompt for Flux generation (legacy path only).
+        # "documentary photography style" intentionally avoids "cinematic" — see
+        # FORBIDDEN_FLUX_WORDS in storyboard_validator.py (Phase 12.6).
         s["flux_prompt"] = (
-            f"{sq}, photorealistic, cinematic documentary style, "
+            f"{sq}, photorealistic, documentary photography style, "
             f"desaturated color grade, no people, no text"
         )
 
