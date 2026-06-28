@@ -113,8 +113,15 @@ check("2a: remap_beats_for_short() no longer calls generate_beat_image() itself"
 check("2b: generate_pending_beat_images() exists as the deferred-generation step",
       callable(getattr(storyboard_mod, "generate_pending_beat_images", None)))
 src_pending = inspect.getsource(storyboard_mod.generate_pending_beat_images)
-check("2c: generate_pending_beat_images() is the one that calls generate_beat_image()",
-      "generate_beat_image(" in src_pending)
+check("2c: generate_pending_beat_images() is the one that triggers real image generation "
+      "(Phase 14.6: through generate_beat_image_with_routing(), which itself calls "
+      "generate_beat_image() — the routing wrapper, not a stub)",
+      "generate_beat_image_with_routing(" in src_pending
+      and "generate_beat_image(" in inspect.getsource(
+          __import__(
+              "app.agents.agent4_visuals.services.flux_generator", fromlist=["x"]
+          ).generate_beat_image_with_routing
+      ))
 src_run_child_short_visuals = inspect.getsource(orchestrator._run_child_short_visuals)
 check("2d: orchestrator calls _check_storyboard_issues() before generate_pending_beat_images()",
       src_run_child_short_visuals.index("_check_storyboard_issues(")

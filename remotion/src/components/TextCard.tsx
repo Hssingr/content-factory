@@ -11,6 +11,8 @@ interface TextCardProps {
   accentColor?: string;
   /** Visual style variant. Defaults to "default". */
   cardStyle?: TextCardStyle;
+  /** Keep the generated background image visible behind the Remotion text layer. */
+  transparentBackground?: boolean;
 }
 
 // ── Shared animation hook ──────────────────────────────────────────────────────
@@ -27,12 +29,12 @@ function useCardAnimations() {
 // ── Default variant ────────────────────────────────────────────────────────────
 // Dark radial gradient, centred bold text, gold accent bar.
 
-function DefaultCard({ text, accentColor }: { text: string; accentColor: string }) {
+function DefaultCard({ text, accentColor, transparentBackground }: { text: string; accentColor: string; transparentBackground: boolean }) {
   const { scale, opacity } = useCardAnimations();
   return (
     <AbsoluteFill
       style={{
-        background: "radial-gradient(ellipse at center, #1a1a2e 0%, #0a0a0f 70%)",
+        background: transparentBackground ? "rgba(10, 10, 15, 0.34)" : "radial-gradient(ellipse at center, #1a1a2e 0%, #0a0a0f 70%)",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
@@ -73,12 +75,12 @@ function DefaultCard({ text, accentColor }: { text: string; accentColor: string 
 // Simulates a messaging interface: dark background, speech bubble with rounded
 // corners, as if a message is being received live.
 
-function ChatCard({ text, accentColor }: { text: string; accentColor: string }) {
+function ChatCard({ text, accentColor, transparentBackground }: { text: string; accentColor: string; transparentBackground: boolean }) {
   const { scale, opacity } = useCardAnimations();
   return (
     <AbsoluteFill
       style={{
-        background: "#0d0d14",
+        background: transparentBackground ? "transparent" : "#0d0d14",
         display: "flex",
         alignItems: "center",
         justifyContent: "flex-start",
@@ -172,12 +174,12 @@ function ChatCard({ text, accentColor }: { text: string; accentColor: string }) 
 // Simulates a typed document or report: off-white background, dark text,
 // subtle top header bar with a coloured stripe.
 
-function DocumentCard({ text, accentColor }: { text: string; accentColor: string }) {
+function DocumentCard({ text, accentColor, transparentBackground }: { text: string; accentColor: string; transparentBackground: boolean }) {
   const { scale, opacity } = useCardAnimations();
   return (
     <AbsoluteFill
       style={{
-        background: "#f5f0e8",
+        background: transparentBackground ? "transparent" : "#f5f0e8",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
@@ -260,7 +262,7 @@ function DocumentCard({ text, accentColor }: { text: string; accentColor: string
 // Splits text at the first line break (or "|") into a large primary stat and
 // smaller context line. Falls back to rendering all text as the large value.
 
-function StatisticCard({ text, accentColor }: { text: string; accentColor: string }) {
+function StatisticCard({ text, accentColor, transparentBackground }: { text: string; accentColor: string; transparentBackground: boolean }) {
   const { scale, opacity } = useCardAnimations();
 
   // Split on "|" or newline to separate stat from context label
@@ -271,7 +273,7 @@ function StatisticCard({ text, accentColor }: { text: string; accentColor: strin
   return (
     <AbsoluteFill
       style={{
-        background: "linear-gradient(160deg, #0f0f1a 0%, #1a1030 60%, #0a0a0f 100%)",
+        background: transparentBackground ? "rgba(10, 10, 15, 0.30)" : "linear-gradient(160deg, #0f0f1a 0%, #1a1030 60%, #0a0a0f 100%)",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
@@ -346,12 +348,12 @@ function StatisticCard({ text, accentColor }: { text: string; accentColor: strin
 // For verbatim quotes: decorative oversized quotation marks, italic text,
 // subtle vignette background.
 
-function QuoteCard({ text, accentColor }: { text: string; accentColor: string }) {
+function QuoteCard({ text, accentColor, transparentBackground }: { text: string; accentColor: string; transparentBackground: boolean }) {
   const { scale, opacity } = useCardAnimations();
   return (
     <AbsoluteFill
       style={{
-        background: "radial-gradient(ellipse at center, #1c1520 0%, #0a080c 80%)",
+        background: transparentBackground ? "rgba(10, 8, 12, 0.32)" : "radial-gradient(ellipse at center, #1c1520 0%, #0a080c 80%)",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
@@ -431,8 +433,9 @@ export const TextCard: React.FC<TextCardProps> = ({
   style = {},
   accentColor = "#FFD700",
   cardStyle = "default",
+  transparentBackground = false,
 }) => {
-  const cardProps = { text, accentColor };
+  const cardProps = { text, accentColor, transparentBackground };
 
   const inner = (() => {
     switch (cardStyle) {

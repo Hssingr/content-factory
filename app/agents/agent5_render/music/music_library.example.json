@@ -1,0 +1,59 @@
+{
+  "_TEMPLATE_ONLY": true,
+  "_warning": "EXAMPLE/TEMPLATE FILE — Phase 15.2 design artifact. Every entry below is FICTITIOUS placeholder metadata. No audio file exists for any entry. No entry has been verified as royalty-free or licensed. Do NOT treat any value here as a real, usable, or legally-cleared asset. Before Phase 15.3 ever selects a real track, every field — especially license/source/safe_for_commercial_use — must be replaced with real, human-verified values, and the corresponding audio file must be placed under {media_path}/music/ (never committed to this repository).",
+  "schema_version": "15.2",
+  "entries": [
+    {
+      "id": "example-low-001",
+      "filename": "example-low-001.mp3",
+      "intensity_tier": "low",
+      "mood_tags": ["neutral", "calm"],
+      "bpm": null,
+      "loopable": true,
+      "duration_sec": 90.0,
+      "license": "<<REPLACE_WITH_VERIFIED_LICENSE_NAME_OR_TERMS>>",
+      "source": "<<REPLACE_WITH_VERIFIED_PROVIDER_NAME_AND_URL>>",
+      "attribution_required": false,
+      "safe_for_commercial_use": true
+    },
+    {
+      "id": "example-medium-suspense-001",
+      "filename": "example-medium-suspense-001.mp3",
+      "intensity_tier": "medium",
+      "mood_tags": ["suspense", "tense", "uneasy"],
+      "bpm": 92,
+      "loopable": true,
+      "duration_sec": 120.0,
+      "license": "<<REPLACE_WITH_VERIFIED_LICENSE_NAME_OR_TERMS>>",
+      "source": "<<REPLACE_WITH_VERIFIED_PROVIDER_NAME_AND_URL>>",
+      "attribution_required": true,
+      "safe_for_commercial_use": true
+    },
+    {
+      "id": "example-high-dread-001",
+      "filename": "example-high-dread-001.mp3",
+      "intensity_tier": "high",
+      "mood_tags": ["dread", "suspense"],
+      "bpm": 70,
+      "loopable": false,
+      "duration_sec": 45.0,
+      "license": "<<REPLACE_WITH_VERIFIED_LICENSE_NAME_OR_TERMS>>",
+      "source": "<<REPLACE_WITH_VERIFIED_PROVIDER_NAME_AND_URL>>",
+      "attribution_required": true,
+      "safe_for_commercial_use": true
+    },
+    {
+      "id": "example-medium-aftermath-NOT-CLEARED",
+      "filename": "example-medium-aftermath-not-cleared.mp3",
+      "intensity_tier": "medium",
+      "mood_tags": ["aftermath", "calm"],
+      "bpm": 80,
+      "loopable": true,
+      "duration_sec": 100.0,
+      "license": "<<UNVERIFIED — DO NOT USE>>",
+      "source": "<<UNKNOWN PROVENANCE — DO NOT USE>>",
+      "attribution_required": true,
+      "safe_for_commercial_use": false
+    }
+  ]
+}

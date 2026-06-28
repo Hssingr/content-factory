@@ -10,7 +10,10 @@ import {
   useVideoConfig,
 } from "remotion";
 import { KaraokeSubtitles } from "../components/KaraokeSubtitles";
-import { MediaSection, transitionDurationFrames } from "../components/MediaSection";
+import {
+  MediaSection, transitionDurationFrames, computeOverlaySuppressWindows,
+  OverlaySuppressWindow,
+} from "../components/MediaSection";
 import { ShortProps } from "../types";
 
 // ── Metadata ──────────────────────────────────────────────────────────────────
@@ -48,6 +51,12 @@ export const Short: React.FC<ShortProps> = ({
 
   const mainFrames = Math.ceil((duration_ms / 1000) * fps);
 
+  // Phase 14.10b — windows where a section's own overlay is showing; shifted
+  // into Short-local ms (offset by start_ms) the same way captions already
+  // are via KaraokeSubtitlesWithOffset below, so both stay in the same
+  // coordinate space.
+  const suppressWindows = computeOverlaySuppressWindows(sections, start_ms);
+
   return (
     <AbsoluteFill style={{ backgroundColor: "#0a0a0f" }}>
 
@@ -83,6 +92,7 @@ export const Short: React.FC<ShortProps> = ({
           <KaraokeSubtitlesWithOffset
             captions={subtitles.captions}
             startMs={start_ms}
+            suppressWindows={suppressWindows}
           />
         </Sequence>
       )}
@@ -98,11 +108,14 @@ export const Short: React.FC<ShortProps> = ({
 // ── KaraokeSubtitles wrapper — shifts absolute timings to Short-local ─────────
 
 interface KaraokeOffsetProps {
-  captions: ShortProps["subtitles"]["captions"];
-  startMs:  number;
+  captions:        ShortProps["subtitles"]["captions"];
+  startMs:         number;
+  suppressWindows?: OverlaySuppressWindow[];
 }
 
-const KaraokeSubtitlesWithOffset: React.FC<KaraokeOffsetProps> = ({ captions, startMs }) => {
+const KaraokeSubtitlesWithOffset: React.FC<KaraokeOffsetProps> = ({
+  captions, startMs, suppressWindows,
+}) => {
   const shifted = captions.map((chunk) => ({
     ...chunk,
     start_ms: chunk.start_ms - startMs,
@@ -113,7 +126,10 @@ const KaraokeSubtitlesWithOffset: React.FC<KaraokeOffsetProps> = ({ captions, st
       e: w.e - startMs,
     })),
   }));
-  return <KaraokeSubtitles captions={shifted} />;
+  // suppressWindows is already Short-local (computeOverlaySuppressWindows()
+  // was called with offsetMs=start_ms in Short's render) — passed straight
+  // through, not shifted again.
+  return <KaraokeSubtitles captions={shifted} suppressWindows={suppressWindows} />;
 };
 
 // ── Part label overlay ────────────────────────────────────────────────────────

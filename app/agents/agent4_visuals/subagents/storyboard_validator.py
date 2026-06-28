@@ -30,6 +30,7 @@ only, exactly like the child path's storyboard MAJOR findings.
 from __future__ import annotations
 
 import logging
+import re
 from collections import Counter
 from pathlib import Path
 from typing import TypedDict
@@ -121,6 +122,21 @@ _SUBJECT_STOPWORDS: frozenset[str] = frozenset({
     "by", "from", "this", "that", "it", "as", "or", "for",
 })
 
+# Phase 14.7 — phrases that ask an image model to render specific readable
+# text (as opposed to just describing a document/poster/sign as a physical
+# prop, which is fine). A quoted phrase of letters is the strongest signal —
+# image models render quoted text literally, and it always comes back as
+# illegible gibberish. The phrase list below catches the same intent spelled
+# without quote marks ("the text reads...", "a sign that says...").
+_QUOTED_TEXT_RE = re.compile(r'"[A-Za-z][^"]{1,80}"')
+_AI_TEXT_RENDERING_PHRASES: tuple[str, ...] = (
+    "the text reads", "text that reads", "label reading", "label that reads",
+    "words that say", "the words", "stamped with the words",
+    "engraved with the words", "written on it", "handwritten text saying",
+    "caption reading", "headline reads", "sign that reads", "sign reading",
+    "name tag reading", "that reads",
+)
+
 # A flux_prompt with fewer than this many "real subject" words (after
 # stripping stopwords, style-only words, generic filler, and technical
 # boilerplate) is flagged as lacking a concrete subject.
@@ -195,18 +211,10 @@ _TEXT_CARD_SENTINEL = "__text_card__"
 # for it exists).
 _VALID_MEDIA_TYPES: frozenset[str] = frozenset({"image"})
 
-# Strategies that do NOT require a real media file — i.e. text-card beats.
-# Deliberately checked as "!= remotion_text_card" everywhere below, not
-# "== flux_generated": per the Phase 4D-E0 audit (Bug Candidate 1), child
-# remap beats never explicitly set `media_strategy` and it is silently
-# defaulted to "flux_generated" by `_build_beat_section()`. That default is
-# currently always correct (child remap never produces a real text-card),
-# but a check written as "== flux_generated" would be implicitly trusting a
-# producer claim that, for the child path, was never actually made. Gating
-# on "not a text card" instead is true whether the value is real or
-# defaulted, and does not get fooled either way if Bug Candidate 1 is fixed
-# later and starts producing real remotion_text_card beats from child remap.
-_NO_MEDIA_REQUIRED_STRATEGY = "remotion_text_card"
+# Text-card hard-failure sentinel. Deliberate remotion_text_card beats should
+# normally have generated background images under cache/. The sentinel is allowed
+# only when Flux background generation failed and Remotion must render the text-card
+# fallback without a media clip.
 
 
 class StoryboardIssue(TypedDict):
@@ -287,7 +295,7 @@ def validate_storyboard(beats: list[dict]) -> list[StoryboardIssue]:
     for beat in beats:
         strategy = beat.get("media_strategy", "flux_generated")
         if strategy != "flux_generated":
-            continue  # text_card beats have no flux_prompt requirement
+            continue  # text_card background prompts are generated/derived downstream
 
         prompt_lower = (beat.get("flux_prompt") or "").lower()
         if not prompt_lower:
@@ -314,6 +322,18 @@ def validate_storyboard(beats: list[dict]) -> list[StoryboardIssue]:
                     "Rewrite to answer 'what exact thing would a camera be pointing at?'"
                 ),
             ))
+
+    # ── MAJOR check 19: flux_prompt asks the image model to render readable
+    # text (Phase 14.7) — a document/poster/calendar/sign/name-tag prompt
+    # that asks Flux to render specific words/letters/numbers always comes
+    # back as illegible gibberish. Distinct from check 4: that only catches
+    # an explicit mood word; this catches a request for literal rendered
+    # text regardless of mood-word presence. Applies to flux_generated beats
+    # only — text_card backgrounds are exempt the same way check 4 is, since
+    # Phase 14.4's own derivation/sanitization (and Phase 14.7's text-prop
+    # sanitization) run downstream of this validation pass, on a prompt this
+    # check has not seen yet.
+    issues.extend(_find_ai_text_rendering_issues(beats))
 
     # ── MINOR check 5: environment over-saturation (>35% of beats) ───────────
     env_counts: Counter[str] = Counter(
@@ -502,6 +522,51 @@ def validate_storyboard(beats: list[dict]) -> list[StoryboardIssue]:
     else:
         logger.info("CHILD_SHORT_REUSE_CLUSTERING risk=LOW runs=0")
 
+    return issues
+
+
+def _find_ai_text_rendering_issues(beats: list[dict]) -> list[StoryboardIssue]:
+    """Flag a flux_generated beat whose prompt asks the image model to
+    render specific readable text (Phase 14.7).
+
+    A quoted phrase of letters, or a "the text reads"/"sign that says"-style
+    instruction, asks Flux to literally render words — image models cannot
+    do this reliably and the result is always illegible. Readable text for
+    a document/poster/calendar/sign beat must come from a Remotion overlay
+    instead (`flux_generator.derive_text_prop_overlay()`), not from the
+    generated image itself.
+
+    Exempt: `remotion_text_card` beats — their background prompt is derived/
+    sanitized downstream of this validation pass (Phase 14.4's
+    `derive_text_card_background_prompt()`), which this check has not seen
+    yet at validation time. Same exemption shape as check 4
+    (`forbidden_flux_word`).
+    """
+    issues: list[StoryboardIssue] = []
+    for beat in beats:
+        if beat.get("media_strategy", "flux_generated") != "flux_generated":
+            continue
+        prompt = str(beat.get("flux_prompt", "") or "")
+        if not prompt:
+            continue
+        lowered = prompt.lower()
+        quoted_match = _QUOTED_TEXT_RE.search(prompt)
+        phrase_match = next((p for p in _AI_TEXT_RENDERING_PHRASES if p in lowered), None)
+        if quoted_match or phrase_match:
+            evidence = f'quoted text {quoted_match.group(0)!r}' if quoted_match else f"phrase {phrase_match!r}"
+            issues.append(StoryboardIssue(
+                severity="MAJOR",
+                beat_order=beat.get("beat_order", 0),
+                check="ai_text_rendering_requested",
+                description=(
+                    f"flux_prompt for beat_order={beat.get('beat_order', 0)} appears to ask "
+                    f"the image model to render specific readable text ({evidence}). Image "
+                    "models cannot render legible text reliably — it always comes back as "
+                    "gibberish. Describe the physical prop only (document/poster/calendar/sign "
+                    "as a blank or non-legible object) and render any needed readable text as "
+                    f"a Remotion overlay instead. prompt={prompt[:200]!r}"
+                ),
+            ))
     return issues
 
 
@@ -874,8 +939,6 @@ def validate_media_assets(beats: list[dict], content_id: str) -> list[Storyboard
     for beat in beats:
         order = beat.get("beat_order", 0)
         strategy = beat.get("media_strategy", "flux_generated")
-        if strategy == _NO_MEDIA_REQUIRED_STRATEGY:
-            continue  # text-card beats have no media file requirement
 
         media_type = beat.get("media_type", "image")
         if media_type not in _VALID_MEDIA_TYPES:
@@ -904,10 +967,9 @@ def validate_media_assets(beats: list[dict], content_id: str) -> list[Storyboard
             continue
 
         if url == _TEXT_CARD_SENTINEL:
-            # A real, expected outcome of a failed Flux generation — not a
-            # validator finding on its own (the render path's existing
-            # technical-blocker check already accounts for the text_card
-            # fallback ratio); skip rather than double-report it here.
+            # A real, expected outcome of a failed Flux/text-card background
+            # generation — not a validator finding on its own. Successful
+            # deliberate text cards should normally carry cache/ background media.
             continue
 
         if not url.startswith(_LOCAL_CACHE_PREFIX):

@@ -39,6 +39,7 @@ import uuid
 
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.agents.agent4_visuals.system_prompt import (
     STORYBOARD_BATCH_MAX_TOKENS as _STORYBOARD_BATCH_MAX_TOKENS_LOG,
     STORYBOARD_SCHEMA_VERSION as _STORYBOARD_SCHEMA_VERSION_LOG,
@@ -46,7 +47,14 @@ from app.agents.agent4_visuals.system_prompt import (
 )
 from app.models import VideoSection
 from app.services.claude_client import call_claude_structured_with_usage
-from app.agents.agent4_visuals.services.flux_generator import generate_beat_image
+from app.agents.agent4_visuals.services.flux_generator import (
+    derive_text_prop_overlay,
+    derive_text_prop_prompt,
+    generate_beat_image_with_routing,
+    generate_text_card_background_image,
+    is_text_card_beat,
+    is_text_prop_beat,
+)
 from app.shared.text_normalize import normalize_for_matching as _normalize_for_matching
 
 logger = logging.getLogger(__name__)
@@ -130,6 +138,10 @@ _TEXT_CARD_SENTINEL = "__text_card__"
 # match_score threshold: assignments at or above this reuse the parent Flux image;
 # below this threshold a new image is generated.
 _MATCH_SCORE_THRESHOLD = 70
+
+# Default child Short visual-hold ceiling. Read through settings so operators can
+# tune the target without touching code; parent long-form mapping never uses it.
+_SHORT_VISUAL_MAX_HOLD_MS = settings.short_visual_max_hold_ms
 
 # Word-count window for child remap alignment hints — mirrors the parent
 # storyboard schema's own start_hint/end_hint convention (system_prompt.py
@@ -1050,6 +1062,29 @@ def _build_beat_section(beat: dict, index: int, start_ms: int, end_ms: int, scri
     if raw_strategy == "remotion_text_card":
         resolved_visual_type = "text_card"
 
+    # ── Text-prop prompt sanitization (Phase 14.7) ────────────────────────
+    # Ordinary (non-text-card) beats whose subject is a document/poster/
+    # calendar/sign/name-tag prop get their flux_prompt rewritten to forbid
+    # readable text in the generated image; any safely-derivable readable
+    # text becomes a Remotion overlay instead. Never applies to
+    # remotion_text_card beats — those are Phase 14.4's separate mechanism.
+    flux_prompt_value      = str(beat.get("flux_prompt", "") or "")
+    overlay_text_value     = str(beat.get("overlay_text", "") or "")
+    overlay_position_value = beat.get("overlay_position")
+
+    if raw_strategy == "flux_generated" and is_text_prop_beat(beat):
+        sanitized_prompt = derive_text_prop_prompt(beat)
+        derived_overlay  = derive_text_prop_overlay(beat)
+        logger.info(
+            "TEXT_PROP_PROMPT_SANITIZED beat=%d original_prompt=%r sanitized_prompt=%r overlay=%r",
+            beat_order, flux_prompt_value[:160], sanitized_prompt, derived_overlay,
+        )
+        flux_prompt_value = sanitized_prompt
+        if derived_overlay and not overlay_text_value:
+            overlay_text_value = derived_overlay
+            if not overlay_position_value or overlay_position_value == "none":
+                overlay_position_value = "center"
+
     return {
         "beat_order":           beat_order,
         "section_order":        beat_order,
@@ -1061,12 +1096,12 @@ def _build_beat_section(beat: dict, index: int, start_ms: int, end_ms: int, scri
         "visual_type":          resolved_visual_type,
         "visual_category":      _safe_enum(beat.get("visual_category"), _VALID_VISUAL_CATEGORIES, _DEFAULT_VISUAL_CATEGORY),
         "environment":          _safe_enum(beat.get("environment"), _VALID_ENVIRONMENTS, _DEFAULT_ENVIRONMENT),
-        "flux_prompt":          str(beat.get("flux_prompt", "") or ""),
+        "flux_prompt":          flux_prompt_value,
         "effect":               _safe_enum(beat.get("effect"), _VALID_EFFECTS, _DEFAULT_EFFECT),
         "color_grade":          _safe_enum(beat.get("color_grade"), _VALID_GRADES, _DEFAULT_GRADE),
         "transition_to_next":   _safe_enum(beat.get("transition_to_next"), _VALID_TRANSITIONS, _DEFAULT_TRANSITION),
-        "overlay_text":         str(beat.get("overlay_text", "") or ""),
-        "overlay_position":     _safe_enum(beat.get("overlay_position"), _VALID_OVERLAY_POSITIONS, _DEFAULT_OVERLAY_POSITION),
+        "overlay_text":         overlay_text_value,
+        "overlay_position":     _safe_enum(overlay_position_value, _VALID_OVERLAY_POSITIONS, _DEFAULT_OVERLAY_POSITION),
         "motif":                _safe_enum(beat.get("motif"), _VALID_MOTIFS, _DEFAULT_MOTIF),
         "beat_intensity":       intensity,
         "suggested_duration_sec": suggested_sec,
@@ -1077,6 +1112,85 @@ def _build_beat_section(beat: dict, index: int, start_ms: int, end_ms: int, scri
         "media_url":            beat.get("media_url", ""),
         "media_type":           beat.get("media_type", "image"),
     }
+
+
+def _apply_short_visual_hold_cap(
+    sections: list[dict],
+    *,
+    max_hold_ms: int | None = None,
+    content_id: str | None = None,
+    language: str | None = None,
+) -> list[dict]:
+    """Cap child Short visual exposure by advancing the next existing beat.
+
+    This intentionally does not create synthetic beats or alter the audio/subtitle
+    timeline. When a non-terminal beat exceeds the cap, its end is shortened and
+    the next existing visual beat starts earlier. The terminal beat is left alone
+    when no later beat exists to take over the remaining narration span.
+    """
+    if not sections:
+        return []
+
+    cap_ms = int(max_hold_ms if max_hold_ms is not None else _SHORT_VISUAL_MAX_HOLD_MS)
+    if cap_ms <= 0:
+        logger.warning(
+            "SHORT_VISUAL_HOLD_CAP_SKIPPED content_id=%s language=%s reason=invalid_cap cap_ms=%d",
+            content_id or "unknown", language or "unknown", cap_ms,
+        )
+        return [dict(section) for section in sections]
+
+    capped = [dict(section) for section in sections]
+    durations_before = [
+        max(0, int(s.get("audio_end_ms", 0)) - int(s.get("audio_start_ms", 0)))
+        for s in capped
+    ]
+    capped_count = 0
+
+    for idx in range(len(capped) - 1):
+        start_ms = int(capped[idx].get("audio_start_ms", 0))
+        end_ms = int(capped[idx].get("audio_end_ms", start_ms))
+        hold_ms = max(0, end_ms - start_ms)
+        if hold_ms <= cap_ms:
+            continue
+
+        new_end_ms = start_ms + cap_ms
+        capped[idx]["audio_end_ms"] = new_end_ms
+        capped[idx + 1]["audio_start_ms"] = new_end_ms
+        capped_count += 1
+
+    terminal_uncapped = 0
+    if capped:
+        last = capped[-1]
+        last_hold_ms = max(
+            0,
+            int(last.get("audio_end_ms", 0)) - int(last.get("audio_start_ms", 0)),
+        )
+        if last_hold_ms > cap_ms:
+            terminal_uncapped = 1
+
+    for section in capped:
+        start_ms = int(section.get("audio_start_ms", 0))
+        end_ms = int(section.get("audio_end_ms", start_ms))
+        section["duration_sec"] = max(0, end_ms - start_ms) / 1000
+
+    durations_after = [
+        max(0, int(s.get("audio_end_ms", 0)) - int(s.get("audio_start_ms", 0)))
+        for s in capped
+    ]
+    if capped_count or terminal_uncapped:
+        logger.info(
+            "SHORT_VISUAL_HOLD_CAP_APPLIED content_id=%s language=%s cap_ms=%d "
+            "capped_beats=%d terminal_uncapped=%d max_before_ms=%d max_after_ms=%d",
+            content_id or "unknown",
+            language or "unknown",
+            cap_ms,
+            capped_count,
+            terminal_uncapped,
+            max(durations_before) if durations_before else 0,
+            max(durations_after) if durations_after else 0,
+        )
+
+    return capped
 
 
 
@@ -1419,7 +1533,14 @@ def remap_beats_for_short(
         allow_legacy_fallback=True,
         language=language,
     )
-    return mapped or []
+    if not mapped:
+        return []
+
+    return _apply_short_visual_hold_cap(
+        mapped,
+        content_id=content_id_str,
+        language=language,
+    )
 
 
 def generate_pending_beat_images(beats: list[dict], content_id: str) -> list[dict]:
@@ -1448,7 +1569,13 @@ def generate_pending_beat_images(beats: list[dict], content_id: str) -> list[dic
     """
     pending = [
         b for b in beats
-        if b.get("media_strategy", "flux_generated") == "flux_generated" and not b.get("media_url")
+        if (
+            b.get("media_strategy", "flux_generated") == "flux_generated" and not b.get("media_url")
+        )
+        or (
+            is_text_card_beat(b)
+            and not (b.get("media_url") or "").startswith("cache/")
+        )
     ]
     if not pending:
         return beats
@@ -1458,14 +1585,23 @@ def generate_pending_beat_images(beats: list[dict], content_id: str) -> list[dic
         content_id, len(pending), len(beats),
     )
 
+    # Caller-scoped only (this child language's generation pass), never
+    # persisted — same Pro-tier bookkeeping contract as the parent path's
+    # generate_all_beat_images(); see generate_beat_image_with_routing().
+    tier_counts: dict[str, int] = {}
+
     for beat in pending:
-        new_url = generate_beat_image(
-            flux_prompt=beat.get("flux_prompt", ""),
-            beat_index=beat.get("beat_order", 0),
-            content_id=content_id,
-            environment=beat.get("environment", "other"),
-        )
+        if is_text_card_beat(beat):
+            generate_text_card_background_image(beat, content_id)
+            continue
+
+        new_url = generate_beat_image_with_routing(beat, content_id, tier_counts)
         beat["media_url"] = new_url if new_url else _TEXT_CARD_SENTINEL
         beat["media_type"] = "image"
+
+    if tier_counts:
+        logger.info(
+            "IMAGE_ROUTE_TIER_COUNTS content=%s tier_counts=%s", content_id, tier_counts,
+        )
 
     return beats

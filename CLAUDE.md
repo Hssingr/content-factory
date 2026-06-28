@@ -1577,7 +1577,8 @@ flowchart TD
     D -->|exists| F[remap_beats_for_short]
     F --> G[reuse parent images or generate new]
     G --> H[map to child Whisper timestamps]
-    H --> I[save child VideoSection rows]
+    H --> H2[apply Short visual hold cap]
+    H2 --> I[save child VideoSection rows]
     I --> J[Child CHILD_SHORT_VISUALS_DONE]
 ```
 
@@ -1783,6 +1784,7 @@ Checks (current full inventory):
 | 16 | `flux_prompt_near_duplicate` — `flux_prompt`'s word-token set overlaps ≥80% (Jaccard) with an earlier beat's | MINOR |
 | 17 | `reuse_clustering` — 3+ consecutive beats reuse the identical `media_url` | MINOR |
 | 18 | `excessive_reuse_ratio` — ≥70% of `flux_generated` beats already have a non-empty `media_url` at validation time | MINOR |
+| 19 | `ai_text_rendering_requested` — `flux_generated` `flux_prompt` contains a quoted phrase or a "the text reads"/"sign that says"-style instruction asking the image model to render readable text (Phase 14.7) | MAJOR |
 
 Checks 12–16 validate `flux_prompt` *text quality* (subject/environment/
 information clarity, exact/near duplication) — distinct from check 4, which
@@ -1791,8 +1793,11 @@ reuse patterns* (Phase 4E-E) — only ever observable on the child remap path:
 parent beats never have a `media_url` set at the point `validate_storyboard()`
 runs (Flux hasn't generated yet — see the Ordering rule under
 `remap_beats_for_short` above), so these two checks are naturally always
-zero/LOW for parents with no child-specific branch required. All checks live
-in the same function; none is a second validator.
+zero/LOW for parents with no child-specific branch required. Check 19
+(Phase 14.7, §11.6) is a defense-in-depth complement to Phase 14.7's
+Python-side prompt sanitization — it fires only on a beat the sanitization's
+keyword detector missed, not on the normal sanitized happy path. All checks
+live in the same function; none is a second validator.
 
 Rules:
 
@@ -1939,6 +1944,7 @@ app/agents/agent4_visuals/services/flux_generator.py
 Responsibilities:
 
 - Generate or reuse Flux images.
+- Generate contextual backgrounds for deliberate Remotion text-card beats.
 - Save local cache images.
 - Attach local `media_url`.
 
@@ -1947,6 +1953,17 @@ Rules:
 - `media_url` must always be local, usually `cache/...`.
 - Never pass HTTP URLs to Remotion props.
 - Cache reuse must not create obvious visual repetition.
+- Deliberate `media_strategy="remotion_text_card"` beats must receive a real
+  generated background image whenever Flux succeeds. The text itself remains
+  `overlay_text` rendered by Remotion; Flux prompts for these backgrounds must
+  describe only a concrete contextual scene and must explicitly avoid readable
+  text, letters, numbers, captions, logos, signs, and typography.
+- Text-card background generation always uses Flux Schnell via the hardcoded
+  fal.ai endpoint `fal-ai/flux-1/schnell` in `flux_generator.py`. It is not a
+  routed model task and is exempt from future higher-tier model routing.
+- If text-card background generation fails, the beat may fall back to the
+  `__text_card__` sentinel and Remotion's text-card fallback; this must be
+  logged as `TEXT_CARD_BACKGROUND_FALLBACK`.
 - If cache reuse is controlled by prompt hash, log enough to debug repeated frames.
 
 #### `remap_beats_for_short`
@@ -1964,6 +1981,7 @@ Responsibilities:
 - Decide reuse vs. new-image-needed per beat (does **not** call Flux itself —
   see Ordering rule below).
 - Map beats to child Whisper timestamps.
+- Apply the child Short visual hold cap.
 - Return child short beats.
 
 Rules:
@@ -1974,6 +1992,15 @@ Rules:
 - Reuse parent images only when match score threshold passes.
 - Threshold is enforced in Python, not prompt.
 - Log reuse stats.
+- Child Short visual sections use `settings.short_visual_max_hold_ms` (default
+  6000 ms) as a maximum non-terminal image hold target after timestamp mapping.
+  If a non-terminal beat exceeds the cap, Agent 4 shortens that beat and
+  advances the next existing visual beat earlier to cover the remaining
+  narration span. It never creates fake beats, never changes child audio,
+  never changes Whisper/subtitle timing, and never applies this cap to parent
+  long-form storyboard timing. A terminal beat with no later visual beat may
+  remain above the cap, and the cap application is logged as
+  `SHORT_VISUAL_HOLD_CAP_APPLIED`.
 
 Alignment-hint rule (Phase 6A-1):
 
@@ -2068,17 +2095,322 @@ Responsibilities:
 
 - Generate a Flux image for every beat `remap_beats_for_short()` left
   pending (`media_strategy="flux_generated"` and `media_url=""`).
+- Generate a contextual background image for any deliberate text-card beat
+  that does not yet have a local `cache/` background.
 - Leave already-reused beats (non-empty `media_url`) untouched — never
-  regenerates a beat that already has a real image.
+  regenerates a beat that already has a real image, except that a text-card
+  sentinel is replaced by a generated background when generation succeeds.
 
 Rules:
 
 - Must run **after** `_check_storyboard_issues()`, never before — this is
   the entire point of the Phase 4E-E ordering alignment.
+- Ordinary (non-text-card) pending beats go through the same
+  `generate_beat_image_with_routing()` model-tier decision as the parent
+  path (see §11.5) — conservative/Schnell by default. Text-card backgrounds
+  are never routed through any model tier selector; they always call
+  `generate_beat_image()` with no `model_key` argument, which defaults to
+  Schnell unconditionally.
 - Is not a retry or regeneration mechanism: it fills in exactly the beats
   that were always going to need a new image, once, regardless of what
   `validate_storyboard()` found. A MAJOR/MINOR validator finding on a
   child beat does not change which beats this function generates.
+
+### 11.5 Image Model Routing (Phase 14.6)
+
+File:
+
+```text
+app/agents/agent4_visuals/services/image_router.py
+```
+
+Owns the *decision* of which image source/model a beat should use (reuse /
+stock / Schnell / Dev / Pro-family) and the *payload normalization* for
+whichever fal.ai Flux endpoint is selected. It does not call fal.ai —
+`flux_generator.py` remains the only direct `fal_client` integration point;
+`image_router.py` makes no `fal_client` import.
+
+Core exports:
+
+- `ImageRequest` / `ImageResult` / `ImageRoute` — pipeline-level dataclasses
+  (provider-agnostic on the request/route side; `ImageResult.media_url` is
+  always a local `cache/...` path or `None`, never a remote URL).
+- `MODEL_CAPABILITIES` — capability table keyed by `schnell`, `dev`,
+  `pro_1_1`, `pro_1_1_ultra`, `flux_2_pro`. Each entry declares `endpoint`,
+  `size_mode` (`"image_size"` or `"aspect_ratio"`), `supports_steps`,
+  `default_steps`, `supports_guidance`, `default_guidance`, `supports_seed`,
+  `safety_mode` (`"enable_safety_checker"`, `"safety_tolerance"`, or
+  `"both"`), and `output_formats`.
+- `select_route(beat, content_id, ...)` — the routing decision function.
+- `build_fal_payload(model_key, prompt, ...)` — pure payload builder; emits
+  only the fields the chosen model's capability entry supports (Pro-family
+  never receives a Schnell-shaped field, Flux 2 Pro never receives
+  `num_inference_steps`/`guidance_scale`).
+- `build_cache_key_material(model_key, prompt, ...)` — model-aware cache
+  hash input, backward-compatible with every pre-Phase-14.6 cache entry for
+  the Schnell tier (see Cache keys below).
+
+Conservative-by-default contract (the load-bearing invariant of this
+section — do not relax without an explicit operator config change):
+
+- **Text-card backgrounds always route to Schnell**, unconditionally,
+  regardless of any routing config — a hard short-circuit in
+  `select_route()` on `purpose="text_card_background"`, not a heuristic.
+  This is the Phase 14.4 invariant, preserved exactly.
+- **Ordinary generated beats route to Schnell** unless
+  `settings.image_routing_enabled` is `True` **and** the relevant tier flag
+  (`image_routing_allow_dev` / `image_routing_allow_pro`) is `True` **and**
+  the first-pass eligibility heuristic (`_heuristic_qualifies_for_higher_tier()`
+  — cover frame, `beat_intensity="high"`, `visual_category="person"`, a
+  reveal/climax keyword in `script_text`, or a future `thumbnail_candidate`
+  flag) says the beat qualifies.
+- **Pro-family usage is hard-capped per content** by
+  `settings.image_routing_max_pro_per_content`, default `0` — Pro is never
+  selected at all until an operator explicitly raises this above zero, even
+  if `image_routing_allow_pro` is `True`.
+- **Stock is reserved, never selected** — no stock provider exists yet;
+  `_build_beat_section()` already overrides any stock `media_strategy` to
+  `flux_generated` before beats reach the router (defensive branch only).
+- **`schnell`'s endpoint is intentionally left as the repo's pre-existing
+  literal** (`"fal-ai/flux-1/schnell"`), not updated to fal.ai's current
+  documented name (`"fal-ai/flux/schnell"`, per Phase 14.5's research) —
+  changing a live-traffic endpoint string cannot be verified without a live
+  fal.ai call, which this and prior phases are forbidden from making. Dev/Pro
+  endpoints use the Phase-14.5-verified documented names since they are
+  never called by default and have no pre-existing production traffic to
+  preserve.
+
+Config flags (`app/config.py`, all default to preserving exact pre-14.6
+behavior):
+
+```text
+image_routing_enabled              default False
+image_routing_allow_dev            default False
+image_routing_allow_pro            default False
+image_routing_max_pro_per_content  default 0
+```
+
+Provider adapter (`flux_generator.py`):
+
+- `_call_fal(prompt, cache_dir, media_path, cache_key_extra="", model_key="schnell")`
+  resolves the endpoint and request payload from `image_router` — it no
+  longer hardcodes a Schnell-shaped argument dict.
+- `generate_beat_image(..., model_key="schnell")` — new trailing optional
+  parameter; every pre-Phase-14.6 caller (including
+  `generate_text_card_background_image()`, which never passes it) gets
+  exactly the prior behavior unchanged.
+- `generate_beat_image_with_routing(beat, content_id, tier_counts)` — the
+  one centralized call site that runs `image_router.select_route()` then
+  `generate_beat_image()`. Both `generate_all_beat_images()` (parent) and
+  `generate_pending_beat_images()` (child) call this for ordinary beats so
+  the two paths make the identical routing decision with identical
+  per-content Pro-tier bookkeeping (`tier_counts` — caller-scoped to one
+  content item's generation run, never persisted).
+
+Cache keys (model-aware, backward-compatible by construction):
+
+- For the Schnell tier (the default, and the tier every pre-Phase-14.6
+  caller used, including Phase 14.4 text-card backgrounds),
+  `build_cache_key_material()` reproduces the exact pre-Phase-14.6 material
+  (`prompt` alone, or `f"{cache_key_extra}\n{prompt}"` when a namespace is
+  given) — zero cache invalidation for any existing cached image.
+- For any non-Schnell tier, the material is prefixed with
+  `model={model_key}` and `size={width}x{height}` so a Dev/Pro/Flux-2-Pro
+  generation of the same prompt can never collide with (or accidentally
+  reuse) a Schnell cache entry.
+
+Logs:
+
+```text
+IMAGE_ROUTE_SELECTED        — every select_route() call (model/source/reason)
+IMAGE_ROUTE_FALLBACK        — stock-disabled defensive fallback to schnell
+FAL_IMAGE_REQUEST_PREPARED  — payload keys for the model about to be called
+FAL_IMAGE_GENERATED         — successful generation, with model/endpoint/media_url
+IMAGE_ROUTE_TIER_COUNTS     — per-content tier usage summary, parent and child paths
+```
+
+Rules:
+
+- Agent 5 still receives only local `cache/...` `media_url` values from
+  `VideoSection` rows — the router changes nothing about that contract;
+  every `ImageResult`/generated path is downloaded to local disk before
+  persistence, exactly as before this phase.
+- Do not add a second fal.ai integration point — all endpoint selection and
+  payload construction stays inside `image_router.py`'s capability table
+  and `flux_generator.py`'s single `_call_fal()` call site.
+- Do not change `MODEL_CAPABILITIES["schnell"]["endpoint"]` without an
+  operator-run live canary outside Claude Code/Codex first (CLAUDE.md §19.1).
+- Do not enable Dev/Pro tiers by default; do not raise
+  `image_routing_max_pro_per_content` above `0` without an explicit
+  operator decision.
+
+### 11.6 AI Text Rendering Ban — Text-Prop Sanitization (Phase 14.7)
+
+Image models cannot render legible text reliably — a generated document,
+missing-person poster, calendar, sign, or name tag that asks Flux to render
+specific words/letters/numbers always comes back as illegible gibberish
+(the real defect this section fixes: a missing-person poster with a
+corrupted name and body text). The rule going forward:
+
+- **AI image models must never be asked to render readable text.** No
+  `flux_prompt`, at any tier (Schnell/Dev/Pro-family, §11.5), may request a
+  quoted phrase, a "the text reads ...", "label reading ...", "sign that
+  says ...", or any other literal-text-rendering instruction.
+- **Remotion owns every readable text overlay.** Any text a viewer needs to
+  actually read — a poster's name, a document's case number, a calendar's
+  date — is rendered by Remotion's existing `TextOverlay` mechanism
+  (`MediaSection.tsx`), the same mechanism already used for every other
+  `overlay_text`/`overlay_position` pair. No new Remotion component was
+  added for this — `TextOverlay` already renders for any non-`"none"`
+  `overlay_position` with non-empty `overlay_text`, on top of any generated
+  clip, for any `visual_type`.
+- **Generated image prompts for a text-bearing prop must request a
+  blank/non-legible version of that prop**, not an absence of the prop
+  itself — a missing-person poster beat still shows a poster; it just isn't
+  asked to carry legible text.
+- **Text cards (Phase 14.4) remain their own separate mechanism** and are
+  never touched by this section's detector — `is_text_prop_beat()` always
+  returns `False` for any beat `is_text_card_beat()` already claims. The two
+  generated-background-plus-overlay patterns look similar in spirit (both
+  generate a clean image and let Remotion render text on top) but are
+  independent code paths with independent triggers
+  (`media_strategy == "remotion_text_card"` vs. a keyword match on an
+  ordinary `flux_generated` beat).
+
+Detection — `flux_generator.is_text_prop_beat(beat)`:
+
+- Excludes any beat `is_text_card_beat()` already claims.
+- True when `flux_prompt`, `visual_intent`, or `motif` contains any of a
+  curated keyword list (`_TEXT_PROP_KEYWORDS`): document, case file, report,
+  file folder, missing/wanted poster, poster, calendar, street sign, sign,
+  label, handwritten note, note, diary, letter, newspaper, article, phone
+  screen, text message, phone message, name tag, identification/ID card,
+  license, headline.
+- Deliberately keyword-based and conservative (no attempt to flag every
+  possible readable-text prop) — false negatives are caught by the
+  independent validator check below (defense in depth), not assumed away.
+
+Sanitization — `flux_generator.derive_text_prop_prompt(beat)`, wired into
+`storyboard._build_beat_section()` (the single function shared by the
+parent storyboard path and the child remap path, per §11.4):
+
+- Discards the original `flux_prompt`'s literal-text phrasing entirely
+  rather than trying to surgically edit it — derives a fresh prompt from
+  `visual_intent` (preferred) or the original `flux_prompt`/`script_text` as
+  a fallback context, plus the detected prop label (e.g. "missing person
+  poster", "calendar") and the beat's `environment` scene words.
+- Always appends an explicit forbidding clause: "blank and unmarked, no
+  readable text, no legible letters, no legible numbers, no legible words,
+  no readable typography, no readable logos, no readable names, no readable
+  dates, illegible or blank surface only."
+- Runs only when `media_strategy == "flux_generated"` — text-card beats
+  (`"remotion_text_card"`) are never sanitized by this path; their own
+  Phase 14.4 derivation (`derive_text_card_background_prompt()`) is
+  untouched and independent.
+- Logged as `TEXT_PROP_PROMPT_SANITIZED` (original prompt, sanitized
+  prompt, and derived overlay, all truncated for log size).
+
+Overlay derivation — `flux_generator.derive_text_prop_overlay(beat)` — only
+two narrow, non-inventing rules, by design (CLAUDE.md §21.3: never invent
+facts not present in the source material):
+
+1. A missing-person/wanted-poster beat gets the generic label `"MISSING"` —
+   never a fabricated name.
+2. A calendar/date beat gets an exact date substring matched verbatim out of
+   the beat's own `script_text` (month-name or numeric date pattern) — never
+   an invented date. No match found → no overlay.
+
+Every other text-prop beat (document, sign, name tag, ID card, ...) gets no
+overlay at all unless the beat already carried explicit `overlay_text` from
+upstream — this phase never invents detailed body copy (a case number, a
+full headline, an address). When a derived overlay exists and the beat's
+`overlay_position` was unset/`"none"`, it is set to `"center"` so the
+overlay actually renders instead of silently doing nothing (`TextOverlay`
+returns `null` for `position === "none"`).
+
+Validator — `storyboard_validator._find_ai_text_rendering_issues()`, check
+19 (`ai_text_rendering_requested`, MAJOR), added to `validate_storyboard()`'s
+existing single shared check list (§11.4 — no second validator, no forked
+check list):
+
+- Fires when a `flux_generated` beat's `flux_prompt` contains a quoted
+  phrase of letters or one of a curated phrase list ("the text reads",
+  "label reading", "sign that says", "written on it", ...).
+- Independent of, and a defense-in-depth complement to, the sanitization
+  above — it catches any beat the keyword-based detector misses (a prompt
+  that asks for rendered text without using one of the curated prop
+  keywords), regardless of beat category.
+- Same exemption as check 4 (`forbidden_flux_word`): `remotion_text_card`
+  beats are skipped, since their background prompt is derived/sanitized
+  downstream of this validation pass.
+- MAJOR severity means the existing routing applies unchanged: one
+  full-storyboard retry for the parent path, logged-and-proceed for the
+  child remap path (§11.4) — this section introduces no new retry/blocking
+  mechanism.
+
+Rules:
+
+- Do not ask Flux/Dev/Pro (any tier from §11.5) to render readable text,
+  ever — this applies regardless of which model tier a beat is routed to.
+- Do not remove readable text from the final rendered video — every
+  sanitized beat either keeps its existing `overlay_text` or gets a
+  conservative derived one; sanitization changes where text is rendered
+  (Remotion, not the image model), never whether it appears.
+- Do not invent detailed body copy (names, addresses, full headlines) for
+  an overlay — only the two narrow rules above (`"MISSING"`, an
+  exact-verbatim date) are allowed; everything else gets no overlay.
+- Agent 5 remains render-only — `_section_for_remotion()` already passes
+  `overlay_text`/`overlay_position` through for every beat regardless of
+  `visual_type`; no Remotion/Agent-5 code changed for this phase, and Agent
+  5 still makes no image-generation or Agent-4 call of any kind.
+
+### 11.7 Visual Amplification Rule — Amplify, Don't Illustrate (Phase 14.8)
+
+A visual that simply shows the literal noun or action the narration just
+named (narration: "she entered the room" → image: a room) is illustration,
+not amplification, and reads as artificial/AI-generated. `_STORYBOARD_SYSTEM_PROMPT`
+(`app/agents/agent4_visuals/system_prompt.py`) now carries an explicit rule
+(Principle B2) requiring every beat to add at least one of: emotional
+reaction, hidden threat, consequence, evidence, spatial tension,
+symbolic/foreshadowing detail, human vulnerability, or aftermath — never
+just the bare noun/action from the sentence it accompanies.
+
+A second new section ("beat category rotation") instructs the model to
+alternate between six rotation categories — human reaction, threatening
+space, evidence/prop, environmental clue, consequence/aftermath,
+motion/action — expressed entirely through the **existing**
+`visual_category` / `visual_type` / `motif` beat fields (`person`/`place`/
+`object`/`document` etc.). No new beat schema field was added for this;
+`STORYBOARD_SCHEMA_VERSION` stays `6.1`. The rule explicitly names the
+regression pattern to avoid: a run of object → object → room → object with
+no human-reaction/threat/consequence variety.
+
+This is a prompt-only change (`PROMPT_VERSION` 3.3 → 3.4). No new
+deterministic validator check was added — the existing `validate_storyboard()`
+checks (`consecutive_same_environment`, `motif_repetition_in_window`,
+`near_duplicate_beat`, `ai_slideshow_risk`) already detect repeated
+category/environment/motif runs, confirmed directly against a hand-built
+object/room-repetition fixture rather than assumed. A small, equivalent
+nudge ("prefer a reaction/consequence/evidence query over the literal
+noun/action") was also added to `_SPLITTER_SYSTEM_PROMPT`, the legacy
+section-splitter fallback prompt — additive only, no JSON-shape change to
+that path's `search_query`/`suggested_visual` contract.
+
+Rules:
+
+- This principle applies to ordinary `flux_generated` beat content choice
+  only — it does not change `remotion_text_card` media-strategy selection,
+  text-card background derivation (§11.6/Phase 14.4), the AI text-rendering
+  ban (§11.6/Phase 14.7), image model routing (§11.5/Phase 14.6), or the
+  Short visual hold-cap (§11.4/Phase 14.3).
+- Do not add a new beat schema field for "rotation category" — express it
+  through `visual_category`/`visual_type`/`motif`, exactly as this phase
+  does, unless a future phase produces concrete runtime evidence (CLAUDE.md
+  §19.4) that the existing fields cannot carry the distinction.
+- Do not add a quality-judgment validator check for "this prompt merely
+  illustrates the narration" — that is a semantic judgment a deterministic
+  Python check cannot make reliably; rely on the prompt rule plus the
+  existing structural-repetition checks instead.
 
 ---
 
@@ -2286,6 +2618,8 @@ Rules:
 - Use vertical layout.
 - Use child audio.
 - Use child timed beats.
+- Preserve text-card background `media_url` values as local image clips; the
+  readable text remains Remotion-rendered overlay text.
 - Do not add rehook/bridge audio unless a future architecture explicitly reintroduces standalone short bookends.
 
 #### `render_main_video`
@@ -2318,6 +2652,172 @@ Rules:
 - Store as `VideoRender(format="short")`.
 - Output belongs to the child content ID.
 
+### 11A.5 Subtitle/Overlay Collision Prevention (Phase 14.10b)
+
+A confirmed real-world defect (`code_report/phase_14_10_double_subtitle_investigation.md`)
+showed two text layers rendering simultaneously with different text and
+styling: the composition-wide subtitle/caption layer
+(`StandardSubtitles`/`KaraokeSubtitles`) and a per-section text layer
+(`TextOverlay`/`TextCard` in `MediaSection.tsx`) are structurally
+independent components with no built-in coordination, so any section
+carrying `overlay_text`/`overlay_position` (including ordinary, non-text-card
+beats — e.g. Phase 14.7's text-prop overlays) or any `visual_type ===
+"text_card"` beat collided with the always-on subtitle layer for that
+section's entire on-screen duration.
+
+**Design decision: the section overlay wins.** Global subtitles are
+suppressed during a section's own overlay window rather than letting the
+two layers visually collide.
+
+Implementation (`remotion/src/components/MediaSection.tsx`):
+
+- `sectionHasActiveOverlay(section)` — true when
+  `overlay_text` is non-empty and `overlay_position != "none"`, OR
+  `visual_type === "text_card"`.
+- `computeOverlaySuppressWindows(sections, offsetMs?)` — maps every section
+  matching the above to a `{start_ms, end_ms}` window, in the same absolute
+  ms coordinate space the subtitle captions already use. `offsetMs` lets
+  `Short.tsx` shift these into Short-local ms, exactly mirroring how
+  `KaraokeSubtitlesWithOffset` already shifts captions.
+- `MainVideo.tsx`/`Short.tsx` compute `suppressWindows` directly from the
+  `sections` prop they already receive — **no new data was added to the
+  Python prop builders**; Agent 5 remains render-only and unaware of this
+  coordination logic, per CLAUDE.md §11A.1.
+- `StandardSubtitles`/`KaraokeSubtitles` both gained an optional
+  `suppressWindows` prop (default `[]`, fully backward compatible): before
+  evaluating which caption is active, each checks
+  `suppressWindows.some(w => currentMs >= w.start_ms && currentMs < w.end_ms)`
+  and renders nothing if suppressed. Subtitle chunk timing data itself
+  (`app/agents/agent5_render/services/subtitles.py`) is completely
+  untouched — suppression is a render-time gate, not a data change.
+- A section's own `TextOverlay`/`TextCard` rendering is unchanged by this
+  mechanism — only the global subtitle layer is gated. Overlay text is
+  never removed.
+
+**Secondary mechanism — crossfade transition overlap, also fixed.** A
+`transition_to_next` of `"crossfade"`/`"dip_to_black"`/etc. intentionally
+extends a section's `Sequence` mount window backward by `crossfadeIn`
+frames (0-20 frames) so its image can dissolve in. During that window the
+*previous* section's `MediaSection` is still mounted too, so if both
+sections carried an overlay, they could collide with each other (not with
+subtitles). Fixed by gating `TextOverlay`/`TextCard` on `frame >=
+crossfadeIn` inside `MediaSection.tsx` (`showOverlay`) — an incoming
+section's own overlay never appears until its crossfade-in has finished,
+so at most one section's overlay is ever visible at a time. This is an
+intentional trade-off: it can produce a brief (≤0.67s) window with neither
+an overlay nor (if the suppression window already started) subtitles
+visible, which is accepted as strictly preferable to the two layers ever
+colliding again.
+
+Rules:
+
+- Do not add a second/duplicate subtitle component to work around this —
+  extend `suppressWindows`/the existing components instead.
+- Do not move this coordination logic into Agent 5's Python prop builders —
+  it belongs in the Remotion (`.tsx`) layer, since it only needs data
+  (`sections`) Agent 5 already passes through unchanged.
+- Do not remove the `showOverlay`/`suppressWindows` gates without an
+  equivalent replacement — doing so reopens the originally-reported defect.
+
+### 11A.6 Color Grade CSS Filter (Phase 14.11)
+
+`MediaSection.tsx`'s `GRADE_FILTER` constant is the **render-active**
+implementation of `color_grade` — applied directly as the CSS `filter`
+style on every rendered clip (`filter: GRADE_FILTER[colorGrade] ?? "none"`
+in `SingleClip`). `color_grade` is not descriptive metadata; whatever value
+a beat carries genuinely changes the pixels Remotion renders.
+
+A confirmed real defect (`code_report/phase_14_11_color_grade_cast_investigation.md`):
+`cold_blue`'s filter originally used `hue-rotate(200deg)` — not a subtle
+cool nudge, but a rotation of nearly half the hue wheel. CSS `hue-rotate`
+shifts every hue in the image by the given angle; 200deg pushes skin tones
+(~25-35deg, orange) into the blue family and green foliage (~90-130deg)
+into violet/magenta — confirmed by direct hue-math, matching the reported
+"unnatural purple/blue tint... including foliage and skin tones" defect.
+Fixed by reducing the magnitude to `hue-rotate(15deg)` — small enough that
+no recognizable real-world hue (skin, foliage, sky) crosses into an
+unrelated color family; the "cool/muted" feel comes from the
+already-present `saturate(70%)`/`brightness(80%)` components, not from an
+extreme hue rotation.
+
+Investigation also confirmed, and rules out as causes:
+
+- Agent 4's storyboard prompt (`_STORYBOARD_SYSTEM_PROMPT`'s "Color grade
+  integration" section) asks only for "naturally cool-toned lighting" for
+  `cold_blue` — it never mentions purple/magenta and is never told the
+  actual CSS value the render layer applies, so the cast was not
+  prompt-induced.
+- The image router (§11.5) sends no color/style parameters to any fal.ai
+  model tier.
+- No mix-blend-mode, full-frame overlay, or ffmpeg/ renderer-level color/LUT
+  post-process exists anywhere else in the pipeline — `GRADE_FILTER` is the
+  only mechanism capable of a wholesale hue-family shift.
+
+Rules:
+
+- Any grade using `hue-rotate` must keep the magnitude small enough that no
+  representative real-world hue (skin ~25-35deg, foliage ~90-130deg, sky
+  ~200-220deg) crosses into an unrelated hue family after rotation — verify
+  with the same hue-math approach this phase used before changing the value
+  again.
+- If a grade's prompt-side guidance (`system_prompt.py`) implies a specific
+  CSS effect, state the actual CSS values in the prompt (as `dark_contrast`
+  already does) so Claude's choices and the render-layer effect stay
+  legible to whoever reads/maintains the prompt.
+
+### 11A.7 Future Background Music Asset Strategy (Phase 15.2 — design only)
+
+No background music/score layer exists in the pipeline yet. Phase 15.1
+(`code_report/phase_15_1_music_intensity_curve_investigation.md`) confirmed
+this and recommended a local royalty-free loop library plus a Remotion
+volume curve as the safest future architecture. Phase 15.2
+(`code_report/phase_15_2_music_asset_strategy.md`) defined, but did not
+wire into any render path, the asset/metadata strategy a future
+implementation phase will build on:
+
+- **Ownership: Agent 5/Remotion**, not Agent 3 — voice/TTS generation is
+  untouched by this strategy and must remain so.
+- **Real audio files belong under `{media_path}/music/{filename}`** — the
+  same runtime, git-ignored, operator-populated convention already used
+  for `audio/`, `video/`, and `cache/` (§13). No audio file may ever be
+  committed to this repository. `staticFile()` + the render command's
+  existing `--public-dir <media_path>` flag already resolve this path the
+  same way the narration `audio_file` prop does — no new Remotion bundler
+  configuration is needed when a real implementation phase wires this up.
+- **Metadata schema** lives at
+  `app/agents/agent5_render/music/schema.py` (the required-field
+  definitions and two pure, local-only validators —
+  `validate_entry_metadata()` for shape/licensing,
+  `validate_entry_asset_on_disk()` for local filesystem existence/format/
+  duration) and
+  `app/agents/agent5_render/music/music_library.example.json` (a
+  template with fictitious placeholder entries only — never real track
+  metadata, clearly marked `_TEMPLATE_ONLY: true`).
+- **Licensing policy — default-deny, not default-allow:** every entry must
+  carry a non-empty `license` and `source`, and
+  `safe_for_commercial_use` must be explicitly `true` — missing, false, or
+  any non-boolean value makes an entry ineligible for use. No unverified or
+  undocumented asset may ever be selected by a future implementation.
+- **Intensity/mood tagging** reuses the storyboard's existing
+  `beat_intensity` enum (`high`/`medium`/`low`) as the `intensity_tier`
+  field, rather than inventing a new scale — but `beat_intensity` is
+  currently NOT forwarded by `_section_for_remotion()`/`SectionData`
+  (`types.ts`) into Remotion props; a future implementation phase's first
+  step is forwarding that one existing field, not adding a new data
+  source.
+
+Rules:
+
+- Do not add a real audio file to this repository under any path.
+- Do not treat `music_library.example.json` as real, usable, or
+  legally-cleared data — every value in it is a placeholder.
+- A future implementation phase must not select or mix any music-library
+  entry whose `validate_entry_metadata()` result is non-empty, or whose
+  `safe_for_commercial_use` is not exactly `true`.
+- Do not add a music provider or live music-generation API as part of this
+  strategy — the minimum viable architecture is a static local loop
+  library only.
+
 ---
 
 ## 12. Parent vs Child Short Comparison
@@ -2331,7 +2831,7 @@ Rules:
 | Whisper | parent transcript | child transcript |
 | Breakpoints | empty | empty |
 | Bookends/rehooks/bridges | disabled | disabled |
-| Visual pass | full storyboard + Flux | remap parent visual beats |
+| Visual pass | full storyboard + Flux | remap parent visual beats, then cap non-terminal visual holds |
 | Images | parent Flux cache | reuse parent images or generate child cache |
 | Remotion composition | `MainVideo.tsx` | `Short.tsx` |
 | Resolution | 1920×1080 | 1080×1920 |
@@ -3146,6 +3646,10 @@ Rules:
 - Flux images must be stored locally.
 - `media_url` must be local.
 - HTTP image URLs must never reach Remotion.
+- Deliberate Remotion text cards must use generated local Flux Schnell
+  backgrounds; Flux must not render the readable text itself.
+- Text-card backgrounds are exempt from model-tier routing and always use
+  `fal-ai/flux-1/schnell`.
 - Flux prompt hash caching is allowed.
 - Cache reuse must not create poor viewer experience.
 - Reuse parent images for child shorts only when visually relevant.
@@ -3202,6 +3706,9 @@ Rules:
 - Shorts have their own audio.
 - Shorts have their own Whisper.
 - Shorts use remapped parent visual beats.
+- Shorts cap non-terminal visual holds with `settings.short_visual_max_hold_ms`
+  (default 6000 ms) by advancing the next existing visual beat, without
+  changing narration audio or subtitle timing and without creating fake beats.
 - Shorts render vertically.
 - Parent content does not render shorts.
 - Parent content does not generate breakpoints for shorts.

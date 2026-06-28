@@ -17,9 +17,9 @@ Verifies:
   8. Statuses unchanged.
   9. Scheduling unchanged.
   10. No second validator framework; no AI/network calls in the new logic.
-  11. Bug Candidate 1 exclusion: the new checks gate on
-      "media_strategy != remotion_text_card", never on
-      "media_strategy == flux_generated" (Part 0 requirement).
+  11. Text-card background contract: the __text_card__ sentinel remains an
+      explicit fallback, while generated text-card cache/ media is validated
+      like any other local image.
 
 No live APIs, no Flux generation, no Remotion render, no DB migration.
 """
@@ -106,7 +106,7 @@ try:
         beat(2, "http://evil.example.com/x.jpg"),         # malformed/remote
         beat(3, f"cache/{cid}/zero.jpg"),                  # zero-byte
         beat(4, f"cache/{cid}/does_not_exist.jpg"),        # missing on disk, own asset
-        beat(5, "__text_card__", media_strategy="remotion_text_card"),  # exempt
+        beat(5, "__text_card__", media_strategy="remotion_text_card"),  # explicit fallback sentinel
         beat(6, f"cache/{cid}/real.jpg", media_type="video"),  # unsupported type
     ]
     issues = validator_mod.validate_media_assets(fixture_beats, cid)
@@ -121,7 +121,7 @@ try:
           issues_by_order.get(3) == "media_file_empty")
     check("3e: missing-on-disk own asset detected (beat 4)",
           issues_by_order.get(4) == "media_file_missing_on_disk")
-    check("3f: text_card beat (beat 5) is exempt — no issue",
+    check("3f: text_card fallback sentinel (beat 5) produces no media issue",
           5 not in issues_by_order)
     check("3g: unsupported media_type detected (beat 6)",
           issues_by_order.get(6) == "media_type_unsupported")
@@ -205,13 +205,20 @@ try:
           "(Path.exists/is_file/stat), no image decoding library import",
           "is_file(" in src_validate_media_assets or "stat(" in src_validate_media_assets)
 
-    print("\n── 11: Bug Candidate 1 exclusion (Phase 4D-E0 / Part 0) ──")
-    check("11a: the new checks gate on '!= remotion_text_card', never "
-          "'== flux_generated' as a trusted producer claim",
-          'strategy == _NO_MEDIA_REQUIRED_STRATEGY' in src_validate_media_assets
-          and '== "flux_generated"' not in src_validate_media_assets)
-    check("11b: CLAUDE.md-visible rationale comment for the exclusion exists in source",
-          "Bug Candidate 1" in inspect.getsource(validator_mod))
+    print("\n── 11: Text-card background contract ──")
+    text_card_real_media = [
+        beat(0, f"cache/{cid}/real.jpg", media_strategy="remotion_text_card"),
+    ]
+    text_card_real_issues = validator_mod.validate_media_assets(text_card_real_media, cid)
+    check("11a: text-card beats with generated cache/ backgrounds are validated and pass",
+          text_card_real_issues == [])
+    text_card_empty = [beat(0, "", media_strategy="remotion_text_card")]
+    text_card_empty_issues = validator_mod.validate_media_assets(text_card_empty, cid)
+    check("11b: text-card beats with empty media_url are no longer globally exempt",
+          len(text_card_empty_issues) == 1
+          and text_card_empty_issues[0]["check"] == "media_url_empty")
+    check("11c: the __text_card__ sentinel remains an explicit fallback, not a media issue",
+          5 not in issues_by_order)
 
 finally:
     settings.media_path = _orig_media_path

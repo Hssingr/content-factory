@@ -11,7 +11,19 @@ from app.services.claude_client import (
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "3.3"  # v3.3: _SPLITTER_SYSTEM_PROMPT (legacy section-splitter fallback,
+PROMPT_VERSION = "3.4"  # v3.4: Phase 14.8 — added "Principle B2: amplify, don't illustrate"
+                        #        and a "beat category rotation" section to
+                        #        _STORYBOARD_SYSTEM_PROMPT, instructing beats to add a
+                        #        reaction/threat/consequence/evidence/tension/foreshadowing/
+                        #        vulnerability/aftermath element rather than literally
+                        #        restating the narration's noun/action, and to rotate
+                        #        between six categories expressed via the EXISTING
+                        #        visual_category/visual_type/motif fields (no schema change —
+                        #        STORYBOARD_SCHEMA_VERSION stays 6.1). Also added one line to
+                        #        _SPLITTER_SYSTEM_PROMPT's SEARCH QUERY rules nudging the
+                        #        legacy fallback path toward the same reaction/consequence/
+                        #        evidence framing (no JSON schema change there either).
+                        # v3.3: _SPLITTER_SYSTEM_PROMPT (legacy section-splitter fallback,
                         #        reachable only via ChannelConfig.allow_legacy_fallback) had
                         #        "atmospheric", "cinematic", and "dramatic" wording that
                         #        directly contradicted FORBIDDEN_FLUX_WORDS — replaced with
@@ -98,6 +110,54 @@ Every beat must do at least ONE of the following — otherwise rethink it:
   - Create deliberate contrast with the previous beat
 A beat that simply restates the same visual idea as the previous beat is not a
 transition — it is padding. Cut it or replace it.
+
+== Principle B2: Visuals must amplify the narration, not illustrate it ==
+A visual that simply shows the literal noun or action the narration just named
+is illustration, not amplification — the single most common reason these
+videos feel artificial. If the narration says "she entered the room," the beat
+must NOT simply show a room. It must add something the words alone do not
+already give the viewer.
+
+Every beat must add at least ONE of:
+  - emotional reaction — a human response to what is happening
+  - hidden threat — something in the environment that signals danger before the
+    narration names it
+  - consequence — the result or fallout of an action already described
+  - evidence — a concrete object, prop, or document that supports or
+    complicates the story
+  - spatial tension — framing/composition that makes the space itself feel
+    unsafe or charged, not just a neutral establishing shot
+  - symbolic/foreshadowing detail — a concrete object that hints at what is
+    coming next
+  - human vulnerability — a detail that makes a person feel exposed, small,
+    or at risk
+  - aftermath — what is left behind after an event, shown instead of the
+    event itself
+
+Before finalizing any beat, ask: "what does this shot ADD that the narration
+sentence alone does not already tell the viewer?" If the honest answer is
+"nothing — it's just the noun from the sentence," redesign the beat using one
+of the eight additions above instead.
+
+== Beat category rotation (sequence diversity) ==
+Use the EXISTING visual_category / visual_type / motif fields below to express
+six rotation categories — do not invent new fields or values:
+  - human reaction       → visual_category="person", motif="face" or "hands"
+  - threatening space     → visual_category="place", motif="doorway"/"corridor"/"room",
+    composition/lighting chosen to make the space feel charged, not neutral
+  - evidence / prop       → visual_category="object" or "document", motif="object"/
+    "document"/"photo"
+  - environmental clue    → visual_category="place" or "object", motif="room"/"object"/
+    "reflection"
+  - consequence/aftermath → visual_category="place" or "object"; visual_intent makes
+    the aftermath explicit (what changed, what was left behind)
+  - motion/action         → visual_type="action"
+
+Do not repeat the same rotation category more than twice in a row. A run such
+as object → object → room → object — all evidence/environmental-clue, with zero
+human-reaction, threatening-space, or consequence/aftermath variety — is exactly
+the pattern to avoid. Within every 3–4 beat stretch, include at least one
+human-reaction, threatening-space, or consequence/aftermath beat.
 
 == Pacing ==
 - youtube_long format: place one visual beat every 3–5 seconds of narration.
@@ -213,6 +273,12 @@ remotion_text_card (deliberate choice, not a fallback):
     statistic  → large number centered, thin subtitle
     quote      → italic text, attribution line, quotation marks
     default    → centered text on dark gradient
+  The flux_prompt for remotion_text_card is still REQUIRED, but it is ONLY the
+  generated background image prompt. It must describe a concrete contextual scene
+  behind the card (room, desk, street, object, surface, or setting) and must NOT
+  ask Flux to render the readable text, letters, numbers, UI copy, captions, logos,
+  signs, or typography. The readable text belongs only in overlay_text and is
+  rendered by Remotion.
 
 stock_video / stock_image: reserved for a future release. Do not use.
 
@@ -274,7 +340,7 @@ Bad examples (forbidden):
      underwater | indoor_office | indoor_domestic | forest_nature | urban_street |
      corridor_interior | abstract_dark | open_landscape | laboratory | industrial |
      vehicle | other
-6. flux_prompt — Flux Schnell image generation prompt (see rules above).
+6. flux_prompt — Flux Schnell image generation prompt (see rules above). For remotion_text_card, this is the background scene only; never include readable text instructions.
 7. effect — slow_zoom | zoom_out | pan | push_in | shake | cut | fade_in | parallax
 8. color_grade — desaturated | cold_blue | warm_amber | dark_contrast | neutral
 9. transition_to_next — cut | crossfade | dip_to_black | whip_pan | zoom_blur | match_cut | none
@@ -329,7 +395,7 @@ _BEAT_SCHEMA: dict = {
         "visual_type":             {"type": "string", "enum": ["b-roll", "action", "text_overlay", "document", "map", "screenshot", "generated_visual"]},
         "visual_category":         {"type": "string", "enum": ["person", "place", "object", "document", "screen", "map", "abstract", "text"]},
         "environment":             {"type": "string", "enum": ["underwater", "indoor_office", "indoor_domestic", "forest_nature", "urban_street", "corridor_interior", "abstract_dark", "open_landscape", "laboratory", "industrial", "vehicle", "other"]},
-        "flux_prompt":             {"type": "string", "description": "Flux image generation prompt: specific physical subject only, no mood words, no faces, no logos, 50-80 words, photorealistic."},
+        "flux_prompt":             {"type": "string", "description": "Flux image generation prompt: specific physical subject only, no mood words, no faces, no logos, no readable text. For remotion_text_card, this is the generated background scene only; Remotion renders overlay_text."},
         "effect":                  {"type": "string", "enum": ["slow_zoom", "zoom_out", "pan", "push_in", "shake", "cut", "fade_in", "parallax"]},
         "color_grade":             {"type": "string", "enum": ["desaturated", "cold_blue", "warm_amber", "dark_contrast", "neutral"]},
         "transition_to_next":      {"type": "string", "enum": ["cut", "crossfade", "dip_to_black", "whip_pan", "zoom_blur", "match_cut", "none"]},
@@ -658,6 +724,10 @@ For each section you must decide:
    - Avoid people's faces unless the section explicitly calls for human presence.
    - Name a concrete subject, place, or object from the section text — not a mood or
      feeling. Answer "what exact thing would the camera be pointing at?"
+   - Prefer a query that captures a reaction, consequence, evidence, or detail tied to
+     the moment over one that just restates the literal noun/action in the sentence
+     (e.g. for "she entered the room," prefer "hand turning a rusted doorknob" over
+     "empty room").
    - Never invent places, people, or events — base the query on the section text only.
 
 2. SUGGESTED VISUAL — the type of visual that fits the section:

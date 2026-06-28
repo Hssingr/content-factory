@@ -71,9 +71,26 @@ class Settings(BaseSettings):
     # Set REMOTION_PRE_BUNDLE=true to enable; old bundles auto-pruned (keep last 2).
     remotion_pre_bundle: bool = False
 
+    # Agent 4 child Shorts: cap individual visual holds so sparse remaps do not
+    # leave one image on screen for long short-form spans. Parent timing is unchanged.
+    short_visual_max_hold_ms: int = 6000
+
     # Post-render verification: run ffprobe/blackdetect/silencedetect after every render.
     # Set VERIFY_RENDERS=false to skip (e.g. in CI or when ffmpeg is unavailable).
     verify_renders: bool = True
+
+    # Agent 4 image model routing (Phase 14.6 foundation) — conservative by
+    # default. With routing disabled (the default), every generated beat and
+    # every text-card background uses Flux Schnell exactly as before this
+    # phase. Text-card backgrounds always use Schnell regardless of these
+    # flags (enforced in image_router.select_route(), not configurable).
+    image_routing_enabled: bool = False
+    image_routing_allow_dev: bool = False
+    image_routing_allow_pro: bool = False
+    # Hard cap on Pro-family images per content item. Default 0 means Pro is
+    # never selected even if image_routing_allow_pro is true, until an
+    # operator explicitly raises this.
+    image_routing_max_pro_per_content: int = 0
 
 
 settings = Settings()

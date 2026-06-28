@@ -582,10 +582,11 @@ def _collect_technical_blockers(
         blockers.append("no_beats")
         return blockers
 
-    # Beats without real media (neither a local Flux image nor a text_card)
+    # Beats without real media. The text-card sentinel remains a valid explicit
+    # fallback when Flux background generation failed.
     no_media = sum(
         1 for s in sections
-        if s.get("visual_type") != "text_card"
+        if (s.get("media_url", "") or "") != _TEXT_CARD_SENTINEL
         and not (s.get("media_url", "") or "").startswith("cache/")
     )
     if no_media / len(sections) > _MISSING_MEDIA_BLOCK_RATIO:
@@ -639,12 +640,11 @@ def _check_props_sanity(sections: list[dict], duration_ms: int) -> tuple[bool, s
         else:
             max_end_ms = max(max_end_ms, int(end))
 
-        url   = s.get("media_url", "")
-        vtype = s.get("visual_type", "b-roll")
-        if vtype != "text_card":
+        url = s.get("media_url", "")
+        if url and url != _TEXT_CARD_SENTINEL:
             if url.startswith("http"):
                 errors.append(f"Section {order}: remote URL survived to props: {url[:80]!r}")
-            elif url and not url.startswith("cache/"):
+            elif not url.startswith("cache/"):
                 errors.append(f"Section {order}: unexpected non-local media_url: {url[:80]!r}")
 
         if len(errors) >= 5:

@@ -197,8 +197,8 @@ def _section_for_remotion(s: dict) -> dict:
     """Return only the keys Remotion needs from a section dict.
 
     Under the Flux architecture every section has exactly one image in ``media_url``
-    (a local cache/ path) or ``visual_type == "text_card"`` when Flux generation
-    failed. Text-card beats carry no media URL — Remotion renders TextCard.tsx.
+    (a local cache/ path). Deliberate text-card beats also carry a generated
+    background image; Remotion renders the readable text overlay itself.
 
     All media URLs are validated to be local paths (not http/https) before the
     props are written. This invariant is also enforced by _audit_props_for_remote_urls
@@ -211,19 +211,17 @@ def _section_for_remotion(s: dict) -> dict:
     visual_type = s.get("visual_type", "b-roll")
     is_text_card = visual_type == "text_card"
 
-    if is_text_card:
-        # No media file needed — Remotion renders TextCard.tsx from overlay_text / script_text
-        clips     = []
-        media_url = ""
-        media_type = "text_card"
+    media_url = s.get("media_url", "")
+    if media_url and media_url != "__text_card__":
+        _assert_local_url(media_url, f"section {order} media_url")
     else:
-        media_url = s.get("media_url", "")
-        if media_url and media_url != "__text_card__":
-            _assert_local_url(media_url, f"section {order} media_url")
-        else:
-            media_url = ""
-        media_type = s.get("media_type", "image")
-        clips = [{"url": media_url, "type": media_type}] if media_url else []
+        media_url = ""
+    media_type = s.get("media_type", "image")
+    clips = [{"url": media_url, "type": media_type}] if media_url else []
+
+    if is_text_card and media_url:
+        media_type = "image"
+        clips = [{"url": media_url, "type": media_type}]
 
     return {
         "order":          order,
