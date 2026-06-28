@@ -171,13 +171,23 @@ The house was silent after that.
 
 orig_cartesia = cartesia.Cartesia
 orig_call_claude = tts.call_claude
+orig_sdk_supports_generation_config = tts._cartesia_sdk_supports_generation_config
 cartesia.Cartesia = FakeCartesia
 tts.call_claude = lambda _system_prompt, user_message, **_kwargs: (CLAUDE_REVIEW_CALLS.append(user_message) or user_message)
+# Hotfix A added a pre-flight check that the installed Cartesia SDK actually
+# supports the generation_config request shape this fixture's sonic-3.5
+# voice needs. This smoke replaces the Cartesia client/TTS entirely with a
+# fake that accepts any kwargs, so it simulates an SDK that DOES support
+# generation_config (an operator who has upgraded the 'cartesia' package).
+# Real SDK-compatibility detection is proven separately in
+# scripts/smoke_cartesia_sdk_compatibility.py.
+tts._cartesia_sdk_supports_generation_config = lambda: True
 try:
     audio_bytes = tts.generate_audio(SCRIPT, Voice(), is_short_episode=False)
 finally:
     cartesia.Cartesia = orig_cartesia
     tts.call_claude = orig_call_claude
+    tts._cartesia_sdk_supports_generation_config = orig_sdk_supports_generation_config
 
 check("four fake Cartesia calls were made", len(CAPTURED_CALLS) == 4, str(len(CAPTURED_CALLS)))
 check("Claude pause review was stubbed once per section", len(CLAUDE_REVIEW_CALLS) == 4, str(len(CLAUDE_REVIEW_CALLS)))

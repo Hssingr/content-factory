@@ -1490,14 +1490,12 @@ non-existent audit — see the Phase 11 close-out report,
 ✓ 11.6  Chunk-boundary stitching mitigation (Agent 3)
 ```
 
-Status: **COMPLETE** at the code level. One operational item remains open
-and is tracked here rather than silently assumed done: the Phase 11.3
-migration (`alembic/versions/003_add_cartesia_pronunciation_dict_id.py`) had
-not been applied to the local dev database as of this section's last
-update — `channel_voices.cartesia_pronunciation_dict_id` will not exist
-until that migration is run. This does not block any other Phase 11
-sub-phase (the column is read via `getattr(..., None)` and treated as
-absent/optional everywhere it's used).
+Status: **COMPLETE** at the code level. The Phase 11.3 migration
+(`alembic/versions/003_add_cartesia_pronunciation_dict_id.py`) has been
+applied to the local dev database — `channel_voices.cartesia_pronunciation_dict_id`
+exists. (This was previously tracked here as an open operational item; it
+was surfaced by a real `test_full_pipeline.py --confirm` run failing with
+`UndefinedColumn`, then resolved by running `alembic upgrade head`.)
 
 #### Future Phase Safety
 
@@ -3928,6 +3926,13 @@ A pipeline change is done only when:
 - parent/child behavior is correct
 - `CLAUDE.md` is updated if architecture changed
 - no obsolete phase/development naming is introduced
+
+---
+
+## 37. Voice choice for the tests
+
+- Elevenlab: Provider: elevenlabs, tts_model: eleven_v3, voice_id: nzFihrBIvB34imQBuxub
+- Elevenlab: cartesia: elevenlabs, tts_model: sonic-3.5, voice_id: 65209f8e-6140-4a20-b819-3cc2e21da19b
 
 ---
 

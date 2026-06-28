@@ -74,10 +74,20 @@ orig_cartesia = cartesia.Cartesia
 orig_call_claude = tts.call_claude
 orig_wav_to_mp3 = tts._wav_to_mp3
 orig_concat_mp3_chunks = tts._concat_mp3_chunks
+orig_sdk_supports_generation_config = tts._cartesia_sdk_supports_generation_config
 cartesia.Cartesia = FakeCartesia
 tts.call_claude = lambda _system_prompt, user_message, **_kwargs: user_message
 tts._wav_to_mp3 = lambda wav_bytes: b"fake-mp3:" + wav_bytes
 tts._concat_mp3_chunks = lambda chunks: b"".join(chunks)
+# Hotfix A added a pre-flight check that the installed Cartesia SDK actually
+# supports the generation_config request shape sonic-3/3.5 needs. This smoke
+# replaces the Cartesia client/TTS entirely with a fake that accepts any
+# kwargs (it is testing _build_cartesia_tts_kwargs()'s section-delivery
+# logic, not real SDK compatibility), so it simulates an SDK that DOES
+# support generation_config — exactly like an operator who has upgraded the
+# 'cartesia' package. Real SDK-compatibility detection itself is proven
+# separately in scripts/smoke_cartesia_sdk_compatibility.py.
+tts._cartesia_sdk_supports_generation_config = lambda: True
 
 try:
     sonic35_calls = run_cartesia(LONG_SCRIPT, make_voice(model="sonic-3.5", emotion="calm"))
@@ -125,6 +135,7 @@ finally:
     tts.call_claude = orig_call_claude
     tts._wav_to_mp3 = orig_wav_to_mp3
     tts._concat_mp3_chunks = orig_concat_mp3_chunks
+    tts._cartesia_sdk_supports_generation_config = orig_sdk_supports_generation_config
 
 print(f"SMOKE PASS - {ASSERTIONS} checks")
 print(f"sonic35_intro={intro35['generation_config']}")

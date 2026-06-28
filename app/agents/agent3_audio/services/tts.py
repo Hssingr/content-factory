@@ -1,3 +1,5 @@
+import functools
+import inspect
 import logging
 import re
 
@@ -561,6 +563,97 @@ def _cartesia_model_generation(tts_model: str) -> str:
     raise ValueError(f"Unsupported Cartesia TTS model for request formatting: {tts_model}")
 
 
+# ── Hotfix A — installed Cartesia SDK compatibility (no live API call) ────────
+# Phase 11.3 added the generation_config request shape (`voice={...}`,
+# `generation_config={...}`) for Sonic 3/3.5, alongside the pre-existing
+# legacy shape (`voice_id=...`, `_experimental_voice_controls={...}`) for
+# Sonic 2. That assumed the installed `cartesia` Python package's
+# `TTS.bytes()` accepts both shapes. A real pipeline run surfaced
+# ``TypeError: TTS.bytes() got an unexpected keyword argument 'voice'`` —
+# the installed SDK version (1.3.1) only implements the OLDER signature
+# (`model_id, transcript, output_format, voice_id, voice_embedding,
+# duration, language, _experimental_voice_controls` — confirmed directly via
+# `inspect.signature(TTS.bytes)`, no live call). `generation_config` and
+# `voice=` do not exist on this SDK version at all, for any model.
+#
+# This check is pure local introspection of the already-imported package —
+# it never makes a network/API call, so it can run safely even with no
+# CARTESIA_API_KEY configured.
+@functools.lru_cache(maxsize=1)
+def _cartesia_sdk_supports_generation_config() -> bool:
+    """True if the installed Cartesia SDK's ``TTS.bytes()`` accepts the
+    Sonic 3/3.5 request shape (``voice=`` + ``generation_config=``).
+
+    Cached for the process lifetime — the installed SDK version cannot
+    change mid-process, so introspecting it more than once is wasted work.
+    """
+    try:
+        from cartesia.tts import TTS
+        params = inspect.signature(TTS.bytes).parameters
+        return "voice" in params and "generation_config" in params
+    except Exception:
+        logger.warning(
+            "CARTESIA_SDK_INTROSPECTION_FAILED — could not inspect the installed "
+            "cartesia package's TTS.bytes() signature; assuming generation_config "
+            "is NOT supported (fail-safe default)",
+            exc_info=True,
+        )
+        return False
+
+
+def _check_cartesia_sdk_compatibility(tts_model: str) -> str:
+    """Validate the installed Cartesia SDK supports this model's request shape
+    before any TTS work is attempted.
+
+    Returns the request generation (``"legacy"`` or ``"generation_config"``)
+    on success — the same value ``_cartesia_model_generation()`` returns, so
+    callers can use this as a drop-in replacement for that call.
+
+    Raises:
+        RuntimeError: If ``tts_model`` requires the ``generation_config``
+            request shape but the installed SDK does not support it. This
+            replaces the previous failure mode — a raw, unactionable
+            ``TypeError: TTS.bytes() got an unexpected keyword argument
+            'voice'`` surfacing from deep inside the SDK call — with an
+            explicit, actionable error raised BEFORE any chunk is processed
+            or any API call is attempted. There is no safe legacy-shape
+            fallback for a generation_config model: Cartesia's documented
+            API contract for Sonic 3/3.5 requires the newer shape, and
+            silently downgrading the request format for a model that may
+            not accept the legacy shape cannot be verified without a live
+            API call, which is not permitted here (CLAUDE.md §19.1) — failing
+            loud is the safe choice, not a silent reformat.
+    """
+    generation = _cartesia_model_generation(tts_model)
+    sdk_supports_generation_config = _cartesia_sdk_supports_generation_config()
+    logger.info(
+        "CARTESIA_SDK_COMPATIBILITY model=%s request_generation=%s "
+        "sdk_supports_generation_config=%s",
+        tts_model, generation, sdk_supports_generation_config,
+    )
+
+    if generation == "generation_config" and not sdk_supports_generation_config:
+        logger.error(
+            "CARTESIA_SDK_INCOMPATIBLE model=%s required_request_generation=generation_config "
+            "sdk_supports_generation_config=False reason=installed_cartesia_sdk_predates_sonic3 "
+            "action=upgrade_cartesia_package_or_use_a_sonic-2_voice",
+            tts_model,
+        )
+        raise RuntimeError(
+            f"Installed Cartesia SDK does not support the voice=/generation_config= "
+            f"request shape required by model {tts_model!r}. This is a local SDK "
+            f"version mismatch, not a Cartesia API/account issue. Fix by either: "
+            f"(1) upgrading the 'cartesia' Python package (pip install -U cartesia) "
+            f"so client.tts.bytes() accepts voice=/generation_config=, or "
+            f"(2) switching this channel voice's tts_model to 'sonic-2' "
+            f"(channel_voices.tts_model), which uses the legacy request shape this "
+            f"SDK version already supports. Refusing to call the Cartesia API with a "
+            f"request shape the installed SDK cannot send."
+        )
+
+    return generation
+
+
 def _resolve_cartesia_numeric_speed(channel_voice, speed_profile: str | None = None) -> float:
     """Resolve Sonic 3/3.5 numeric speed, preserving explicit voice overrides."""
     if getattr(channel_voice, "speed_override", None) is not None:
@@ -908,7 +1001,11 @@ def _generate_cartesia_audio(voice_script: str, channel_voice, is_short_episode:
     tts_model = getattr(channel_voice, "tts_model", None) or "sonic-2"
     voice_id  = channel_voice.voice_id
     emotion   = (getattr(channel_voice, "emotion", None) or _DEFAULT_EMOTION).lower()
-    _cartesia_model_generation(tts_model)
+    # Hotfix A: validate the installed Cartesia SDK can actually send this
+    # model's request shape BEFORE any section is prepared or any API call
+    # is attempted — fails loud with an actionable message instead of a raw
+    # TypeError surfacing mid-run from inside client.tts.bytes().
+    _check_cartesia_sdk_compatibility(tts_model)
 
     section_units = _split_script_into_section_units(voice_script)
     client    = Cartesia(api_key=settings.cartesia_api_key)
@@ -955,8 +1052,14 @@ def _generate_cartesia_audio(voice_script: str, channel_voice, is_short_episode:
         try:
             wav_bytes = client.tts.bytes(**request_kwargs)
         except TypeError:
+            # _check_cartesia_sdk_compatibility() already validated the SDK
+            # supports this model's request shape before this loop started —
+            # a TypeError reaching here means something unexpected (e.g. a
+            # different kwarg mismatch this hotfix did not anticipate), not
+            # the original "unexpected keyword argument 'voice'" failure mode.
             logger.exception(
-                "CARTESIA_REQUEST_FORMAT_UNSUPPORTED: model=%s request_generation=%s",
+                "CARTESIA_REQUEST_FORMAT_UNSUPPORTED: model=%s request_generation=%s "
+                "(unexpected — SDK compatibility was already pre-checked for this model)",
                 tts_model, _cartesia_model_generation(tts_model),
             )
             raise
