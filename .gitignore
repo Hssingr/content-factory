@@ -46,8 +46,9 @@ celerybeat.pid
 # ── Generated code reports ────────────────────────────────────────────────────
 code_report/
 
-# ── One-off scripts ───────────────────────────────────────────────────────────
-scripts/migrate_flux_cache.py
+# ── Local-only scripts and pipeline tests ────────────────────────────────────
+scripts/
+test_pipeline/
 
 # ── OS ────────────────────────────────────────────────────────────────────────
 .DS_Store
