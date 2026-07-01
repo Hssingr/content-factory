@@ -20,8 +20,9 @@ export default function CredentialRow({ channelId, platform, language, onVerifie
     setSaving(true)
     setError('')
     try {
+      // saveCredentials verifies before storing (verify-before-store pattern,
+      // CLAUDE.md §8.3) — no separate verifyCredential call needed.
       await api.saveCredentials(channelId, { language, platform, credentials: values })
-      await api.verifyCredential(channelId, { language, platform })
       setVerified(true)
       setExpanded(false)
       onVerified()

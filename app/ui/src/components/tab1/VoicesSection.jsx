@@ -1,110 +1,135 @@
-import { useState } from 'react'
-import AISuggestionField from '../AISuggestionField'
-import VoicePicker from './VoicePicker'
-import { EMOTIONS, MUSIC_STYLES, USE_CASES } from '../../constants'
-import { api } from '../../api/agent1'
+import { LANGUAGES, VOICE_PROVIDERS, VOICE_MODELS_BY_PROVIDER, DEFAULT_VOICE_MODEL_BY_PROVIDER } from '../../constants'
 
-export default function VoicesSection({
-  languages, voices, setVoices,
-  sharedUseCase, setSharedUseCase,
-  sharedEmotion, setSharedEmotion,
-  sharedMusicStyle, setSharedMusicStyle,
-  ctx,
-}) {
-  const [autoSelecting, setAutoSelecting] = useState({})
+const languageLabel = (code) => LANGUAGES.find(l => l.code === code)?.label ?? code.toUpperCase()
 
-  const setVoiceId = (lang, id) =>
-    setVoices(prev => ({ ...prev, [lang]: { ...prev[lang], voice_id: id } }))
+const normalizeVoice = (voice = {}) => {
+  const provider = voice.provider || 'cartesia'
+  const fallbackModel = DEFAULT_VOICE_MODEL_BY_PROVIDER[provider] || 'sonic-3.5'
+  return {
+    provider,
+    tts_model: voice.tts_model || fallbackModel,
+    voice_id: voice.voice_id || '',
+    voice_validated: Boolean(voice.voice_validated),
+  }
+}
 
-  const autoSelect = async (lang) => {
-    if (!sharedUseCase) return
-    setAutoSelecting(prev => ({ ...prev, [lang]: true }))
-    try {
-      const data      = await api.getVoices(lang, sharedUseCase)
-      const currentId = voices[lang]?.voice_id
-      // Exclude the already-selected voice so Claude picks a different one on re-click
-      const available = (data.voices ?? []).filter(v => v.voice_id !== currentId)
-      if (!available.length) return
-      const res = await api.suggest('voice_id', {
-        ...ctx,
-        language:         lang,
-        available_voices: available.map(v => ({
-          voice_id:    v.voice_id,
-          name:        v.name,
-          gender:      v.gender,
-          age:         v.age,
-          descriptive: v.descriptive,
-          description: v.description,
-        })),
-      })
-      setVoiceId(lang, res.suggestion)
-    } catch (e) {
-      console.error('Auto-select failed for', lang, e)
-    } finally {
-      setAutoSelecting(prev => ({ ...prev, [lang]: false }))
-    }
+export default function VoicesSection({ languages, voices, setVoices }) {
+  const updateVoice = (lang, patch) => {
+    setVoices(prev => ({
+      ...prev,
+      [lang]: {
+        ...normalizeVoice(prev[lang]),
+        ...patch,
+      },
+    }))
+  }
+
+  const changeProvider = (lang, provider) => {
+    updateVoice(lang, {
+      provider,
+      tts_model: DEFAULT_VOICE_MODEL_BY_PROVIDER[provider] || '',
+      voice_id: '',
+      voice_validated: false,
+    })
+  }
+
+  const changeModel = (lang, ttsModel) => {
+    updateVoice(lang, { tts_model: ttsModel, voice_validated: false })
+  }
+
+  const changeVoiceId = (lang, voiceId) => {
+    updateVoice(lang, { voice_id: voiceId, voice_validated: false })
+  }
+
+  const validateVoice = (lang) => {
+    const voice = normalizeVoice(voices[lang])
+    if (!voice.voice_id.trim()) return
+    updateVoice(lang, { voice_validated: true })
+  }
+
+  if (!languages.length) {
+    return (
+      <p className="placeholder" style={{ fontSize: '0.82rem' }}>
+        Select publishing languages first. A separate voice card will appear for each language.
+      </p>
+    )
   }
 
   return (
-    <>
-      <AISuggestionField
-        label="Voice use case (all languages)"
-        field="voice_use_case"
-        value={sharedUseCase}
-        onChange={setSharedUseCase}
-        context={ctx}
-        options={[{ value: '', label: 'Select a use case…' }, ...USE_CASES]}
-      />
+    <div className="voice-card-list">
+      {languages.map(lang => {
+        const voice = normalizeVoice(voices[lang])
+        const models = VOICE_MODELS_BY_PROVIDER[voice.provider] || []
+        const isValidated = voice.voice_validated && voice.voice_id.trim().length > 0
 
-      <div className="voice-shared-row">
-        <AISuggestionField
-          label="Narrator emotion (all languages)"
-          field="voice_emotion"
-          value={sharedEmotion}
-          onChange={setSharedEmotion}
-          context={ctx}
-          options={EMOTIONS}
-        />
-        <AISuggestionField
-          label="Music style (all languages)"
-          field="music_style"
-          value={sharedMusicStyle}
-          onChange={setSharedMusicStyle}
-          context={ctx}
-          options={MUSIC_STYLES}
-        />
-      </div>
+        return (
+          <div key={lang} className="voice-block voice-card">
+            <div className="voice-block-header">
+              <div>
+                <p className="voice-block-title">{languageLabel(lang)}</p>
+                <span className="voice-description">Independent narration voice for {lang.toUpperCase()} publishing.</span>
+              </div>
+              <span className={`voice-status${isValidated ? ' voice-status--valid' : ''}`}>
+                {isValidated ? 'Saved for review ✓' : 'Not saved'}
+              </span>
+            </div>
 
-      {!sharedUseCase && (
-        <p className="placeholder" style={{ fontSize: '0.82rem' }}>
-          Select a use case above to browse and auto-select voices for each language.
-        </p>
-      )}
+            <div className="voice-card-grid">
+              <label className="field">
+                <span className="field-label">Provider</span>
+                <select
+                  className="field-select"
+                  value={voice.provider}
+                  onChange={e => changeProvider(lang, e.target.value)}
+                >
+                  {VOICE_PROVIDERS.map(provider => (
+                    <option key={provider.value} value={provider.value}>{provider.label}</option>
+                  ))}
+                </select>
+              </label>
 
-      {languages.map(lang => (
-        <div key={lang} className={`voice-block${!sharedUseCase ? ' voice-block--locked' : ''}`}>
-          <div className="voice-block-header">
-            <p className="voice-block-title">{lang.toUpperCase()}</p>
-            {sharedUseCase && (
+              <label className="field">
+                <span className="field-label">Model</span>
+                <select
+                  className="field-select"
+                  value={voice.tts_model}
+                  onChange={e => changeModel(lang, e.target.value)}
+                >
+                  {models.map(model => (
+                    <option key={model.value} value={model.value}>{model.label}</option>
+                  ))}
+                </select>
+              </label>
+            </div>
+
+            <label className="field">
+              <span className="field-label">Voice ID</span>
+              <input
+                className="field-input"
+                value={voice.voice_id}
+                onChange={e => changeVoiceId(lang, e.target.value)}
+                placeholder="Paste provider voice ID"
+              />
+            </label>
+
+            <div className="voice-card-footer">
+              <span className="voice-description">
+                {isValidated
+                  ? 'Voice ID saved — will be verified when the channel first runs audio generation.'
+                  : 'Enter a Voice ID and click Save to confirm your selection.'}
+              </span>
               <button
                 type="button"
-                className="btn-suggest"
-                onClick={() => autoSelect(lang)}
-                disabled={autoSelecting[lang]}
-                title="AI auto-select best voice"
+                className="btn-secondary"
+                onClick={() => validateVoice(lang)}
+                disabled={!voice.voice_id.trim()}
               >
-                {autoSelecting[lang] ? '…' : '✨ Auto-select'}
+                Save Voice ID
               </button>
-            )}
+            </div>
           </div>
-          <VoicePicker
-            language={lang}
-            useCase={sharedUseCase}
-            value={voices[lang]?.voice_id ?? ''}
-            onChange={id => setVoiceId(lang, id)}
-          />
-        </div>
-      ))}
-    </>
+        )
+      })}
+    </div>
   )
 }

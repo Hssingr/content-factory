@@ -38,6 +38,7 @@ export const api = {
   upsertTimings:       (id, body)   => req('PUT',    `/channels/${id}/timings`, body),
   saveCredentials:     (id, body)   => req('POST',   `/channels/${id}/credentials`, body),
   verifyCredential:    (id, body)   => req('POST',   `/channels/${id}/verify`, body),
+  getReadiness:        (id)         => req('GET',    `/channels/${id}/readiness`),
   activateChannel:     (id)         => req('POST',   `/channels/${id}/activate`),
   suggestTiming:       (id)         => req('POST',   `/channels/${id}/suggest-timing`),
 
@@ -46,4 +47,5 @@ export const api = {
 
   // AI suggestions
   suggest:             (field, ctx) => req('POST',   '/suggest', { field, context: ctx }),
+  researchIdeas:       (body)       => req('POST',   '/research-ideas', body),
 }

@@ -1,4 +1,6 @@
-import { SHORTS_RULES, LANGUAGES } from '../../constants'
+import {
+  SHORTS_RULES, LANGUAGES,
+} from '../../constants'
 
 const ALL_DAYS = ['monday','tuesday','wednesday','thursday','friday','saturday','sunday']
 

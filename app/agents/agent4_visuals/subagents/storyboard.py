@@ -242,6 +242,8 @@ def split_into_beats(
     allow_legacy_fallback: bool = False,
     language: str = "en",
     storyboard_constraints: str = "",
+    visual_style: str = "",
+    image_style: str = "",
 ) -> list[dict] | None:
     """Generate a storyboard with Claude (batched per segment) and map it onto real audio timestamps.
 
@@ -341,6 +343,8 @@ def split_into_beats(
                     previous_segment_summary=previous_summary,
                     target_beat_count=sub_target_beat_count,
                     override_instructions=storyboard_constraints,
+                    visual_style=visual_style,
+                    image_style=image_style,
                 )
             except Exception as exc:
                 logger.error(

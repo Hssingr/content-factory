@@ -30,6 +30,8 @@ class ScriptWorkflowContext:
     source_voice: ChannelVoice | None
     tts_model: str
     tts_provider: str
+    visual_style: str
+    image_style: str
 
 
 def run_script_workflow(content: Content, db: Session) -> None:
@@ -45,6 +47,8 @@ def run_script_workflow(content: Content, db: Session) -> None:
         story,
         context.channel,
         script_format=context.script_format,
+        visual_style=context.visual_style,
+        image_style=context.image_style,
     )
     logger.info(
         "Blueprint generated for content %s — %d major_turns, suggested_sections=%d",
@@ -63,6 +67,8 @@ def run_script_workflow(content: Content, db: Session) -> None:
         channel_voice=context.source_voice,
         script_format=context.script_format,
         audio_tags_enabled=context.audio_tags_enabled,
+        visual_style=context.visual_style,
+        image_style=context.image_style,
     )
 
     hook_excerpt = scripts.get("voice_script", "").strip()[:300].replace("\n", " ")
@@ -149,6 +155,8 @@ def _load_script_workflow_context(
 
     tts_model = src_voice.tts_model if src_voice else "sonic-2"
     tts_provider = src_voice.provider if src_voice else "cartesia"
+    visual_style = config.visual_style if config else ""
+    image_style = config.image_style if config else ""
 
     return ScriptWorkflowContext(
         channel=channel,
@@ -158,6 +166,8 @@ def _load_script_workflow_context(
         source_voice=src_voice,
         tts_model=tts_model,
         tts_provider=tts_provider,
+        visual_style=visual_style,
+        image_style=image_style,
     )
 
 

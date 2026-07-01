@@ -27,6 +27,12 @@ class Content(Base):
     # Blueprint JSON persisted immediately after generate_story_blueprint() — used as constraint
     # for per-section generation and stored with visual_intent_history for Agent 4 visual continuity.
     story_blueprint: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # Immutable, point-in-time snapshot of the channel's effective configuration
+    # at content-generation start (Phase Agent1-V3.6 — foundation only). Built by
+    # app.agents.agent1_setup.services.config_snapshot.build_channel_config_snapshot().
+    # Nullable: no generation-start hook writes this yet, and no existing row has
+    # one. Not read by Agent 2/3/4/5 today — see CLAUDE.md §8.5.
+    channel_config_snapshot: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # Short episode fields — null on long-form content rows

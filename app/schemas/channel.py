@@ -1,5 +1,15 @@
 import uuid
+from typing import Literal
 from pydantic import BaseModel, ConfigDict
+
+# Content Factory V3 groundwork (Phase Agent1-V3.2) — see CLAUDE.md §8.1.
+# Only 'single_story' / 'reddit' / 'youtube_and_shorts' are functionally
+# supported today; the other listed values are accepted by the schema
+# (so operators/clients can already select them) but are not yet consumed
+# by any agent — no downstream behavior changes based on these values yet.
+ContentMode  = Literal["single_story", "limited_series", "ongoing_series"]
+ScriptSource = Literal["reddit", "ai_generated", "user_provided", "hybrid"]
+OutputMode   = Literal["youtube_and_shorts", "youtube_long_only", "shorts_only"]
 
 
 class ChannelCreate(BaseModel):
@@ -29,6 +39,12 @@ class ChannelConfigUpsert(BaseModel):
     video_style_type: str = "documentary"
     video_color_grade: str | None = None
     runway_enabled: bool = False
+    # V3 groundwork fields — additive, not yet consumed downstream (see CLAUDE.md §8.1).
+    content_mode: ContentMode = "single_story"
+    script_source: ScriptSource = "reddit"
+    output_mode: OutputMode = "youtube_and_shorts"
+    visual_style: str = "documentary"
+    image_style: str = "photorealistic"
 
 
 class LanguageEntry(BaseModel):
@@ -38,7 +54,8 @@ class LanguageEntry(BaseModel):
 
 class VoiceEntry(BaseModel):
     language: str
-    provider: str = "elevenlabs"
+    provider: str = "cartesia"
+    tts_model: str = "sonic-3.5"
     voice_id: str
     emotion: str | None = None
     music_style: str | None = None
@@ -90,6 +107,11 @@ class ChannelConfigResponse(BaseModel):
     video_style_type: str
     video_color_grade: str | None
     runway_enabled: bool
+    content_mode: ContentMode
+    script_source: ScriptSource
+    output_mode: OutputMode
+    visual_style: str
+    image_style: str
 
 
 class LanguageResponse(BaseModel):
@@ -104,6 +126,7 @@ class VoiceResponse(BaseModel):
     id: uuid.UUID
     language: str
     provider: str
+    tts_model: str
     voice_id: str
     emotion: str | None
     music_style: str | None

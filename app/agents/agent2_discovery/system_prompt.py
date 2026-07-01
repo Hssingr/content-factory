@@ -440,7 +440,13 @@ _STORY_BLUEPRINT_SCHEMA: dict = {
 }
 
 
-def generate_story_blueprint(story, channel, script_format: str = "youtube_long") -> dict:
+def generate_story_blueprint(
+    story,
+    channel,
+    script_format: str = "youtube_long",
+    visual_style: str = "",
+    image_style: str = "",
+) -> dict:
     """Extract the narrative skeleton from a story before any script writing.
 
     Generates a constraint document — hook, central question, major turns, final payoff,
@@ -451,6 +457,10 @@ def generate_story_blueprint(story, channel, script_format: str = "youtube_long"
         story:         Story object (title, url, body, language).
         channel:       Channel ORM object (niche, tone).
         script_format: Format key — affects suggested_section_count recommendation.
+        visual_style:  Channel visual style guide (e.g. "documentary", "noir"). Forwarded
+                       from ChannelConfig; informs hook framing and narrative aesthetic.
+        image_style:   Channel image rendering style (e.g. "photorealistic"). Forwarded
+                       from ChannelConfig for downstream Agent 4 context.
 
     Returns:
         Dict with keys: hook, central_question, major_turns, final_payoff,
@@ -463,6 +473,8 @@ def generate_story_blueprint(story, channel, script_format: str = "youtube_long"
     user_message = (
         f"Channel niche: {channel.niche}\n"
         f"Channel tone: {channel.tone}\n"
+        f"Visual style: {visual_style or 'documentary'}\n"
+        f"Image style: {image_style or 'photorealistic'}\n"
         f"Script format: {script_format}\n\n"
         f"Story title: {story.title}\n"
         f"Story URL: {story.url}\n\n"
@@ -663,6 +675,8 @@ def generate_section(
     override_instruction: str = "",
     primary_required_turn: str | None = None,
     future_uncovered_turns: list[str] | None = None,
+    visual_style: str = "",
+    image_style: str = "",
 ) -> dict:
     """Generate a single narration section guided by the story blueprint.
 
@@ -707,6 +721,8 @@ def generate_section(
     user_message = (
         f"Channel niche: {channel.niche}\n"
         f"Channel tone: {channel.tone}\n"
+        f"Visual style: {visual_style or 'documentary'}\n"
+        f"Image style: {image_style or 'photorealistic'}\n"
         f"Script format: {script_format}\n\n"
         f"Blueprint:\n{blueprint_json}\n\n"
         f"Prior sections summary:\n{prior_json}\n\n"
@@ -1783,6 +1799,8 @@ def generate_short_episode_script(
     channel,
     channel_voice,
     override_instruction: str = "",
+    visual_style: str = "",
+    image_style: str = "",
 ) -> dict:
     """Generate a single TikTok episode script from a part plan.
 
@@ -1819,6 +1837,8 @@ def generate_short_episode_script(
     user_message = (
         f"Channel niche: {channel.niche}\n"
         f"Channel tone: {channel.tone}\n"
+        f"Visual style: {visual_style or 'documentary'}\n"
+        f"Image style: {image_style or 'photorealistic'}\n"
         f"Part: {part_n} of {total_parts}\n\n"
         f"Part plan:\n{part_json}\n\n"
         f"Blueprint:\n{bp_json}\n\n"

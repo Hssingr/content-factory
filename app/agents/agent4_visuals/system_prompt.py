@@ -11,7 +11,14 @@ from app.services.claude_client import (
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "3.4"  # v3.4: Phase 14.8 — added "Principle B2: amplify, don't illustrate"
+PROMPT_VERSION = "3.5"  # v3.5: wire operator-configured visual_style and image_style into
+                        #        every storyboard call via a "Global Visual Direction" block
+                        #        injected into the user message. The system prompt now documents
+                        #        how Claude should apply these constraints to flux_prompt,
+                        #        color_grade, and effect choices while keeping Principles A/B
+                        #        and the anti-slideshow rules intact. Defaults to
+                        #        documentary/photorealistic when not configured.
+                        # v3.4: Phase 14.8 — added "Principle B2: amplify, don't illustrate"
                         #        and a "beat category rotation" section to
                         #        _STORYBOARD_SYSTEM_PROMPT, instructing beats to add a
                         #        reaction/threat/consequence/evidence/tension/foreshadowing/
@@ -84,9 +91,9 @@ video production system. Think like a human video editor, not a stock-search gen
 You design the storyboard ONE NARRATION SEGMENT AT A TIME — a single [INTRO],
 [SECTION N], or [OUTRO] block — never the whole video in one pass. You receive:
 which segment this is (its position among the video's narration segments), the
-segment's narration text, the channel niche/tone/format, and a short note on the
-visual approach used in the immediately preceding segment (for continuity only —
-do not repeat it).
+segment's narration text, the channel niche/tone/format, an optional operator-configured
+global visual direction and image style, and a short note on the visual approach used
+in the immediately preceding segment (for continuity only — do not repeat it).
 
 Design an ordered sequence of visual beats that carries the viewer through THIS
 SEGMENT's narration — and ONLY this segment's narration — from its first word to
@@ -138,6 +145,26 @@ Before finalizing any beat, ask: "what does this shot ADD that the narration
 sentence alone does not already tell the viewer?" If the honest answer is
 "nothing — it's just the noun from the sentence," redesign the beat using one
 of the eight additions above instead.
+
+== Global Visual Direction (operator-configured) ==
+When "Global visual direction:" and "Global image style:" lines appear in the user
+message, apply them as consistent stylistic constraints across every beat:
+  - Visual direction governs overall mood, color palette, and lighting feel.
+    Examples: "documentary" → neutral, factual, naturalistic; "noir" → high-contrast
+    shadows, muted desaturated tones, deep blacks; "cinematic-realism" → natural
+    lighting, immersive depth, grounded color grading; "archival" → aged, sepia or
+    monochrome tones, worn-paper texture aesthetic.
+  - Image style governs the artistic rendering approach for Flux-generated images.
+    Examples: "photorealistic" → realistic photography quality, accurate lighting and
+    material; "illustrative" → slightly stylized, editorial illustration feel;
+    "anime" → anime-influenced rendering; "realistic_documentary" → documentary
+    photography realism, deep color accuracy.
+  - Weave these as stylistic constraints into flux_prompt (append one short style
+    clause, e.g. "documentary photography, naturalistic lighting"), color_grade
+    (match the mood), and effect choices — NEVER at the cost of Principle A
+    (narrative relevance) or the anti-slideshow rules.
+  - When no global direction is specified in the user message, default to
+    documentary / photorealistic.
 
 == Beat category rotation (sequence diversity) ==
 Use the EXISTING visual_category / visual_type / motif fields below to express
@@ -441,6 +468,8 @@ def generate_storyboard_batch(
     previous_segment_summary: str = "",
     target_beat_count: int = 0,
     override_instructions: str = "",
+    visual_style: str = "",
+    image_style: str = "",
 ) -> tuple[dict, dict, dict]:
     """Ask Claude to design the storyboard for ONE narration segment only.
 
@@ -481,11 +510,18 @@ def generate_storyboard_batch(
             f"\nRETRY REQUIRED — fix these issues before responding:\n{override_instructions}\n"
             if override_instructions else ""
         )
+        direction_lines = ""
+        if visual_style or image_style:
+            direction_lines = (
+                f"Global visual direction: {visual_style or 'documentary'}\n"
+                f"Global image style: {image_style or 'photorealistic'}\n"
+            )
         return (
             f"Channel niche: {channel.niche}\n"
             f"Channel tone: {channel.tone}\n"
             f"Script format: {script_format}\n"
-            f"Segment: {segment_label} — {segment_index} of {segment_count} narration segments in this video\n"
+            + direction_lines
+            + f"Segment: {segment_label} — {segment_index} of {segment_count} narration segments in this video\n"
             + count_line
             + (
                 f"Previous segment context (do not open with the same visual approach): "

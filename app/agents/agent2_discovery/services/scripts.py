@@ -977,6 +977,8 @@ def _call_section_generation(
     primary_required_turn: str | None,
     future_uncovered_turns: list[str] | None,
     attempt: int,
+    visual_style: str = "",
+    image_style: str = "",
 ) -> dict | None:
     try:
         return generate_section(
@@ -993,6 +995,8 @@ def _call_section_generation(
             override_instruction=override,
             primary_required_turn=primary_required_turn,
             future_uncovered_turns=future_uncovered_turns,
+            visual_style=visual_style,
+            image_style=image_style,
         )
     except Exception as exc:
         logger.error("Section %s generation error (attempt %d): %s", label, attempt, exc)
@@ -1157,6 +1161,8 @@ def _generate_section_with_retry(
     prior_summary_text: str = "",
     primary_required_turn: str | None = None,
     future_uncovered_turns: list[str] | None = None,
+    visual_style: str = "",
+    image_style: str = "",
 ) -> dict | None:
     """Generate a single section, retrying up to _MAX_SECTION_RETRIES on MAJOR violations."""
     override = ""
@@ -1179,6 +1185,8 @@ def _generate_section_with_retry(
             primary_required_turn=primary_required_turn,
             future_uncovered_turns=future_uncovered_turns,
             attempt=attempt,
+            visual_style=visual_style,
+            image_style=image_style,
         )
         if result is None:
             if attempt > _MAX_SECTION_RETRIES:
@@ -1317,6 +1325,8 @@ def check_narrative_completeness(
 def _build_section_generation_context(
     channel_voice: ChannelVoice | None,
     blueprint: dict,
+    visual_style: str = "",
+    image_style: str = "",
 ) -> dict:
     major_turns = blueprint.get("major_turns") or []
     max_body = max(
@@ -1334,6 +1344,8 @@ def _build_section_generation_context(
         "major_turns": major_turns,
         "max_body": max_body,
         "min_body_for_blueprint": min_body_for_blueprint,
+        "visual_style": visual_style,
+        "image_style": image_style,
     }
 
 
@@ -1434,6 +1446,8 @@ def _generate_intro_section(
         prior_summary_text="",
         primary_required_turn=None,
         future_uncovered_turns=None,
+        visual_style=context.get("visual_style", ""),
+        image_style=context.get("image_style", ""),
     )
     if intro is None:
         raise RuntimeError("generate_script_sections: INTRO generation failed after retries")
@@ -1574,6 +1588,8 @@ def _run_body_section_loop(
             prior_summary_text=state["prior_sections_summary"][-1]["summary"] if state["prior_sections_summary"] else "",
             primary_required_turn=primary_turn,
             future_uncovered_turns=future_turns if future_turns else None,
+            visual_style=context.get("visual_style", ""),
+            image_style=context.get("image_style", ""),
         )
         if section is None:
             logger.warning(
@@ -1629,6 +1645,8 @@ def _generate_outro_section(
         prior_summary_text=state["prior_sections_summary"][-1]["summary"] if state["prior_sections_summary"] else "",
         primary_required_turn=None,
         future_uncovered_turns=None,
+        visual_style=context.get("visual_style", ""),
+        image_style=context.get("image_style", ""),
     )
     if outro is None:
         raise RuntimeError("generate_script_sections: OUTRO generation failed after retries")
@@ -2057,6 +2075,8 @@ def generate_script_sections(
     channel_voice: ChannelVoice | None,
     script_format: str = "youtube_long",
     audio_tags_enabled: bool = False,
+    visual_style: str = "",
+    image_style: str = "",
 ) -> dict:
     """Generate INTRO → body sections → OUTRO guided by the story blueprint.
 
@@ -2077,7 +2097,9 @@ def generate_script_sections(
     here was redundant: this function returns before the quality gate ever sees the
     script, so the result had nowhere to go but a log line.
     """
-    context = _build_section_generation_context(channel_voice, blueprint)
+    context = _build_section_generation_context(
+        channel_voice, blueprint, visual_style=visual_style, image_style=image_style
+    )
     state = _create_section_loop_state()
     _log_blueprint_summary(blueprint, context["major_turns"], context["max_body"])
 
@@ -2291,6 +2313,8 @@ def run_shorts_planner(
     blueprint: dict = long_content.story_blueprint or {}
     voice_script = source_script.voice_script or ""
     channel_voice = _load_short_source_voice(long_content, channel, db)
+    visual_style: str = config.visual_style if config else ""
+    image_style: str = config.image_style if config else ""
 
     plan = _generate_shorts_plan_with_retry(voice_script, blueprint, channel)
     if plan is None:
@@ -2327,6 +2351,8 @@ def run_shorts_planner(
             channel=channel,
             channel_voice=channel_voice,
             source_language=long_content.source_language,
+            visual_style=visual_style,
+            image_style=image_style,
         )
         if generated is None:
             _remove_failed_short_content(short_content, part_n, db)
@@ -2488,6 +2514,8 @@ def _generate_validated_short_script(
     channel: Channel,
     channel_voice: ChannelVoice | None,
     source_language: str,
+    visual_style: str = "",
+    image_style: str = "",
 ) -> dict | None:
     """Generate one child Short script, structurally and AI-quality validated.
 
@@ -2524,6 +2552,8 @@ def _generate_validated_short_script(
                     f"Fix these issues from the previous attempt: "
                     f"{'; '.join(i['description'] for i in issues_for_retry[:3])}"
                 ),
+                visual_style=visual_style,
+                image_style=image_style,
             )
         except Exception as exc:
             logger.error(

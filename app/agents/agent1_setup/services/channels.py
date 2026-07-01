@@ -115,6 +115,7 @@ def replace_voices(db: Session, channel_id: uuid.UUID, entries: list[VoiceEntry]
             channel_id=channel_id,
             language=e.language,
             provider=e.provider,
+            tts_model=e.tts_model,
             voice_id=e.voice_id,
             emotion=e.emotion,
             music_style=e.music_style,
@@ -173,7 +174,13 @@ def get_platform(db: Session, channel_id: uuid.UUID, language: str, platform: st
     )
 
 
-def save_credential(db: Session, channel_id: uuid.UUID, data: CredentialSave, encrypted: str) -> Channel | None:
+def save_credential(
+    db: Session,
+    channel_id: uuid.UUID,
+    data: CredentialSave,
+    encrypted: str,
+    verified: bool = False,
+) -> Channel | None:
     if db.get(Channel, channel_id) is None:
         return None
     platform = (
@@ -186,8 +193,8 @@ def save_credential(db: Session, channel_id: uuid.UUID, data: CredentialSave, en
         db.add(platform)
     platform.platform_channel_id = data.platform_channel_id
     platform.credentials_encrypted = encrypted
-    platform.verified = False
-    platform.active = False
+    platform.verified = verified
+    platform.active = verified
     db.commit()
     return _load(db, channel_id)
 

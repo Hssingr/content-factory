@@ -1,4 +1,5 @@
 import json
+import logging
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -14,6 +15,9 @@ from app.schemas.channel import (
 from app.services.auth import get_current_user_id
 from app.services import crypto, platform_verifier
 from app.agents.agent1_setup.services import channels as channels_service
+from app.agents.agent1_setup.services.activation_readiness import check_activation_readiness
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/agent1/channels", tags=["agent1-channels"])
 
@@ -117,8 +121,17 @@ def save_credentials(
     user_id: uuid.UUID = Depends(get_current_user_id),
     db: Session = Depends(get_db),
 ):
+    # Verify on the raw (not yet encrypted) credentials before storing anything.
+    # platform_verifier is fully stubbed today (always returns True) — this enforces
+    # the correct verify-before-store pattern so real verification works correctly
+    # when platform verifiers are implemented in a future phase (CLAUDE.md §8.3).
+    if not platform_verifier.verify(body.platform, body.credentials):
+        raise HTTPException(status_code=400, detail="Credential verification failed")
     encrypted = crypto.encrypt(json.dumps(body.credentials))
-    return _or_404(channels_service.save_credential(db, channel_id, body, encrypted), channel_id)
+    return _or_404(
+        channels_service.save_credential(db, channel_id, body, encrypted, verified=True),
+        channel_id,
+    )
 
 
 @router.post("/{channel_id}/verify")
@@ -200,14 +213,54 @@ def suggest_timing(
     return suggestions
 
 
+@router.get("/{channel_id}/readiness")
+def get_readiness(
+    channel_id: uuid.UUID,
+    user_id: uuid.UUID = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    """Return activation readiness status without activating (pre-flight check).
+
+    The frontend calls this on mount in the Activation step so the operator
+    can see every blocking issue before clicking Activate (CLAUDE.md §8.3).
+    The backend's `check_activation_readiness()` remains the sole source of truth;
+    this endpoint just exposes it without mutating anything.
+    """
+    channel = channels_service.get_by_id(db, channel_id)
+    _or_404(channel, channel_id)
+    return check_activation_readiness(channel)
+
+
 @router.post("/{channel_id}/activate", response_model=ChannelResponse)
 def activate_channel(
     channel_id: uuid.UUID,
     user_id: uuid.UUID = Depends(get_current_user_id),
     db: Session = Depends(get_db),
 ):
+    """Activate a channel only when it is fully ready (Phase Agent1-V3.4).
+
+    The backend is the source of truth for activation readiness — see
+    `activation_readiness.check_activation_readiness()`. This replaces the
+    previous `any(p.verified for p in channel.platforms)` check, which let
+    a channel activate with only one of several selected platforms
+    verified — a real mismatch the V3.1 audit found between this route and
+    the frontend's own (stricter) "all platforms verified" gating. A direct
+    API call can no longer activate an incomplete or partially-verified
+    channel.
+    """
     channel = channels_service.get_by_id(db, channel_id)
     _or_404(channel, channel_id)
-    if not any(p.verified for p in channel.platforms):
-        raise HTTPException(status_code=400, detail="At least one platform must be verified before activating")
+
+    readiness = check_activation_readiness(channel)
+    if not readiness["ready"]:
+        issue_codes = [issue["code"] for issue in readiness["issues"]]
+        logger.warning(
+            "CHANNEL_ACTIVATION_BLOCKED channel_id=%s issue_codes=%s",
+            channel_id, issue_codes,
+        )
+        detail = "Channel is not ready to activate: " + "; ".join(
+            issue["message"] for issue in readiness["issues"]
+        )
+        raise HTTPException(status_code=400, detail=detail)
+
     return channels_service.activate(db, channel_id)

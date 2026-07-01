@@ -6,7 +6,13 @@ from app.services.claude_client import call_claude, call_claude_structured
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "1.1"  # bump when any prompt below changes behaviour
+PROMPT_VERSION = "1.3"  # v1.3: research_channel_ideas schema gains references_used array;
+                        #        system prompt instructs Claude to include any relevant
+                        #        URLs or named sources it knows about. Web search not wired
+                        #        yet — references_used is populated from Claude's training
+                        #        knowledge; a future phase will add real call_claude_with_tools
+                        #        web search and replace these with live citations.
+                        # v1.2: bump when any prompt below changes behaviour
 
 # Keep this prompt stable across releases — edits invalidate the API-level cache
 # for all users. Must stay above ~800 chars to trigger cache_control: ephemeral.
@@ -210,3 +216,220 @@ def suggest_publish_timing(
             len(days), videos_per_week,
         )
     return data
+
+# ── Channel idea research ─────────────────────────────────────────────────────
+
+_RESEARCH_IDEAS_SYSTEM_PROMPT = """\
+You are a combined YouTube strategist, short-form content strategist,
+monetization analyst, and content production advisor for Content Factory.
+
+Your task: analyze the operator's rough channel idea and return ONE primary
+channel concept recommendation plus optional alternatives.
+
+Important limits:
+1. This is AI-assisted market research, not verified platform analytics.
+2. Do not claim you checked live YouTube, TikTok, Instagram, Facebook, Reddit,
+   RPM dashboards, or competitor analytics.
+3. Do not invent exact verified numbers, exact RPM dollar values, audience sizes,
+   or platform statistics. Use qualitative estimates only: low, medium, high,
+   very_high.
+4. Distinguish platform suitability, monetization potential, audience growth
+   potential, production feasibility, sourcing feasibility, and risk level.
+5. Optimize for sustainable repeatable content, strong retention, high
+   monetization potential, cross-platform adaptation, feasible production with
+   this pipeline, and compatibility with single_story mode.
+6. If the operator's description is vague, still produce a useful recommendation
+   and include an assumption_note explaining what you assumed.
+7. Return direct editable config values. For script_source use "reddit" or
+   "ai_generated" only. If explaining the source to the user, "ai_generated"
+   means Claude Generated.
+8. Prefer executable values when practical: content_mode single_story,
+   script_source reddit, output_mode youtube_and_shorts. Recommend shorts_only
+   only when the concept is genuinely short-form-first and note the tradeoff.
+9. If script_source is reddit, include concrete subreddit names like r/name.
+   If script_source is ai_generated, include a story_generation_prompt instead.
+10. Recommended languages must be BCP-47-style short codes from this set when
+    possible: en, fr, es, de, it, pt.
+11. Recommended platforms must use: youtube, tiktok, instagram, facebook.
+12. Explain WHY the subject was selected. The why_selected field is mandatory
+    and should mention opportunity, retention, monetization, sourcing, and
+    production feasibility where relevant.
+13. In references_used, include any well-known subreddits, YouTube channels,
+    RSS feeds, publications, or public reports you are confident exist and are
+    directly relevant to this niche (e.g. "r/personalfinance", "Nature News RSS",
+    "JSTOR Daily"). Only include sources you are confident are real. Do not invent
+    URLs or fabricate source names. Leave the array empty when no well-known
+    relevant source comes to mind. This is NOT a web search — these are known
+    sources from training data.
+
+Return ONLY valid JSON matching the provided schema. No markdown. No code fence.
+"""
+
+_RESEARCH_IDEAS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "research_label": {
+            "type": "string",
+            "description": "Must say this is an AI market research estimate, not verified platform analytics.",
+        },
+        "primary_recommendation": {
+            "type": "object",
+            "properties": {
+                "recommended_channel_concept": {"type": "string"},
+                "why_selected": {"type": "string"},
+                "rpm_potential": {"type": "string", "enum": ["low", "medium", "high", "very_high"]},
+                "follower_growth_potential": {"type": "string", "enum": ["low", "medium", "high", "very_high"]},
+                "platform_suitability": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "platform": {"type": "string", "enum": ["youtube", "tiktok", "instagram", "facebook"]},
+                            "fit": {"type": "string", "enum": ["low", "medium", "high", "very_high"]},
+                            "reasoning": {"type": "string"},
+                        },
+                        "required": ["platform", "fit", "reasoning"],
+                        "additionalProperties": False,
+                    },
+                },
+                "best_script_source": {"type": "string", "enum": ["reddit", "claude_generated"]},
+                "recommended_output_mode": {"type": "string", "enum": ["youtube_and_shorts", "shorts_only"]},
+                "recommended_visual_style": {"type": "string"},
+                "recommended_image_style": {"type": "string"},
+                "recommended_tone": {"type": "string"},
+                "recommended_target_languages": {"type": "array", "items": {"type": "string"}},
+                "recommended_platforms": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": ["youtube", "tiktok", "instagram", "facebook"]},
+                },
+                "suggested_channel_names": {"type": "array", "items": {"type": "string"}},
+                "example_video_ideas": {"type": "array", "items": {"type": "string"}},
+                "risks_difficulty": {"type": "array", "items": {"type": "string"}},
+                "final_recommendation_summary": {"type": "string"},
+                "assumption_note": {"type": ["string", "null"]},
+                "editable_config": {
+                    "type": "object",
+                    "properties": {
+                        "channel_name": {"type": "string"},
+                        "description": {"type": "string"},
+                        "niche": {"type": "string"},
+                        "tone": {"type": "string"},
+                        "script_source": {"type": "string", "enum": ["reddit", "ai_generated"]},
+                        "output_mode": {"type": "string", "enum": ["youtube_and_shorts", "shorts_only"]},
+                        "visual_style": {"type": "string"},
+                        "image_style": {"type": "string"},
+                        "languages": {"type": "array", "items": {"type": "string"}},
+                        "platforms": {
+                            "type": "array",
+                            "items": {"type": "string", "enum": ["youtube", "tiktok", "instagram", "facebook"]},
+                        },
+                        "videos_per_week": {"type": "integer", "minimum": 1, "maximum": 21},
+                        "subreddits": {"type": "array", "items": {"type": "string"}},
+                        "story_generation_prompt": {"type": ["string", "null"]},
+                    },
+                    "required": [
+                        "channel_name", "description", "niche", "tone", "script_source",
+                        "output_mode", "visual_style", "image_style", "languages",
+                        "platforms", "videos_per_week", "subreddits",
+                    ],
+                    "additionalProperties": False,
+                },
+            },
+            "required": [
+                "recommended_channel_concept", "why_selected", "rpm_potential",
+                "follower_growth_potential", "platform_suitability", "best_script_source",
+                "recommended_output_mode", "recommended_visual_style",
+                "recommended_image_style", "recommended_tone", "recommended_target_languages",
+                "recommended_platforms", "suggested_channel_names", "example_video_ideas",
+                "risks_difficulty", "final_recommendation_summary", "editable_config",
+            ],
+            "additionalProperties": False,
+        },
+        "alternative_ideas": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "concept": {"type": "string"},
+                    "why_it_could_work": {"type": "string"},
+                    "main_tradeoff": {"type": "string"},
+                },
+                "required": ["concept", "why_it_could_work", "main_tradeoff"],
+                "additionalProperties": False,
+            },
+        },
+        "references_used": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Well-known subreddits, YouTube channels, RSS feeds, publications, or "
+                "public reports directly relevant to this niche that Claude knows from "
+                "training data. Only include sources you are confident are real. "
+                "Leave empty when none are applicable."
+            ),
+        },
+    },
+    "required": ["research_label", "primary_recommendation", "alternative_ideas", "references_used"],
+    "additionalProperties": False,
+}
+
+
+def research_channel_ideas(
+    channel_description: str,
+    content_mode: str = "single_story",
+    target_languages: list[str] | None = None,
+    target_platforms: list[str] | None = None,
+    mode: str = "validate",
+) -> dict:
+    """Return structured AI market-research estimates for an Agent 1 channel idea.
+
+    mode="explore"  — operator has no idea yet; description may be empty.
+                      Claude proposes the best channel opportunity from scratch.
+    mode="validate" — operator has an idea; description is required and Claude
+                      analyses/refines it.
+
+    This uses Claude only through the shared structured client. It does not call
+    platform APIs, scrape platforms, or verify analytics; the returned label must
+    keep that limitation visible to the operator.
+    """
+    description = (channel_description or "").strip()
+
+    if mode == "validate" and not description:
+        raise ValueError("channel_description is required for validate mode")
+
+    # For explore mode with no description, give Claude an explicit open-ended brief
+    # so rule 6 of the system prompt ("if description is vague, still produce a
+    # useful recommendation") works as intended — Claude knows to freely propose.
+    if mode == "explore" and not description:
+        description = (
+            "The operator has not provided a channel idea yet — propose the best "
+            "channel opportunity for a new content creator starting from scratch. "
+            "Focus on niches that have strong repeatable content potential, work "
+            "well with Reddit-sourced stories, and are feasible with the Content "
+            "Factory pipeline."
+        )
+
+    context = {
+        "mode": mode,
+        "channel_description": description,
+        "content_mode": content_mode,
+        "target_languages": target_languages or [],
+        "target_platforms": target_platforms or [],
+        "pipeline_constraints": {
+            "currently_executable_content_mode": "single_story",
+            "currently_executable_script_source": "reddit",
+            "currently_executable_output_mode": "youtube_and_shorts",
+            "no_platform_api_access": True,
+            "no_verified_analytics": True,
+            "operator_review_required": True,
+        },
+    }
+    user_message = json.dumps(context, ensure_ascii=False, indent=2)
+    return call_claude_structured(
+        task="channel_research",
+        system_prompt=_RESEARCH_IDEAS_SYSTEM_PROMPT,
+        user_message=user_message,
+        schema_name="channel_research_ideas",
+        input_schema=_RESEARCH_IDEAS_SCHEMA,
+        max_tokens=4096,
+    )

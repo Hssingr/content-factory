@@ -29,6 +29,7 @@ MODEL_ROUTING: dict[str, str] = {
     "revision":                SONNET,
     "story_research":          SONNET,  # uses web_search tool — Haiku does not support it
     "channel_suggestion":      SONNET,  # Agent 1 UX — poor suggestions harm onboarding quality
+    "channel_research":        SONNET,  # Agent 1 market-research estimate; nuanced strategy output
     "story_blueprint":         SONNET,  # Narrative skeleton — foundation for all sections
     "section_generation":      SONNET,  # Creative writing per section
     "short_script":            SONNET,  # Standalone short planning: TikTok-optimised episode script

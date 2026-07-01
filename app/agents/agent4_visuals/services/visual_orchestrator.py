@@ -63,6 +63,8 @@ def run_visual_generation(
     script_format: str,
     allow_legacy_fallback: bool,
     db: Session,
+    visual_style: str = "",
+    image_style: str = "",
 ) -> dict:
     """Ensure visual readiness for one content item (parent or child short).
 
@@ -94,6 +96,8 @@ def run_visual_generation(
         script_format=script_format,
         allow_legacy_fallback=allow_legacy_fallback,
         db=db,
+        visual_style=visual_style,
+        image_style=image_style,
     )
 
 
@@ -142,6 +146,8 @@ def run_visual_generation_for_content(content_id: uuid.UUID, db: Session) -> boo
     config: ChannelConfig | None = db.get(ChannelConfig, channel.id)
     script_format         = config.script_format         if config else "youtube_long"
     allow_legacy_fallback = config.allow_legacy_fallback if config else False
+    visual_style          = (config.visual_style  or "") if config else ""
+    image_style           = (config.image_style   or "") if config else ""
 
     scripts_by_lang: dict[str, Script] = {
         s.language: s
@@ -170,6 +176,8 @@ def run_visual_generation_for_content(content_id: uuid.UUID, db: Session) -> boo
         script_format=script_format,
         allow_legacy_fallback=allow_legacy_fallback,
         db=db,
+        visual_style=visual_style,
+        image_style=image_style,
     )
 
     status = result["status"]
@@ -204,6 +212,8 @@ def _run_parent_visuals(
     script_format: str,
     allow_legacy_fallback: bool,
     db: Session,
+    visual_style: str = "",
+    image_style: str = "",
 ) -> dict:
     shared_beats = _load_shared_beats(content_id, db)
 
@@ -222,6 +232,8 @@ def _run_parent_visuals(
             script_format=script_format,
             allow_legacy_fallback=allow_legacy_fallback,
             db=db,
+            visual_style=visual_style,
+            image_style=image_style,
         )
         if shared_beats is None:
             return {"status": "VISUALS_FAILED", "beats_by_lang": {}}
@@ -272,6 +284,8 @@ def _run_visual_pass(
     script_format: str,
     allow_legacy_fallback: bool,
     db: Session,
+    visual_style: str = "",
+    image_style: str = "",
 ) -> tuple[list[dict] | None, int]:
     """Generate storyboard + Flux images once for this content item.
 
@@ -322,6 +336,8 @@ def _run_visual_pass(
         whisper_transcript=source_audio.whisper_transcript or [],
         allow_legacy_fallback=allow_legacy_fallback,
         language=source_lang,
+        visual_style=visual_style,
+        image_style=image_style,
     )
 
     if beats is None:

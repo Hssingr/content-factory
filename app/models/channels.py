@@ -13,8 +13,8 @@ class Channel(Base):
     user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
-    niche: Mapped[str] = mapped_column(String(128), nullable=False)
-    tone: Mapped[str] = mapped_column(String(64), nullable=False)
+    niche: Mapped[str] = mapped_column(String(255), nullable=False)
+    tone: Mapped[str] = mapped_column(String(255), nullable=False)
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
     user: Mapped["User"] = relationship("User", back_populates="channels")

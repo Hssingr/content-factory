@@ -574,7 +574,7 @@ Current responsibilities:
 - Field suggestions through Claude.
 - Channel configuration persistence.
 - Language setup.
-- Voice ID entry.
+- Per-language voice provider/model/Voice ID entry.
 - Platform credential entry and verification.
 - Fernet encryption before credential storage.
 - Channel activation after required credentials are verified.
@@ -592,7 +592,550 @@ Rules:
 - Credentials must be encrypted before storage.
 - Credential verification must be explicit and logged without secrets.
 - Claude may suggest channel fields, but not validate credentials.
-- Voice IDs are operator-provided hard inputs unless a future voice browser is explicitly implemented.
+- Voice IDs are operator-provided hard inputs. The setup UI may mark a Voice ID as locally validated for operator review, but it must not call a provider validation API unless a future backend phase explicitly implements one.
+
+### 8.1 Content Factory V3 Groundwork Fields (schema-only, Phase Agent1-V3.2)
+
+`code_report/agent1_v3_1_architecture_baseline_audit.md` audited the
+current Agent 1 stack ahead of a V3 redesign (dynamic, conditional channel
+setup). Phase Agent1-V3.2 added the minimum additive schema/model
+groundwork for that redesign — five new `channel_config` columns. **None
+of these fields are read by Agent 2, Agent 3, Agent 4, or Agent 5 yet.**
+Setting any of them today changes no runtime behavior — they exist so
+Agent 1's API/UI can start capturing operator intent before any agent
+acts on it.
+
+| Field | Type | Default | Currently supported value(s) | Coming-soon values (accepted, not yet executed) |
+|---|---|---|---|---|
+| `content_mode` | `str` (Pydantic `Literal`) | `"single_story"` | `"single_story"` — matches today's only real behavior (one discovery → one parent + standalone shorts per cycle) | `"limited_series"`, `"ongoing_series"` — reserved; no Agent 2 execution logic exists for either |
+| `script_source` | `str` (Pydantic `Literal`) | `"reddit"` | `"reddit"` — matches Agent 2's current discovery default | `"ai_generated"`, `"user_provided"`, `"hybrid"` — reserved; Agent 2 always runs the same discovery→blueprint→script flow regardless of this value today |
+| `output_mode` | `str` (Pydantic `Literal`) | `"youtube_and_shorts"` | `"youtube_and_shorts"` — matches today's only real behavior (parent render + standalone shorts via `run_shorts_planner`, per §9.4) | `"youtube_long_only"`, `"shorts_only"` — reserved; no agent currently branches on this value |
+| `visual_style` | `str` (free-form, no DB enum) | `"documentary"` | **Read by Agent 2 and Agent 4** — Agent 2 injects it into `generate_story_blueprint()`, `generate_section()`, and `generate_short_episode_script()` user messages as "Visual style:" so narration and hook framing align with the channel's visual aesthetic; Agent 4 injects it into every `generate_storyboard_batch()` call as "Global visual direction:" applying a consistent mood/color/lighting constraint across all beats. See §11 (Agent 4) for the Agent 4 injection contract. | Intentionally a **separate column from `video_style_type`** (§19's existing field, same default); a future phase should decide whether to reconcile/deprecate one of them — do not silently merge them without updating this section |
+| `image_style` | `str` (free-form, no DB enum) | `"photorealistic"` | **Read by Agent 2 and Agent 4** — Agent 2 injects it into the same three prompt functions as `visual_style` as "Image style:"; Agent 4 injects it into every `generate_storyboard_batch()` call as "Global image style:" applying a consistent Flux rendering approach across all beats. See §11 (Agent 4) for the Agent 4 injection contract. | No per-beat `image_style` override exists; the channel-level setting applies uniformly to every `flux_generated` beat |
+
+Rules:
+
+- `visual_style` and `image_style` are now wired into **both Agent 2 and
+  Agent 4** — do not treat them as unread. Agent 2 receives them in
+  `generate_story_blueprint()`, `generate_section()`, and
+  `generate_short_episode_script()` via the `ScriptWorkflowContext`
+  threading chain; Agent 4 receives them in
+  `generate_storyboard_batch()` via `split_into_beats()` (see §11.4).
+  All other fields (`content_mode`, `script_source`, `output_mode`)
+  remain schema-only; do not make any other agent read them until a
+  dedicated phase explicitly wires them in, documents the new behavior
+  here, and proves it with a runtime test (§19.4).
+- `content_mode`/`script_source`/`output_mode` are Pydantic `Literal`
+  types in `app/schemas/channel.py` (`ContentMode`/`ScriptSource`/
+  `OutputMode`) — the API rejects any value outside the table above.
+  `visual_style`/`image_style` are plain strings (no enum), matching the
+  existing looseness of `video_style_type`/`video_color_grade`.
+- All five columns are `NOT NULL` with a `server_default` (migration
+  `alembic/versions/004_add_v3_channel_config_fields.py`) — additive and
+  backwards-compatible; every existing channel row is backfilled with the
+  same default a brand-new row gets, with no manual data migration step.
+- Do not add execution logic for `limited_series`/`ongoing_series`,
+  or voice/credential verification under this section — those are
+  explicitly separate, not-yet-scheduled phases per the V3.1 audit's
+  phase plan.
+
+### 8.2 V3 Config Rule Helpers (Phase Agent1-V3.3; enforced only at activation since V3.4)
+
+File:
+
+```text
+app/agents/agent1_setup/services/v3_config_rules.py
+```
+
+Pure, local, side-effect-free helpers that classify §8.1's `content_mode`/
+`script_source`/`output_mode` values along two independent axes:
+**supported** (does the V3.2 Pydantic schema accept this value at all?)
+and **executable** (does any agent actually run differently, or run at
+all, for this value, today?). No database access, no network call, no
+mutation of a `ChannelConfig` row.
+
+**Only one combination is executable today:**
+`content_mode="single_story"` + `script_source="reddit"` +
+`output_mode="youtube_and_shorts"` — i.e. exactly what every channel
+already does. Everything else is schema-supported (an operator can already
+save it) but not yet executable:
+
+| Field | Executable today | Supported, not executable | Reason |
+|---|---|---|---|
+| `content_mode` | `single_story` | `limited_series`, `ongoing_series` | Agent 2 has no multi-episode or open-ended series planning/execution logic |
+| `script_source` | `reddit` (only when `content_mode="single_story"`) | `ai_generated` (alias: `claude_generated`), `user_provided`, `hybrid` | Agent 2's discovery flow always fetches a real source story today, for every content_mode — there is no AI-improvised, operator-supplied, or mixed script-origin path |
+| `output_mode` | `youtube_and_shorts` | `shorts_only`, `youtube_long_only` | Nothing in Agent 2/Agent 5 reads `output_mode` yet; `run_shorts_planner()` always runs and Agent 5 always renders the parent main video, unconditionally |
+
+`normalize_script_source()` maps `"claude_generated"` → `"ai_generated"` —
+a pure mapping, never a DB write. The V3.2 schema itself only ever accepts
+`"ai_generated"` (the alias only matters for a future internal caller that
+bypasses the Pydantic schema).
+
+`validate_v3_channel_config(config: dict) -> dict` returns
+`{"executable": bool, "supported": bool, "issues": list[V3ConfigIssue]}`
+— one `V3ConfigIssue` (`severity`/`field`/`code`/`message`) per
+not-yet-executable or unsupported field, each `coming_soon_reason()`-backed
+where applicable.
+
+Rules:
+
+- **Not wired into any route, the activation check, or any agent yet** —
+  confirmed and tested directly (`scripts/smoke_agent1_v3_config_rules.py`):
+  neither `routers/channels.py` nor `services/channels.py` imports this
+  module. A future phase decides where enforcement belongs (the activation
+  route, a new dedicated endpoint, or the frontend) — do not assume this
+  module is already protecting anything.
+- Do not add execution logic for any "supported, not executable" value
+  under this section — that remains separate, not-yet-scheduled phase
+  work per the V3.1 audit's phase plan.
+- Do not let this module's normalization functions write to the database —
+  they only ever return a value.
+- **Update (Phase Agent1-V3.4):** this module is now used by
+  `activation_readiness.check_activation_readiness()` (§8.3) — a channel
+  whose `content_mode`/`script_source`/`output_mode` is not fully
+  executable per this module can no longer be activated. It is still not
+  called from anywhere in Agent 2/3/4/5, and it still performs no database
+  access itself.
+
+### 8.3 Channel Activation Readiness (Phase Agent1-V3.4)
+
+File:
+
+```text
+app/agents/agent1_setup/services/activation_readiness.py
+```
+
+**The backend is the sole source of truth for activation readiness.** The
+frontend's own "all platforms verified" gating on the Activate button
+(`Tab2Credentials.jsx`) is a UI affordance only — it may mirror the
+backend's rule for a responsive UI, but it must never be treated as
+enforcement. `POST /api/agent1/channels/{id}/activate`
+(`activate_channel()`) calls
+`check_activation_readiness(channel)` and rejects activation (`400`) for
+any channel that is not fully ready — a direct API call can no longer
+activate an incomplete or partially-verified channel.
+
+This replaces the previous, looser check
+(`any(p.verified for p in channel.platforms)` — at least one verified
+platform was enough) with a check that **all** selected platform rows
+(every `ChannelPlatform` row that exists for the channel — a row only
+exists once credentials were saved for that platform×language pair) must
+be `verified=True`. This was a real mismatch the V3.1 audit found between
+this route and the frontend's own (always-stricter) gating; it is now
+fixed at the backend.
+
+`check_activation_readiness(channel)` is a pure function over an
+already-eager-loaded `Channel` ORM object (no queries of its own, no
+network call) returning
+`{"ready": bool, "issues": list[ReadinessIssue], "warnings": list}`. Checks
+performed, all independent (every issue is collected, not just the first):
+
+1. A `ChannelConfig` row exists.
+2. The channel's V3 config is fully executable per §8.2's
+   `validate_v3_channel_config()` — this is how `limited_series`/
+   `ongoing_series` (and any other not-yet-executable V3 value) block
+   activation.
+3. At least one `ChannelLanguage` row exists.
+4. Every configured language has at least one `ChannelVoice` row.
+5. `script_source="reddit"` (the only executable script source today)
+   requires at least one `ChannelSource` row.
+6. At least one `ChannelPublishTiming` row exists.
+7. At least one `ChannelPlatform` row exists.
+8. **Every** existing `ChannelPlatform` row is `verified=True` — not just
+   one of them.
+9. `output_mode="youtube_and_shorts"` (the only executable output mode
+   today) requires a `ChannelPlatform` row with `platform="youtube"`.
+
+Logging: a blocked activation logs
+`CHANNEL_ACTIVATION_BLOCKED channel_id=<id> issue_codes=[...]` at WARNING,
+listing every blocking issue's machine-readable code.
+
+**Credential save workflow (verify-before-store):** `POST /api/agent1/channels/{id}/credentials`
+now calls `platform_verifier.verify()` on the raw (not-yet-encrypted) credentials before
+encrypting or persisting anything. If verification fails the endpoint returns `400` and
+nothing is stored. On success, `save_credential(db, ..., verified=True)` writes the
+encrypted credential and sets `ChannelPlatform.verified = True` in one step — no separate
+`/verify` call is needed for a newly-saved credential. The existing `POST .../verify`
+endpoint remains for re-verifying previously-saved credentials.
+
+**Pre-flight readiness endpoint:** `GET /api/agent1/channels/{id}/readiness` exposes
+`check_activation_readiness()` as a read-only endpoint. `ActivationStep.jsx` calls this on
+mount so the operator sees every blocking issue before clicking Activate — the issues list
+renders inline as a checklist, and the Activate button is disabled until `ready=True`.
+The `POST .../activate` route still calls `check_activation_readiness()` internally, so the
+backend remains the sole enforcement point regardless of what the UI shows.
+
+Rules:
+
+- **Platform credential verification itself remains fully stubbed** — this
+  phase did not touch `app/services/platform_verifier.py`. Activation now
+  consistently relies on the existing `ChannelPlatform.verified` flag
+  (requiring it `True` for every selected platform, not just one). Real
+  per-platform credential verification is a separate, not-yet-scheduled
+  phase.
+- The `HTTPException` raised on a blocked activation still carries a plain
+  string `detail` (not a structured object).
+- Do not loosen check 8 back to "any platform verified" — that reopens the
+  exact mismatch this phase fixed.
+- Do not call `check_activation_readiness()` from Agent 2/3/4/5 — it is
+  Agent 1's own activation gate only.
+
+### 8.4 Setup Wizard UI (9-step redesign, supersedes Phase Agent1-V3.5)
+
+Key API area:
+
+```text
+app/ui/src/App.jsx                          (owns the full step state machine)
+app/ui/src/components/StepIndicator.jsx     (sticky top nav + "why this step" panel)
+app/ui/src/components/ReadinessSidebar.jsx  (live progress checklist)
+app/ui/src/components/StepShell.jsx         (generic per-step card/back/next chrome)
+app/ui/src/components/ModeStep.jsx          (content_mode selection)
+app/ui/src/components/CredentialsStep.jsx   (credential entry/verify, no activate bar)
+app/ui/src/components/ActivationStep.jsx    (final readiness + activate + success screen)
+app/ui/src/index.css, app/ui/src/form.css   (full visual reskin — dark purple/indigo theme)
+```
+
+Phase Agent1-V3.5's three-stage structure (`Tab0Discovery.jsx`,
+`Tab1Config.jsx`'s six stacked accordion sections, `Tab2Credentials.jsx`)
+was replaced by a single flattened, one-step-at-a-time wizard with 9 named
+steps: **Mode → Concept → Languages → Voices → Schedule → Sources →
+Platforms → Credentials → Activation**. This was an operator-directed
+visual and structural redesign (modeled on an externally supplied
+reference design) — not a new V3.x phase number, since no new backend
+capability, schema, or executable/supported matrix changed. `Tab0Discovery.jsx`,
+`tab0/ModeSelectionSection.jsx`, `Tab1Config.jsx`, `Tab2Credentials.jsx`,
+and `Section.jsx` were deleted; `App.jsx` now owns all wizard state
+directly (the per-section state and save handlers that used to live in
+`Tab1Config.jsx` moved here unchanged).
+
+**Most leaf section components kept their pre-existing logic** —
+`LanguagesSection.jsx`, `VoicesSection.jsx`,
+`ScheduleSection.jsx`, `SourcesSection.jsx`, `PlatformsSection.jsx`,
+`CredentialRow.jsx`, `AISuggestionField.jsx`, and `ChannelList.jsx` remain
+ordinary editable form components. `BasicInfoSection.jsx` is the exception:
+it now owns the Agent 1 Research Ideas UX (§8.5). No new dependency was
+added — no Tailwind, no icon library, no animation library; the visual
+design is plain hand-written CSS.
+
+**`BasicInfoSection.jsx` — two-path UX with progressive reveal (supersedes
+earlier inline Research panel):** The Concept step now shows a description
+textarea and two explicitly-separated action paths. "✨ Research Ideas" is
+enabled when the description is **empty** (the operator has no idea yet and
+wants Claude to find one); "✨ Validate Description" is enabled when the
+description is **non-empty** (the operator has an idea and wants feedback).
+Both paths call `POST /api/agent1/research-ideas`. The result appears in a
+**modal dialog** (`ResearchDialog`) overlaid on the step, not inline below
+the textarea. The editable channel-name/niche/tone fields are **hidden until
+the operator takes an action** — either uses a recommendation (populates the
+fields and closes the dialog), closes the dialog without applying, or clicks
+"Skip — I'll fill in details manually" (progressive reveal). This fixes the
+previously-inverted flow (Research was disabled when empty, enabled when
+non-empty — the opposite of the intended design).
+
+**`ScheduleSection.jsx` — dropdowns with explanations (Items 16/17):**
+`visual_style` and `image_style` are now `<select>` dropdowns driven by
+`VISUAL_STYLE_OPTIONS`/`IMAGE_STYLE_OPTIONS` in `constants.js` (structured
+`{value, label, description}` objects), replacing the previous
+`<input type="text">` + `<datalist>` pair. A per-option description line
+renders below the selected value. `output_mode` has an `OUTPUT_MODE_DESCRIPTIONS`
+sentence rendered below the dropdown explaining what that mode produces.
+All three constants remain in sync with Agent 4's runtime behavior — the
+dropdown labels match the values Agent 4 receives.
+
+**`VoicesSection.jsx` — honest voice status labels:** "Validated ✓" and
+"Not validated" (implying a provider API had been called) were replaced by
+"Saved for review ✓" / "Not saved" and "Save Voice ID" button label. The
+status bar below the Voice ID field now reads "Voice ID saved — will be
+verified when the channel first runs audio generation." This matches the
+actual architecture (no provider API call is made; the Voice ID is stored
+and used on Agent 3's first TTS run).
+
+**`Tab2Credentials.jsx` was split into two separate steps**, mirroring the
+reference design's separate Credentials/Readiness steps: `CredentialsStep.jsx`
+(the credential-row grid only — real Fernet-encrypted save + verify,
+unchanged from before) and `ActivationStep.jsx` (the final review +
+`POST .../activate` call + success screen). `ActivationStep.jsx` now loads
+`GET /api/agent1/channels/{id}/readiness` on mount and displays a pre-flight
+checklist with every blocking issue before the operator clicks Activate. The
+Activate button is disabled while the readiness check is loading or when
+`ready=False`. Issue codes are mapped to human labels in `ActivationStep.jsx`;
+the API response format itself is untouched.
+
+**`ModeStep.jsx` replaces `Tab0Discovery.jsx`/`ModeSelectionSection.jsx`**
+with identical behavior: only `content_mode="single_story"` (`CONTENT_MODES`
+in `constants.js`, mirroring §8.2's executable matrix) allows Continue;
+`limited_series`/`ongoing_series` show a Coming Soon notice and make no
+API call of any kind.
+
+**`ReadinessSidebar.jsx` is new** — a live checklist (mode/concept/
+languages/voices/schedule/sources/platforms/credentials) driven by the
+same `completedSteps` state `App.jsx` already tracks; it is a pure
+presentation layer over existing state, not a new readiness computation
+(the real, authoritative readiness check remains §8.3's backend
+`check_activation_readiness()`, surfaced in `ActivationStep.jsx`).
+
+**`StepIndicator.jsx`'s context panel is deliberately a single, honest
+"why this step" explanation** — the reference design this was modeled on
+also had a second panel implying a live background AI process ("AI Agent
+State"); that panel was not carried over because no such background
+process exists, and CLAUDE.md §15/§25 forbid implying unimplemented
+behavior. Every real AI-assisted action in this wizard (the ✨ suggest
+buttons, ✨ Research Ideas, ✨ Suggest timing) already speaks for
+itself at the point it runs.
+
+**Per-language voice configuration (Agent 1 V3 voice tab)** —
+voice setup is per publishing language, not per channel. For every selected
+language, `VoicesSection.jsx` renders an independent Voice Card with
+provider, model, Voice ID, and local setup status. Production providers
+currently exposed by the UI are Cartesia (`sonic-3.5` default; `sonic-3`
+and `sonic-2` also selectable) and ElevenLabs (`eleven_v3` default;
+`eleven_multilingual_v2` also selectable). Saving voices writes one
+`ChannelVoice` row per language with `language`, `provider`, `tts_model`,
+and `voice_id`; it does not create a shared channel-level voice.
+
+**No fake provider/API voice-test or OAuth simulation exists** —
+the Voice Card's `Save Voice ID` button (formerly "Validate Voice") is a
+local setup-state affordance for a non-empty operator-entered Voice ID; it
+does not call Cartesia, ElevenLabs, Claude, or any external service. The
+status display reads "Saved for review ✓" (not "Validated") — this matches
+the actual architecture where the Voice ID is accepted and stored but only
+verified on Agent 3's first real TTS run, not at setup time. No synthesized-tone
+fake verification or simulated OAuth handshake was added anywhere. Agent 1's
+Research Ideas feature (§8.5) is a real backend Claude call, not a simulated
+background process, and it never verifies platform analytics or credentials.
+
+Rules:
+
+- Do not reintroduce a multi-section-at-once accordion view — the wizard
+  is one step at a time by design, matching the approved reference.
+- Do not add a simulated voice-test button or simulated OAuth flow — these
+  were explicitly decided against; if a future phase wants real versions of
+  either, that is new backend scope requiring its own CLAUDE.md update, not
+  a frontend-only addition.
+- Do not add Tailwind, an icon library, or an animation library to
+  `app/ui/` without updating this section — the current design intentionally
+  uses zero new dependencies.
+- Keep `ReadinessSidebar.jsx`'s checklist driven by `App.jsx`'s
+  `completedSteps` state, not a second readiness computation — the
+  backend's `check_activation_readiness()` (§8.3) remains the sole source
+  of truth for whether activation will actually succeed.
+- Keep `constants.js`'s `CONTENT_MODES`/`SCRIPT_SOURCES`/`OUTPUT_MODES`
+  `executable` flags in sync by hand with §8.2's `is_executable_*()`
+  helpers — there is no shared source of truth between frontend and
+  backend yet.
+- Keep `VISUAL_STYLE_OPTIONS`/`IMAGE_STYLE_OPTIONS` in `constants.js`
+  in sync with values that Agent 2's script prompts and Agent 4's
+  storyboard prompt both recognize — both agents now receive these as
+  free-form strings (Agent 2 via "Visual style:"/"Image style:" lines in
+  blueprint/section/short-episode user messages; Agent 4 via "Global
+  visual direction:"/"Global image style:" lines in the storyboard user
+  message). Adding a new option here that neither agent's prompts
+  explicitly document causes silent prompt mismatch.
+- Research results open in a modal dialog (`ResearchDialog`) — do not
+  reinline them below the textarea; that was an explicitly-fixed UX defect.
+
+### 8.5 Research Ideas UX (Agent 1 V3.5c)
+
+Agent 1's Concept step includes a real **Research Ideas** action for
+`content_mode="single_story"` setup. The operator enters a rough channel
+description, then clicks `✨ Research Ideas`; the frontend calls
+`POST /api/agent1/research-ideas` and shows a rich recommendation panel
+before the channel is saved or activated.
+
+Backend ownership:
+
+```text
+app/agents/agent1_setup/routers/suggest.py      — `/api/agent1/research-ideas`
+app/agents/agent1_setup/system_prompt.py        — `research_channel_ideas()` structured Claude prompt
+app/schemas/research_ideas.py                   — request/response models
+app/services/model_routing.py                   — `channel_research` Claude task key
+```
+
+The endpoint accepts `channel_description` (optional when `mode="explore"`),
+`mode` (`"explore"` | `"validate"`, default `"validate"`), `content_mode`,
+optional `target_languages`, and optional `target_platforms`.
+
+`mode="explore"` — the operator has no channel idea yet; `channel_description`
+may be empty. `research_channel_ideas()` injects a synthetic open-ended brief
+so Claude proposes the best available niche opportunity from scratch.
+`mode="validate"` — the operator has an idea and wants feedback;
+`channel_description` is required and the endpoint returns HTTP 400 if empty.
+The frontend sends `mode="explore"` for the **"✨ Research Ideas"** button and
+`mode="validate"` for the **"✨ Validate Description"** button.
+
+The endpoint calls Claude only through the shared `call_claude_structured()`
+client pattern with task `channel_research`. It does **not** call YouTube,
+TikTok, Instagram, Facebook, Reddit, credential-verification services, or any
+scraping/tooling. If web-enabled Claude research tooling is unavailable, the
+feature remains a structured AI estimate based only on the operator's
+description (or the pipeline-constraint brief in explore mode) and the current
+pipeline constraints.
+
+Required response shape includes: recommended channel concept, why Claude
+selected it, qualitative RPM potential, qualitative follower/subscriber
+growth potential, platform suitability for YouTube/TikTok/Instagram/
+Facebook, best script source (`reddit` or Claude Generated), recommended
+output mode, visual style, image style, tone, target languages, target
+platforms, suggested channel names, example video ideas, risks/difficulty,
+a final recommendation summary, an `editable_config` object that maps
+into the wizard's existing editable state, and a `references_used` array
+of well-known subreddits, publications, or public resources Claude knows
+from training data (empty when none apply — real web search is a future
+phase, not wired yet).
+
+The result is explicitly labeled **"AI market research estimate — not
+verified platform analytics"**. Claude must not invent exact verified
+numbers, exact RPM values, competitor analytics, audience sizes, or claims
+that it checked live platforms. Qualitative labels (`low`/`medium`/`high`/
+`very_high`) are allowed when paired with reasoning. `references_used`
+entries must only be sources Claude is confident are real — it must not
+fabricate URLs or source names.
+
+Frontend behavior (two-path UX with progressive reveal):
+
+- `BasicInfoSection.jsx` shows a description textarea and two action paths:
+  **"✨ Research Ideas"** (enabled when description is empty — sends
+  `mode="explore"`; no idea yet, Claude proposes one from scratch) and
+  **"✨ Validate Description"** (enabled when description is non-empty —
+  sends `mode="validate"`; operator has an idea and wants Claude to analyse
+  it). Both paths call `POST /api/agent1/research-ideas` and open the same
+  `ResearchDialog`.
+- Research/Validate result opens in a **modal dialog** (`ResearchDialog`)
+  overlaid on the step — not inline below the textarea.
+- Editable fields (channel name, niche, tone) are hidden until the
+  operator takes an action: closes the dialog (with or without applying),
+  or clicks "Skip — I'll fill in details manually" (progressive reveal).
+- `Use this recommendation` updates local React state only — channel name,
+  description, niche, tone, script source, output mode, visual style, image
+  style, languages, platforms, videos per week, and Reddit source rows when
+  applicable — then closes the dialog and reveals the editable fields. It
+  does not save the channel, activate the channel, create content, start
+  Agent 2, or bypass operator review.
+- Loading text is explicit: "Analyzing niche opportunities…", "Checking
+  platform fit…", "Estimating monetization potential…", and "Preparing
+  channel recommendation…".
+
+Rules:
+
+- Research Ideas is Agent 1 setup assistance only; it must never start
+  script generation, discovery, credential verification, Telegram approval,
+  or activation.
+- Telegram validation remains mandatory later in the pipeline; Research
+  Ideas does not approve or publish anything.
+- Do not implement real platform API integrations, scraping, or credential
+  verification under this feature.
+- Do not wire `limited_series`, `ongoing_series`, `shorts_only`, or
+  `ai_generated` execution into Agent 2/3/4/5 from this feature. Those
+  values may be suggested into editable setup state, but activation/runtime
+  executability remains governed by §8.2/§8.3 until future phases implement
+  them.
+- `references_used` is populated from Claude's training knowledge only —
+  do not add `call_claude_with_tools()` web search under this section. A
+  future phase may add real web citations; when it does, this section must
+  be updated and the schema field's description updated to reflect that it
+  may contain live-fetched URLs.
+- Research result must open in the `ResearchDialog` modal — do not reinline
+  it below the textarea (that was an explicitly-fixed UX defect).
+- `mode="explore"` must never call an external API to discover ideas — Claude
+  generates the opportunity from its training data using the synthetic brief
+  in `research_channel_ideas()`. Do not wire real discovery or scraping into
+  the explore path without explicitly scheduling it as a new phase and updating
+  this section.
+- Do not make `channel_description` required when `mode="explore"` — the
+  entire point of explore mode is that the operator has nothing to describe yet.
+
+### 8.6 Channel Configuration Snapshot Foundation (Phase Agent1-V3.6)
+
+File:
+
+```text
+app/agents/agent1_setup/services/config_snapshot.py
+```
+
+Today every agent reads channel configuration live, via whatever
+`channel.config`/`channel.languages`/`channel.voices`/`channel.sources`/
+`channel.platforms`/`channel.publish_timings` happen to be at the moment
+it runs — there is no stable, point-in-time record of what configuration
+actually applied to a given content run. If an operator edits the channel
+mid-pipeline, a later agent has no way to know whether it saw the same
+configuration an earlier agent saw. This phase adds the **foundation
+only** for fixing that: an immutable snapshot dict, captured once per
+content run, carried on the `Content` row itself.
+
+**Storage decision: a nullable JSONB column on `Content`
+(`channel_config_snapshot`), not a new table.** `Content` already carries
+a directly analogous nullable JSONB column for exactly this kind of
+point-in-time captured data (`story_blueprint`, captured once at
+blueprint-generation time and never mutated afterward) — reusing that
+existing, proven pattern is lower-risk than introducing a new table with
+its own model, relationship wiring, and migration surface for a value
+that is always 1:1 with a single `Content` row and never queried
+independently of it. A new table would only be justified if a snapshot
+needed to be queried/joined across many content rows by its own fields,
+or needed its own history (many snapshots per content) — neither applies
+here: a content run has exactly one snapshot, captured exactly once.
+
+`build_channel_config_snapshot(channel) -> dict` — a pure function over an
+already-eager-loaded `Channel` (the same precondition §8.3's
+`check_activation_readiness()` already documents: `config`/`languages`/
+`voices`/`sources`/`platforms`/`publish_timings` must already be loaded).
+No query of its own, no network/API call. Captures:
+
+```text
+channel_id, channel_config_id, content_mode, script_source, output_mode,
+visual_style, image_style, languages (language + channel_name),
+platforms (platform + language + verified + active — never
+credentials_encrypted), videos_per_week, publish_timing_summary
+(platform/language/timezone/days/hours), voices (language/provider/
+tts_model/voice_id — never any ElevenLabs override field), source_summary
+(source_type/source_value/language/trust_score), captured_at (UTC ISO
+timestamp)
+```
+
+`ChannelConfig` is a one-to-one row keyed directly by `channel_id` (no
+separate version column exists today) — `channel_config_id` is therefore
+identical to `channel_id` when a config row exists, `None` when it does
+not. This is documented as a known simplification rather than invented as
+a fake version number; a future phase may add a real version column to
+`ChannelConfig` if config history ever needs its own audit trail.
+
+`validate_channel_config_snapshot(snapshot) -> list[ConfigSnapshotIssue]`
+— deterministic structural validation only (every required top-level key
+present; `channel_id` specifically non-empty). Returns an issue list
+rather than raising, matching §8.2/§8.3's existing "collect every issue,
+let the caller decide" convention. Never judges snapshot *content*
+correctness (e.g. it does not re-derive what the snapshot "should" have
+contained) — only that the shape a caller built is structurally complete.
+
+`attach_snapshot_to_content(content, snapshot) -> None` — sets
+`content.channel_config_snapshot` in memory only; no query, no commit.
+**Immutability is enforced at this one point**: calling it a second time
+on a content row that already has a snapshot raises `ValueError` rather
+than overwriting — this is the only mechanism in this phase that actively
+prevents a snapshot from being silently replaced.
+
+Rules:
+
+- **Not wired into any route, task, Celery job, or agent yet** — no code
+  anywhere calls `build_channel_config_snapshot()` or
+  `attach_snapshot_to_content()` outside this module's own smoke test. A
+  future phase decides the actual generation-start hook (most likely
+  inside Agent 2's `run_script_workflow()`, at the point parent `Content`
+  moves `APPROVED` → `GENERATING_SCRIPTS`, but that decision is explicitly
+  **not** made by this phase) and updates this section when it does.
+- Do not call either function from Agent 2/3/4/5 until that future phase
+  explicitly wires it in and documents the chosen hook here.
+- Do not add a `channel_config_snapshots` table — the JSONB-column
+  decision above is deliberate; revisit only if a real requirement for
+  cross-content snapshot querying or multiple snapshots per content
+  emerges.
+- Never include `ChannelPlatform.credentials_encrypted` or any
+  `ChannelVoice` override field in a snapshot — see CLAUDE.md §30; a
+  snapshot must never become a second, less-protected copy of credential
+  material.
+- A snapshot, once attached, must never be mutated or re-attached — any
+  future change to a content row's effective configuration belongs in a
+  new content run, not a rewritten snapshot.
 
 ---
 
@@ -1618,6 +2161,28 @@ Responsibilities:
 - Ask Claude for structured visual beats.
 - Return schema-validated storyboard batch.
 
+**Operator visual direction injection (`PROMPT_VERSION` 3.4 → 3.5):**
+`generate_storyboard_batch()` accepts optional `visual_style` and
+`image_style` string arguments (threaded from `ChannelConfig` via
+`split_into_beats()` → `_run_visual_pass()` → `_run_parent_visuals()` →
+`run_visual_generation()` → `run_visual_generation_for_content()`). When
+either is non-empty, `_build_message()` prepends two lines to the Claude
+user message:
+
+```
+Global visual direction: <visual_style or "documentary">
+Global image style: <image_style or "photorealistic">
+```
+
+The `_STORYBOARD_SYSTEM_PROMPT` carries a "== Global Visual Direction
+(operator-configured) ==" section (between §B2 and the beat-category
+rotation rule) instructing Claude to weave these as stylistic constraints
+into `flux_prompt` (one short appended style clause), `color_grade`, and
+`effect` choices — never at the cost of narrative relevance or
+anti-slideshow rules. When neither line appears in the user message,
+Claude defaults to documentary/photorealistic (unchanged behavior for any
+existing channel that has not set these fields).
+
 Rules:
 
 - Use `call_claude_structured()`.
@@ -1626,6 +2191,9 @@ Rules:
 - Storyboard prompt must produce physical, camera-pointable visuals.
 - Prompt must not rely on vague mood words.
 - Prompt must support visual continuity and identity consistency.
+- Do not hardcode visual style choices inside the prompt — the operator's
+  `ChannelConfig.visual_style`/`image_style` values are the authoritative
+  source and are injected per-call, not baked into the system prompt.
 
 Retry behavior (two independent, bounded retry classes — never combined into
 one retry path):
