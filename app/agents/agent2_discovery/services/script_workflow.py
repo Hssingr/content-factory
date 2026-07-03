@@ -16,6 +16,7 @@ from app.agents.agent2_discovery.services.scripts import (
 from app.agents.agent2_discovery.services.story import Story
 from app.agents.agent2_discovery.system_prompt import generate_story_blueprint
 from app.models import Channel, ChannelConfig, ChannelVoice, Content, Script
+from app.services.local_run_paths import ensure_run_dirs
 from app.services.script_estimator import estimate_duration_sec
 
 logger = logging.getLogger(__name__)
@@ -36,6 +37,7 @@ class ScriptWorkflowContext:
 
 def run_script_workflow(content: Content, db: Session) -> None:
     """Generate, validate, persist, and plan scripts for approved parent content."""
+    ensure_run_dirs(content.id)
     context = _load_script_workflow_context(content, db)
     if context is None:
         return

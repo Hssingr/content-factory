@@ -10,6 +10,7 @@ from app.models import (
 from app.agents.agent3_audio.services.tts import generate_audio
 from app.agents.agent3_audio.services.storage import audio_path, save_audio
 from app.agents.agent3_audio.services.whisper import transcribe
+from app.services.local_run_paths import ensure_run_dirs
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,8 @@ def run_audio_generation(content_id: uuid.UUID, db: Session) -> bool:
     if not content:
         logger.error("Content %s not found", content_id)
         return False
+
+    ensure_run_dirs(content_id)
 
     channel: Channel | None = db.get(Channel, content.channel_id)
     if not channel:

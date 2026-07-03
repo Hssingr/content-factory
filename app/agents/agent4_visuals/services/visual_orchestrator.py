@@ -43,6 +43,12 @@ from app.agents.agent4_visuals.subagents.storyboard_validator import (
     validate_storyboard, validate_media_assets,
 )
 from app.agents.agent4_visuals.services.flux_generator import generate_all_beat_images
+from app.agents.agent4_visuals.services.cinematic_prompts import apply_cinematic_prompts_to_beats
+from app.agents.agent4_visuals.services.first15_validator import apply_first15_enhancement_and_validation
+from app.agents.agent4_visuals.services.media_validation import validate_visual_media_assets
+from app.agents.agent4_visuals.services.visual_bible import generate_visual_bible_for_content, load_visual_bible_for_content
+from app.agents.agent4_visuals.services.visual_review import generate_visual_review_html
+from app.services.local_run_paths import ensure_run_dirs
 from app.agents.agent4_visuals.system_prompt import (
     STORYBOARD_SCHEMA_VERSION as _STORYBOARD_SCHEMA_VERSION,
     enrich_sections_with_visuals,
@@ -126,6 +132,8 @@ def run_visual_generation_for_content(content_id: uuid.UUID, db: Session) -> boo
         logger.error("Content %s not found", content_id)
         return False
 
+    ensure_run_dirs(content_id)
+
     channel: Channel | None = db.get(Channel, content.channel_id)
     if not channel:
         logger.error("Channel not found for content %s", content_id)
@@ -168,6 +176,21 @@ def run_visual_generation_for_content(content_id: uuid.UUID, db: Session) -> boo
         db.commit()
         return False
 
+    try:
+        visual_bible = generate_visual_bible_for_content(content_id, db)
+        logger.info(
+            "AGENT4_VISUAL_BIBLE_READY content_id=%s characters=%d locations=%d motifs=%d",
+            content_id,
+            len(visual_bible.get("characters") or []),
+            len(visual_bible.get("locations") or []),
+            len(visual_bible.get("recurring_motifs") or []),
+        )
+    except Exception as exc:
+        logger.error("AGENT4_VISUAL_BIBLE_FAILED content_id=%s error=%s", content_id, exc)
+        content.status = "FAILED"
+        db.commit()
+        return False
+
     result = run_visual_generation(
         content=content,
         channel=channel,
@@ -190,10 +213,45 @@ def run_visual_generation_for_content(content_id: uuid.UUID, db: Session) -> boo
         db.commit()
         return False
 
+    validation = validate_visual_media_assets(content_id, db)
+    for warning in validation.warnings:
+        logger.warning(
+            "AGENT4_MEDIA_VALIDATION_WARNING content_id=%s language=%s section=%s code=%s media=%s message=%s",
+            content_id, warning.language, warning.section_order, warning.code,
+            warning.media_path, warning.message,
+        )
+    if not validation.passed:
+        logger.error(
+            "AGENT4_MEDIA_VALIDATION_BLOCKED content_id=%s blocking=%d checked=%d codes=%s",
+            content_id,
+            len(validation.blocking_issues),
+            validation.checked_count,
+            [issue.code for issue in validation.blocking_issues],
+        )
+        for issue in validation.blocking_issues:
+            logger.error(
+                "AGENT4_MEDIA_VALIDATION_BLOCKING_ISSUE content_id=%s language=%s section=%s code=%s media=%s message=%s",
+                content_id, issue.language, issue.section_order, issue.code,
+                issue.media_path, issue.message,
+            )
+        content.status = "FAILED"
+        db.commit()
+        return False
+
     # status is "PARENT_VISUALS_DONE" or "CHILD_SHORT_VISUALS_DONE" — Agent 4
     # is the sole writer of these statuses; pickup_visual_ready reads them.
     content.status = status
     db.commit()
+
+    try:
+        review_path = generate_visual_review_html(content_id, db)
+        logger.info("AGENT4_VISUAL_REVIEW_HTML content_id=%s path=%s", content_id, review_path)
+    except Exception as exc:
+        logger.warning(
+            "AGENT4_VISUAL_REVIEW_HTML_FAILED content_id=%s error=%s",
+            content_id, exc,
+        )
+
     logger.info(
         "AGENT4_VISUAL_GENERATION_DONE content_id=%s status=%s languages=%d",
         content_id, status, len(result["beats_by_lang"]),
@@ -389,6 +447,37 @@ def _run_visual_pass(
             content_id,
         )
         return None, 0
+
+    visual_bible = load_visual_bible_for_content(content_id)
+    beats = apply_cinematic_prompts_to_beats(
+        beats,
+        visual_bible=visual_bible,
+        content_kind="parent_long_form",
+    )
+    beats, first15_result = apply_first15_enhancement_and_validation(
+        beats,
+        visual_bible=visual_bible,
+        content_kind="parent",
+    )
+    if first15_result.status == "FAIL_BLOCKING":
+        logger.error(
+            "Agent4 [FAIL] content=%s status=FIRST15_VISUAL_HOOK_FAILED "
+            "checked=%d strong=%d generic=%d issues=%s",
+            content_id,
+            first15_result.checked_count,
+            first15_result.strong_hook_count,
+            first15_result.weak_generic_count,
+            [issue.code for issue in first15_result.issues],
+        )
+        return None, 0
+    logger.info(
+        "Agent4 [FIRST15] content=%s status=%s checked=%d strong=%d warnings=%d",
+        content_id,
+        first15_result.status,
+        first15_result.checked_count,
+        first15_result.strong_hook_count,
+        sum(1 for issue in first15_result.issues if issue.severity == "WARNING"),
+    )
 
     # ── 2. Save storyboard beats before Flux — protects storyboard work ─────────
     # If Flux crashes mid-run, --from-video can reload these beats and skip straight
@@ -855,6 +944,39 @@ def _run_child_short_visuals(
                 [i["check"] for i in major_issues],
             )
 
+        visual_bible = load_visual_bible_for_content(content_id)
+        beats = apply_cinematic_prompts_to_beats(
+            beats,
+            visual_bible=visual_bible,
+            content_kind="child_short",
+        )
+        beats, first15_result = apply_first15_enhancement_and_validation(
+            beats,
+            visual_bible=visual_bible,
+            content_kind="child_short",
+        )
+        if first15_result.status == "FAIL_BLOCKING":
+            logger.error(
+                "Agent4 [FAIL] content=%s language=%s status=FIRST15_VISUAL_HOOK_FAILED "
+                "checked=%d strong=%d generic=%d issues=%s",
+                content_id,
+                language,
+                first15_result.checked_count,
+                first15_result.strong_hook_count,
+                first15_result.weak_generic_count,
+                [issue.code for issue in first15_result.issues],
+            )
+            continue
+        logger.info(
+            "Agent4 [FIRST15] content=%s language=%s status=%s checked=%d strong=%d warnings=%d",
+            content_id,
+            language,
+            first15_result.status,
+            first15_result.checked_count,
+            first15_result.strong_hook_count,
+            sum(1 for issue in first15_result.issues if issue.severity == "WARNING"),
+        )
+
         # Generation happens AFTER validation, not before (Phase 4E-E ordering
         # alignment) — the remap step above deliberately left any
         # below-threshold beat's media_url empty so the validation gate above
@@ -977,4 +1099,23 @@ def _beat_extras(s: dict) -> dict:
         "media_type":         s.get("media_type", "image"),
         "media_strategy":     s.get("media_strategy", "flux_generated"),
         "text_card_style":    s.get("text_card_style", "default"),
+        "negative_prompt":    s.get("negative_prompt", ""),
+        "shot_type":          s.get("shot_type", ""),
+        "subject":            s.get("subject", ""),
+        "action":             s.get("action", ""),
+        "emotion":            s.get("emotion", ""),
+        "camera":             s.get("camera", ""),
+        "lighting":           s.get("lighting", ""),
+        "composition":        s.get("composition", ""),
+        "continuity_tags":    s.get("continuity_tags", []),
+        "visual_bible_refs":  s.get("visual_bible_refs", []),
+        "location":           s.get("location", ""),
+        "character":          s.get("character", ""),
+        "is_first_15_seconds": s.get("is_first_15_seconds", False),
+        "prompt_quality_warnings": s.get("prompt_quality_warnings", []),
+        "first15_validation_status": s.get("first15_validation_status", ""),
+        "first15_issues": s.get("first15_issues", []),
+        "first15_strength_tags": s.get("first15_strength_tags", []),
+        "first15_enhanced": s.get("first15_enhanced", False),
+        "first15_validation_summary": s.get("first15_validation_summary", {}),
     }

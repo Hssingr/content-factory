@@ -48,6 +48,7 @@ from pathlib import Path
 from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.services.local_run_paths import ensure_run_dirs
 from app.models import (
     AudioFile, Channel, ChannelConfig, Content, Script, VideoRender, VideoSection,
 )
@@ -102,6 +103,8 @@ def run_video_generation(content_id: uuid.UUID, db: Session) -> bool:
     if not content:
         logger.error("Content %s not found", content_id)
         return False
+
+    ensure_run_dirs(content_id)
 
     channel: Channel | None = db.get(Channel, content.channel_id)
     if not channel:

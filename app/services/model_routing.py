@@ -25,6 +25,7 @@ MODEL_ROUTING: dict[str, str] = {
     "quality_rewrite":         SONNET,
     "auto_correction":         SONNET,  # dev-mode exception — correction quality matters
     "storyboard":              SONNET,
+    "visual_bible_generation": SONNET,  # Agent 4 story-level visual continuity bible
     "story_gate_scoring":      SONNET,  # single-story gate: 18-dimension structured call
     "revision":                SONNET,
     "story_research":          SONNET,  # uses web_search tool — Haiku does not support it

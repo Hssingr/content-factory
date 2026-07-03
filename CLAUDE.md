@@ -3409,6 +3409,109 @@ Rules:
 
 ## 13. Artifact Map
 
+### Local run folder structure
+
+For every content run, local debugging artifacts are grouped under:
+
+```text
+{media_path}/runs/{content_id}/
+```
+
+Subfolders:
+
+```text
+script/
+audio/
+whisper/
+visuals/
+review/
+renders/
+```
+
+`run_manifest.json` is created in the run root when the local run folders are
+ensured.
+
+Before visual beat generation, Agent 4 creates or loads a local visual bible:
+
+```text
+{media_path}/runs/{content_id}/visuals/visual_bible.json
+```
+
+The visual bible defines story-level visual continuity: stable characters,
+locations, motifs, global style, lighting rules, camera language, negative
+prompt rules, first-15-seconds visual rules, and forbidden generic shots. It is
+generated from the validated script, `Content.story_blueprint` when available,
+and non-secret channel configuration such as `visual_style`, `image_style`,
+`video_style_type`, `video_color_grade`, content mode, output mode, target
+languages, and target platforms. If `Content.channel_config_snapshot` is
+present, Agent 4 uses it as the config source; otherwise it reads live
+non-secret channel/config rows. Parent content creates the canonical visual
+bible. Child shorts reuse the parent visual bible when available so they do not
+create separate visual worlds. The bible is local-debug/quality infrastructure;
+it does not replace `VideoSection` rows and Agent 5 does not depend on it.
+
+Agent 4 uses `visual_bible.json` to build cinematic Flux/image prompts before
+image generation. The prompt builder adds subject, action, emotion,
+environment, camera/lens/framing, lighting, composition, continuity tags,
+visual-bible references, negative prompt rules, and a first-15-seconds flag.
+The improved prompt metadata is stored in the existing `VideoSection.generation_prompt`
+JSON. Prompt specificity checks are warnings-only in this phase; they do not
+block visual generation or change status transitions. `visual_review.html`
+displays the cinematic prompt fields. Agent 5 does not generate, repair, or
+validate prompts.
+
+Agent 4 also validates and strengthens first-15-second visual hooks with
+deterministic checks before Flux generation. The check uses the Visual Bible
+`first_15_seconds_rules`, forbidden generic shots, negative prompt rules,
+global style, and config context to look for strong opening subjects, actions,
+emotions, mysterious objects, specific horror clues, and story-specific
+locations while avoiding generic dark streets, forests, empty rooms, abstract
+symbols, and low-tension filler openings. Clearly unusable openings fail using
+the existing Agent 4 failure convention; weak but usable openings are warnings.
+The result is stored in existing `VideoSection.generation_prompt` metadata and
+displayed in `visual_review.html`. Agent 5 does not own or repair
+first-15-second visual quality. This is not the general visual
+repetition/rhythm validator.
+
+After successful Agent 4 visual generation, Agent 4 also writes a local review
+page:
+
+```text
+{media_path}/runs/{content_id}/review/visual_review.html
+```
+
+The review page summarizes the content item and renders the persisted
+`VideoSection` rows beat by beat with escaped narration, prompts, metadata,
+media paths, warnings, and local image previews when files exist. It is
+local-debug only: it is not a production readiness gate, does not replace
+`VideoSection` rows, and Agent 5 does not depend on it.
+
+Local agent-by-agent quality scripts live under `scripts/local_quality/`. They
+are local development tools only: each script either inspects existing DB rows
+and local artifacts or calls the existing agent service entrypoint when an
+explicit external-cost flag is provided. They write JSON reports under
+`{media_path}/runs/<content_id>/review/` (or `runs/channel_<channel_id>/review/`
+for channel-only Agent 1 checks). They do not replace Celery/Redis
+orchestration, do not own agent business logic, and do not add production
+statuses. External-cost execution requires explicit flags such as `--real-ai`,
+`--real-tts`, `--real-whisper`, `--real-flux`, `--real-render`, or
+`--allow-external`.
+
+Agent 4 validates persisted visual media assets before writing visual-ready
+status. Blocking failures include missing media paths, remote URLs where local
+media is required, unsafe paths outside the configured media root/run root,
+missing files, non-file paths, zero-byte files, unsupported local media
+extensions, and local image files that cannot be opened/read. Intentional
+text-card sections are allowed without local image media when explicitly marked
+by the persisted section metadata. This validation is deterministic and local:
+it does not call AI providers or external media services. Agent 5 does not
+repair Agent 4 media and does not own this validation.
+
+This structure is local-debug organization only. It does not replace
+PostgreSQL as the source of truth, does not change Celery orchestration, and
+does not introduce production object storage. Existing artifact paths below
+remain unchanged.
+
 ### Parent audio
 
 ```text
