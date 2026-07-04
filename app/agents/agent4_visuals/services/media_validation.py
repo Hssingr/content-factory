@@ -47,8 +47,32 @@ def validate_visual_media_assets(
     db: Session,
     *,
     language: str | None = None,
+    beats_by_lang: dict[str, list[dict]] | None = None,
 ) -> MediaValidationResult:
-    """Validate persisted Agent 4 media references before visual-ready status."""
+    """Validate persisted Agent 4 media references before visual-ready status.
+
+    Roadmap 6.4 / audit V-7, AR-2: this is now the single media validator —
+    `storyboard_validator.validate_media_assets()` (a separate, per-language,
+    observability-only check that ran during generation) was folded in here
+    and deleted; this function is the sole remaining media validator and the
+    sole one that can block visual-ready status.
+
+    Args:
+        content_id:    Content row id.
+        db:            SQLAlchemy session.
+        language:      Optional filter to a single language's rows.
+        beats_by_lang: Optional ``{language: [beat dict, ...]}`` — the
+            in-memory beats each language was generated with, as returned by
+            `run_visual_generation()`. When provided, additionally runs the
+            persistence round-trip check (folded in from the deleted
+            `visual_orchestrator._check_media_assets()`): each beat's
+            `media_url`/`media_type` is compared against what was actually
+            reloaded from the DB, catching a future `_build_beat_section()`-
+            style bug where a field silently changes across persistence.
+            Round-trip findings are diagnostic — like the original check,
+            they are always appended to `warnings`, never `blocking_issues`,
+            so this call's `passed` result is unaffected either way.
+    """
     content = db.get(Content, content_id)
     if content is None:
         issue = MediaValidationIssue(
@@ -83,17 +107,12 @@ def validate_visual_media_assets(
         if inspected.metadata_warning:
             warnings.append(_issue(row, "metadata_unreadable", inspected.metadata_warning, severity="WARNING"))
 
+        # Subtitles-only rendering (audit G-0/G-8): the text-card exemption is
+        # retired — every section, legacy text-card rows included, must carry a
+        # real local image. A legacy row still marked as a text card is counted
+        # for observability but validated exactly like any other section.
         if inspected.is_text_card:
             text_card_count += 1
-            if not inspected.media_path or inspected.media_path == TEXT_CARD_SENTINEL:
-                warnings.append(_issue(
-                    row,
-                    "text_card_without_local_image",
-                    "Intentional text-card section has no local image; allowed by current architecture.",
-                    inspected.media_path,
-                    severity="WARNING",
-                ))
-                continue
 
         if inspected.media_type and inspected.media_type != "image":
             blocking.append(_issue(
@@ -126,13 +145,16 @@ def validate_visual_media_assets(
             continue
 
         if media_path == TEXT_CARD_SENTINEL:
-            text_card_count += 1
-            warnings.append(_issue(
+            # Legacy failure sentinel — text cards are removed product-wide;
+            # a section still carrying it has no real image and blocks
+            # visual-ready status (regenerate with --force-visuals).
+            missing_media_count += 1
+            blocking.append(_issue(
                 row,
-                "text_card_sentinel",
-                "Text-card sentinel is allowed and has no local image to validate.",
+                "legacy_text_card_sentinel",
+                "Legacy '__text_card__' sentinel found — text cards are removed "
+                "(subtitles-only rendering); this section has no local image.",
                 media_path,
-                severity="WARNING",
             ))
             continue
 
@@ -151,6 +173,9 @@ def validate_visual_media_assets(
 
         valid_local_media_count += 1
 
+    if beats_by_lang:
+        warnings.extend(_check_persistence_round_trip(rows, beats_by_lang))
+
     return _result(
         blocking=blocking,
         warnings=warnings,
@@ -160,6 +185,68 @@ def validate_visual_media_assets(
         remote_media_count=remote_media_count,
         text_card_count=text_card_count,
     )
+
+
+def _check_persistence_round_trip(
+    rows: list[VideoSection],
+    beats_by_lang: dict[str, list[dict]],
+) -> list[MediaValidationIssue]:
+    """Compare each in-memory beat against what was actually reloaded from
+    the DB, per (language, section_order). Diagnostic only — folded in from
+    the deleted `visual_orchestrator._check_media_assets()` (roadmap 6.4)."""
+    reloaded_by_key: dict[tuple[str, int], VideoSection] = {
+        (row.language, row.section_order): row for row in rows
+    }
+    issues: list[MediaValidationIssue] = []
+
+    for lang, beats in beats_by_lang.items():
+        for beat in beats:
+            order = beat.get("section_order", beat.get("beat_order", 0))
+            reloaded = reloaded_by_key.get((lang, order))
+            if reloaded is None:
+                issues.append(MediaValidationIssue(
+                    severity="WARNING",
+                    code="persistence_row_missing",
+                    section_order=order,
+                    language=lang,
+                    message=(
+                        f"beat_order={order} was saved but no matching VideoSection "
+                        f"row was found on reload (language={lang})."
+                    ),
+                ))
+                continue
+
+            reloaded_inspected = _inspect_section(reloaded)
+            expected_url = beat.get("media_url", "")
+            if expected_url != reloaded_inspected.media_path:
+                issues.append(MediaValidationIssue(
+                    severity="WARNING",
+                    code="persistence_media_url_mismatch",
+                    section_order=order,
+                    language=lang,
+                    message=(
+                        f"beat_order={order} media_url changed across persistence: "
+                        f"saved={expected_url!r} but reloaded={reloaded_inspected.media_path!r} "
+                        f"(language={lang})."
+                    ),
+                    media_path=expected_url,
+                ))
+
+            expected_type = beat.get("media_type", "image")
+            if expected_type != reloaded_inspected.media_type:
+                issues.append(MediaValidationIssue(
+                    severity="WARNING",
+                    code="persistence_media_type_mismatch",
+                    section_order=order,
+                    language=lang,
+                    message=(
+                        f"beat_order={order} media_type changed across persistence: "
+                        f"saved={expected_type!r} but reloaded={reloaded_inspected.media_type!r} "
+                        f"(language={lang})."
+                    ),
+                ))
+
+    return issues
 
 
 def _load_sections(

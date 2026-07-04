@@ -3,6 +3,7 @@ import logging
 import re
 import time
 
+from app.agents.agent4_visuals.services.cinematic_prompts import compact_visual_bible_for_storyboard
 from app.services.claude_client import (
     call_claude,
     call_claude_structured_with_usage,
@@ -11,7 +12,36 @@ from app.services.claude_client import (
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "3.5"  # v3.5: wire operator-configured visual_style and image_style into
+PROMPT_VERSION = "4.2"  # v4.2: Phase 2.9 (audit G-3) — reworked "Every beat is a
+                        #        generated image" into a named, generalizable
+                        #        text-prop framing taxonomy (ANGLE / DISTANCE /
+                        #        LIGHTING / DETAIL) so Claude can apply the
+                        #        technique to any text-bearing prop, not only the
+                        #        four worked examples v4.0 shipped with. The
+                        #        deterministic Python-side sanitizer
+                        #        (flux_generator.derive_text_prop_prompt(), Phase
+                        #        14.7) now injects the same taxonomy as a
+                        #        positive framing clause instead of a purely
+                        #        negative "no readable text" instruction —
+                        #        Flux prompting guidance is explicit that
+                        #        positive description outperforms negative
+                        #        instruction (Flux has no true negative-prompt
+                        #        channel). No JSON schema change.
+                        # v4.1: Phase 2.1 prompt inversion — visual_bible is now
+                        #        passed into generate_storyboard_batch() as compact JSON
+                        #        so Claude writes continuity into the validated storyboard
+                        #        flux_prompt natively. Post-storyboard enrichment is
+                        #        additive only and never replaces prompts with templates.
+                        # v4.0: subtitles-only rendering (audit G-0/G-8) — removed the
+                        #        "Media strategy selection" section (remotion_text_card is
+                        #        gone; there are no text cards and no on-screen overlay text;
+                        #        the subtitle track is the video's only text layer), removed
+                        #        the overlay_text/overlay_position per-beat decisions, and
+                        #        added "Every beat is a generated image": textual narration
+                        #        moments are designed as physical scenes WITHOUT readable
+                        #        text (phone face-down, closed folder, unreadable-distance
+                        #        calendar) — the narration already says what the text said.
+                        # v3.5: wire operator-configured visual_style and image_style into
                         #        every storyboard call via a "Global Visual Direction" block
                         #        injected into the user message. The system prompt now documents
                         #        how Claude should apply these constraints to flux_prompt,
@@ -69,7 +99,15 @@ PROMPT_VERSION = "3.5"  # v3.5: wire operator-configured visual_style and image_
 # and maps the merged beats onto Whisper timestamps. Flux Schnell then generates
 # one image per beat from the flux_prompt Claude wrote.
 
-STORYBOARD_SCHEMA_VERSION = "6.1"  # v6.1: removed why_this_visual and story_progression_role —
+STORYBOARD_SCHEMA_VERSION = "7.0"  # v7.0: subtitles-only rendering (audit G-0/G-8) — removed
+                                   #        media_strategy, stock_queries, fallback_flux_prompt,
+                                   #        text_card_style, overlay_text, overlay_position from
+                                   #        the beat schema. Every beat is a Flux-generated
+                                   #        image; Python hardcodes media_strategy=
+                                   #        "flux_generated" downstream. Stock was never
+                                   #        implemented (always overridden); text cards and
+                                   #        overlay text are removed product-wide.
+                                   # v6.1: removed why_this_visual and story_progression_role —
                                    #        confirmed zero downstream consumers (Phase 6B-1) and,
                                    #        per a live A/B proof (Phase 6D-1), zero measurable
                                    #        quality regression; ~17.6% lower storyboard output
@@ -92,12 +130,19 @@ You design the storyboard ONE NARRATION SEGMENT AT A TIME — a single [INTRO],
 [SECTION N], or [OUTRO] block — never the whole video in one pass. You receive:
 which segment this is (its position among the video's narration segments), the
 segment's narration text, the channel niche/tone/format, an optional operator-configured
-global visual direction and image style, and a short note on the visual approach used
+global visual direction and image style, a compact visual continuity bible (when available), and a short note on the visual approach used
 in the immediately preceding segment (for continuity only — do not repeat it).
 
 Design an ordered sequence of visual beats that carries the viewer through THIS
 SEGMENT's narration — and ONLY this segment's narration — from its first word to
 its last.
+
+When the previous-segment context contains lines beginning
+"FORBIDDEN environments for the next segment:" or
+"FORBIDDEN motifs for the next segment:", treat those values as hard diversity
+constraints for THIS response. Do not use those environment or motif values
+unless the narration explicitly makes one unavoidable; if unavoidable, use it
+only for the minimum number of beats and vary every other dimension.
 
 == Principle A: Relevance first ==
 Visual diversity must NEVER destroy narrative meaning. Variety is a tool, not a goal.
@@ -145,6 +190,20 @@ Before finalizing any beat, ask: "what does this shot ADD that the narration
 sentence alone does not already tell the viewer?" If the honest answer is
 "nothing — it's just the noun from the sentence," redesign the beat using one
 of the eight additions above instead.
+
+== Visual Continuity Bible (compact JSON) ==
+When a "Visual continuity bible (compact JSON):" block appears in the user message,
+use it as source material while writing each beat's flux_prompt. The bible is
+input to your prompt design, not a separate post-processing template.
+  - Preserve matched character identity with concrete appearance, clothing, and
+    body-language details inside the relevant flux_prompt.
+  - Preserve matched location identity with concrete physical details and recurring
+    objects when the narration returns to that place.
+  - Use recurring motifs only when they add narrative meaning to the beat.
+  - Do not copy bible field names, JSON syntax, camera-rule lists, or lighting-rule
+    lists verbatim into flux_prompt. Write natural, subject-first image prompts.
+  - Never add an "Avoid:" suffix or a negative-prompt list to flux_prompt; describe
+    only what the image should contain.
 
 == Global Visual Direction (operator-configured) ==
 When "Global visual direction:" and "Global image style:" lines appear in the user
@@ -278,36 +337,36 @@ The [INTRO] segment must visually escalate toward the central tension:
   beat_order=2: the tension object or action the story is actually about
 Each successive beat must increase the viewer's sense of "I need to know what happens next."
 
-== Media strategy selection ==
+== Every beat is a generated image ==
 
-For every beat, choose ONE media_strategy:
+There are no text cards and no on-screen overlay text — the video's only text
+layer is the subtitle track, rendered separately. Every beat you design becomes
+exactly one Flux-generated image. Image models cannot render legible text —
+any prompt that asks for readable words always comes back as illegible
+gibberish, no matter how the request is worded.
 
-flux_generated (default for most beats):
-  Use for: specific scenes, symbolic visuals, character actions, story-specific
-  environments, anything that benefits from exact visual matching to the narration.
-  This is the default — when in doubt, use flux_generated.
-
-remotion_text_card (deliberate choice, not a fallback):
-  Use for: any beat where the content is primarily TEXT that the viewer needs to READ.
-  Examples: chat messages, emails, documents, receipts, statistics, newspaper headlines,
-  social media posts, dates/times, direct quotes, official documents, warning labels.
-  A Remotion text card is MORE realistic and MORE readable than a Flux-generated image
-  of a phone screen or document — always prefer text_card for readable content.
-  REQUIRED when using remotion_text_card: set overlay_text to the exact text to display,
-  and set text_card_style to the appropriate value:
-    chat       → speech bubble, phone UI frame, message timestamp
-    document   → white page, serif font, official header
-    statistic  → large number centered, thin subtitle
-    quote      → italic text, attribution line, quotation marks
-    default    → centered text on dark gradient
-  The flux_prompt for remotion_text_card is still REQUIRED, but it is ONLY the
-  generated background image prompt. It must describe a concrete contextual scene
-  behind the card (room, desk, street, object, surface, or setting) and must NOT
-  ask Flux to render the readable text, letters, numbers, UI copy, captions, logos,
-  signs, or typography. The readable text belongs only in overlay_text and is
-  rendered by Remotion.
-
-stock_video / stock_image: reserved for a future release. Do not use.
+When the narration's content is textual (a chat message, a document, a
+statistic, a headline, a date, a sign, a name tag), do not compose a
+straight-on, readable shot of it. Instead choose a physical framing where
+legible text is naturally impossible or irrelevant, using ONE of these four
+techniques — this is a general rule, apply it to any text-bearing prop, not
+only the examples given:
+  - ANGLE — shoot the text-bearing surface from the side, from behind, or
+    at an oblique angle so a reader's view is blocked or foreshortened (a
+    closed folder seen from its spine, a phone face-down on a table, a
+    note glimpsed over a shoulder).
+  - DISTANCE — make the text-bearing surface a small element in a wider or
+    more distant shot rather than the subject itself (a calendar on a far
+    wall, a stack of newspapers seen across a room).
+  - LIGHTING — use raking or grazing side light across the surface so any
+    text is obscured by glare, shadow, or texture rather than lit for
+    reading.
+  - DETAIL — push in on a physical, non-textual detail of the object
+    instead of the text (typewriter keys instead of the typed page, a worn
+    corner or torn edge instead of a headline, a wax seal instead of a
+    letter's contents).
+The narration itself already tells the viewer what the text said — the image
+only needs to establish the physical object, never repeat its content.
 
 == Flux image generation prompt rules ==
 Each beat requires a ``flux_prompt`` — a photorealistic image generation prompt that
@@ -367,13 +426,12 @@ Bad examples (forbidden):
      underwater | indoor_office | indoor_domestic | forest_nature | urban_street |
      corridor_interior | abstract_dark | open_landscape | laboratory | industrial |
      vehicle | other
-6. flux_prompt — Flux Schnell image generation prompt (see rules above). For remotion_text_card, this is the background scene only; never include readable text instructions.
+6. flux_prompt — Flux Schnell image generation prompt (see rules above). Never
+   include readable-text instructions — no quoted phrases, no "the text reads".
 7. effect — slow_zoom | zoom_out | pan | push_in | shake | cut | fade_in | parallax
 8. color_grade — desaturated | cold_blue | warm_amber | dark_contrast | neutral
 9. transition_to_next — cut | crossfade | dip_to_black | whip_pan | zoom_blur | match_cut | none
-10. overlay_text — short on-screen text (a name, date, statistic, key phrase) or ""
-11. overlay_position — center | lower_third | top_left | top_right | none
-12. motif — dominant visual motif this beat shows:
+10. motif — dominant visual motif this beat shows:
       doorway | corridor | face | hands | object | clock | phone | photo | exterior |
       text | screen | reflection | document | room | other
 
@@ -389,8 +447,8 @@ Bad examples (forbidden):
 - Hints must contain no digits — write out any number in words.
 - The `beats` field of your tool call must be a native JSON array of beat
   objects — never a JSON-encoded string containing array text. No field
-  value (start_hint, end_hint, visual_intent, flux_prompt, overlay_text,
-  etc.) may itself contain a literal quotation mark character (") — if the
+  value (start_hint, end_hint, visual_intent, flux_prompt, etc.)
+  may itself contain a literal quotation mark character (") — if the
   segment narration contains quoted dialogue or a written note, describe or
   paraphrase it without the surrounding quote marks instead of copying them.
 
@@ -422,27 +480,19 @@ _BEAT_SCHEMA: dict = {
         "visual_type":             {"type": "string", "enum": ["b-roll", "action", "text_overlay", "document", "map", "screenshot", "generated_visual"]},
         "visual_category":         {"type": "string", "enum": ["person", "place", "object", "document", "screen", "map", "abstract", "text"]},
         "environment":             {"type": "string", "enum": ["underwater", "indoor_office", "indoor_domestic", "forest_nature", "urban_street", "corridor_interior", "abstract_dark", "open_landscape", "laboratory", "industrial", "vehicle", "other"]},
-        "flux_prompt":             {"type": "string", "description": "Flux image generation prompt: specific physical subject only, no mood words, no faces, no logos, no readable text. For remotion_text_card, this is the generated background scene only; Remotion renders overlay_text."},
+        "flux_prompt":             {"type": "string", "description": "Flux image generation prompt: specific physical subject only, no mood words, no faces, no logos, no readable text."},
         "effect":                  {"type": "string", "enum": ["slow_zoom", "zoom_out", "pan", "push_in", "shake", "cut", "fade_in", "parallax"]},
         "color_grade":             {"type": "string", "enum": ["desaturated", "cold_blue", "warm_amber", "dark_contrast", "neutral"]},
         "transition_to_next":      {"type": "string", "enum": ["cut", "crossfade", "dip_to_black", "whip_pan", "zoom_blur", "match_cut", "none"]},
-        "overlay_text":            {"type": "string"},
-        "overlay_position":        {"type": "string", "enum": ["center", "lower_third", "top_left", "top_right", "none"]},
         "motif":                   {"type": "string", "enum": ["doorway", "corridor", "face", "hands", "object", "clock", "phone", "photo", "exterior", "text", "screen", "reflection", "document", "room", "other"]},
         "beat_intensity":          {"type": "string", "enum": ["high", "medium", "low"], "description": "Narrative intensity at this moment: high=reveal/shock (1–2.5s), medium=progression (2.5–4s), low=establishing/pause (4–6s)."},
         "suggested_duration_sec":  {"type": "number", "description": "Suggested display duration in seconds. Must fall within the intensity tier range."},
-        "media_strategy":          {"type": "string", "enum": ["flux_generated", "stock_video", "stock_image", "remotion_text_card"], "description": "How this beat's visual will be sourced. stock_video and stock_image are reserved for a future release — use flux_generated or remotion_text_card only."},
-        "stock_queries":           {"type": "array", "items": {"type": "string"}, "description": "Future release only. Leave empty array []."},
-        "fallback_flux_prompt":    {"type": "string", "description": "Future release only. Leave empty string."},
-        "text_card_style":         {"type": "string", "enum": ["chat", "document", "statistic", "quote", "default"], "description": "Required when media_strategy is remotion_text_card. Ignored otherwise."},
     },
     "required": [
         "beat_order", "start_hint", "end_hint", "visual_intent",
         "visual_type", "visual_category", "environment", "flux_prompt",
-        "effect", "color_grade", "transition_to_next",
-        "overlay_text", "overlay_position", "motif",
+        "effect", "color_grade", "transition_to_next", "motif",
         "beat_intensity", "suggested_duration_sec",
-        "media_strategy", "stock_queries", "fallback_flux_prompt", "text_card_style",
     ],
 }
 
@@ -470,6 +520,7 @@ def generate_storyboard_batch(
     override_instructions: str = "",
     visual_style: str = "",
     image_style: str = "",
+    visual_bible_context: dict | None = None,
 ) -> tuple[dict, dict, dict]:
     """Ask Claude to design the storyboard for ONE narration segment only.
 
@@ -490,6 +541,9 @@ def generate_storyboard_batch(
         override_instructions: Optional constraint text appended to the user
             message — used for validation-gate retries to pass MAJOR issue
             descriptions back to Claude so it can correct them.
+        visual_bible_context: Optional visual-bible dict. Serialized as compact
+            JSON in the user message so Claude can author continuity directly
+            in the storyboard prompts.
 
     Returns:
         ``(storyboard, usage, diag)`` — storyboard has keys ``storyboard_status``,
@@ -516,11 +570,19 @@ def generate_storyboard_batch(
                 f"Global visual direction: {visual_style or 'documentary'}\n"
                 f"Global image style: {image_style or 'photorealistic'}\n"
             )
+        compact_bible = compact_visual_bible_for_storyboard(visual_bible_context)
+        bible_lines = ""
+        if compact_bible:
+            bible_lines = (
+                "Visual continuity bible (compact JSON):\n"
+                f"{json.dumps(compact_bible, ensure_ascii=True, sort_keys=True, separators=(',', ':'))}\n"
+            )
         return (
             f"Channel niche: {channel.niche}\n"
             f"Channel tone: {channel.tone}\n"
             f"Script format: {script_format}\n"
             + direction_lines
+            + bible_lines
             + f"Segment: {segment_label} — {segment_index} of {segment_count} narration segments in this video\n"
             + count_line
             + (
@@ -744,96 +806,3 @@ def generate_storyboard_batch(
 
 
 
-# ── Section Splitter — visual enrichment prompt ───────────────────────────────
-# Used only in the legacy section-splitter fallback path.
-
-_SPLITTER_SYSTEM_PROMPT = """\
-You are a visual director for an automated multilingual video production system.
-
-You receive a list of script sections with their timings and narrative text.
-For each section you must decide:
-
-1. SEARCH QUERY — a 3-to-5-word English phrase to find a relevant stock image or video.
-   Rules:
-   - Always write in English, regardless of the script language.
-   - Be specific and descriptive (e.g. "abandoned dark hospital hallway" not "hospital").
-   - Avoid people's faces unless the section explicitly calls for human presence.
-   - Name a concrete subject, place, or object from the section text — not a mood or
-     feeling. Answer "what exact thing would the camera be pointing at?"
-   - Prefer a query that captures a reaction, consequence, evidence, or detail tied to
-     the moment over one that just restates the literal noun/action in the sentence
-     (e.g. for "she entered the room," prefer "hand turning a rusted doorknob" over
-     "empty room").
-   - Never invent places, people, or events — base the query on the section text only.
-
-2. SUGGESTED VISUAL — the type of visual that fits the section:
-   - "b-roll"       : footage or photos of a concrete place, object, or setting (most sections)
-   - "text_overlay" : black/dark background with text (intro hooks, statistics, key phrases)
-   - "action"       : footage of visible physical movement (a chase, a struggle, a collapse)
-
-Return ONLY valid JSON. No markdown. No code fence. No extra keys.
-Output format — a JSON array, one object per section, in the same order received:
-[
-  {
-    "section_order": 0,
-    "search_query": "...",
-    "suggested_visual": "b-roll" | "text_overlay" | "action"
-  }
-]\
-"""
-
-
-def enrich_sections_with_visuals(sections: list[dict], channel_niche: str, channel_tone: str) -> list[dict]:
-    """Add search_query, suggested_visual, and a basic flux_prompt to each legacy section.
-
-    Used only in the legacy section-splitter fallback path. The storyboard path
-    generates flux_prompt directly.
-
-    Args:
-        sections:      List of dicts with at least ``section_order`` and ``script_text``.
-        channel_niche: Channel niche for context.
-        channel_tone:  Channel tone.
-
-    Returns:
-        Original sections list enriched with ``search_query``, ``suggested_visual``,
-        and a synthesized ``flux_prompt``.
-
-    Raises:
-        ValueError: If Claude returns malformed JSON.
-    """
-    section_lines = "\n\n".join(
-        f"Section {s['section_order']} ({s.get('duration_sec', 0):.0f}s):\n{s['script_text'][:600]}"
-        for s in sections
-    )
-    user_message = (
-        f"Channel niche: {channel_niche}\n"
-        f"Channel tone: {channel_tone}\n\n"
-        f"Sections to enrich:\n\n{section_lines}"
-    )
-
-    raw = call_claude(_SPLITTER_SYSTEM_PROMPT, user_message, max_tokens=1024, task="section_splitting")
-    cleaned = re.sub(r"```(?:json)?\s*([\s\S]*?)```", r"\1", raw).strip()
-    try:
-        enrichments: list[dict] = json.loads(cleaned)
-        if not isinstance(enrichments, list):
-            raise ValueError(f"Expected JSON array, got {type(enrichments).__name__}")
-    except (json.JSONDecodeError, ValueError) as exc:
-        logger.error("Section enrichment JSON error: %s | raw: %.300s", exc, raw)
-        raise ValueError(f"Claude returned invalid enrichment JSON: {exc}") from exc
-
-    by_order = {e["section_order"]: e for e in enrichments if "section_order" in e}
-    for s in sections:
-        order = s["section_order"]
-        enrichment = by_order.get(order, {})
-        sq = enrichment.get("search_query", f"{channel_niche} stock footage")
-        s["search_query"]     = sq
-        s["suggested_visual"] = enrichment.get("suggested_visual", "b-roll")
-        # Synthesize a basic flux_prompt for Flux generation (legacy path only).
-        # "documentary photography style" intentionally avoids "cinematic" — see
-        # FORBIDDEN_FLUX_WORDS in storyboard_validator.py (Phase 12.6).
-        s["flux_prompt"] = (
-            f"{sq}, photorealistic, documentary photography style, "
-            f"desaturated color grade, no people, no text"
-        )
-
-    return sections

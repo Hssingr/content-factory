@@ -30,7 +30,7 @@ _MAX_DURATION_MS         = 4500   # split chunk if it would exceed 4.5 s
 
 _MIN_WORDS_KARAOKE       = 2
 _TARGET_WORDS_KARAOKE    = 4
-_MAX_WORDS_KARAOKE       = 8      # Shorts hard cap 8 for easy karaoke tracking; was 6
+_MAX_WORDS_KARAOKE       = 5      # Shorts: 4-5 word karaoke chunks for mobile readability
 _MAX_DURATION_MS_KARAOKE = 3000
 
 _DEFAULT_KARAOKE_COLOR = "#FFD700"

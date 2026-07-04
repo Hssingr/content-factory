@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.models import Channel, ChannelConfig, ChannelSource, Content, ContentValidation, User
 from app.agents.agent2_discovery.services.fetcher import fetch_batch, _MAX_NUCLEAR_EXCLUSION
-from app.agents.agent2_discovery.services.story import Story
+from app.agents.agent2_discovery.services.story import MAX_SOURCE_EXCERPT_CHARS, Story
 from app.agents.agent2_discovery.services.scoring import (
     score_story_assessment,
     decide_story_acceptance,
@@ -173,7 +173,7 @@ def run_discovery(
         content_hash=story.content_hash,
         title=story.title,
         status="PENDING_APPROVAL",
-        source_excerpt=story.body[:8000] if story.body else None,
+        source_excerpt=story.body[:MAX_SOURCE_EXCERPT_CHARS] if story.body else None,
     )
     db.add(content)
     db.flush()

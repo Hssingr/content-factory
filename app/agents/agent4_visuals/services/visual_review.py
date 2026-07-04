@@ -15,13 +15,86 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models import AudioFile, Content, Script, VideoSection
-from app.services.local_run_paths import ensure_run_dirs, get_review_dir, get_run_root
+from app.services.local_run_paths import ensure_run_dirs, get_review_dir, get_run_root, get_visuals_dir
 from app.agents.agent4_visuals.services.visual_bible import get_visual_bible_path, load_visual_bible_for_content
 
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 _REMOTE_PREFIXES = ("http://", "https://")
 _TEXT_CARD_SENTINEL = "__text_card__"
 _DASH = "—"
+
+# Roadmap 6.5 / audit AR-3: review-only beat metadata (first15 diagnostics,
+# cinematic continuity tags, prompt quality warnings) — nothing in the live
+# pipeline queries these after generation; only this review page does. They
+# are written here, to the run folder, instead of into generation_prompt
+# (which used to carry them, bloating every DB load and the delete-then-
+# insert per language).
+_REVIEW_METADATA_FIELDS: tuple[str, ...] = (
+    "negative_prompt", "shot_type", "subject", "action", "emotion", "camera",
+    "lighting", "composition", "continuity_tags", "visual_bible_refs",
+    "location", "character", "is_first_15_seconds", "prompt_quality_warnings",
+    "first15_validation_status", "first15_issues", "first15_strength_tags",
+    "first15_enhanced", "first15_validation_summary",
+)
+
+
+def get_review_metadata_path(content_id: int | str | UUID) -> Path:
+    return get_visuals_dir(content_id) / "beat_review_metadata.json"
+
+
+def save_beat_review_metadata(
+    content_id: int | str | UUID,
+    language: str,
+    beats: list[dict],
+) -> None:
+    """Persist this language's review-only beat metadata to the run folder.
+
+    Merges into any existing file so each language's entry can be written
+    independently (mirroring how `_save_video_sections()` persists one
+    language at a time) without clobbering other already-written languages.
+    """
+    path = get_review_metadata_path(content_id)
+    existing = _load_review_metadata_raw(path)
+    existing[language] = [
+        {
+            "section_order": beat.get("section_order", beat.get("beat_order", i)),
+            **{
+                key: beat[key]
+                for key in _REVIEW_METADATA_FIELDS
+                if key in beat
+            },
+        }
+        for i, beat in enumerate(beats)
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(existing, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
+def _load_review_metadata_raw(path: Path) -> dict[str, list[dict]]:
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _load_review_metadata_by_key(content_id: int | str | UUID) -> dict[tuple[str, int], dict]:
+    """Load the run-folder review metadata file, indexed by (language, section_order)."""
+    raw = _load_review_metadata_raw(get_review_metadata_path(content_id))
+    result: dict[tuple[str, int], dict] = {}
+    for language, entries in raw.items():
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict) or "section_order" not in entry:
+                continue
+            result[(language, entry["section_order"])] = entry
+    return result
 
 
 @dataclass(frozen=True)
@@ -51,12 +124,13 @@ def generate_visual_review_html(
     sections = _load_video_sections(content_id, db, language=language)
     scripts_by_lang = _load_language_rows(Script, content_id, db)
     audio_by_lang = _load_language_rows(AudioFile, content_id, db)
+    review_metadata = _load_review_metadata_by_key(content_id)
 
     review_dir = get_review_dir(content_id)
     review_dir.mkdir(parents=True, exist_ok=True)
     output_path = review_dir / "visual_review.html"
 
-    rows = [_extract_row(section, review_dir) for section in sections]
+    rows = [_extract_row(section, review_dir, review_metadata) for section in sections]
     html = _render_html(
         content=content,
         rows=rows,
@@ -89,8 +163,19 @@ def _load_language_rows(model: type, content_id: int | str | UUID, db: Session) 
     return {getattr(row, "language", ""): row for row in rows if getattr(row, "language", "")}
 
 
-def _extract_row(section: VideoSection, review_dir: Path) -> dict[str, Any]:
+def _extract_row(
+    section: VideoSection,
+    review_dir: Path,
+    review_metadata: dict[tuple[str, int], dict] | None = None,
+) -> dict[str, Any]:
     extras = _parse_generation_prompt(getattr(section, "generation_prompt", None))
+    # Roadmap 6.5 / audit AR-3: review-only fields (first15 diagnostics,
+    # cinematic continuity tags, prompt quality warnings) now live in the
+    # run-folder JSON file, not generation_prompt. `review` takes priority;
+    # `extras` remains the fallback for rows persisted before this change,
+    # which still carry these fields in generation_prompt.
+    review = (review_metadata or {}).get((section.language, section.section_order), {})
+    combined = {**extras, **review}
     media_path = _first_text(
         extras.get("media_url"),
         extras.get("image_path"),
@@ -110,28 +195,28 @@ def _extract_row(section: VideoSection, review_dir: Path) -> dict[str, Any]:
         "duration": _format_duration(duration_ms, getattr(section, "suggested_duration_sec", None)),
         "script_text": section.script_text or "",
         "flux_prompt": section.flux_prompt or _first_text(extras.get("flux_prompt"), extras.get("prompt")),
-        "negative_prompt": _first_text(extras.get("negative_prompt"), extras.get("negativePrompt")),
+        "negative_prompt": _first_text(combined.get("negative_prompt"), combined.get("negativePrompt")),
         "media_path": media_info.display_path,
         "preview_src": media_info.preview_src,
         "warnings": tuple(warnings),
-        "badges": _metadata_badges(section, extras, media_info),
+        "badges": _metadata_badges(section, combined, media_info),
         "visual_intent": _first_text(extras.get("visual_intent"), extras.get("visualIntent")),
-        "shot_type": _first_text(extras.get("shot_type")),
-        "subject": _first_text(extras.get("subject")),
-        "action": _first_text(extras.get("action")),
-        "emotion": _first_text(extras.get("emotion")),
-        "camera": _first_text(extras.get("camera")),
-        "lighting": _first_text(extras.get("lighting")),
-        "composition": _first_text(extras.get("composition")),
-        "continuity_tags": extras.get("continuity_tags") if isinstance(extras.get("continuity_tags"), list) else [],
-        "visual_bible_refs": extras.get("visual_bible_refs") if isinstance(extras.get("visual_bible_refs"), list) else [],
-        "is_first_15_seconds": bool(extras.get("is_first_15_seconds")),
-        "first15_validation_status": _first_text(extras.get("first15_validation_status")),
-        "first15_issues": extras.get("first15_issues") if isinstance(extras.get("first15_issues"), list) else [],
-        "first15_strength_tags": extras.get("first15_strength_tags") if isinstance(extras.get("first15_strength_tags"), list) else [],
-        "first15_enhanced": bool(extras.get("first15_enhanced")),
-        "first15_validation_summary": extras.get("first15_validation_summary") if isinstance(extras.get("first15_validation_summary"), dict) else {},
-        "prompt_quality_warnings": extras.get("prompt_quality_warnings") if isinstance(extras.get("prompt_quality_warnings"), list) else [],
+        "shot_type": _first_text(combined.get("shot_type")),
+        "subject": _first_text(combined.get("subject")),
+        "action": _first_text(combined.get("action")),
+        "emotion": _first_text(combined.get("emotion")),
+        "camera": _first_text(combined.get("camera")),
+        "lighting": _first_text(combined.get("lighting")),
+        "composition": _first_text(combined.get("composition")),
+        "continuity_tags": combined.get("continuity_tags") if isinstance(combined.get("continuity_tags"), list) else [],
+        "visual_bible_refs": combined.get("visual_bible_refs") if isinstance(combined.get("visual_bible_refs"), list) else [],
+        "is_first_15_seconds": bool(combined.get("is_first_15_seconds")),
+        "first15_validation_status": _first_text(combined.get("first15_validation_status")),
+        "first15_issues": combined.get("first15_issues") if isinstance(combined.get("first15_issues"), list) else [],
+        "first15_strength_tags": combined.get("first15_strength_tags") if isinstance(combined.get("first15_strength_tags"), list) else [],
+        "first15_enhanced": bool(combined.get("first15_enhanced")),
+        "first15_validation_summary": combined.get("first15_validation_summary") if isinstance(combined.get("first15_validation_summary"), dict) else {},
+        "prompt_quality_warnings": combined.get("prompt_quality_warnings") if isinstance(combined.get("prompt_quality_warnings"), list) else [],
         "extras": extras,
     }
 

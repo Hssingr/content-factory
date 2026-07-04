@@ -8,8 +8,12 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379"
 
     anthropic_api_key: str = ""
-    claude_model: str = "claude-sonnet-4-6"  # legacy fallback; prefer task routing via MODEL_ROUTING
-    # "dev" forces Haiku for every Claude call regardless of task routing.
+    # Roadmap 4.2 / audit S-2 (exec-6): both slots are Sonnet-class so no
+    # MODEL_ROUTING task — including the SECONDARY_MODEL-tier quality gates
+    # (script_quality_check, short_quality_check) — defaults to Haiku anymore.
+    primary_model: str = "claude-sonnet-5"
+    secondary_model: str = "claude-sonnet-4-6"
+    # "dev" forces the configured secondary model for every Claude call except hard quality/tool exceptions.
     # "prod" uses MODEL_ROUTING (the default). Set CLAUDE_TIER=dev in .env during development.
     claude_tier: str = "prod"
     elevenlabs_api_key: str = ""
@@ -22,32 +26,15 @@ class Settings(BaseSettings):
     telegram_webhook_secret: str = "" # random string for X-Telegram-Bot-Api-Secret-Token verification
 
     fal_key: str = ""
-    runway_api_key: str = ""
-
-    brightdata_username: str = ""
-    brightdata_password: str = ""
 
     fernet_key: str = ""
     secret_key: str = "change-me-in-production"
-
-    # Agent 3 — minutes to wait for user FIX reply before auto-proceeding on MINOR issues
-    agent3_minor_timeout_minutes: int = 5
 
     remotion_path: str = "./remotion"
     media_path: str = "./media"      # base directory for audio/video files
     # Full path to the node binary to use for Remotion (must be Node ≥18).
     # Set in .env when nvm is used: NODE_BIN=/home/user/.nvm/versions/node/v20.19.6/bin/node
     node_bin: str = "node"
-
-    # Controls whether storyboard beats with visual_type="generated_visual" are kept as
-    # AI-generation placeholders (__generated_pending__) or silently replaced with a dark
-    # text-overlay fallback. Default false — AI video generation is not implemented yet.
-    generate_required_frame: bool = False
-
-    # Download all remote media URLs to local disk before calling Remotion.
-    # Eliminates "Page crashed!" caused by Chromium loading many remote video streams.
-    # Set LOCALIZE_MEDIA_BEFORE_RENDER=false to skip (e.g. fast local test runs).
-    localize_media_before_render: bool = True
 
     # Remotion --concurrency value for normal renders.
     # High-video-count renders (>40 video sections) are capped at render_concurrency // 2 (min 1).
@@ -72,12 +59,30 @@ class Settings(BaseSettings):
     remotion_pre_bundle: bool = False
 
     # Agent 4 child Shorts: cap individual visual holds so sparse remaps do not
-    # leave one image on screen for long short-form spans. Parent timing is unchanged.
+    # leave one image on screen for long short-form spans.
     short_visual_max_hold_ms: int = 6000
+
+    # Shorts "Part N of M" corner label. Remotion renders subtitles ONLY
+    # (audit G-0) — this label is the single allowed, operator-opt-in
+    # exception. Default off: no non-subtitle text is drawn.
+    short_part_label_enabled: bool = False
+
+    # Agent 4 parent long-form: last-line hold cap after timestamp mapping. Even
+    # if every upstream guard (hint proximity window, anchor span sanity) is
+    # defeated, no non-terminal parent beat may hold a single image longer than
+    # this. Applied in split_into_beats() by advancing the next beat — never by
+    # creating beats or touching audio/subtitle timing.
+    parent_visual_max_hold_ms: int = 9000
 
     # Post-render verification: run ffprobe/blackdetect/silencedetect after every render.
     # Set VERIFY_RENDERS=false to skip (e.g. in CI or when ffmpeg is unavailable).
     verify_renders: bool = True
+
+    # Dev-mode transcription (roadmap 6.7 / audit §8.6): when True, local
+    # faster-whisper runs FIRST and the OpenAI Whisper API is the fallback —
+    # zeroes out Whisper spend during iteration. Default False: OpenAI Whisper
+    # stays primary in production (quality: word timings from the hosted model).
+    whisper_local_primary: bool = False
 
     # Agent 4 image model routing (Phase 14.6 foundation) — conservative by
     # default. With routing disabled (the default), every generated beat and

@@ -69,22 +69,29 @@ def beat(**extra):
 
 
 class TestCinematicFluxPrompts(unittest.TestCase):
-    def test_builds_cinematic_prompt_with_visual_bible(self):
+    def test_adds_only_matched_continuity_to_existing_prompt(self):
+        original = (
+            "Eli beside a half-open bedroom door, pale face turned toward the hall, "
+            "documentary photograph, grounded natural shadows, no readable text"
+        )
         result = build_cinematic_flux_prompt(
-            beat=beat(), narration_excerpt=beat()["script_text"], visual_bible=bible(),
+            beat=beat(flux_prompt=original), narration_excerpt=beat()["script_text"], visual_bible=bible(),
             channel_config_context=bible()["config_context"], content_kind="parent_long_form",
             beat_index=0, total_beats=5,
         )
         prompt = result["flux_prompt"]
         metadata = result["prompt_metadata"]
-        self.assertGreater(len(prompt.split()), 55)
-        self.assertIn("documentary horror", prompt)
+        self.assertTrue(prompt.startswith(original))
+        self.assertIn("Character continuity: Eli", prompt)
         self.assertIn("oversized gray hoodie", prompt)
-        self.assertIn("cold blue moonlight", prompt)
+        self.assertIn("Location continuity: upstairs hallway", prompt)
+        self.assertNotIn("Avoid:", prompt)
+        self.assertNotIn("camera/lens/framing:", prompt)
+        self.assertNotIn("lighting/color grade:", prompt)
+        self.assertTrue(metadata["base_prompt_preserved"])
         self.assertIn("eli-gray-hoodie", metadata["continuity_tags"])
         self.assertIn("upstairs-hallway-blue-gray", metadata["continuity_tags"])
         self.assertIn("character:Eli", metadata["visual_bible_refs"])
-        self.assertIn("no readable text", result["negative_prompt"])
 
     def test_first_15_seconds_flag_and_guidance(self):
         result = build_cinematic_flux_prompt(
@@ -93,7 +100,7 @@ class TestCinematicFluxPrompts(unittest.TestCase):
             beat_index=0, total_beats=5,
         )
         self.assertTrue(result["prompt_metadata"]["is_first_15_seconds"])
-        self.assertIn("First 15 seconds", result["flux_prompt"])
+        self.assertNotIn("First 15 seconds", result["flux_prompt"])
 
     def test_falls_back_without_character_match(self):
         result = build_cinematic_flux_prompt(
@@ -102,26 +109,25 @@ class TestCinematicFluxPrompts(unittest.TestCase):
             channel_config_context=bible()["config_context"], content_kind="parent_long_form",
             beat_index=2, total_beats=5,
         )
-        self.assertIn("documentary horror", result["flux_prompt"])
+        self.assertNotIn("documentary horror", result["flux_prompt"])
         self.assertNotIn("character:Eli", result["prompt_metadata"]["visual_bible_refs"])
 
     def test_quality_inspector_warns_on_weak_prompt(self):
         issues = inspect_flux_prompt_quality({
             "flux_prompt": "A scary hallway at night.",
-            "negative_prompt": "",
             "prompt_metadata": {},
         })
         codes = {issue.code for issue in issues}
         self.assertIn("prompt_too_short", codes)
-        self.assertIn("missing_subject", codes)
-        self.assertIn("missing_negative_prompt", codes)
+        self.assertIn("missing_base_prompt_preserved", codes)
         self.assertIn("generic_horror_prompt", codes)
 
     def test_apply_enriches_beat_with_persistable_metadata_concepts(self):
         enriched = apply_cinematic_prompts_to_beats([beat()], visual_bible=bible(), content_kind="parent_long_form")
-        for key in ("negative_prompt", "shot_type", "subject", "action", "emotion", "camera", "lighting", "composition", "continuity_tags", "visual_bible_refs", "is_first_15_seconds", "prompt_quality_warnings"):
+        for key in ("base_prompt_preserved", "continuity_tags", "visual_bible_refs", "is_first_15_seconds", "prompt_quality_warnings"):
             self.assertIn(key, enriched[0])
-        self.assertIn("Avoid:", enriched[0]["flux_prompt"])
+        self.assertNotIn("negative_prompt", enriched[0])
+        self.assertNotIn("Avoid:", enriched[0]["flux_prompt"])
 
     def test_child_prompt_uses_parent_bible_continuity(self):
         result = build_cinematic_flux_prompt(
@@ -130,7 +136,7 @@ class TestCinematicFluxPrompts(unittest.TestCase):
             content_kind="child_short", beat_index=1, total_beats=3,
         )
         self.assertIn("eli-gray-hoodie", result["prompt_metadata"]["continuity_tags"])
-        self.assertIn("documentary horror", result["flux_prompt"])
+        self.assertNotIn("documentary horror", result["flux_prompt"])
 
 
 if __name__ == "__main__":

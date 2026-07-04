@@ -3,9 +3,31 @@
 Pure Python helpers used before real audio exists. Agent 3 later records the
 measured duration from generated audio; parent-short breakpoint estimation is
 not part of the V2 standalone child-short architecture.
+
+Roadmap 3.8 / audit G-7: the static ``SPEECH_RATES`` below were never
+calibrated against real TTS output — a real run measured 135 wpm for parent
+narration (assumed 150) and 120 wpm for child Shorts (planner math assumed
+180 / "3 words per second"), producing a 13.3-minute video instead of ~9-10
+and 110 s Shorts instead of the 60-90 s target band. ``AudioFile`` already
+has the ground truth for every completed generation
+(``duration_ms`` + ``whisper_transcript`` word count) — ``compute_measured_wpm()``
+below computes a rolling per-language average from the most recent real
+generations, and ``get_calibrated_wpm()`` is the single call site every
+caller should use instead of reading ``SPEECH_RATES`` directly, so the
+static table is only ever the cold-start fallback before enough real data
+exists for a given language.
 """
 
-# Average narration speed in words per minute per language (conservative estimates)
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from sqlalchemy.orm import Session
+
+# Average narration speed in words per minute per language (conservative
+# estimates — cold-start fallback only, used until compute_measured_wpm()
+# has enough real samples for a language; see get_calibrated_wpm()).
 SPEECH_RATES: dict[str, float] = {
     "en": 150.0,
     "fr": 140.0,
@@ -16,22 +38,94 @@ SPEECH_RATES: dict[str, float] = {
 }
 _DEFAULT_RATE = 140.0   # used when language is unknown
 
+# Rolling window: average measured wpm over the most recent N real
+# generations for a language. Requires at least _MIN_SAMPLES_FOR_CALIBRATION
+# rows before the measured average is trusted over the static fallback —
+# a single outlier (a very short/long AudioFile row) must not swing the
+# calibration for every subsequent script in that language.
+_ROLLING_WINDOW_SIZE = 20
+_MIN_SAMPLES_FOR_CALIBRATION = 3
 
 
-def estimate_duration_sec(voice_script: str, language: str) -> float:
+def compute_measured_wpm(db: "Session", language: str) -> float | None:
+    """Compute the rolling average measured wpm for a language from real audio.
+
+    Queries the most recent ``_ROLLING_WINDOW_SIZE`` ``AudioFile`` rows for
+    ``language`` that have a real Whisper transcript, and averages each row's
+    measured rate — ``len(whisper_transcript) / (duration_ms / 60_000)``.
+    Whisper's own word-level token count is used (not a re-split of the
+    script text) since it reflects what the TTS engine actually spoke,
+    including any words it dropped or added.
+
+    Returns:
+        The rolling average wpm, or ``None`` if fewer than
+        ``_MIN_SAMPLES_FOR_CALIBRATION`` usable rows exist yet (fail-open —
+        callers fall back to the static ``SPEECH_RATES`` table).
+    """
+    from sqlalchemy import desc
+
+    from app.models import AudioFile
+
+    rows: list[AudioFile] = (
+        db.query(AudioFile)
+        .filter(AudioFile.language == language, AudioFile.duration_ms > 0)
+        .order_by(desc(AudioFile.id))
+        .limit(_ROLLING_WINDOW_SIZE)
+        .all()
+    )
+
+    samples: list[float] = []
+    for row in rows:
+        transcript = row.whisper_transcript
+        if not transcript:
+            continue
+        minutes = row.duration_ms / 60_000.0
+        if minutes <= 0:
+            continue
+        samples.append(len(transcript) / minutes)
+
+    if len(samples) < _MIN_SAMPLES_FOR_CALIBRATION:
+        return None
+    return sum(samples) / len(samples)
+
+
+def get_calibrated_wpm(db: "Session | None", language: str) -> float:
+    """Return the best-known narration speed (wpm) for a language.
+
+    Uses the rolling measured average (``compute_measured_wpm()``) when a
+    database session is provided and enough real samples exist; otherwise
+    falls back to the static ``SPEECH_RATES`` table. This is the single
+    place wpm-dependent callers (Agent 2 script/Short word bands, Agent 4
+    storyboard beat-pacing diagnostics) should read from, rather than
+    reading ``SPEECH_RATES`` directly, so a future caller with a db session
+    automatically benefits from real calibration data as it accumulates.
+    """
+    if db is not None:
+        measured = compute_measured_wpm(db, language)
+        if measured is not None:
+            return measured
+    return SPEECH_RATES.get(language, _DEFAULT_RATE)
+
+
+def estimate_duration_sec(voice_script: str, language: str, db: "Session | None" = None) -> float:
     """Estimate narration duration from a voice script's word count.
 
-    Uses language-specific average speech rates. The result feeds
-    ``scripts.estimated_duration_sec`` before real audio exists.
+    Uses ``get_calibrated_wpm()`` — the rolling measured rate when ``db`` is
+    provided and enough real samples exist for ``language``, otherwise the
+    static ``SPEECH_RATES`` fallback (identical to pre-roadmap-3.8 behavior
+    when ``db`` is omitted). The result feeds ``scripts.estimated_duration_sec``
+    before real audio exists.
 
     Args:
         voice_script: The narrator text (no stage directions).
         language:     BCP-47 language code (e.g. "fr", "en").
+        db:           Optional session; when provided, calibrates against
+                      real measured audio for this language (roadmap 3.8).
 
     Returns:
         Estimated duration in seconds, rounded to 1 decimal place.
     """
-    rate = SPEECH_RATES.get(language, _DEFAULT_RATE)
+    rate = get_calibrated_wpm(db, language)
     word_count = len(voice_script.split())
     result = round((word_count / rate) * 60.0, 1)
     return result

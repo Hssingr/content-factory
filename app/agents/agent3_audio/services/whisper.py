@@ -2,6 +2,7 @@ import logging
 import time
 from pathlib import Path
 
+from app.config import settings
 from app.services.openai_client import get_client
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,27 @@ def transcribe(file_path: str, language: str | None = None) -> list[dict]:
         raise FileNotFoundError(f"Audio file not found: {file_path}")
 
     logger.info("Whisper transcription start: %s lang=%s", path.name, language or "auto")
+
+    # Dev-mode order swap (roadmap 6.7): local faster-whisper first, hosted
+    # API as the fallback — zero Whisper spend during iteration. Production
+    # default keeps the hosted model primary.
+    if settings.whisper_local_primary:
+        logger.info("WHISPER_LOCAL_PRIMARY enabled — trying faster-whisper before the OpenAI API")
+        result = _try_faster_whisper(path, language)
+        if result is not None:
+            return result
+        logger.warning(
+            "faster-whisper unavailable/failed for %s — falling back to OpenAI Whisper",
+            path.name,
+        )
+        result = _try_openai_whisper(path, language)
+        if result is not None:
+            return result
+        logger.error(
+            "Both faster-whisper and OpenAI Whisper failed for %s — returning empty transcript",
+            path.name,
+        )
+        return []
 
     result = _try_openai_whisper(path, language)
     if result is not None:

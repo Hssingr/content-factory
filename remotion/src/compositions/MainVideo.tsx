@@ -7,9 +7,7 @@ import {
   staticFile,
   useVideoConfig,
 } from "remotion";
-import {
-  MediaSection, transitionDurationFrames, computeOverlaySuppressWindows,
-} from "../components/MediaSection";
+import { MediaSection, transitionDurationFrames } from "../components/MediaSection";
 import { StandardSubtitles } from "../components/StandardSubtitles";
 import { MainVideoProps } from "../types";
 
@@ -29,11 +27,6 @@ export const MainVideo: React.FC<MainVideoProps> = ({
 }) => {
   const { fps } = useVideoConfig();
   const audioSrc = staticFile(audio_file);
-
-  // Phase 14.10b — windows where a section's own overlay is showing; the
-  // global subtitle layer is suppressed during them instead of colliding
-  // with it. Sections here are already in absolute ms, same as captions.
-  const suppressWindows = computeOverlaySuppressWindows(sections);
 
   return (
     <AbsoluteFill style={{ backgroundColor: "#0a0a0f" }}>
@@ -62,7 +55,7 @@ export const MainVideo: React.FC<MainVideoProps> = ({
       })}
 
       {subtitles.captions.length > 0 && (
-        <StandardSubtitles captions={subtitles.captions} suppressWindows={suppressWindows} />
+        <StandardSubtitles captions={subtitles.captions} />
       )}
     </AbsoluteFill>
   );

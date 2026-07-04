@@ -1,35 +1,21 @@
 import React from "react";
 import { AbsoluteFill, useCurrentFrame, useVideoConfig } from "remotion";
 import { KaraokeChunk } from "../types";
-import { OverlaySuppressWindow } from "./MediaSection";
 
+// Subtitles-only rendering (audit G-0/G-8): this is the video's ONLY text
+// layer — the per-section overlay layers and the suppress-window machinery
+// that coordinated with them are removed. Subtitles render unconditionally.
 interface Props {
   captions:     KaraokeChunk[];
   activeColor?: string; // default #FFD700
-  /**
-   * Phase 14.10b — windows during which a section's own TextOverlay/TextCard
-   * is showing; the global subtitle layer must not render during them (the
-   * design decision is "the section overlay wins" — see
-   * code_report/phase_14_10_double_subtitle_investigation.md /
-   * phase_14_10b_subtitle_overlay_collision_fix.md). Optional and defaults to
-   * empty so this component's existing API/behavior is unchanged for any
-   * caller that does not pass it. Callers (Short.tsx) pass these already
-   * shifted into Short-local ms, the same coordinate space as `captions`.
-   */
-  suppressWindows?: OverlaySuppressWindow[];
 }
 
 export const KaraokeSubtitles: React.FC<Props> = ({
-  captions, activeColor = "#FFD700", suppressWindows = [],
+  captions, activeColor = "#FFD700",
 }) => {
   const frame = useCurrentFrame();
   const { fps } = useVideoConfig();
   const currentMs = (frame / fps) * 1000;
-
-  const suppressed = suppressWindows.some(
-    (w) => currentMs >= w.start_ms && currentMs < w.end_ms,
-  );
-  if (suppressed) return null;
 
   const activeChunk = captions.find(
     (c) => currentMs >= c.start_ms && currentMs < c.end_ms,
@@ -67,26 +53,28 @@ export const KaraokeSubtitles: React.FC<Props> = ({
 const containerStyle: React.CSSProperties = {
   justifyContent: "flex-end",
   alignItems:     "center",
-  paddingBottom:  "8%",
+  paddingBottom:  "32%",
+  paddingLeft:    48,
+  paddingRight:   48,
 };
 
 const boxStyle: React.CSSProperties = {
-  backgroundColor: "rgba(0, 0, 0, 0.70)",
-  borderRadius:    10,
-  padding:         "12px 24px",
-  maxWidth:        "85%",
+  backgroundColor: "rgba(0, 0, 0, 0.76)",
+  borderRadius:    8,
+  padding:         "14px 28px",
+  maxWidth:        "92%",
   textAlign:       "center",
   display:         "flex",
   flexWrap:        "wrap",
   justifyContent:  "center",
-  lineHeight:      1.4,
+  lineHeight:      1.08,
 };
 
 const wordStyle: React.CSSProperties = {
-  fontFamily:    "Arial, Helvetica, sans-serif",
-  fontSize:      52,
-  fontWeight:    "bold",
-  textShadow:    "2px 2px 6px rgba(0,0,0,0.9)",
+  fontFamily:    "Arial Black, Arial, Helvetica, sans-serif",
+  fontSize:      82,
+  fontWeight:    900,
+  textShadow:    "0 4px 12px rgba(0,0,0,0.95)",
   transition:    "color 0.05s ease, transform 0.05s ease",
-  letterSpacing: 0.5,
+  letterSpacing: 0,
 };

@@ -14,6 +14,59 @@ from app.services.local_run_paths import ensure_run_dirs
 
 logger = logging.getLogger(__name__)
 
+_MIN_SHORT_AUDIO_DURATION_MS = 61_000
+
+
+def _assert_short_audio_min_duration(
+    *,
+    content_id: uuid.UUID,
+    language: str,
+    duration_ms: int,
+    is_short_episode: bool,
+) -> bool:
+    """Return False when a child Short audio file misses the hard 61 s floor."""
+    if not is_short_episode:
+        return True
+    if duration_ms >= _MIN_SHORT_AUDIO_DURATION_MS:
+        return True
+    logger.error(
+        "CHILD_SHORT_AUDIO_TOO_SHORT content_id=%s lang=%s duration_ms=%d min_duration_ms=%d",
+        content_id, language, duration_ms, _MIN_SHORT_AUDIO_DURATION_MS,
+    )
+    return False
+
+
+def _assert_short_audio_has_transcript(
+    *,
+    content_id: uuid.UUID,
+    language: str,
+    transcript: list[dict],
+    is_short_episode: bool,
+) -> bool:
+    """Return False when a child Short's Whisper transcript is empty.
+
+    Roadmap 3.9 / audit A-3, exec-10: ``transcribe()`` already tries OpenAI
+    Whisper then falls back to local ``faster-whisper``, returning ``[]``
+    only when both engines fail. That empty result was previously tolerated
+    silently for every content type — persisted as-is, `AUDIO_DONE` reached
+    regardless — which let a captionless vertical Short reach Agent 5 (the
+    render-side blocker in ``agent5/services/video.py``'s
+    ``_collect_technical_blockers`` is the second, independent half of this
+    fix). Scoped to Shorts only: parent long-form content still tolerates a
+    missing transcript exactly as before, since the storyboard/timestamp
+    pipeline already has its own proportional-fallback timing machinery.
+    """
+    if not is_short_episode:
+        return True
+    if transcript:
+        return True
+    logger.error(
+        "CHILD_SHORT_AUDIO_EMPTY_TRANSCRIPT content_id=%s lang=%s "
+        "— both Whisper engines failed or returned no words",
+        content_id, language,
+    )
+    return False
+
 
 def run_audio_generation(content_id: uuid.UUID, db: Session) -> bool:
     """Run the full Agent 3 audio pipeline for one piece of content.
@@ -105,12 +158,25 @@ def run_audio_generation(content_id: uuid.UUID, db: Session) -> bool:
                 audio_bytes             = generate_audio(script.voice_script, voice, is_short_episode=is_short_episode)
                 file_path, duration_ms  = save_audio(content_id, lang, audio_bytes)
 
+            if not _assert_short_audio_min_duration(
+                content_id=content_id,
+                language=lang,
+                duration_ms=duration_ms,
+                is_short_episode=is_short_episode,
+            ):
+                db.rollback()
+                continue
+
         except Exception as exc:
             logger.error("TTS/storage failed lang=%s: %s", lang, exc)
             db.rollback()
             continue
 
-        # ── Step 3: Whisper transcription (soft — missing transcript is tolerated) ──
+        # ── Step 3: Whisper transcription ─────────────────────────────────────
+        # Soft for parent long-form content — missing transcript is tolerated,
+        # falling back to proportional timing downstream. Hard for child
+        # Shorts (roadmap 3.9 / audit A-3, exec-10) — see
+        # _assert_short_audio_has_transcript() below.
         transcript: list[dict] = []
         try:
             transcript = transcribe(file_path, language=lang)
@@ -119,6 +185,15 @@ def run_audio_generation(content_id: uuid.UUID, db: Session) -> bool:
                 "Whisper failed lang=%s (%s) — continuing without word timestamps",
                 lang, exc,
             )
+
+        if not _assert_short_audio_has_transcript(
+            content_id=content_id,
+            language=lang,
+            transcript=transcript,
+            is_short_episode=is_short_episode,
+        ):
+            db.rollback()
+            continue
 
         try:
             # ── Step 5: Persist AudioFile ────────────────────────────────────

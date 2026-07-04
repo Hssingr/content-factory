@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.models import Channel, ChannelConfig, ChannelLanguage, ChannelVoice, Content, ContentValidation, Script
 from app.services.script_estimator import estimate_duration_sec
+from app.agents.agent2_discovery.services.story import MAX_SOURCE_EXCERPT_CHARS
 from app.agents.agent2_discovery.system_prompt import (
     assess_script_quality,
     assess_short_script_quality,
@@ -25,7 +26,9 @@ from app.services.script_checks import (
     check_tts_compliance,
     check_completeness,
     check_minimum_length,
+    check_maximum_length,
     check_length_coherence,
+    check_retention_structure,
     check_section_transition,
     check_sentence_rhythm_variance,
     split_long_sentences,
@@ -192,6 +195,7 @@ def run_script_quality_gate(
             current=current,
             language=language,
             extra_issues=global_issues if attempt == 1 else [],
+            script_format=script_format,
         )
         _log_quality_gate_review(issue_group, attempt)
 
@@ -296,13 +300,22 @@ def _collect_quality_gate_issues(
     current: dict,
     language: str,
     extra_issues: list[dict] | None = None,
+    script_format: str = "youtube_long",
 ) -> dict:
     status = review.get("status", "PASSED")
     claude_issues: list[dict] = review.get("issues", [])
     voice_script = current.get("voice_script", "")
     tts_det = check_tts_compliance(voice_script, language)
     hook_det = check_hook_quality(voice_script, language)
-    det_majors = [issue for issue in tts_det + hook_det if issue["severity"] == "MAJOR"]
+    length_det = check_maximum_length(voice_script, language, script_format)
+    # roadmap 6.3 / audit §6, §7: check_retention_structure() is always MINOR
+    # (curiosity-gap/dead-ending advisory, never a hard gate) — wired in as
+    # observability only, never converted to a rewrite-triggering HIGH issue
+    # and never counted toward det_majors below.
+    retention_det = check_retention_structure(voice_script, language, script_format)
+    det_majors = [
+        issue for issue in tts_det + hook_det + length_det if issue["severity"] == "MAJOR"
+    ]
     converted_det: list[dict] = [
         {
             "severity": "HIGH",
@@ -318,6 +331,8 @@ def _collect_quality_gate_issues(
         "status": status,
         "tts_det": tts_det,
         "hook_det": hook_det,
+        "length_det": length_det,
+        "retention_det": retention_det,
         "converted_det": converted_det,
         "global": global_issues,
         "all_issues": all_issues,
@@ -337,15 +352,24 @@ def _log_quality_gate_review(issue_group: dict, attempt: int) -> None:
     hook_major_count = len([
         issue for issue in issue_group["hook_det"] if issue["severity"] == "MAJOR"
     ])
+    length_major_count = len([
+        issue for issue in issue_group.get("length_det", []) if issue["severity"] == "MAJOR"
+    ])
     logger.debug(
-        "QUALITY_GATE_BREAKDOWN attempt=%d det_tts_maj=%d det_hook_maj=%d",
-        attempt, tts_major_count, hook_major_count,
+        "QUALITY_GATE_BREAKDOWN attempt=%d det_tts_maj=%d det_hook_maj=%d det_length_maj=%d",
+        attempt, tts_major_count, hook_major_count, length_major_count,
     )
     for issue in all_issues:
         logger.debug(
             "Script quality issue [%s/%s]: %s -> %s",
             issue.get("severity", "?"), issue.get("category", "?"),
             issue.get("description", ""), issue.get("fix", ""),
+        )
+    # Telemetry only — never blocking, never fed into all_issues/the rewrite loop.
+    for issue in issue_group.get("retention_det", []):
+        logger.info(
+            "QUALITY_GATE_RETENTION_STRUCTURE attempt=%d [MINOR]: %s",
+            attempt, issue.get("description", ""),
         )
 
 
@@ -497,12 +521,25 @@ def generate_multilingual_scripts(
             result.append(source_script)
             continue
 
-        if lang in existing_by_lang:
-            existing = existing_by_lang[lang]
+        existing = existing_by_lang.get(lang)
+        if existing is not None and existing.validated:
             _mark_script_validated(existing)
             result.append(existing)
-            logger.debug("Script for lang=%s already exists — skipping", lang)
+            logger.debug("Script for lang=%s already exists and is validated — skipping", lang)
             continue
+
+        if existing is not None and not existing.validated:
+            # Roadmap 4.4 / audit S-4 (exec-7): a pre-existing row that never
+            # reached validated=True (e.g. a prior interrupted/failed run)
+            # must not be blindly force-marked valid and reused — it goes
+            # through the same regeneration path as a missing language below,
+            # updating this row in place instead of inserting a second row
+            # (which would violate uq_script_content_language_version).
+            logger.warning(
+                "SCRIPT_REVALIDATION_REQUIRED content=%s lang=%s — existing row is not "
+                "validated, regenerating instead of marking it valid unchecked",
+                content.id, lang,
+            )
 
         lang_voice: ChannelVoice | None = voice_map.get(lang)
         lang_model    = lang_voice.tts_model if lang_voice else "sonic-2"
@@ -556,18 +593,26 @@ def generate_multilingual_scripts(
             )
             continue
 
-        script = Script(
-            content_id=content.id,
-            language=lang,
-            voice_script=adapted["voice_script"],
-            version=1,
-            validated=True,
-            estimated_duration_sec=estimate_duration_sec(adapted["voice_script"], lang),
-        )
-        db.add(script)
-        db.flush()
-        result.append(script)
-        logger.debug("Script saved: lang=%s id=%s", lang, script.id)
+        if existing is not None:
+            existing.voice_script = adapted["voice_script"]
+            existing.validated = True
+            existing.estimated_duration_sec = estimate_duration_sec(adapted["voice_script"], lang, db=db)
+            db.flush()
+            result.append(existing)
+            logger.debug("Script re-validated in place: lang=%s id=%s", lang, existing.id)
+        else:
+            script = Script(
+                content_id=content.id,
+                language=lang,
+                voice_script=adapted["voice_script"],
+                version=1,
+                validated=True,
+                estimated_duration_sec=estimate_duration_sec(adapted["voice_script"], lang, db=db),
+            )
+            db.add(script)
+            db.flush()
+            result.append(script)
+            logger.debug("Script saved: lang=%s id=%s", lang, script.id)
 
     scripts_by_lang = {script.language: script for script in result}
     missing = [lang for lang in required_languages if lang not in scripts_by_lang]
@@ -626,12 +671,12 @@ def generate_multilingual_scripts(
 # the parent branch called generate_native_script() and persisted its result
 # with no validation call of any kind in between).
 #
-# Reuses check_completeness() and check_tts_compliance() exactly as
-# run_deterministic_checks() already does for the source-language script
-# (app/services/script_checks.py) — no structural-check logic is duplicated
-# here. Only two new source-comparison checks are added below, since those
-# require the source script as a second input that no existing per-language
-# check function takes.
+# Reuses check_completeness() and check_tts_compliance() — the same
+# functions `_assemble_sections_with_diagnostics()` already calls for the
+# source-language script (app/services/script_checks.py) — no structural-
+# check logic is duplicated here. Only two new source-comparison checks are
+# added below, since those require the source script as a second input that
+# no existing per-language check function takes.
 
 _MAX_PARENT_TRANSLATION_CORRECTION_ROUNDS = 2
 
@@ -654,9 +699,10 @@ def _collect_translated_parent_script_issues(
 
     Reuses ``check_completeness()`` (section markers present, consecutive
     numbering — catches missing/duplicated/malformed [INTRO]/[SECTION N]/
-    [OUTRO] headers) and ``check_tts_compliance()``, exactly as
-    ``run_deterministic_checks()`` already runs for the source-language
-    script. Adds two source-comparison checks no existing function covers:
+    [OUTRO] headers) and ``check_tts_compliance()``, the same functions
+    already run for the source-language script
+    (``_assemble_sections_with_diagnostics()``). Adds two source-comparison
+    checks no existing function covers:
 
     - section-count parity: the translation must have the same number of
       [SECTION N] markers as the source — catches a section silently
@@ -979,6 +1025,7 @@ def _call_section_generation(
     attempt: int,
     visual_style: str = "",
     image_style: str = "",
+    midpoint_retention_trap: str | None = None,
 ) -> dict | None:
     try:
         return generate_section(
@@ -997,6 +1044,7 @@ def _call_section_generation(
             future_uncovered_turns=future_uncovered_turns,
             visual_style=visual_style,
             image_style=image_style,
+            midpoint_retention_trap=midpoint_retention_trap,
         )
     except Exception as exc:
         logger.error("Section %s generation error (attempt %d): %s", label, attempt, exc)
@@ -1163,6 +1211,7 @@ def _generate_section_with_retry(
     future_uncovered_turns: list[str] | None = None,
     visual_style: str = "",
     image_style: str = "",
+    midpoint_retention_trap: str | None = None,
 ) -> dict | None:
     """Generate a single section, retrying up to _MAX_SECTION_RETRIES on MAJOR violations."""
     override = ""
@@ -1187,6 +1236,7 @@ def _generate_section_with_retry(
             attempt=attempt,
             visual_style=visual_style,
             image_style=image_style,
+            midpoint_retention_trap=midpoint_retention_trap,
         )
         if result is None:
             if attempt > _MAX_SECTION_RETRIES:
@@ -1222,18 +1272,40 @@ def _generate_section_with_retry(
     return None
 
 
+_SECTION_TITLE_WORD_RE = re.compile(r"[A-Za-z0-9À-ɏ'’.-]+")
+_SECTION_BODY_LABEL_RE = re.compile(r"^SECTION\s+\d+$", re.IGNORECASE)
+
+
+def _section_title_from_text(text: str, max_words: int = 7) -> str:
+    """Return a compact marker-safe title from a blueprint turn or reveal."""
+    words = _SECTION_TITLE_WORD_RE.findall(str(text or ""))
+    title = " ".join(words[:max_words]).strip(" .-:;,")
+    return title[:80].strip(" .-:;,")
+
+
+def _section_marker_for(section: dict) -> str:
+    label = str(section.get("label", "")).strip()
+    title = _section_title_from_text(section.get("title", ""))
+    if title and _SECTION_BODY_LABEL_RE.match(label):
+        return f"[{label}: {title}]"
+    return f"[{label}]"
+
+
 def assemble_script(sections: list[dict]) -> str:
     """Assemble section dicts into a marked voice_script.
 
     Args:
         sections: List of dicts with keys ``label`` and ``script_text``, in order.
+            Body sections may also carry ``title``; when present, SECTION
+            markers are emitted as ``[SECTION N: Title]`` so downstream TTS
+            and storyboard segmentation receive the blueprint-turn context.
 
     Returns:
-        The assembled voice_script text, with [LABEL] markers on their own line.
+        The assembled voice_script text, with markers on their own line.
     """
     parts: list[str] = []
     for s in sections:
-        parts.append(f"[{s['label']}]")
+        parts.append(_section_marker_for(s))
         parts.append(s["script_text"])
     return "\n\n".join(parts)
 
@@ -1344,6 +1416,13 @@ def _build_section_generation_context(
         "major_turns": major_turns,
         "max_body": max_body,
         "min_body_for_blueprint": min_body_for_blueprint,
+        # Roadmap 4.3 / audit S-3, §6: approximate 1-based body_index nearest
+        # the story's halfway point, using the planned body-section count
+        # (max_body) as the estimate — the real generated count can still
+        # extend past this via _should_stop_body_loop()'s soft-max-but-
+        # uncovered-turns rule, so this is a best-effort midpoint, not an
+        # exact post-hoc recalculation against the final section count.
+        "midpoint_body_index": (max_body + 1) // 2,
         "visual_style": visual_style,
         "image_style": image_style,
     }
@@ -1384,7 +1463,10 @@ def _append_generated_section(
     track_turns: bool = True,
 ) -> set[int]:
     state["section_calls"] += 1
-    state["sections"].append({"label": label, "script_text": section["script_text"]})
+    section_row = {"label": label, "script_text": section["script_text"]}
+    if section.get("title"):
+        section_row["title"] = section["title"]
+    state["sections"].append(section_row)
     _update_accumulator(
         state["visual_intent_accumulator"],
         section,
@@ -1573,6 +1655,7 @@ def _run_body_section_loop(
             ",".join(str(i) for i in sorted(state["covered_turns"])),
             primary_idx, uncovered,
         )
+        is_midpoint_section = body_index == context.get("midpoint_body_index")
         section = _generate_section_with_retry(
             label=label,
             story=story,
@@ -1590,6 +1673,9 @@ def _run_body_section_loop(
             future_uncovered_turns=future_turns if future_turns else None,
             visual_style=context.get("visual_style", ""),
             image_style=context.get("image_style", ""),
+            midpoint_retention_trap=(
+                blueprint.get("midpoint_retention_trap") if is_midpoint_section else None
+            ),
         )
         if section is None:
             logger.warning(
@@ -1597,6 +1683,10 @@ def _run_body_section_loop(
             )
             break
 
+        if primary_turn:
+            section["title"] = _section_title_from_text(primary_turn)
+        elif section.get("reveals"):
+            section["title"] = _section_title_from_text(section.get("reveals", [""])[0])
         matched_turns = _append_generated_section(state, label, section, major_turns)
         _credit_body_turn_coverage(state["covered_turns"], matched_turns, label, primary_idx)
         body_index += 1
@@ -1742,7 +1832,7 @@ def _apply_length_correction(
             language=story.language,
             channel=channel,
             script_format=script_format,
-            source_excerpt=(story.body or "")[:8000],
+            source_excerpt=(story.body or "")[:MAX_SOURCE_EXCERPT_CHARS],
             tts_model=context["tts_model"],
             tts_provider=context["tts_provider"],
         )
@@ -1940,7 +2030,10 @@ def _run_single_narrative_retry(
             override_instruction=override,
         )
         retry_text = _clean_narrative_retry_text(result.get("script_text", ""), target_label)
-        sections[idx] = {"label": target_label, "script_text": retry_text}
+        replacement = {"label": target_label, "script_text": retry_text}
+        if sections[idx].get("title"):
+            replacement["title"] = sections[idx]["title"]
+        sections[idx] = replacement
         _new_sha = hashlib.sha256(
             retry_text.encode("utf-8", errors="replace")
         ).hexdigest()[:8]
@@ -2139,7 +2232,12 @@ def generate_script_sections(
 # ── Standalone short planning: Shorts Planner ──────────────────────────────────────────────────
 
 _MAX_SHORT_CORRECTION_ROUNDS = 2
-_MAX_SHORT_WORDS = 250  # 83 s at Cartesia sonic-2 ~3 words/s
+# Calibrated for a 61-90 s Short at the measured ~120 wpm child-Short rate
+# (roadmap 3.6/3.8, audit G-7 — real Shorts run at ~120 wpm, not the
+# previously-assumed 180 wpm / "3 words per second"; the old 250-word cap
+# produced measured 110 s Shorts, overshooting the 60-90 s plan band).
+_MIN_SHORT_WORDS = 125  # ~61 s at 120 wpm
+_MAX_SHORT_WORDS = 180  # ~90 s at 120 wpm
 
 # Section markers must never appear in a child Short's narration — flat narration only
 # (CLAUDE.md §5.2). Catches [INTRO], [SECTION N], [OUTRO], or any other bracketed label
@@ -2174,12 +2272,12 @@ _OVERLAP_MAX_RATIO = 0.15
 # override_instruction concise (mirrors the existing `issues_for_retry[:3]` cap).
 _OVERLAP_MAX_EXCERPTS = 3
 
-_OVERLAP_WORD_TOKEN_RE = re.compile(r"[a-z0-9']+")
+_OVERLAP_WORD_TOKEN_RE = re.compile(r"[^\W_]+(?:['’][^\W_]+)?", re.UNICODE)
 
 
 def _normalize_overlap_tokens(text: str) -> list[str]:
-    """Lowercase, punctuation-stripped word tokens for overlap comparison."""
-    return _OVERLAP_WORD_TOKEN_RE.findall(text.lower())
+    """Casefolded, punctuation-stripped Unicode word tokens for overlap comparison."""
+    return [token.casefold() for token in _OVERLAP_WORD_TOKEN_RE.findall(text or "")]
 
 
 def _find_overlap_spans(
@@ -2220,8 +2318,8 @@ def detect_parent_child_overlap(
     """Deterministic exact word-sequence overlap check (Phase 13.3).
 
     Compares a child Short's narration against its parent long-form
-    ``voice_script`` using normalized (lowercased, punctuation-stripped) word
-    tokens and ``_OVERLAP_NGRAM_LENGTH``-word sliding windows — case and
+    ``voice_script`` using normalized (casefolded, punctuation-stripped) Unicode
+    word tokens and ``_OVERLAP_NGRAM_LENGTH``-word sliding windows — case and
     punctuation differences never affect the result, and only genuine
     consecutive-word reuse counts (a handful of shared names/places scattered
     through different sentences will not form a 6-word verbatim run and will
@@ -2316,6 +2414,12 @@ def run_shorts_planner(
     visual_style: str = config.visual_style if config else ""
     image_style: str = config.image_style if config else ""
 
+    # Roadmap 6.1 / audit S-8, C-2: check for existing children BEFORE the
+    # paid Claude plan call — a re-run against a parent whose Shorts already
+    # exist must cost zero API calls, not one discarded planning call.
+    if _child_shorts_already_exist(long_content_id, db):
+        return
+
     plan = _generate_shorts_plan_with_retry(voice_script, blueprint, channel)
     if plan is None:
         return
@@ -2327,9 +2431,6 @@ def run_shorts_planner(
         long_content_id,
         total_parts,
     )
-
-    if _child_shorts_already_exist(long_content_id, db):
-        return
 
     for part_plan in parts:
         part_n = part_plan.get("part", 0)
@@ -2742,13 +2843,31 @@ def _collect_short_script_major_issues(
         )
 
     ep_wc = len(ep_voice_script.split())
+    if ep_wc < _MIN_SHORT_WORDS:
+        tts_majors.append({
+            "severity": "MAJOR",
+            "category": "script_too_short",
+            "description": (
+                f"voice_script is {ep_wc} words — below the {_MIN_SHORT_WORDS}-word calibrated "
+                f"minimum for a >=61 s Short. Target {_MIN_SHORT_WORDS}–{_MAX_SHORT_WORDS} words. "
+                f"Add {_MIN_SHORT_WORDS - ep_wc} words of concrete story detail without padding."
+            ),
+        })
+        logger.warning(
+            "run_shorts_planner: part %d attempt %d word count %d < floor %d — will retry",
+            part_n,
+            correction_round,
+            ep_wc,
+            _MIN_SHORT_WORDS,
+        )
     if ep_wc > _MAX_SHORT_WORDS:
         tts_majors.append({
             "severity": "MAJOR",
             "category": "script_too_long",
             "description": (
-                f"voice_script is {ep_wc} words — exceeds the {_MAX_SHORT_WORDS}-word hard cap "
-                f"(≈83 s at Cartesia speed). Target 160–{_MAX_SHORT_WORDS} words. "
+                f"voice_script is {ep_wc} words — exceeds the {_MAX_SHORT_WORDS}-word calibrated "
+                f"cap (≈90 s at the measured ~120 wpm Short rate). Target "
+                f"{_MIN_SHORT_WORDS}–{_MAX_SHORT_WORDS} words. "
                 f"Cut {ep_wc - _MAX_SHORT_WORDS} words by removing the least essential sentences."
             ),
         })
@@ -2803,12 +2922,21 @@ def _collect_translated_short_script_issues(
     issues.extend(tts_majors)
 
     wc = len(voice_script.split())
+    if wc < _MIN_SHORT_WORDS:
+        issues.append({
+            "language": language, "severity": "MAJOR", "category": "translated_short_too_short",
+            "description": (
+                f"Translated voice_script is {wc} words — below the {_MIN_SHORT_WORDS}-word "
+                f"calibrated minimum for a >=61 s Short."
+            ),
+            "suggestion": f"Add {_MIN_SHORT_WORDS - wc} words of concrete story detail while preserving the source narration's shape.",
+        })
     if wc > _MAX_SHORT_WORDS:
         issues.append({
             "language": language, "severity": "MAJOR", "category": "translated_short_too_long",
             "description": (
                 f"Translated voice_script is {wc} words — exceeds the {_MAX_SHORT_WORDS}-word "
-                f"hard cap shared with the source-language Short script."
+                f"calibrated cap shared with the source-language Short script."
             ),
             "suggestion": f"Cut {wc - _MAX_SHORT_WORDS} words by removing the least essential sentences.",
         })

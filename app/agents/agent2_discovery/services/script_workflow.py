@@ -35,14 +35,44 @@ class ScriptWorkflowContext:
     image_style: str
 
 
-def run_script_workflow(content: Content, db: Session) -> None:
-    """Generate, validate, persist, and plan scripts for approved parent content."""
-    ensure_run_dirs(content.id)
-    context = _load_script_workflow_context(content, db)
-    if context is None:
-        return
+def generate_parent_source_script(
+    content: Content,
+    db: Session,
+    story: Story | None = None,
+    context: ScriptWorkflowContext | None = None,
+) -> str | None:
+    """Generate, quality-gate, and persist the parent source-language script.
 
-    story = _build_story(content)
+    The single shared implementation of blueprint → sections → quality gate →
+    source-`Script` persistence (roadmap 4.7 / audit AR-1) — used by BOTH
+    `run_script_workflow()` (production/Celery) and
+    `test_pipeline/test_full_pipeline.py`'s STEP 3 (operator harness), so the
+    two paths can never diverge on generation parameters (visual/image style,
+    audio tags, TTS block) or on persistence/versioning behavior.
+
+    Sets ``Content.status = "GENERATING_SCRIPTS"``. Does NOT generate
+    multilingual scripts, write ``SCRIPTS_VALIDATED``, or run the shorts
+    planner — those remain caller-owned so the harness can interleave its own
+    reuse checks and reporting.
+
+    Args:
+        content: Approved parent `Content` row.
+        db:      SQLAlchemy session managed by the caller.
+        story:   Optional real discovery `Story`; when omitted, rebuilt from
+                 the content row (`source_excerpt` as body).
+        context: Optional preloaded `ScriptWorkflowContext` (saves the caller
+                 a duplicate load); loaded from the DB when omitted.
+
+    Returns:
+        The persisted source voice_script text, or ``None`` when the channel
+        context could not be loaded.
+    """
+    context = context or _load_script_workflow_context(content, db)
+    if context is None:
+        return None
+
+    if story is None:
+        story = _build_story(content)
     _mark_generating_scripts(content, db, context)
 
     blueprint = generate_story_blueprint(
@@ -91,6 +121,19 @@ def run_script_workflow(content: Content, db: Session) -> None:
 
     src_voice_script = _persist_source_script(content, scripts, db)
     _merge_visual_intent_history(content, scripts, db)
+    return src_voice_script
+
+
+def run_script_workflow(content: Content, db: Session) -> None:
+    """Generate, validate, persist, and plan scripts for approved parent content."""
+    ensure_run_dirs(content.id)
+    context = _load_script_workflow_context(content, db)
+    if context is None:
+        return
+
+    src_voice_script = generate_parent_source_script(content, db, context=context)
+    if src_voice_script is None:
+        return
 
     _script_trace("tasks_entering_multilingual", src_voice_script)
     required_scripts = generate_multilingual_scripts(
@@ -204,25 +247,37 @@ def _mark_generating_scripts(
     )
 
 
+def _next_source_script_version(content: Content, db: Session) -> int:
+    previous: Script | None = (
+        db.query(Script)
+        .filter(Script.content_id == content.id, Script.language == content.source_language)
+        .order_by(Script.version.desc())
+        .first()
+    )
+    return (int(previous.version) + 1) if previous else 1
+
+
 def _persist_source_script(content: Content, scripts: dict, db: Session) -> str:
     content.title = scripts.get("title", content.title)
     src_voice_script = scripts.get("voice_script", "")
-    src_dur_sec = estimate_duration_sec(src_voice_script, content.source_language)
+    src_dur_sec = estimate_duration_sec(src_voice_script, content.source_language, db=db)
+    version = _next_source_script_version(content, db)
 
     script_record = Script(
         content_id=content.id,
         language=content.source_language,
         voice_script=src_voice_script,
-        version=1,
+        version=version,
         validated=True,
         estimated_duration_sec=src_dur_sec,
     )
     db.add(script_record)
     db.commit()
     logger.info(
-        "Source script saved for content %s — lang=%s dur=%.1fs",
+        "Source script saved for content %s — lang=%s version=%d dur=%.1fs",
         content.id,
         content.source_language,
+        version,
         src_dur_sec,
     )
     return src_voice_script
@@ -246,7 +301,7 @@ def _set_multilingual_durations(content: Content, db: Session) -> None:
     for script in all_scripts:
         if script.language == content.source_language:
             continue
-        dur = estimate_duration_sec(script.voice_script, script.language)
+        dur = estimate_duration_sec(script.voice_script, script.language, db=db)
         script.estimated_duration_sec = dur
         script.validated = True
         logger.info(

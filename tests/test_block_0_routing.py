@@ -1,22 +1,22 @@
 """Block 0 — model routing tests.
 
 Covers:
-- resolve_model() returns correct model per task (Sonnet vs Haiku)
-- channel_suggestion is Sonnet (onboarding quality)
-- story_research is Sonnet (web_search tool not available on Haiku)
+- resolve_model() returns configured primary/secondary model per task
+- channel_suggestion uses the primary model (onboarding quality)
+- story_research uses the primary model (web_search tool requires the primary model by default)
 - model_override bypasses routing
 - Unknown task raises ValueError
-- Dev and prod resolve every task identically (no env-based override)
+- primary_model and secondary_model settings control concrete routed model IDs
 - call_claude_structured parses tool_use response (mocked client)
 - call_claude passes task+model to the underlying API (mocked client)
 - cache_control applied on long prompts, not on short ones
 """
 
+import os
 import unittest
 from unittest.mock import MagicMock, patch
 
 import anthropic
-
 
 class TestResolveModel(unittest.TestCase):
     """Unit tests for resolve_model() in app.services.model_routing."""
@@ -25,28 +25,61 @@ class TestResolveModel(unittest.TestCase):
         from app.services.model_routing import resolve_model
         return resolve_model(task, model_override)
 
-    def test_sonnet_tasks_return_sonnet(self):
-        from app.services.model_routing import SONNET
-        for task in (
-            "script_generation", "native_adaptation", "quality_rewrite",
-            "intro_optimization", "auto_correction", "storyboard",
-            "story_scoring", "revision", "story_research",
-            # These two are Sonnet by explicit design decision:
-            "channel_suggestion",   # Agent 1 — bad suggestions harm onboarding
-        ):
-            with self.subTest(task=task):
-                self.assertEqual(self._resolve(task), SONNET)
+    def test_primary_tasks_return_configured_primary_model(self):
+        primary = "claude-custom-primary"
+        with patch("app.config.settings") as mock_settings:
+            mock_settings.primary_model = primary
+            mock_settings.secondary_model = "claude-custom-secondary"
+            mock_settings.claude_tier = "prod"
+            for task in (
+                "script_generation", "native_adaptation", "quality_rewrite",
+                "auto_correction", "storyboard", "visual_bible_generation",
+                "story_gate_scoring", "revision", "story_research",
+                "channel_suggestion", "channel_research", "story_blueprint",
+                "section_generation", "short_script",
+            ):
+                with self.subTest(task=task):
+                    self.assertEqual(self._resolve(task), primary)
 
-    def test_haiku_tasks_return_haiku(self):
-        from app.services.model_routing import HAIKU
-        for task in (
-            "script_quality_check", "script_validation", "media_scoring",
-            "telegram_summary",
-            "content_reformat", "section_splitting",
-            "visual_reinterpretation",
-        ):
+    def test_secondary_tasks_return_configured_secondary_model(self):
+        secondary = "claude-custom-secondary"
+        with patch("app.config.settings") as mock_settings:
+            mock_settings.primary_model = "claude-custom-primary"
+            mock_settings.secondary_model = secondary
+            mock_settings.claude_tier = "prod"
+            for task in (
+                "script_quality_check", "short_quality_check",
+                "content_reformat",
+                "global_validation", "shorts_planner",
+                "short_storyboard_remap",
+            ):
+                with self.subTest(task=task):
+                    self.assertEqual(self._resolve(task), secondary)
+
+    def test_model_routing_table_contains_slots_not_model_ids(self):
+        from app.services.model_routing import (
+            DEFAULT_PRIMARY_MODEL,
+            DEFAULT_SECONDARY_MODEL,
+            MODEL_ROUTING,
+            PRIMARY_MODEL,
+            SECONDARY_MODEL,
+        )
+        valid_slots = {PRIMARY_MODEL, SECONDARY_MODEL}
+        for task, slot in MODEL_ROUTING.items():
             with self.subTest(task=task):
-                self.assertEqual(self._resolve(task), HAIKU)
+                self.assertIn(slot, valid_slots)
+                self.assertNotIn(slot, {DEFAULT_PRIMARY_MODEL, DEFAULT_SECONDARY_MODEL})
+
+    def test_primary_and_secondary_models_load_from_environment(self):
+        from app.config import Settings
+        with patch.dict(os.environ, {
+            "primary_model": "claude-env-primary",
+            "secondary_model": "claude-env-secondary",
+        }, clear=False):
+            loaded = Settings(_env_file=None)
+
+        self.assertEqual(loaded.primary_model, "claude-env-primary")
+        self.assertEqual(loaded.secondary_model, "claude-env-secondary")
 
     def test_unknown_task_raises(self):
         with self.assertRaises(ValueError) as ctx:
@@ -60,57 +93,53 @@ class TestResolveModel(unittest.TestCase):
             "claude-opus-4-8",
         )
 
-    def test_override_bypasses_routing_for_haiku_task_too(self):
-        self.assertEqual(
-            self._resolve("media_scoring", model_override="claude-opus-4-8"),
-            "claude-opus-4-8",
-        )
+    def test_dev_tier_uses_secondary_except_hard_primary_exceptions(self):
+        with patch("app.config.settings") as mock_settings:
+            mock_settings.primary_model = "claude-custom-primary"
+            mock_settings.secondary_model = "claude-custom-secondary"
+            mock_settings.claude_tier = "dev"
 
-    def test_dev_prod_parity(self):
-        """Dev and prod must resolve every task to the same model.
+            self.assertEqual(self._resolve("storyboard"), "claude-custom-secondary")
+            self.assertEqual(self._resolve("content_reformat"), "claude-custom-secondary")
+            self.assertEqual(self._resolve("story_research"), "claude-custom-primary")
+            self.assertEqual(self._resolve("auto_correction"), "claude-custom-primary")
 
-        There must be no environment-based model override — what runs in dev
-        is exactly what runs in prod. Concretely: resolve_model() must not
-        read any environment variable or settings value to alter its output.
-        """
-        from app.services.model_routing import MODEL_ROUTING
+    def test_default_primary_and_secondary_model_ids(self):
+        from app.services.model_routing import DEFAULT_PRIMARY_MODEL, DEFAULT_SECONDARY_MODEL
+        self.assertEqual(DEFAULT_PRIMARY_MODEL, "claude-sonnet-5")
+        self.assertEqual(DEFAULT_SECONDARY_MODEL, "claude-sonnet-4-6")
 
-        for tier_label in ("dev", "prod", "staging", ""):
-            with patch("app.config.settings") as mock_settings:
-                mock_settings.claude_tier = tier_label
-                for task, expected_model in MODEL_ROUTING.items():
-                    with self.subTest(tier=tier_label, task=task):
-                        result = self._resolve(task)
-                        self.assertEqual(
-                            result,
-                            expected_model,
-                            msg=(
-                                f"Task '{task}' resolved to '{result}' under "
-                                f"CLAUDE_TIER={tier_label!r}, expected '{expected_model}'. "
-                                f"resolve_model() must not vary by environment."
-                            ),
-                        )
+    def test_config_defaults_upgrade_creative_tier_and_quality_gates_off_haiku(self):
+        """Roadmap 4.2 / audit S-2 (exec-6): with no env override, the creative
+        tier must resolve to the configured Sonnet 5-class primary model, and
+        the quality-gate tasks (previously pinned to Haiku) must resolve to a
+        Sonnet-class secondary model — never Haiku. Uses a real Settings()
+        instance (env_file=None so a local .env cannot mask the code default)
+        and the real resolve_model(), with only app.config.settings patched
+        to that instance — no internal routing logic is stubbed."""
+        from app.config import Settings
+        from app.services.model_routing import resolve_model
 
-    def test_story_research_is_sonnet(self):
-        """story_research must always be Sonnet — Haiku does not support web_search tool."""
-        from app.services.model_routing import SONNET
-        self.assertEqual(self._resolve("story_research"), SONNET)
+        default_settings = Settings(_env_file=None)
+        self.assertEqual(default_settings.primary_model, "claude-sonnet-5")
+        self.assertEqual(default_settings.secondary_model, "claude-sonnet-4-6")
 
-    def test_channel_suggestion_is_sonnet(self):
-        """channel_suggestion must be Sonnet — poor suggestions degrade Agent 1 onboarding."""
-        from app.services.model_routing import SONNET
-        self.assertEqual(self._resolve("channel_suggestion"), SONNET)
+        with patch("app.config.settings", default_settings):
+            creative_tier_tasks = (
+                "script_generation", "native_adaptation", "quality_rewrite",
+                "storyboard", "visual_bible_generation", "story_blueprint",
+                "section_generation", "short_script",
+            )
+            for task in creative_tier_tasks:
+                with self.subTest(task=task):
+                    self.assertEqual(resolve_model(task), "claude-sonnet-5")
 
-    def test_all_routing_table_entries_are_valid_model_ids(self):
-        """Every value in MODEL_ROUTING must be a known Claude model string."""
-        from app.services.model_routing import MODEL_ROUTING, SONNET, HAIKU
-        valid = {SONNET, HAIKU}
-        for task, model in MODEL_ROUTING.items():
-            with self.subTest(task=task):
-                self.assertIn(
-                    model, valid,
-                    msg=f"Task '{task}' maps to unrecognised model '{model}'"
-                )
+            quality_gate_tasks = ("script_quality_check", "short_quality_check")
+            for task in quality_gate_tasks:
+                with self.subTest(task=task):
+                    model = resolve_model(task)
+                    self.assertEqual(model, "claude-sonnet-4-6")
+                    self.assertNotIn("haiku", model.lower())
 
 
 class TestCallClaudeStructured(unittest.TestCase):
@@ -202,7 +231,7 @@ class TestCallClaudeStructured(unittest.TestCase):
         with patch("app.services.claude_client._get_client", return_value=mock_client), \
              patch("app.services.claude_client.resolve_model", return_value="claude-haiku-4-5-20251001"):
             call_claude_structured(
-                task="media_scoring",
+                task="content_reformat",
                 system_prompt="Score candidates.",
                 user_message="Here are candidates.",
                 schema_name="my_schema",
@@ -248,10 +277,10 @@ class TestCallClaudeTaskRouting(unittest.TestCase):
                 "You are a validator.",
                 "Validate this.",
                 max_tokens=256,
-                task="script_validation",
+                task="global_validation",
             )
 
-        mock_resolve.assert_called_once_with("script_validation", None)
+        mock_resolve.assert_called_once_with("global_validation", None)
         self.assertEqual(
             mock_client.messages.create.call_args.kwargs["model"],
             "claude-haiku-4-5-20251001",

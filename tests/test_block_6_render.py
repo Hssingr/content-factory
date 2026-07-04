@@ -247,7 +247,8 @@ class TestVerifyRender:
 # ── 2. remotion_builder — text_card visual_type override ───────────────────── remotion_builder — text_card visual_type override ─────────────────────
 
 class TestTextCardOverride:
-    """_section_for_remotion sets visual_type='text_card' when visual_source='text_card'."""
+    """Subtitles-only rendering: _section_for_remotion never emits text-card
+    or overlay fields — legacy text_card visual_types normalize to b-roll."""
 
     def _make_section(self, visual_source=None, visual_type="b-roll"):
         return {
@@ -268,11 +269,14 @@ class TestTextCardOverride:
             "visual_source":  visual_source,
         }
 
-    def test_text_card_override(self):
+    def test_legacy_text_card_normalized_and_no_overlay_emitted(self):
         from app.agents.agent5_render.services.remotion_builder import _section_for_remotion
-        s = self._make_section(visual_source="text_card", visual_type="b-roll")
+        s = self._make_section(visual_source="text_card", visual_type="text_card")
         out = _section_for_remotion(s)
-        assert out["visual_type"] == "text_card", f"Got: {out['visual_type']}"
+        assert out["visual_type"] == "b-roll", f"Got: {out['visual_type']}"
+        assert "overlay_text" not in out
+        assert "overlay_position" not in out
+        assert "text_card_style" not in out
 
     def test_normal_beat_unchanged(self):
         from app.agents.agent5_render.services.remotion_builder import _section_for_remotion

@@ -8,10 +8,11 @@ export type MediaType  = "image" | "video";
 // Storyboard-beat enums — present when the Storyboard Agent designed this section
 export type Transition = "cut" | "crossfade" | "dip_to_black" | "whip_pan"
                        | "zoom_blur" | "match_cut" | "none";
-export type OverlayPosition = "center" | "lower_third" | "top_left" | "top_right" | "none";
+// Subtitles-only rendering (audit G-0/G-8): the retired OverlayPosition /
+// TextCardStyle types and the "text_card" visual_type are removed — Remotion
+// draws no text except the subtitle track.
 export type VisualType = "b-roll" | "action" | "text_overlay" | "document"
-                       | "map" | "screenshot" | "generated_visual" | "text_card";
-export type TextCardStyle = "chat" | "document" | "statistic" | "quote" | "default";
+                       | "map" | "screenshot" | "generated_visual";
 
 export interface ClipData {
   url:   string;
@@ -34,9 +35,6 @@ export interface SectionData {
   visual_intent?:      string;
   visual_type?:        VisualType;
   transition_to_next?: Transition;
-  overlay_text?:       string;
-  overlay_position?:   OverlayPosition;
-  text_card_style?:    TextCardStyle;
 }
 
 // ── Subtitles ─────────────────────────────────────────────────────────────────

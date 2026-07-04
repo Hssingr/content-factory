@@ -8,10 +8,10 @@ for whichever fal.ai Flux endpoint is selected. It does not call fal.ai itself
 
 Conservative-by-default contract (do not relax without an explicit config
 change from the operator):
-  - Text-card backgrounds (`purpose="text_card_background"`) ALWAYS route to
-    Schnell, unconditionally, regardless of any routing config. This is the
-    Phase 14.4 invariant and is enforced here as a hard short-circuit, not a
-    heuristic.
+  - `purpose="text_card_background"` is LEGACY-INERT: text cards were removed
+    product-wide (subtitles-only rendering, CLAUDE.md §11.6) and no live
+    caller passes this purpose anymore. The Schnell short-circuit branch is
+    retained purely as a defensive guard — do not build new behavior on it.
   - Ordinary generated beats route to Schnell unless
     `settings.image_routing_enabled` is True AND the relevant tier flag
     (`image_routing_allow_dev` / `image_routing_allow_pro`) is True AND the
@@ -50,12 +50,12 @@ MODEL_CAPABILITIES: dict[ModelKey, dict] = {
     "schnell": {
         # Intentionally NOT updated to fal.ai's current documented endpoint
         # name ("fal-ai/flux/schnell", per Phase 14.5's research) — this is
-        # the exact literal string the repo's `_FAL_ENDPOINT` constant has
-        # used in real production calls since before this phase. Changing it
-        # would be a live-behavior change this phase cannot verify (no live
-        # fal.ai calls are permitted here; Phase 14.5 flagged this exact
-        # endpoint-name discrepancy as needing an operator-run live canary
-        # before ever changing it). Preserve-default-behavior wins.
+        # the exact literal string used in real production calls since before
+        # Phase 14.6 introduced this table. Changing it would be a
+        # live-behavior change this phase cannot verify (no live fal.ai calls
+        # are permitted here; Phase 14.5 flagged this exact endpoint-name
+        # discrepancy as needing an operator-run live canary before ever
+        # changing it). Preserve-default-behavior wins.
         "endpoint": "fal-ai/flux-1/schnell",
         "size_mode": "image_size",
         "supports_steps": True,
@@ -116,6 +116,10 @@ _DEFAULT_SAFETY_TOLERANCE = "2"  # fal.ai Pro-family enum (1=strictest .. 6=most
 
 # Beats that already qualify for Dev/Pro under the heuristic (kept narrow and
 # additive — Phase 14.5's recommended first pass, not a quality/cost policy).
+# Known limits, accepted deliberately: _REVEAL_KEYWORDS is English-only (a
+# non-English source script gets no reveal-based upgrades — same
+# source-language-only convention as the stylistic script checks, CLAUDE.md
+# §5.3/S-6), and `thumbnail_candidate` is a future field nothing sets yet.
 _IMPORTANT_VISUAL_CATEGORIES = {"person"}
 _REVEAL_KEYWORDS = (
     "revealed", "discovered", "shocking", "turns out", "truth was",
@@ -313,6 +317,9 @@ def build_fal_payload(
     return payload
 
 
+_DEFAULT_SCHNELL_SIZE = (1920, 1080)  # matches flux_generator._DEFAULT_WIDTH/_HEIGHT
+
+
 def build_cache_key_material(
     model_key: ModelKey,
     prompt: str,
@@ -323,17 +330,21 @@ def build_cache_key_material(
 ) -> str:
     """Build the hash input for the local Flux cache filename.
 
-    Backward-compatible by construction: for the Schnell tier (the default,
-    and the tier every pre-Phase-14.6 caller used, including Phase 14.4's
-    text-card backgrounds), this reproduces the exact pre-Phase-14.6 material
-    — ``prompt`` alone, or ``f"{cache_key_extra}\\n{prompt}"`` when a
-    namespace is given — so every existing cached image (parent beats, child
-    beats, and Phase 14.4 text-card backgrounds) keeps being reused with zero
-    cache invalidation. A model-qualified prefix is added only for a
-    non-Schnell tier, which has no pre-existing cache to preserve and would
-    otherwise collide with Schnell's cache entry for the same prompt.
+    Backward-compatible by construction: for the Schnell tier at its
+    pre-existing default landscape size (1920x1080 — the tier and size every
+    pre-Phase-14.6 caller used, including Phase 14.4's text-card backgrounds),
+    this reproduces the exact pre-Phase-14.6 material — ``prompt`` alone, or
+    ``f"{cache_key_extra}\\n{prompt}"`` when a namespace is given — so every
+    existing cached image (parent beats, child beats, and Phase 14.4
+    text-card backgrounds) keeps being reused with zero cache invalidation.
+
+    A ``size=`` prefix is added whenever the requested size differs from that
+    default (Phase-roadmap-3.1: portrait 1080x1920 Short generation) or the
+    model tier is not Schnell — both cases have no pre-existing cache to
+    preserve and would otherwise collide with the landscape Schnell cache
+    entry for the identical prompt text.
     """
-    if model_key == "schnell":
+    if model_key == "schnell" and (width, height) == _DEFAULT_SCHNELL_SIZE:
         return f"{cache_key_extra}\n{prompt}" if cache_key_extra else prompt
 
     parts = [f"model={model_key}", f"size={width}x{height}"]

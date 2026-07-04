@@ -1,30 +1,25 @@
-"""Storyboard + media validation gate — deterministic, no Claude/fal.ai calls.
-
-Two entrypoints, one shared `StoryboardIssue` shape and severity convention:
+"""Storyboard validation gate — deterministic, no Claude/fal.ai calls.
 
 ``validate_storyboard(beats)`` — text/structure checks (storyboard quality,
   flux_prompt text quality, reuse-pattern checks). Runs BEFORE any fal.ai
   call, via `visual_orchestrator._check_storyboard_issues()`. For the parent
   path, MAJOR issues trigger one full-storyboard retry in
   `split_into_beats()`; the child path has no equivalent regeneration
-  primitive and logs/proceeds immediately.
-
-``validate_media_assets(beats, content_id)`` — media existence/integrity/
-  reuse checks (Phase 4E-F). Runs AFTER generation, via
-  `visual_orchestrator._check_media_assets()`, since a file's existence
-  cannot be checked before it exists. Local filesystem reads only
-  (`Path.exists()`/`stat()`) — no image decoding, no AI/Claude/fal.ai calls.
-
-Both are shared by the parent storyboard path and the child remap path
-through their respective single call sites — there is exactly one
-implementation of each, not a parent variant and a child variant.
+  primitive and logs/proceeds immediately. Shared by the parent storyboard
+  path and the child remap path through their respective single call
+  sites — there is exactly one implementation, not a parent variant and a
+  child variant.
 
 MINOR issues are always logged at WARNING and never block the pipeline.
-MAJOR issues from `validate_media_assets()` are logged at ERROR and also
-never block the pipeline — no retry/regeneration mechanism exists for a
-missing or corrupt media file (see Phase 4E-E's remediation classification
-for the future-work options that would change this); they are observability
-only, exactly like the child path's storyboard MAJOR findings.
+
+Media existence/integrity checks (post-generation, since a file's existence
+cannot be checked before it exists) live in
+`app/agents/agent4_visuals/services/media_validation.py`'s
+`validate_visual_media_assets()` — the single media validator (roadmap 6.4 /
+audit V-7, AR-2). A separate `validate_media_assets()` used to exist in this
+module too; it duplicated the same concern (per-language, observability-only,
+in-memory `beats` list) and was folded into `validate_visual_media_assets()`
+(which also gained its persistence round-trip check) and deleted.
 """
 
 from __future__ import annotations
@@ -32,10 +27,7 @@ from __future__ import annotations
 import logging
 import re
 from collections import Counter
-from pathlib import Path
 from typing import TypedDict
-
-from app.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +53,47 @@ _DARK_REQUIRES_COOCCURRENCE: frozenset[str] = frozenset({
     "eerie", "brooding", "foreboding", "unsettling", "ethereal",
 })
 
+# ── Dark-frame guard (audit G-6) ───────────────────────────────────────────────
+# The `dark_contrast` grade renders as CSS `contrast(140%) brightness(65%)`
+# (MediaSection.tsx GRADE_FILTER): on a well-lit source image it reads as a
+# stylized high-contrast look; on a naturally dark source it produces a
+# near-black frame — two were confirmed on the run-9500c231 contact sheet.
+# The storyboard prompt already instructs "ALWAYS generate a well-lit, bright
+# source image" for dark_contrast; this is that rule's deterministic Python
+# enforcement (business rules live in Python). A prompt with none of the
+# bright-lighting evidence below cannot be trusted with the grade —
+# `_build_beat_section()` downgrades it to `desaturated` in place. The bias
+# is deliberately safe in both directions: a false positive (e.g. "dim lamp"
+# matching "lamp") merely keeps the grade the model chose; a false negative
+# downgrades to a visible grade.
+_BRIGHT_LIGHTING_WORDS: frozenset[str] = frozenset({
+    "daylight", "daylit", "sunlight", "sunlit", "sunrise", "sunset",
+    "bright", "brightly", "fluorescent", "fluorescents", "incandescent",
+    "candlelight", "lamplight", "lamp", "lamps", "lantern", "skylight",
+    "skylights", "floodlight", "floodlights", "spotlight", "neon", "glow",
+    "glowing", "illuminated", "overcast", "firelight", "headlights",
+    "streetlight", "streetlights",
+})
+_BRIGHT_LIGHTING_PHRASES: tuple[str, ...] = (
+    "golden hour", "well lit", "well-lit", "light through", "side light",
+    "window light", "morning light", "afternoon light", "ambient light",
+    "natural light", "practical lighting",
+)
+_LIGHTING_WORD_RE = re.compile(r"[a-z]+")
+
+
+def has_bright_lighting_evidence(flux_prompt: str) -> bool:
+    """True when a flux_prompt names a concrete bright light source/quality.
+
+    Deterministic keyword/phrase check — the gate for whether a beat may keep
+    the `dark_contrast` color grade (see the dark-frame guard note above).
+    """
+    lowered = str(flux_prompt or "").lower()
+    if any(phrase in lowered for phrase in _BRIGHT_LIGHTING_PHRASES):
+        return True
+    tokens = set(_LIGHTING_WORD_RE.findall(lowered))
+    return bool(tokens & _BRIGHT_LIGHTING_WORDS)
+
 # ── Visual repetition / scene duplication / slideshow-risk thresholds ──────────
 # No single motif (recurring subject/object) may repeat more than this many
 # times within any sliding window of this size. Matches the product intent
@@ -69,6 +102,13 @@ _DARK_REQUIRES_COOCCURRENCE: frozenset[str] = frozenset({
 # enforced in Python until this check.
 _MOTIF_WINDOW_SIZE = 10
 _MOTIF_MAX_PER_WINDOW = 2
+
+# Phase 2.3 / audit G-2: document-ish frames are especially likely to become
+# low-variety, text-prop-heavy slideshows. They are a MAJOR finding once they
+# exceed either global saturation or local-window saturation.
+_DOCUMENT_SATURATION_RATIO = 0.15
+_DOCUMENT_WINDOW_SIZE = 10
+_DOCUMENT_MAX_PER_WINDOW = 2
 
 # Two beats within this many positions of each other that share environment,
 # motif, AND camera effect simultaneously are flagged as a near-duplicate shot
@@ -82,6 +122,8 @@ _NEAR_DUPLICATE_PROXIMITY = 2
 # consecutive_same_environment check, and deliberately checked across all
 # three fields (not environment alone).
 _SLIDESHOW_RUN_LENGTH = 5
+_VISUAL_MONOTONY_CONSECUTIVE_ENV_THRESHOLD = 10
+_VISUAL_MONOTONY_SLIDESHOW_THRESHOLD = 2
 
 # Checks counted toward the VISUAL_REPEAT_RATE diagnostic.
 _REPEAT_CHECK_NAMES: frozenset[str] = frozenset({
@@ -187,34 +229,10 @@ _FLUX_DUPLICATE_CHECK_NAMES: frozenset[str] = frozenset({
 # child-specific code is needed to scope this check; the data makes it so.
 _REUSE_CLUSTER_RUN_LENGTH = 3
 
-# If this fraction or more of flux_generated beats already have a non-empty
+# If more than this fraction of flux_generated beats already have a non-empty
 # media_url at validation time (i.e. reused from the parent rather than
-# pending a new image), the short is flagged as over-relying on recycled
-# parent footage with too little of its own visual identity.
-_REUSE_RATIO_THRESHOLD = 0.70
-
-# ── Media asset thresholds (Phase 4E-F) ────────────────────────────────────────
-# The local-path prefix every real generated/cached image must use. Anything
-# else (remote URL, malformed string) is a MAJOR finding — see CLAUDE.md
-# "No remote media URLs in Remotion props."
-_LOCAL_CACHE_PREFIX = "cache/"
-
-# Sentinel written onto a beat's media_url when Flux generation failed
-# (flux_generator.py owns the canonical definition; duplicated here per this
-# codebase's existing convention of a local copy per file rather than a
-# shared constants module — see storyboard.py and video.py for the same
-# pattern).
-_TEXT_CARD_SENTINEL = "__text_card__"
-
-# media_type values currently supported by the pipeline. Anything else is a
-# MAJOR finding (e.g. a future "video" type landing before render support
-# for it exists).
-_VALID_MEDIA_TYPES: frozenset[str] = frozenset({"image"})
-
-# Text-card hard-failure sentinel. Deliberate remotion_text_card beats should
-# normally have generated background images under cache/. The sentinel is allowed
-# only when Flux background generation failed and Remotion must render the text-card
-# fallback without a media clip.
+# pending a new image), the short is over budget and must be remediated.
+_REUSE_RATIO_THRESHOLD = 0.60
 
 
 class StoryboardIssue(TypedDict):
@@ -260,43 +278,36 @@ def validate_storyboard(beats: list[dict]) -> list[StoryboardIssue]:
             ),
         ))
 
-    # ── MAJOR check 2: cover frame is a text card ─────────────────────────────
-    if first.get("media_strategy") == "remotion_text_card":
-        issues.append(StoryboardIssue(
-            severity="MAJOR",
-            beat_order=0,
-            check="cover_frame_text_card",
-            description=(
-                "beat_order=0 (cover frame) is a remotion_text_card. "
-                "The first image must be a photorealistic visual — text cards cannot "
-                "serve as cover frames because they have no image thumbnail for "
-                "platform previews."
-            ),
-        ))
+    # Checks 2 (cover_frame_text_card) and 3 (opening_text_card_pair) are
+    # retired: text cards are removed product-wide (subtitles-only rendering,
+    # audit G-0/G-8) — the conditions they guarded can no longer be produced.
 
-    # ── MAJOR check 3: first two beats are both text cards ────────────────────
-    if (
-        len(beats) >= 2
-        and beats[0].get("media_strategy") == "remotion_text_card"
-        and beats[1].get("media_strategy") == "remotion_text_card"
-    ):
-        issues.append(StoryboardIssue(
-            severity="MAJOR",
-            beat_order=0,
-            check="opening_text_card_pair",
-            description=(
-                "Both beat_order=0 and beat_order=1 are remotion_text_card. "
-                "The opening must lead with at least one photorealistic visual image "
-                "before any text card. Text-only openings lose viewers immediately."
-            ),
-        ))
+    # ── MINOR check 20: dark_contrast on a prompt with no bright lighting ─────
+    # Defense-in-depth behind the dark-frame guard: `_build_beat_section()`
+    # already downgrades such beats to `desaturated` in place, so on the
+    # normal parent/child paths this check stays silent — it fires only if a
+    # beat reached validation without passing through beat building (a future
+    # code path, or hand-built fixtures), keeping the invariant observable.
+    for beat in beats:
+        if (
+            beat.get("color_grade") == "dark_contrast"
+            and not has_bright_lighting_evidence(beat.get("flux_prompt") or "")
+        ):
+            issues.append(StoryboardIssue(
+                severity="MINOR",
+                beat_order=beat.get("beat_order", 0),
+                check="dark_contrast_unlit_prompt",
+                description=(
+                    f"beat_order={beat.get('beat_order', 0)} uses color_grade "
+                    "'dark_contrast' but its flux_prompt names no bright light "
+                    "source (daylight/lamp/fluorescent/golden hour/…). "
+                    "dark_contrast on a dark source renders a near-black frame — "
+                    "beat building should have downgraded this to 'desaturated'."
+                ),
+            ))
 
     # ── MAJOR check 4: generic/mood-only flux_prompts ─────────────────────────
     for beat in beats:
-        strategy = beat.get("media_strategy", "flux_generated")
-        if strategy != "flux_generated":
-            continue  # text_card background prompts are generated/derived downstream
-
         prompt_lower = (beat.get("flux_prompt") or "").lower()
         if not prompt_lower:
             continue
@@ -328,11 +339,8 @@ def validate_storyboard(beats: list[dict]) -> list[StoryboardIssue]:
     # that asks Flux to render specific words/letters/numbers always comes
     # back as illegible gibberish. Distinct from check 4: that only catches
     # an explicit mood word; this catches a request for literal rendered
-    # text regardless of mood-word presence. Applies to flux_generated beats
-    # only — text_card backgrounds are exempt the same way check 4 is, since
-    # Phase 14.4's own derivation/sanitization (and Phase 14.7's text-prop
-    # sanitization) run downstream of this validation pass, on a prompt this
-    # check has not seen yet.
+    # text regardless of mood-word presence. (Text cards are removed
+    # product-wide — subtitles-only rendering — so every beat is checked.)
     issues.extend(_find_ai_text_rendering_issues(beats))
 
     # ── MINOR check 5: environment over-saturation (>35% of beats) ───────────
@@ -371,22 +379,8 @@ def validate_storyboard(beats: list[dict]) -> list[StoryboardIssue]:
                 ),
             ))
 
-    # ── MINOR check 7: text card saturation (>30% of beats) ──────────────────
-    text_card_count = sum(
-        1 for b in beats if b.get("media_strategy") == "remotion_text_card"
-    )
-    if text_card_count / total > 0.30:
-        issues.append(StoryboardIssue(
-            severity="MINOR",
-            beat_order=-1,
-            check="text_card_saturation",
-            description=(
-                f"remotion_text_card in {text_card_count}/{total} beats "
-                f"({100*text_card_count/total:.0f}% > 30% threshold). "
-                "Too many text cards makes the video feel like a slideshow of titles. "
-                "Replace some with photorealistic flux_generated visuals."
-            ),
-        ))
+    # Check 7 (text_card_saturation) is retired: text cards are removed
+    # product-wide (subtitles-only rendering, audit G-0/G-8).
 
     # ── MINOR check 8: 3+ consecutive low-intensity beats ────────────────────
     for i in range(len(beats) - 2):
@@ -411,6 +405,12 @@ def validate_storyboard(beats: list[dict]) -> list[StoryboardIssue]:
     # but never checked in Python until now.
     issues.extend(_find_motif_repetition_issues(beats))
 
+    # ── MAJOR check 21: document saturation ─────────────────────────────────
+    # Audit G-2: too many document-ish beats make the visual track read as a
+    # stack of paper/screen frames. Applies to either motif=document or
+    # visual_type=document, per roadmap 2.3.
+    issues.extend(_find_document_saturation_issues(beats))
+
     # ── MINOR check 10: near-duplicate beats (scene duplication) ─────────────
     # Multi-field signal: two nearby beats sharing environment AND motif AND
     # camera effect simultaneously are a stronger "this looks like the same
@@ -421,6 +421,13 @@ def validate_storyboard(beats: list[dict]) -> list[StoryboardIssue]:
     # Broader than consecutive_same_environment: checks environment, motif,
     # AND effect independently, and at a longer run length (5+ vs 3).
     issues.extend(_find_slideshow_risk_issues(beats))
+
+    # ── MAJOR check 22: aggregate visual monotony ───────────────────────────
+    # Individual repetition findings stay MINOR for diagnostics, but once the
+    # aggregate crosses the audit thresholds it must become one retry-triggering
+    # MAJOR. Document saturation is already MAJOR; this check groups it with
+    # the other repetition signals so the retry reason is explicit.
+    issues.extend(_find_visual_monotony_issues(issues))
 
     # ── MINOR checks 12-14: flux_prompt text quality (subject/environment/
     # information presence) — distinct from check 4's forbidden-word gate,
@@ -525,27 +532,63 @@ def validate_storyboard(beats: list[dict]) -> list[StoryboardIssue]:
     return issues
 
 
+def _find_visual_monotony_issues(issues: list[StoryboardIssue]) -> list[StoryboardIssue]:
+    """Escalate aggregate repetition signals into one MAJOR retry reason."""
+    consecutive_env_count = sum(
+        1 for issue in issues if issue["check"] == "consecutive_same_environment"
+    )
+    slideshow_count = sum(
+        1 for issue in issues if issue["check"] == "ai_slideshow_risk"
+    )
+    document_saturation_count = sum(
+        1 for issue in issues if issue["check"] == "document_saturation"
+    )
+
+    reasons: list[str] = []
+    if consecutive_env_count > _VISUAL_MONOTONY_CONSECUTIVE_ENV_THRESHOLD:
+        reasons.append(
+            "consecutive_same_environment findings="
+            f"{consecutive_env_count} > {_VISUAL_MONOTONY_CONSECUTIVE_ENV_THRESHOLD}"
+        )
+    if slideshow_count > _VISUAL_MONOTONY_SLIDESHOW_THRESHOLD:
+        reasons.append(
+            "ai_slideshow_risk findings="
+            f"{slideshow_count} > {_VISUAL_MONOTONY_SLIDESHOW_THRESHOLD}"
+        )
+    if document_saturation_count:
+        reasons.append(
+            f"document_saturation fired {document_saturation_count} time(s)"
+        )
+
+    if not reasons:
+        return []
+
+    return [StoryboardIssue(
+        severity="MAJOR",
+        beat_order=-1,
+        check="visual_monotony",
+        description=(
+            "Aggregate visual repetition exceeds retry threshold: "
+            + "; ".join(reasons)
+            + ". Regenerate with stronger environment, motif, and composition variety."
+        ),
+    )]
+
+
 def _find_ai_text_rendering_issues(beats: list[dict]) -> list[StoryboardIssue]:
     """Flag a flux_generated beat whose prompt asks the image model to
     render specific readable text (Phase 14.7).
 
     A quoted phrase of letters, or a "the text reads"/"sign that says"-style
     instruction, asks Flux to literally render words — image models cannot
-    do this reliably and the result is always illegible. Readable text for
-    a document/poster/calendar/sign beat must come from a Remotion overlay
-    instead (`flux_generator.derive_text_prop_overlay()`), not from the
-    generated image itself.
-
-    Exempt: `remotion_text_card` beats — their background prompt is derived/
-    sanitized downstream of this validation pass (Phase 14.4's
-    `derive_text_card_background_prompt()`), which this check has not seen
-    yet at validation time. Same exemption shape as check 4
-    (`forbidden_flux_word`).
+    do this reliably and the result is always illegible. Under subtitles-only
+    rendering there is no overlay substitute either: the prompt must describe
+    the physical prop without legible text, and the narration itself conveys
+    what the text said. Every beat is checked (text cards are removed
+    product-wide, so no exemption exists anymore).
     """
     issues: list[StoryboardIssue] = []
     for beat in beats:
-        if beat.get("media_strategy", "flux_generated") != "flux_generated":
-            continue
         prompt = str(beat.get("flux_prompt", "") or "")
         if not prompt:
             continue
@@ -563,10 +606,84 @@ def _find_ai_text_rendering_issues(beats: list[dict]) -> list[StoryboardIssue]:
                     f"the image model to render specific readable text ({evidence}). Image "
                     "models cannot render legible text reliably — it always comes back as "
                     "gibberish. Describe the physical prop only (document/poster/calendar/sign "
-                    "as a blank or non-legible object) and render any needed readable text as "
-                    f"a Remotion overlay instead. prompt={prompt[:200]!r}"
+                    "as a blank or non-legible object); the narration already conveys what "
+                    f"the text said. prompt={prompt[:200]!r}"
                 ),
             ))
+    return issues
+
+
+def _is_documentish_beat(beat: dict) -> bool:
+    """True when the beat is document-heavy by motif or visual type."""
+    return (
+        str(beat.get("motif") or "").lower() == "document"
+        or str(beat.get("visual_type") or "").lower() == "document"
+    )
+
+
+def _find_document_saturation_issues(beats: list[dict]) -> list[StoryboardIssue]:
+    """Flag global or local overuse of document-ish beats as MAJOR.
+
+    A beat is document-ish when either its ``motif`` or ``visual_type`` is
+    exactly ``document``. The rule fires when document-ish beats exceed 15% of
+    the storyboard globally, or more than 2 beats in any 10-beat window.
+    """
+    issues: list[StoryboardIssue] = []
+    total = len(beats)
+    if not total:
+        return issues
+
+    document_indices = [i for i, beat in enumerate(beats) if _is_documentish_beat(beat)]
+    document_count = len(document_indices)
+    if document_count / total > _DOCUMENT_SATURATION_RATIO:
+        issues.append(StoryboardIssue(
+            severity="MAJOR",
+            beat_order=-1,
+            check="document_saturation",
+            description=(
+                f"Document-ish beats (motif=document or visual_type=document) appear in "
+                f"{document_count}/{total} beats ({100 * document_count / total:.0f}% > "
+                f"{100 * _DOCUMENT_SATURATION_RATIO:.0f}% threshold). Too many document "
+                "frames create a text-prop slideshow; replace most with reactions, "
+                "aftermath, locations, objects, or spatial tension."
+            ),
+        ))
+
+    n = len(beats)
+    i = 0
+    while i < n:
+        window = beats[i:i + _DOCUMENT_WINDOW_SIZE]
+        if len(window) < 2:
+            break
+        count = sum(1 for beat in window if _is_documentish_beat(beat))
+        if count <= _DOCUMENT_MAX_PER_WINDOW:
+            i += 1
+            continue
+
+        start = i
+        j = i + 1
+        while j < n:
+            next_window = beats[j:j + _DOCUMENT_WINDOW_SIZE]
+            next_count = sum(1 for beat in next_window if _is_documentish_beat(beat))
+            if next_count > _DOCUMENT_MAX_PER_WINDOW:
+                j += 1
+            else:
+                break
+
+        issues.append(StoryboardIssue(
+            severity="MAJOR",
+            beat_order=beats[start].get("beat_order", start),
+            check="document_saturation",
+            description=(
+                f"{count} document-ish beats appear in the {_DOCUMENT_WINDOW_SIZE}-beat "
+                f"window starting at beat_order={beats[start].get('beat_order', start)} "
+                f"(>{_DOCUMENT_MAX_PER_WINDOW} allowed). Break the document run with "
+                "non-document visuals that show human reaction, consequence, setting, "
+                "or evidence without readable text."
+            ),
+        ))
+        i = j
+
     return issues
 
 
@@ -692,8 +809,8 @@ def _find_slideshow_risk_issues(beats: list[dict]) -> list[StoryboardIssue]:
 def _find_flux_prompt_quality_issues(beats: list[dict]) -> list[StoryboardIssue]:
     """Flag flux_generated beats whose `flux_prompt` is weak text: missing a
     concrete subject, never establishing its stated environment, or mostly
-    generic filler. Skips beats with no `flux_prompt` (text_card beats) — that
-    absence is not a text-quality problem, just not applicable.
+    generic filler. Skips beats with no `flux_prompt` — that absence is not a
+    text-quality problem, just not applicable.
     """
     issues: list[StoryboardIssue] = []
 
@@ -874,7 +991,7 @@ def _find_reuse_clustering_issues(beats: list[dict]) -> list[StoryboardIssue]:
 
 
 def _find_excessive_reuse_issues(beats: list[dict]) -> list[StoryboardIssue]:
-    """Flag a storyboard where `_REUSE_RATIO_THRESHOLD` or more of its
+    """Flag a storyboard where more than `_REUSE_RATIO_THRESHOLD` of its
     flux_generated beats already have a non-empty media_url at validation
     time (i.e. reused rather than pending a new image) — too little of the
     short's own visual identity, mostly recycled parent footage.
@@ -891,143 +1008,119 @@ def _find_excessive_reuse_issues(beats: list[dict]) -> list[StoryboardIssue]:
 
     reused = sum(1 for b in flux_generated if (b.get("media_url") or "").startswith("cache/"))
     ratio = reused / len(flux_generated)
-    if ratio < _REUSE_RATIO_THRESHOLD:
+    if ratio <= _REUSE_RATIO_THRESHOLD:
         return []
 
     return [StoryboardIssue(
-        severity="MINOR",
+        severity="MAJOR",
         beat_order=-1,
         check="excessive_reuse_ratio",
         description=(
-            f"{reused}/{len(flux_generated)} beats ({100*ratio:.0f}% >= "
-            f"{100*_REUSE_RATIO_THRESHOLD:.0f}% threshold) already reuse a parent "
+            f"{reused}/{len(flux_generated)} beats ({100*ratio:.0f}% > "
+            f"{100*_REUSE_RATIO_THRESHOLD:.0f}% budget) already reuse a parent "
             "image at validation time — this short may be mostly recycled "
             "parent footage with too little of its own visual identity."
         ),
     )]
 
 
-def validate_media_assets(beats: list[dict], content_id: str) -> list[StoryboardIssue]:
-    """Run media existence/integrity/reuse checks on already-generated beats.
 
-    Unlike `validate_storyboard()`, this must run AFTER generation — a file's
-    existence cannot be checked before it exists. Pure local filesystem reads
-    (`Path.exists()`/`stat()`) only; no image decoding, no AI/Claude/fal.ai
-    calls. Shared by both the parent and child paths via the single call site
-    `visual_orchestrator._check_media_assets()`.
+# ── Duplicate-prompt repair (audit G-5.3) ──────────────────────────────────────
+# Two beats with byte-identical `flux_prompt` text hash to the SAME Flux cache
+# file (image_router/flux_generator's cache key is sha256(prompt) within one
+# content_id's cache directory) — a surviving `flux_prompt_exact_duplicate`/
+# `flux_prompt_near_duplicate`/`near_duplicate_beat` finding is not just a
+# validator note, it is a guaranteed duplicate or near-duplicate image. MAJOR
+# findings already trigger a storyboard retry; these three checks are MINOR by
+# design (a handful of similar beats is not worth a Sonnet re-generation), so
+# nothing today fixes them once the retry pass is exhausted. This
+# deterministic, zero-cost repair runs immediately before Flux generation: it
+# appends a composition-slot variation (camera distance + angle, drawn from a
+# fixed rotation — never random, never an AI call) to exactly the beat_order
+# each check itself flags — the later occurrence for the two flux_prompt
+# checks (`_find_flux_prompt_duplicate_issues` always names the first
+# occurrence of a prompt as "the original" and flags every later match), the
+# earlier of the two positions for `near_duplicate_beat` (its own convention —
+# see `_find_near_duplicate_issues`). Only PENDING beats are ever modified
+# (see `repair_duplicate_flux_prompts`), so a beat whose media is already
+# resolved elsewhere is never touched by either convention.
+_DUPLICATE_REPAIR_CHECKS: frozenset[str] = frozenset({
+    "flux_prompt_exact_duplicate", "flux_prompt_near_duplicate", "near_duplicate_beat",
+})
+
+_COMPOSITION_DISTANCES: tuple[str, ...] = (
+    "close-up framing", "medium shot framing", "wide shot framing", "extreme close-up framing",
+)
+_COMPOSITION_ANGLES: tuple[str, ...] = (
+    "eye-level angle", "low-angle upward view", "high-angle downward view",
+    "three-quarter angle view", "profile side view", "over-the-shoulder angle",
+)
+# Distance x angle — 24 distinct, purely technical/compositional phrases
+# (no mood words, consistent with the storyboard prompt's own COMPOSITION
+# field), cycled by occurrence order so repeated runs are deterministic.
+_COMPOSITION_ROTATION: tuple[str, ...] = tuple(
+    f"{distance}, {angle}"
+    for distance in _COMPOSITION_DISTANCES
+    for angle in _COMPOSITION_ANGLES
+)
+
+
+def find_duplicate_prompt_beat_orders(beats: list[dict]) -> dict[int, str]:
+    """Return ``{beat_order: check}`` for beats validate_storyboard() flags as
+    a visual duplicate — the exact set of beats ``repair_duplicate_flux_prompts()``
+    would act on. Reuses ``validate_storyboard()`` itself so the repair target
+    list can never drift from what the validator actually detects.
+    """
+    targets: dict[int, str] = {}
+    for issue in validate_storyboard(beats):
+        if issue["check"] in _DUPLICATE_REPAIR_CHECKS and issue["beat_order"] not in targets:
+            targets[issue["beat_order"]] = issue["check"]
+    return targets
+
+
+def repair_duplicate_flux_prompts(beats: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Deterministically vary the flux_prompt of beats flagged as visual duplicates.
+
+    Only beats still PENDING Flux generation (``media_url`` empty) are ever
+    modified — a beat that already has a resolved `media_url` (a deliberate
+    parent-image reuse on the child remap path, or an already-rendered parent
+    beat) reflects a decision already made elsewhere; rewriting its
+    descriptive `flux_prompt` after the fact would desync stored metadata
+    from the actual persisted image. Repairing the PENDING duplicate's own
+    prompt is what actually changes what gets generated next.
 
     Args:
-        beats:      Beat dicts with `media_url`/`media_type` already resolved
-                    (post-`generate_all_beat_images()` for parents,
-                    post-`generate_pending_beat_images()` for children).
-        content_id: The *current* content's id (str) — used to distinguish a
-                    beat's own freshly-generated media from a reused parent
-                    asset (whose `cache/{other_id}/...` path names a
-                    different content id).
+        beats: Full beat list, in beat_order sequence, as it will be passed to
+            Flux generation.
 
     Returns:
-        List of StoryboardIssue dicts, all MAJOR (this function does not
-        produce MINOR findings). Empty list means every beat's media
-        reference is present, well-formed, and exists on disk.
+        ``(repaired_beats, repairs)`` — a new list (beats are shallow-copied,
+        originals untouched) and a list of ``{beat_order, check, variation}``
+        dicts describing every repair applied, for the caller to log. Empty
+        repairs list means no beat needed repair (including the common case
+        of zero duplicate findings).
     """
-    if not beats:
-        return []
+    targets = find_duplicate_prompt_beat_orders(beats)
+    if not targets:
+        return beats, []
 
-    issues: list[StoryboardIssue] = []
-    media_root = Path(settings.media_path)
+    repaired = [dict(beat) for beat in beats]
+    repairs: list[dict] = []
+    occurrence = 0
 
-    for beat in beats:
-        order = beat.get("beat_order", 0)
-        strategy = beat.get("media_strategy", "flux_generated")
-
-        media_type = beat.get("media_type", "image")
-        if media_type not in _VALID_MEDIA_TYPES:
-            issues.append(StoryboardIssue(
-                severity="MAJOR",
-                beat_order=order,
-                check="media_type_unsupported",
-                description=(
-                    f"beat_order={order} has media_type={media_type!r}, not in "
-                    f"the supported set {sorted(_VALID_MEDIA_TYPES)}."
-                ),
-            ))
-
-        url = beat.get("media_url")
-        if url is None or url == "":
-            issues.append(StoryboardIssue(
-                severity="MAJOR",
-                beat_order=order,
-                check="media_url_missing" if url is None else "media_url_empty",
-                description=(
-                    f"beat_order={order} (media_strategy={strategy!r}) has no "
-                    "media_url at the point media validation runs — generation "
-                    "should already be complete by here."
-                ),
-            ))
+    for beat in repaired:
+        order = beat.get("beat_order")
+        check = targets.get(order)
+        if check is None:
             continue
+        if beat.get("media_url"):
+            continue  # already resolved elsewhere — never rewritten
 
-        if url == _TEXT_CARD_SENTINEL:
-            # A real, expected outcome of a failed Flux/text-card background
-            # generation — not a validator finding on its own. Successful
-            # deliberate text cards should normally carry cache/ background media.
-            continue
+        variation = _COMPOSITION_ROTATION[occurrence % len(_COMPOSITION_ROTATION)]
+        occurrence += 1
 
-        if not url.startswith(_LOCAL_CACHE_PREFIX):
-            issues.append(StoryboardIssue(
-                severity="MAJOR",
-                beat_order=order,
-                check="media_url_malformed",
-                description=(
-                    f"beat_order={order} media_url={url[:80]!r} does not start "
-                    f"with {_LOCAL_CACHE_PREFIX!r} and is not the text_card "
-                    "sentinel — looks like a remote URL or otherwise invalid "
-                    "local file reference."
-                ),
-            ))
-            continue
+        original_prompt = str(beat.get("flux_prompt", "") or "").rstrip(". ")
+        beat["flux_prompt"] = f"{original_prompt}, {variation}." if original_prompt else f"{variation}."
+        repairs.append({"beat_order": order, "check": check, "variation": variation})
 
-        owner_id = url.split("/", 2)[1] if url.count("/") >= 2 else ""
-        is_reused = bool(owner_id) and owner_id != content_id
-        path = media_root / url
-
-        if not path.is_file():
-            issues.append(StoryboardIssue(
-                severity="MAJOR",
-                beat_order=order,
-                check="reused_media_missing" if is_reused else "media_file_missing_on_disk",
-                description=(
-                    f"beat_order={order} media_url={url!r} does not exist on disk "
-                    f"at {path} ({'reused parent asset' if is_reused else 'own generated asset'})."
-                ),
-            ))
-            continue
-
-        try:
-            size = path.stat().st_size
-        except OSError as exc:
-            issues.append(StoryboardIssue(
-                severity="MAJOR",
-                beat_order=order,
-                check="media_file_unreadable",
-                description=f"beat_order={order} media_url={url!r} could not be read: {exc}",
-            ))
-            continue
-
-        if size == 0:
-            issues.append(StoryboardIssue(
-                severity="MAJOR",
-                beat_order=order,
-                check="reused_media_empty" if is_reused else "media_file_empty",
-                description=(
-                    f"beat_order={order} media_url={url!r} is a zero-byte file "
-                    f"({'reused parent asset' if is_reused else 'own generated asset'})."
-                ),
-            ))
-
-    if issues:
-        logger.debug(
-            "validate_media_assets: %d MAJOR issue(s) found in %d beats (content=%s)",
-            len(issues), len(beats), content_id,
-        )
-
-    return issues
+    return repaired, repairs

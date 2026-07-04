@@ -13,11 +13,16 @@ import {
   ClipData,
   ColorGrade,
   Effect,
-  OverlayPosition,
   SectionData,
   Transition,
 } from "../types";
-import { TextCard } from "./TextCard";
+
+// Subtitles-only rendering (audit G-0/G-8): this component draws IMAGES only.
+// The retired TextCard/TextOverlay layers (and the suppress-window machinery
+// that coordinated them with the global subtitle components) are removed —
+// the subtitle track, rendered at the composition level, is the video's only
+// text layer. A section with no usable media renders a plain dark fill with
+// no placeholder text of any kind.
 
 interface Props {
   section:      SectionData;
@@ -35,13 +40,9 @@ const CLIP_CROSSFADE = 12;   // 0.4 s at 30 fps
 // cold_blue (Phase 14.11 fix): was `hue-rotate(200deg)`, a near-180-degree
 // rotation of the ENTIRE hue wheel — not a subtle cool nudge. CSS hue-rotate
 // shifts every hue by the given angle, so 200deg pushes skin tones (~25-35deg,
-// orange) into the blue family (~225-235deg) and green foliage (~90-130deg)
-// into violet/magenta (~290-330deg) — this is the confirmed root cause of the
-// reported "unnatural purple/blue tint ... including foliage and skin tones"
-// defect (code_report/phase_14_11_color_grade_cast_investigation.md). Reduced
-// to a small nudge that cannot push a recognizable hue into an unrelated
-// color family; saturate/brightness (already present) carry the "cool/muted"
-// feel instead of an extreme hue rotation.
+// orange) into the blue family and green foliage (~90-130deg) into
+// violet/magenta — the confirmed root cause of the reported "unnatural
+// purple/blue tint" defect (code_report/phase_14_11_color_grade_cast_investigation.md).
 const GRADE_FILTER: Record<ColorGrade, string> = {
   desaturated:   "saturate(30%) brightness(85%)",
   cold_blue:     "saturate(70%) hue-rotate(15deg) brightness(80%)",
@@ -58,64 +59,7 @@ const DARK_FALLBACK_STYLE: React.CSSProperties = {
 
 const isFallback = (url: string) =>
   !url ||
-  url === "__dark_fallback__" ||
-  url === "__runway_pending__" ||
-  url === "__generated_pending__";
-
-// ── Overlay text placement ─────────────────────────────────────────────────────
-
-const OVERLAY_POSITION_STYLE: Record<OverlayPosition, React.CSSProperties> = {
-  center:      { top: "50%", left: "50%", transform: "translate(-50%, -50%)", textAlign: "center" },
-  lower_third: { bottom: "12%", left: "8%", right: "8%", textAlign: "left" },
-  top_left:    { top: "8%", left: "8%", textAlign: "left" },
-  top_right:   { top: "8%", right: "8%", textAlign: "right" },
-  none:        { display: "none" },
-};
-
-interface TextOverlayProps {
-  text:     string;
-  position: OverlayPosition;
-}
-
-const TextOverlay: React.FC<TextOverlayProps> = ({ text, position }) => {
-  if (!text || position === "none") return null;
-
-  return (
-    <AbsoluteFill style={{ pointerEvents: "none" }}>
-      <div style={{ position: "absolute", maxWidth: "84%", ...OVERLAY_POSITION_STYLE[position] }}>
-        <span
-          style={{
-            color:       "#ffffff",
-            fontSize:    56,
-            fontFamily:  "Arial, Helvetica, sans-serif",
-            fontWeight:  "bold",
-            lineHeight:  1.25,
-            textShadow:  "2px 2px 6px rgba(0,0,0,0.85)",
-          }}
-        >
-          {text}
-        </span>
-      </div>
-    </AbsoluteFill>
-  );
-};
-
-// Placeholder rendered for generated_visual beats until AI-image generation lands
-const GeneratedPlaceholder: React.FC = () => (
-  <AbsoluteFill style={{ ...DARK_FALLBACK_STYLE, display: "flex", alignItems: "center", justifyContent: "center" }}>
-    <span
-      style={{
-        color:         "rgba(255,255,255,0.25)",
-        fontSize:      28,
-        fontFamily:    "Arial, Helvetica, sans-serif",
-        letterSpacing: 4,
-        textTransform: "uppercase",
-      }}
-    >
-      Generated visual
-    </span>
-  </AbsoluteFill>
-);
+  url === "__text_card__";
 
 export const MediaSection: React.FC<Props> = ({ section, crossfadeIn = 0, incomingTransition }) => {
   const { fps } = useVideoConfig();
@@ -127,19 +71,6 @@ export const MediaSection: React.FC<Props> = ({ section, crossfadeIn = 0, incomi
   const sectionDurFrames = Math.max(1, Math.round((sectionDurMs / 1000) * fps));
 
   const transitionStyle = getTransitionStyle(incomingTransition, frame, crossfadeIn);
-  const overlayPosition = section.overlay_position ?? "none";
-
-  // Phase 14.10b — secondary double-text mechanism fix: this section's own
-  // Sequence is mounted `crossfadeIn` frames before its narration actually
-  // starts (so the IMAGE can crossfade in smoothly — see the from/dur math
-  // in MainVideo.tsx/Short.tsx). During those crossfadeIn frames the
-  // PREVIOUS section's MediaSection (and its own overlay, if any) is still
-  // mounted too. Delaying this section's own TextOverlay/TextCard until its
-  // crossfade-in has finished means at most one section's overlay is ever
-  // visible at a time — it does not, by itself, touch the primary
-  // overlay-vs-global-subtitles fix (see StandardSubtitles.tsx/
-  // KaraokeSubtitles.tsx + computeOverlaySuppressWindows() below).
-  const showOverlay = frame >= crossfadeIn;
 
   // Resolve clips — fall back to legacy single-media fields when clips array is absent
   const clips: ClipData[] =
@@ -149,39 +80,12 @@ export const MediaSection: React.FC<Props> = ({ section, crossfadeIn = 0, incomi
 
   const validClips = clips.filter((c) => !isFallback(c.url));
 
-  // No usable local media — render a background placeholder + any overlay text.
-  //
-  // Differentiation by visual_type:
-  //   text_card         -> TextCard.tsx fallback when background generation failed
-  //   generated_visual  → GeneratedPlaceholder (AI generation pending in MODE A,
-  //                        or a hard MEDIA_FAILED beat that slipped through in MODE B)
-  //   text_overlay      → dark background; render props must carry a local Flux/cache
-  //                        asset or an approved local fallback. Remote URLs are forbidden before render.
-  //   anything else     → GeneratedPlaceholder (shouldn't happen in a healthy pipeline)
+  // No usable local media — a plain dark fill, with NO placeholder text
+  // (subtitles-only rendering). This state should be rare: Agent 4 fills
+  // hard-failed beats from neighbouring images, and Agent 5's missing-media
+  // blocker stops renders where too many beats have no media.
   if (validClips.length === 0) {
-    const effectiveOverlayPos = overlayPosition === "none" ? "center" : overlayPosition;
-    if (section.visual_type === "text_card") {
-      return showOverlay ? (
-        <TextCard
-          text={section.overlay_text ?? ""}
-          style={transitionStyle}
-          cardStyle={section.text_card_style}
-        />
-      ) : null;
-    }
-    if (section.visual_type === "text_overlay") {
-      return (
-        <AbsoluteFill style={{ ...DARK_FALLBACK_STYLE, ...transitionStyle }}>
-          {showOverlay && <TextOverlay text={section.overlay_text ?? ""} position={effectiveOverlayPos} />}
-        </AbsoluteFill>
-      );
-    }
-    return (
-      <AbsoluteFill style={transitionStyle}>
-        <GeneratedPlaceholder />
-        {showOverlay && <TextOverlay text={section.overlay_text ?? ""} position={overlayPosition} />}
-      </AbsoluteFill>
-    );
+    return <AbsoluteFill style={{ ...DARK_FALLBACK_STYLE, ...transitionStyle }} />;
   }
 
   // Each clip gets an equal share of the section, with an overlap for crossfade
@@ -210,17 +114,6 @@ export const MediaSection: React.FC<Props> = ({ section, crossfadeIn = 0, incomi
           </Sequence>
         );
       })}
-      {showOverlay && (
-        section.visual_type === "text_card" ? (
-          <TextCard
-            text={section.overlay_text ?? ""}
-            cardStyle={section.text_card_style}
-            transparentBackground
-          />
-        ) : (
-          <TextOverlay text={section.overlay_text ?? ""} position={overlayPosition} />
-        )
-      )}
     </AbsoluteFill>
   );
 };
@@ -319,63 +212,6 @@ export function transitionDurationFrames(transition?: Transition): number {
     case "none":
     default:             return 0;
   }
-}
-
-// ── Subtitle/overlay collision fix (Phase 14.10b) ──────────────────────────
-// A section renders its own TextOverlay/TextCard for its full on-screen
-// window (see the validClips>0/validClips===0 branches above). The
-// composition-level subtitle component (StandardSubtitles/KaraokeSubtitles)
-// has no awareness of that on its own — see
-// code_report/phase_14_10_double_subtitle_investigation.md for the
-// confirmed root cause. The helpers below let MainVideo.tsx/Short.tsx
-// compute, directly from the same `sections` prop MediaSection itself reads,
-// which absolute-time windows should suppress the global subtitle layer.
-
-export interface OverlaySuppressWindow {
-  start_ms: number;
-  end_ms:   number;
-}
-
-/**
- * True when this section will render its own per-section text layer
- * (TextOverlay or TextCard) for its on-screen window — i.e. design-decision
- * condition from Phase 14.10b: "overlay_text non-empty and
- * overlay_position != 'none', OR visual_type === 'text_card'".
- */
-export function sectionHasActiveOverlay(section: SectionData): boolean {
-  if (section.visual_type === "text_card") return true;
-  const text     = section.overlay_text ?? "";
-  const position = section.overlay_position ?? "none";
-  return Boolean(text) && position !== "none";
-}
-
-/**
- * Windows (in the same absolute ms coordinate space as the subtitle
- * captions passed to StandardSubtitles/KaraokeSubtitles) during which the
- * global subtitle layer should render nothing, because this section's own
- * overlay is showing instead. `offsetMs` lets Short.tsx shift these into
- * the same Short-local coordinate space it already shifts captions into
- * (via KaraokeSubtitlesWithOffset) — pass `start_ms` there; MainVideo.tsx
- * passes no offset (sections are already absolute there).
- *
- * Uses each section's nominal (non-crossfade-extended) audio_start_ms/
- * audio_end_ms — deliberately not adjusted for the secondary crossfade-in
- * delay above (`showOverlay`), so a section's suppression window can begin
- * very slightly before its own overlay actually becomes visible. This is an
- * intentional, documented trade-off (code_report/phase_14_10b_subtitle_overlay_collision_fix.md):
- * a few-hundred-ms window with neither subtitles nor an overlay visible is
- * preferable to ever risking the two layers colliding again.
- */
-export function computeOverlaySuppressWindows(
-  sections: SectionData[],
-  offsetMs: number = 0,
-): OverlaySuppressWindow[] {
-  return sections
-    .filter(sectionHasActiveOverlay)
-    .map((s) => ({
-      start_ms: s.audio_start_ms - offsetMs,
-      end_ms:   s.audio_end_ms   - offsetMs,
-    }));
 }
 
 /** Per-frame entrance style for the given incoming transition. */

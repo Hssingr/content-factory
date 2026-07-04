@@ -49,8 +49,9 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.services.local_run_paths import ensure_run_dirs
+from app.services.video_sections import load_video_sections
 from app.models import (
-    AudioFile, Channel, ChannelConfig, Content, Script, VideoRender, VideoSection,
+    AudioFile, Channel, ChannelConfig, Content, Script, VideoRender,
 )
 from app.agents.agent5_render.services.subtitles import (
     build_standard_subtitles, build_karaoke_subtitles,
@@ -70,12 +71,11 @@ class VerifyFailedError(RuntimeError):
     """Post-render verification caught a broken render (black frames / silence / bad resolution)."""
 
 
-# text_card sentinel — set on a beat's media_url when Flux generation failed.
+# Legacy sentinel that pre-subtitles-only code wrote onto a beat's media_url
+# when Flux generation failed. New code never produces it (text cards are
+# removed — audit G-0/G-8; hard failures are filled by neighbour reuse in
+# Agent 4). Kept only to recognize and neutralize legacy persisted rows.
 _TEXT_CARD_SENTINEL = "__text_card__"
-
-# Beats whose media_url is one of these are not counted as "real media" for the
-# technical-blocker check (but text_card is a valid visual type, not an error).
-_PLACEHOLDER_URLS: frozenset[str] = frozenset({_TEXT_CARD_SENTINEL})
 
 # Technical-blocker threshold: >50% of beats with no real media → block render.
 _MISSING_MEDIA_BLOCK_RATIO = 0.50
@@ -163,7 +163,7 @@ def run_video_generation(content_id: uuid.UUID, db: Session) -> bool:
     # rows (no storyboard, no Flux, no remap, no Agent 4 fallback).
     beats_by_lang: dict[str, list[dict]] = {}
     for language in scripts_by_lang:
-        sections = _load_video_sections(content_id, language, db)
+        sections = load_video_sections(content_id, language, db)
         if sections:
             beats_by_lang[language] = sections
 
@@ -253,47 +253,9 @@ def run_video_generation(content_id: uuid.UUID, db: Session) -> bool:
 
 # ── Read-only VideoSection access ──────────────────────────────────────────────
 # Agent 5 only reads this table. Persistence (delete-then-insert) is owned by
-# Agent 4 — see app.agents.agent4_visuals.services.visual_orchestrator.
-
-def _load_video_sections(
-    content_id: uuid.UUID, language: str, db: Session
-) -> list[dict]:
-    """Load VideoSection rows Agent 4 already persisted, as render-ready dicts."""
-    rows = (
-        db.query(VideoSection)
-        .filter(
-            VideoSection.content_id == content_id,
-            VideoSection.language   == language,
-        )
-        .order_by(VideoSection.section_order)
-        .all()
-    )
-    result = []
-    for s in rows:
-        section: dict = {
-            "section_order":        s.section_order,
-            "beat_order":           s.section_order,
-            "script_text":          s.script_text,
-            "audio_start_ms":       s.audio_start_ms,
-            "audio_end_ms":         s.audio_end_ms,
-            "duration_sec":         (s.audio_end_ms - s.audio_start_ms) / 1000,
-            "flux_prompt":          s.flux_prompt or "",
-            "effect":               s.effect or "slow_zoom",
-            "color_grade":          s.color_grade or "desaturated",
-            "beat_intensity":       s.beat_intensity or "medium",
-            "suggested_duration_sec": s.suggested_duration_sec,
-            "media_strategy":       s.media_strategy or "flux_generated",
-            "text_card_style":      s.text_card_style or "default",
-        }
-        if s.generation_prompt:
-            try:
-                extras = json.loads(s.generation_prompt)
-            except (json.JSONDecodeError, TypeError):
-                extras = {}
-            if isinstance(extras, dict):
-                section.update(extras)
-        result.append(section)
-    return result
+# Agent 4 — see app.agents.agent4_visuals.services.visual_orchestrator. The
+# loader itself is shared (roadmap 6.5 / audit AR-2) — see
+# app.services.video_sections.load_video_sections.
 
 
 # ── Per-language render pass ───────────────────────────────────────────────────
@@ -331,9 +293,11 @@ def _process_language(
 ) -> bool:
     """Run the render pipeline for one language using pre-generated beat images.
 
-    Beats arrive with ``media_url`` already set to a local cache/ path (or
-    ``"__text_card__"`` for fallback). This function handles: per-language
-    section DB storage, subtitles, Remotion props, render, and verification.
+    Beats arrive with ``media_url`` already set to a local cache/ path
+    (subtitles-only rendering — the retired ``__text_card__`` sentinel is
+    never produced by live code; a legacy row carrying it is normalized to
+    ``""`` on load and owned by the missing-media blocker). This function
+    handles subtitles, Remotion props, render, and verification.
 
     For parent content (``is_short_episode=False``): renders MainVideo.tsx at
     1920×1080 (16:9) and stores ``VideoRender(format="main")``.
@@ -404,7 +368,7 @@ def _process_language(
     standard_subs = build_standard_subtitles(audio.whisper_transcript or [])
     karaoke_subs  = build_karaoke_subtitles(audio.whisper_transcript or [], active_color=karaoke_color)
 
-    blockers = _collect_technical_blockers(beats, standard_subs, audio)
+    blockers = _collect_technical_blockers(beats, standard_subs, audio, is_short_episode=is_short_episode)
     if blockers:
         logger.error(
             "Agent5 [FAIL] language=%s content=%s status=RENDER_BLOCKED "
@@ -431,7 +395,12 @@ def _process_language(
             "start_ms":     0,
             "end_ms":       audio.duration_ms,
             "sections":     beats,
-            "part_label":   _build_part_label(language, part_number, short_total_parts or 1),
+            # Subtitles-only rendering: the part label is Remotion-drawn text,
+            # so it ships only when the operator explicitly opts in.
+            "part_label":   (
+                _build_part_label(language, part_number, short_total_parts or 1)
+                if settings.short_part_label_enabled else ""
+            ),
             "total_parts":  short_total_parts or 1,
         }
         props_path = build_short_props(
@@ -568,6 +537,7 @@ def _collect_technical_blockers(
     sections: list[dict],
     standard_subs: list[dict],
     audio: "AudioFile",
+    is_short_episode: bool = False,
 ) -> list[str]:
     """Return technical blocker descriptions preventing a viable render.
 
@@ -575,6 +545,9 @@ def _collect_technical_blockers(
         sections:     Beat/section dicts after Flux generation.
         standard_subs: Standard subtitle chunks.
         audio:        AudioFile ORM record.
+        is_short_episode: True for Standalone short architecture child Short
+            content — gates the empty-transcript blocker below (roadmap 3.9 /
+            audit A-3, exec-10).
 
     Returns:
         List of blocker strings (empty = render is viable).
@@ -585,12 +558,12 @@ def _collect_technical_blockers(
         blockers.append("no_beats")
         return blockers
 
-    # Beats without real media. The text-card sentinel remains a valid explicit
-    # fallback when Flux background generation failed.
+    # Beats without real media. Subtitles-only rendering: the legacy
+    # text-card sentinel is NOT real media — a beat carrying it would render
+    # as a bare dark frame, so it counts toward the missing-media blocker.
     no_media = sum(
         1 for s in sections
-        if (s.get("media_url", "") or "") != _TEXT_CARD_SENTINEL
-        and not (s.get("media_url", "") or "").startswith("cache/")
+        if not (s.get("media_url", "") or "").startswith("cache/")
     )
     if no_media / len(sections) > _MISSING_MEDIA_BLOCK_RATIO:
         blockers.append(
@@ -600,6 +573,18 @@ def _collect_technical_blockers(
     whisper = audio.whisper_transcript or []
     if not standard_subs and whisper:
         blockers.append("no_captions (Whisper transcript present but caption build failed)")
+
+    # Roadmap 3.9 / audit A-3, exec-10: an empty Whisper transcript (both
+    # transcription engines exhausted — see agent3/services/whisper.py) was
+    # previously tolerated silently, shipping a captionless vertical Short on
+    # platforms where ~80% of viewers watch muted. Scoped to Shorts only —
+    # parent long-form rendering already has its own extensive fallback
+    # timing machinery and is not blocked by this check.
+    if is_short_episode and not whisper:
+        blockers.append(
+            "empty_whisper_transcript_short (Shorts require captions — both "
+            "transcription engines failed or returned no words)"
+        )
 
     return blockers
 

@@ -212,7 +212,7 @@ def _handle_manual_story_input(
         ``(chat_id, message_text)`` to send, or ``None`` on unrecoverable error.
     """
     from app.agents.agent2_discovery.services.fetcher import fetch_batch
-    from app.agents.agent2_discovery.services.story import Story
+    from app.agents.agent2_discovery.services.story import MAX_SOURCE_EXCERPT_CHARS, Story
     from app.scheduler import celery_app
 
     user: User | None = db.get(User, channel.user_id)
@@ -289,7 +289,7 @@ def _handle_manual_story_input(
     content.source_url    = story.url
     content.content_hash  = story.content_hash
     content.title         = story.title
-    content.source_excerpt = story.body[:8000] if story.body else None
+    content.source_excerpt = story.body[:MAX_SOURCE_EXCERPT_CHARS] if story.body else None
     content.status        = "PENDING_APPROVAL"
     content.story_blueprint = {}
 

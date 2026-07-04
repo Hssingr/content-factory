@@ -196,9 +196,14 @@ def _assert_local_url(url: str, context: str) -> None:
 def _section_for_remotion(s: dict) -> dict:
     """Return only the keys Remotion needs from a section dict.
 
-    Under the Flux architecture every section has exactly one image in ``media_url``
-    (a local cache/ path). Deliberate text-card beats also carry a generated
-    background image; Remotion renders the readable text overlay itself.
+    Subtitles-only rendering (audit G-0/G-8): Remotion draws no text except
+    the subtitle track, so no overlay/text-card key is emitted — the retired
+    ``overlay_text`` fallback to ``script_text`` once made a failed beat
+    display its entire narration as a giant card, which is exactly the class
+    of defect this rule removes. Every section is an image beat; a legacy
+    ``text_card`` visual_type or ``__text_card__`` sentinel from old rows is
+    normalized to a plain image section (with no media, if none exists — the
+    render blocker owns that failure).
 
     All media URLs are validated to be local paths (not http/https) before the
     props are written. This invariant is also enforced by _audit_props_for_remote_urls
@@ -207,9 +212,10 @@ def _section_for_remotion(s: dict) -> dict:
     Raises:
         ValueError: If media_url is a remote http URL.
     """
-    order      = s.get("section_order", 0)
+    order       = s.get("section_order", 0)
     visual_type = s.get("visual_type", "b-roll")
-    is_text_card = visual_type == "text_card"
+    if visual_type == "text_card":
+        visual_type = "b-roll"
 
     media_url = s.get("media_url", "")
     if media_url and media_url != "__text_card__":
@@ -218,10 +224,6 @@ def _section_for_remotion(s: dict) -> dict:
         media_url = ""
     media_type = s.get("media_type", "image")
     clips = [{"url": media_url, "type": media_type}] if media_url else []
-
-    if is_text_card and media_url:
-        media_type = "image"
-        clips = [{"url": media_url, "type": media_type}]
 
     return {
         "order":          order,
@@ -235,7 +237,4 @@ def _section_for_remotion(s: dict) -> dict:
         "visual_intent":      s.get("visual_intent", ""),
         "visual_type":        visual_type,
         "transition_to_next": s.get("transition_to_next", "cut"),
-        "overlay_text":       s.get("overlay_text", "") or s.get("script_text", ""),
-        "overlay_position":   s.get("overlay_position", "none"),
-        "text_card_style":    s.get("text_card_style", "default"),
     }

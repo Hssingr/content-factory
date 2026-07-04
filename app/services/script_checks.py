@@ -54,6 +54,8 @@ _ABBREVIATION_RE = re.compile(r"\b(Dr|vs|etc)\.\s|\be\.g\.\s", re.I)
 _FORBIDDEN_CHARS_RE = re.compile(r"[()/%&]")
 _DIGIT_RUN_RE = re.compile(r"\b\d{2,}\b")
 _CAPS_WORD_RE = re.compile(r"\b[A-Z]{3,}\b")
+_WORD_TOKEN_RE = re.compile(r"[^\W_]+(?:['’][^\W_]+)?", re.UNICODE)
+_ENGLISH_STYLE_LANGS = {"source", "en", "en-us", "en-gb", "en-ca", "en-au"}
 
 # Split candidates for long-sentence backstop (natural break points only)
 # Group 1 alternative: semicolon or em-dash with trailing space
@@ -114,10 +116,21 @@ def _strip_markers(text: str) -> str:
     return _MARKER_LINE_RE.sub("", text).strip()
 
 
+def _word_tokens(text: str) -> list[str]:
+    """Return Unicode-aware word tokens, excluding punctuation/underscores."""
+    return _WORD_TOKEN_RE.findall(text or "")
+
+
 def _word_count(text: str) -> int:
-    """Count words after stripping section-marker lines."""
+    """Count Unicode word tokens after stripping section-marker lines."""
     cleaned = _strip_markers(text)
-    return len(cleaned.split()) if cleaned else 0
+    return len(_word_tokens(cleaned)) if cleaned else 0
+
+
+def _uses_english_style_rules(language: str | None) -> bool:
+    """True for English/source scripts where English phrase checks are meaningful."""
+    lang = (language or "").strip().casefold().replace("_", "-")
+    return lang in _ENGLISH_STYLE_LANGS or lang.startswith("en-")
 
 
 _ABBREV_SENTINEL = "⁠"  # word joiner — invisible, never appears in scripts
@@ -208,7 +221,7 @@ def split_long_sentences(text: str, max_words: int = 18) -> str:
         out: list[str] = []
 
         for sent in sentences:
-            if len(sent.split()) <= max_words:
+            if len(_word_tokens(sent)) <= max_words:
                 out.append(sent)
                 continue
 
@@ -216,7 +229,7 @@ def split_long_sentences(text: str, max_words: int = 18) -> str:
             if not m:
                 logger.debug(
                     "split_long_sentences: no split point for %d-word sentence — leaving: %.80r",
-                    len(sent.split()), sent,
+                    len(_word_tokens(sent)), sent,
                 )
                 out.append(sent)
                 continue
@@ -236,7 +249,7 @@ def split_long_sentences(text: str, max_words: int = 18) -> str:
             total_fixed += 1
             logger.debug(
                 "split_long_sentences: split %d-word sentence at pos %d",
-                len(sent.split()), m.start(),
+                len(_word_tokens(sent)), m.start(),
             )
 
         trailing = line[len(stripped):]   # restore original line ending (\n etc.)
@@ -392,13 +405,60 @@ def check_minimum_length(voice_script: str, language: str, script_format: str = 
     return []
 
 
+# Roadmap 3.8 / audit G-7: the quality gate had no upper bound at all before
+# this — a real production script reached 1,799 words against the documented
+# 1,200-1,600 word spec (§9.3's _BASE_YOUTUBE_LONG_FORM_NATIVE), producing a
+# 13.3-minute video instead of the intended ~9-10 minutes. Tolerance keeps a
+# script that is only slightly over target from tripping a rewrite loop for a
+# negligible overage; anything past the ceiling is a real spec violation.
+_MAX_LONG_FORM_WORDS = 1600
+_MAX_LONG_FORM_TOLERANCE = 150  # ceiling: 1,750 words
+_MAX_SHORT_FORM_WORDS = 700     # matches _BASE_SHORT_FORM_NATIVE's own 420-700 word spec
+_MAX_SHORT_FORM_TOLERANCE = 100  # ceiling: 800 words
+
+
+def check_maximum_length(voice_script: str, language: str, script_format: str = "youtube_long") -> list[dict]:
+    """Check that the voice script does not exceed its format's calibrated maximum.
+
+    Args:
+        voice_script:  The voice script text.
+        language:      BCP-47 language code used to tag issues.
+        script_format: Format key — "youtube_long" caps at 1,600 (+150 tolerance)
+                       words; any other format caps at 700 (+100 tolerance) words.
+
+    Returns:
+        List with one MAJOR Issue dict if over the calibrated ceiling, else empty list.
+    """
+    is_long_form = script_format == "youtube_long"
+    max_words = _MAX_LONG_FORM_WORDS if is_long_form else _MAX_SHORT_FORM_WORDS
+    tolerance = _MAX_LONG_FORM_TOLERANCE if is_long_form else _MAX_SHORT_FORM_TOLERANCE
+    ceiling = max_words + tolerance
+
+    wc = _word_count(voice_script)
+    if wc > ceiling:
+        return [{
+            "language": language, "severity": "MAJOR", "category": "maximum_length",
+            "description": (
+                f"voice_script has {wc} words — exceeds the {ceiling}-word calibrated "
+                f"ceiling for {script_format} (target {max_words} words)."
+            ),
+            "suggestion": (
+                f"Cut {wc - max_words} words by removing redundant recap, tightening "
+                f"description, or trimming the least essential sentences. Do not remove "
+                f"required structural markers or narrative content needed for coherence."
+            ),
+            "offending_text": None,
+        }]
+    return []
+
+
 def check_length_coherence(scripts_by_lang: dict[str, dict]) -> list[dict]:
     """Flag languages whose word count deviates >30% from the cross-language median.
 
     PLACEMENT CONSTRAINT: must only be called after ALL language scripts (source +
     all native adaptations) are fully assembled. Never call at section level or before
-    multilingual generation completes. The caller is run_deterministic_checks() which
-    is invoked from generate_multilingual_scripts() after all Script rows are persisted.
+    multilingual generation completes. The caller is generate_multilingual_scripts()
+    (agent2/scripts.py), invoked once after all Script rows are persisted.
 
     Args:
         scripts_by_lang: Dict mapping language code → {"voice_script": str}.
@@ -474,14 +534,16 @@ def check_hook_quality(voice_script: str, language: str) -> list[dict]:
         return []
 
     problems: list[str] = []
-    word_count = len(first_sentence.split())
+    word_count = len(_word_tokens(first_sentence))
     if word_count > 15:
         problems.append(f"{word_count} words (max 15)")
 
-    for opener in _FORBIDDEN_OPENERS:
-        if first_sentence.lower().startswith(opener.lower()):
-            problems.append(f"forbidden opener '{opener.strip()}'")
-            break
+    if _uses_english_style_rules(language):
+        first_sentence_lower = first_sentence.casefold()
+        for opener in _FORBIDDEN_OPENERS:
+            if first_sentence_lower.startswith(opener.casefold()):
+                problems.append(f"forbidden opener '{opener.strip()}'")
+                break
 
     if not problems:
         return []
@@ -525,7 +587,7 @@ def check_tts_compliance(voice_script: str, language: str) -> list[dict]:
             break
 
         # 1. Sentence too long
-        words = sentence.split()
+        words = _word_tokens(sentence)
         if len(words) > 18:
             issues.append({
                 "language": language, "severity": "MAJOR", "category": "tts_compliance",
@@ -625,7 +687,9 @@ def check_retention_structure(
             if not sentences:
                 continue
             last_sent = sentences[-1].strip()
-            first_words = " ".join(last_sent.lower().split()[:4])
+            if not _uses_english_style_rules(language):
+                continue
+            first_words = " ".join(token.casefold() for token in _word_tokens(last_sent)[:4])
             for starter in _SUMMARY_STARTERS:
                 if first_words.startswith(starter):
                     issues.append({
@@ -645,7 +709,7 @@ def check_retention_structure(
                     break
         else:
             # Short-form: ≤130 words OR has a question mark
-            wc = len(body.split())
+            wc = _word_count(body)
             if wc > 130 and "?" not in body:
                 issues.append({
                     "language": language, "severity": "MINOR",
@@ -814,10 +878,11 @@ def check_sentence_rhythm_variance(section_text: str, language: str = "source") 
 
 
 def detect_generic_documentary_phrases(voice_script: str) -> list[dict]:
-    """Scan an assembled voice_script for banned generic AI-documentary phrases.
+    """Scan an English/source voice_script for banned generic AI-documentary phrases.
 
-    Pure Python — no I/O, no Claude calls. The caller is responsible for
-    logging at WARNING level. This function never blocks or fails the pipeline.
+    Pure Python — no I/O, no Claude calls. The phrase list is intentionally
+    English-only; callers should use it only for source/English scripts. The caller is
+    responsible for logging at WARNING level. This function never blocks or fails the pipeline.
 
     Args:
         voice_script: Fully assembled voice_script (markers included are fine).
@@ -837,50 +902,3 @@ def detect_generic_documentary_phrases(voice_script: str) -> list[dict]:
                 break  # report the phrase once — first sentence containing it
     return hits
 
-
-# ── Orchestrator ──────────────────────────────────────────────────────────────
-
-def run_deterministic_checks(
-    scripts_by_lang: dict[str, dict],
-    script_format: str = "youtube_long",
-) -> dict[str, list[dict]]:
-    """Run all deterministic checks on the full set of scripts.
-
-    Runs per-language checks (completeness, minimum_length, hook_quality,
-    tts_compliance, retention_structure) and the cross-language check
-    (length_coherence) on every language simultaneously.
-
-    Args:
-        scripts_by_lang: Dict mapping language code → {"voice_script": str}.
-        script_format:   Format key from channel_config (default "youtube_long").
-
-    Returns:
-        Dict mapping language code → list of Issue dicts (MAJOR and MINOR combined).
-        Every language in scripts_by_lang has an entry (possibly empty).
-    """
-    issues_by_lang: dict[str, list[dict]] = {lang: [] for lang in scripts_by_lang}
-
-    # ── Per-language checks ───────────────────────────────────────────────────
-    for lang, scripts in scripts_by_lang.items():
-        voice_script = scripts.get("voice_script", "")
-
-        issues_by_lang[lang].extend(check_completeness(voice_script, lang))
-        issues_by_lang[lang].extend(check_minimum_length(voice_script, lang, script_format))
-        issues_by_lang[lang].extend(check_hook_quality(voice_script, lang))
-        issues_by_lang[lang].extend(check_tts_compliance(voice_script, lang))
-        issues_by_lang[lang].extend(check_retention_structure(voice_script, lang, script_format))
-
-        n_major = sum(1 for i in issues_by_lang[lang] if i["severity"] == "MAJOR")
-        n_minor = sum(1 for i in issues_by_lang[lang] if i["severity"] == "MINOR")
-        logger.info(
-            "Deterministic checks lang=%s: %d MAJOR, %d MINOR",
-            lang, n_major, n_minor,
-        )
-
-    # ── Cross-language check ──────────────────────────────────────────────────
-    for issue in check_length_coherence(scripts_by_lang):
-        lang = issue["language"]
-        if lang in issues_by_lang:
-            issues_by_lang[lang].append(issue)
-
-    return issues_by_lang

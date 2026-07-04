@@ -6,7 +6,6 @@ import re
 from elevenlabs.types import VoiceSettings
 
 from app.services.elevenlabs_client import get_client
-from app.services.claude_client import call_claude
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +37,7 @@ _TRAILING_SPACE_RE = re.compile(r"[ \t]+\n")
 # ── Sentence-length limiter ───────────────────────────────────────────────────
 _LONG_SENTENCE_RE  = re.compile(r"(?<=[.!?])\s+")
 _MAX_SENTENCE_WORDS = 18
-_WORD_TOKEN_RE = re.compile(r"[A-Za-z0-9]+(?:['][A-Za-z0-9]+)?")
+_WORD_TOKEN_RE = re.compile(r"[^\W_]+(?:['’][^\W_]+)?", re.UNICODE)
 _PAUSE_TAG_RE = re.compile(r"\[\s*dramatic\s+pause\s*\]", re.IGNORECASE)
 
 # Natural split points inside a long sentence — tried in order of preference.
@@ -107,7 +106,13 @@ _CARTESIA_SONIC3_EMOTION_MAP: dict[str, str] = {
 }
 _CARTESIA_LEGACY_MODELS = {"sonic-2"}
 _CARTESIA_GENERATION_CONFIG_MODELS = {"sonic-3", "sonic-3.5"}
-_CLIMAX_SECTION_WORDS = {"reveal", "climax", "truth", "answer", "found", "discovered", "discovery", "horror", "vanished", "missing"}
+_CLIMAX_SECTION_WORDS = {
+    "reveal", "reveals", "revealed", "revealing",
+    "expose", "exposes", "exposed", "exposing",
+    "uncover", "uncovers", "uncovered", "uncovering",
+    "climax", "truth", "answer", "found", "discovered", "discovery",
+    "horror", "vanished", "missing",
+}
 
 # ── Emotion VoiceSettings presets ────────────────────────────────────────────
 # stability        : 0–1  (higher = more consistent; lower = more expressive)
@@ -172,7 +177,7 @@ def _split_long_sentence(sentence: str) -> str:
     Returns:
         Original sentence, or two shorter sentences separated by a period and space.
     """
-    words = sentence.split()
+    words = _WORD_TOKEN_RE.findall(sentence)
     if len(words) <= _MAX_SENTENCE_WORDS:
         return sentence
 
@@ -232,25 +237,6 @@ _REVEAL_CONSEQUENCE_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
-
-_PAUSE_MARKER_REVIEW_PROMPT_VERSION = "1.0"
-_PAUSE_MARKER_REVIEW_SYSTEM_PROMPT = f"""
-PROMPT_VERSION {_PAUSE_MARKER_REVIEW_PROMPT_VERSION}
-
-You are reviewing pause-marker placement only.
-
-Hard rules:
-- Keep every word exactly the same.
-- Do not rewrite the narration.
-- Do not improve style, rhythm, clarity, or emotion.
-- Do not add, remove, replace, reorder, or paraphrase any narration words.
-- Do not change sentence order.
-- Do not change meaning.
-- Only remove, move, or adjust punctuation/pause markers when clearly misplaced.
-- Pause markers include ellipses ("..."), em-dashes, bracketed dramatic-pause tags,
-  or similar punctuation-only pause cues.
-- Return only the corrected narration text.
-""".strip()
 
 
 def _candidate_sentence_from_reveal_match(match: re.Match) -> str:
@@ -355,63 +341,12 @@ def _apply_pacing_markers(
             text = "[dramatic pause] " + text.lstrip()
             insertion_count += 1
         else:
-            first_end = re.search(r"(?<=[a-z])\.\s", text)
-            if first_end and len(text[: first_end.start()].split()) <= 12:
+            first_end = re.search(r"(?<=[^\W_])\.\s", text, re.UNICODE)
+            if first_end and len(_WORD_TOKEN_RE.findall(text[: first_end.start()])) <= 12:
                 text = text[: first_end.start()] + "..." + text[first_end.end() - 1:]
                 insertion_count += 1
 
     return text
-
-
-def _narration_word_sequence(text: str) -> list[str]:
-    """Return narration words only, ignoring pause-marker syntax."""
-    without_pause_tags = _PAUSE_TAG_RE.sub(" ", text)
-    return _WORD_TOKEN_RE.findall(without_pause_tags)
-
-
-def _has_same_narration_words(before: str, after: str) -> bool:
-    """True only when the reviewed text keeps the exact narration word sequence."""
-    return _narration_word_sequence(before) == _narration_word_sequence(after)
-
-
-def _review_pause_marker_placement(text: str) -> str:
-    """Optionally let Haiku adjust pause punctuation, guarded by a word-sequence check."""
-    if not text.strip():
-        return text
-
-    try:
-        reviewed = call_claude(
-            _PAUSE_MARKER_REVIEW_SYSTEM_PROMPT,
-            text,
-            max_tokens=2048,
-            task="pause_marker_review",
-        )
-    except Exception as exc:
-        logger.warning(
-            "TTS_PAUSE_REVIEW_FALLBACK: Claude review failed; using deterministic text. error=%s",
-            type(exc).__name__,
-        )
-        return text
-
-    if not isinstance(reviewed, str) or not reviewed.strip():
-        logger.warning(
-            "TTS_PAUSE_REVIEW_FALLBACK: invalid Claude review output; using deterministic text."
-        )
-        return text
-
-    reviewed = reviewed.strip()
-    if not _has_same_narration_words(text, reviewed):
-        logger.warning(
-            "TTS_PAUSE_REVIEW_FALLBACK: Claude review changed narration words; using deterministic text."
-        )
-        return text
-
-    if reviewed != text:
-        logger.info(
-            "TTS_PAUSE_REVIEW_ACCEPTED: punctuation-only pause-marker adjustment accepted."
-        )
-    return reviewed
-
 
 def _normalize_voice_script(text: str) -> str:
     """Clean up narration text so it reads naturally when spoken by TTS.
@@ -523,8 +458,8 @@ def _select_section_delivery(section_context: dict, channel_emotion: str, channe
     if section_type == "outro":
         return {"emotion": "somber", "speed_profile": "slow", "source": "section", "reason": "outro"}
     if section_type == "body":
-        title = (section_context.get("section_title") or "").lower()
-        title_words = set(re.findall(r"[a-z]+", title))
+        title = (section_context.get("section_title") or "").casefold()
+        title_words = set(_WORD_TOKEN_RE.findall(title))
         if title_words & _CLIMAX_SECTION_WORDS:
             return {"emotion": "scared", "speed_profile": "fast", "source": "section", "reason": "climax_title"}
         index = section_context.get("section_index")
@@ -830,15 +765,12 @@ def prepare_script_for_tts(
     # 4. Pacing cues — reveal pauses for all tones, slow-open for long-form dramatic tones
     text = _apply_pacing_markers(text, tone=tone or "", tts_model=tts_model, is_short_episode=is_short_episode)
 
-    # 5. Optional Haiku review; Python accepts only punctuation/pause-marker-only changes
-    text = _review_pause_marker_placement(text)
-
-    # 6. Diagnostic log
-    original_words = len(voice_script.split())
-    prepared_words = len(text.split())
+    # 5. Diagnostic log
+    original_words = len(_WORD_TOKEN_RE.findall(voice_script))
+    prepared_words = len(_WORD_TOKEN_RE.findall(text))
     sentences_out  = _LONG_SENTENCE_RE.split(text)
     avg_sent_len   = (
-        sum(len(s.split()) for s in sentences_out) / len(sentences_out)
+        sum(len(_WORD_TOKEN_RE.findall(s)) for s in sentences_out) / len(sentences_out)
         if sentences_out else 0.0
     )
     pause_points = text.count("...")
@@ -1038,7 +970,7 @@ def _generate_cartesia_audio(voice_script: str, channel_voice, is_short_episode:
         logger.debug(
             "Cartesia chunk %d/%d: section=%s words=%d chars=%d emotion=%s speed_profile=%s",
             i + 1, len(prepared_units), unit.get("section_label") or "unmarked",
-            len(prepared.split()), len(prepared), unit["delivery"]["emotion"], unit["delivery"]["speed_profile"],
+            len(_WORD_TOKEN_RE.findall(prepared)), len(prepared), unit["delivery"]["emotion"], unit["delivery"]["speed_profile"],
         )
 
         request_kwargs = _build_cartesia_tts_kwargs(
@@ -1086,10 +1018,8 @@ def generate_audio(voice_script: str, channel_voice, is_short_episode: bool = Fa
       INTRO/early-body/climax-titled/OUTRO sections get different delivery;
       missing metadata falls back to the channel-level emotion/speed_profile.
       Each unit's text is run through ``prepare_script_for_tts()`` — which
-      itself applies deterministic pacing (gated by reveal-beat evidence,
-      Phase 11.5) followed by one optional Haiku pause-marker review pass
-      that Python accepts only if it changes no narration words (Phase 11.2)
-      — before being sent as its own Cartesia request. The request payload
+      itself applies deterministic pacing gated by reveal-beat evidence before
+      being sent as its own Cartesia request. The request payload
       shape is chosen per ``tts_model``: the legacy shape for ``sonic-2``, or
       the ``generation_config`` shape (numeric speed, single emotion value,
       optional pronunciation dictionary id) for ``sonic-3``/``sonic-3.5``
@@ -1100,9 +1030,8 @@ def generate_audio(voice_script: str, channel_voice, is_short_episode: bool = Fa
     ElevenLabs path (provider="elevenlabs"):
       Model, VoiceSettings, and chunking (char-limit-based, not section-unit)
       derived from ``channel_voice``. Each chunk still passes through
-      ``prepare_script_for_tts()``, so Phase 11.5's reveal-gated pacing and
-      Phase 11.2's optional Haiku pause review apply here too — Phase 11.3's
-      Cartesia request-shape branching and Phase 11.4's section-aware delivery
+      ``prepare_script_for_tts()``, so Phase 11.5's reveal-gated pacing applies
+      here too — Phase 11.3's Cartesia request-shape branching and Phase 11.4's section-aware delivery
       selection do not, since this path has no Cartesia request to build and
       uses ElevenLabs's own native text-conditioning (``previous_text`` /
       ``next_text``) for cross-chunk continuity instead (skipped for
@@ -1172,7 +1101,7 @@ def generate_audio(voice_script: str, channel_voice, is_short_episode: bool = Fa
         logger.debug(
             "ElevenLabs TTS chunk %d/%d: voice_id=%s emotion=%s words=%d model=%s chars=%d",
             i + 1, len(prepared_chunks), voice_id, emotion,
-            len(prepared.split()), model_id, len(prepared),
+            len(_WORD_TOKEN_RE.findall(prepared)), model_id, len(prepared),
         )
 
         kwargs: dict = dict(

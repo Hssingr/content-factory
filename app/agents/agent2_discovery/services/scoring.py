@@ -45,7 +45,7 @@ _DIMENSION_WEIGHTS: dict[str, float] = {
     "emotional_specificity":           0.04,
     "title_thumbnail_potential":       0.03,
     "visual_range":                    0.03,
-    "stock_media_feasibility":         0.02,
+    "image_generation_feasibility":    0.02,
     "short_form_clip_potential":       0.01,
     "comment_section_potential":       0.01,
     "series_potential":                0.01,
@@ -66,7 +66,7 @@ _MIN_TITLE_THUMBNAIL         = 50
 _MIN_OPENING_SCENE           = 50
 _MIN_THUMBNAIL_STRENGTH      = 50
 _MIN_VISUAL_RANGE            = 35
-_MIN_STOCK_FEASIBILITY       = 40
+_MIN_IMAGE_GENERATION_FEASIBILITY = 40
 
 
 
@@ -104,6 +104,8 @@ def score_story_assessment(assessment: dict) -> dict:
         raw_scores["emotional_stakes"] = raw_scores["emotional_tension"]
     if "controversy_or_debate_potential" in raw_scores and "conflict_or_contradiction" not in raw_scores:
         raw_scores["conflict_or_contradiction"] = raw_scores["controversy_or_debate_potential"]
+    if "stock_media_feasibility" in raw_scores and "image_generation_feasibility" not in raw_scores:
+        raw_scores["image_generation_feasibility"] = raw_scores["stock_media_feasibility"]
 
     def _extract(val) -> int:
         """Accept either plain int (new batch schema) or {"score": int} (legacy)."""
@@ -142,7 +144,7 @@ def score_story_assessment(assessment: dict) -> dict:
     _check("opening_scene_strength",       _MIN_OPENING_SCENE)
     _check("thumbnail_strength",           _MIN_THUMBNAIL_STRENGTH)
     _check("visual_range",                 _MIN_VISUAL_RANGE)
-    _check("stock_media_feasibility",      _MIN_STOCK_FEASIBILITY)
+    _check("image_generation_feasibility", _MIN_IMAGE_GENERATION_FEASIBILITY)
 
     return {
         "overall_score": overall_score,

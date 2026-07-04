@@ -10,10 +10,7 @@ import {
   useVideoConfig,
 } from "remotion";
 import { KaraokeSubtitles } from "../components/KaraokeSubtitles";
-import {
-  MediaSection, transitionDurationFrames, computeOverlaySuppressWindows,
-  OverlaySuppressWindow,
-} from "../components/MediaSection";
+import { MediaSection, transitionDurationFrames } from "../components/MediaSection";
 import { ShortProps } from "../types";
 
 // ── Metadata ──────────────────────────────────────────────────────────────────
@@ -51,12 +48,6 @@ export const Short: React.FC<ShortProps> = ({
 
   const mainFrames = Math.ceil((duration_ms / 1000) * fps);
 
-  // Phase 14.10b — windows where a section's own overlay is showing; shifted
-  // into Short-local ms (offset by start_ms) the same way captions already
-  // are via KaraokeSubtitlesWithOffset below, so both stay in the same
-  // coordinate space.
-  const suppressWindows = computeOverlaySuppressWindows(sections, start_ms);
-
   return (
     <AbsoluteFill style={{ backgroundColor: "#0a0a0f" }}>
 
@@ -92,7 +83,6 @@ export const Short: React.FC<ShortProps> = ({
           <KaraokeSubtitlesWithOffset
             captions={subtitles.captions}
             startMs={start_ms}
-            suppressWindows={suppressWindows}
           />
         </Sequence>
       )}
@@ -108,13 +98,12 @@ export const Short: React.FC<ShortProps> = ({
 // ── KaraokeSubtitles wrapper — shifts absolute timings to Short-local ─────────
 
 interface KaraokeOffsetProps {
-  captions:        ShortProps["subtitles"]["captions"];
-  startMs:         number;
-  suppressWindows?: OverlaySuppressWindow[];
+  captions: ShortProps["subtitles"]["captions"];
+  startMs:  number;
 }
 
 const KaraokeSubtitlesWithOffset: React.FC<KaraokeOffsetProps> = ({
-  captions, startMs, suppressWindows,
+  captions, startMs,
 }) => {
   const shifted = captions.map((chunk) => ({
     ...chunk,
@@ -126,10 +115,7 @@ const KaraokeSubtitlesWithOffset: React.FC<KaraokeOffsetProps> = ({
       e: w.e - startMs,
     })),
   }));
-  // suppressWindows is already Short-local (computeOverlaySuppressWindows()
-  // was called with offsetMs=start_ms in Short's render) — passed straight
-  // through, not shifted again.
-  return <KaraokeSubtitles captions={shifted} suppressWindows={suppressWindows} />;
+  return <KaraokeSubtitles captions={shifted} />;
 };
 
 // ── Part label overlay ────────────────────────────────────────────────────────
@@ -155,8 +141,8 @@ const PartLabel: React.FC<PartLabelProps> = ({ label }) => {
       <div
         style={{
           position:        "absolute",
-          top:             48,
-          right:           48,
+          top:             96,
+          left:            48,
           backgroundColor: "rgba(0,0,0,0.65)",
           borderRadius:    8,
           padding:         "8px 18px",
@@ -166,7 +152,7 @@ const PartLabel: React.FC<PartLabelProps> = ({ label }) => {
         <span
           style={{
             color:       "#FFD700",
-            fontSize:    36,
+            fontSize:    32,
             fontFamily:  "Arial, Helvetica, sans-serif",
             fontWeight:  "bold",
             textShadow:  "1px 1px 3px rgba(0,0,0,0.9)",

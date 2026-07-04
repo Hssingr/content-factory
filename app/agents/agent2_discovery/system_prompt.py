@@ -2,10 +2,16 @@ import logging
 import re
 
 from app.services.claude_client import call_claude, call_claude_structured, parse_claude_json
+from app.agents.agent2_discovery.services.story import MAX_SOURCE_EXCERPT_CHARS
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "4.3"  # v4.3: removed RETENTION_BLOCK (dead since v4.0 — zero callers,
+PROMPT_VERSION = "4.4"  # v4.4: spoken-video delivery rules (present tense, direct address,
+                        # contractions, read-aloud test) added to _SECTION_GENERATION_SYSTEM_PROMPT
+                        # and _SHORT_EPISODE_SYSTEM_PROMPT; blueprint gained midpoint_retention_trap,
+                        # wired as a targeted MUST-deliver-now constraint on the one body section
+                        # nearest the story's halfway point (roadmap 4.3 / audit S-3, §6).
+                        # v4.3: removed RETENTION_BLOCK (dead since v4.0 — zero callers,
                         # confirmed by Phase 12.3 audit and re-verified by Phase 12.5's
                         # repo-wide reference sweep). Its "youtube_long" mini-hook/tension
                         # guidance was already duplicated, in substance, inline in
@@ -410,6 +416,12 @@ Rules:
   escalations — each one advancing toward the final_payoff. Minimum 2 required.
 - final_payoff: what is revealed or resolved at the end of the story.
 - comment_trigger: ≤20 words, ends with a question mark, forces a strong viewer opinion.
+- midpoint_retention_trap: one concrete reveal or counterintuitive fact from the story,
+  placed at roughly the halfway point of the video, that recontextualizes what the viewer
+  thought they knew so far and gives them a new reason to keep watching. This is distinct
+  from final_payoff (the ending) and from the existing 25%/60% mini-hook cadence — it is
+  the single highest-leverage retention beat in the middle of the story. Must be a real
+  fact grounded in the story body, never invented or vague.
 - suggested_section_count: number of BODY sections (not counting INTRO and OUTRO).
   Between 2 and 5. Python may override.
 - suggested_title: YouTube title derived from hook. 60–70 chars. SEO-optimized.
@@ -430,11 +442,12 @@ _STORY_BLUEPRINT_SCHEMA: dict = {
         "major_turns":            {"type": "array", "items": {"type": "string"}, "minItems": 2},
         "final_payoff":           {"type": "string"},
         "comment_trigger":        {"type": "string"},
+        "midpoint_retention_trap": {"type": "string"},
         "suggested_section_count": {"type": "integer", "minimum": 2, "maximum": 5},
         "suggested_title":        {"type": "string"},
     },
     "required": [
-        "hook", "central_question", "major_turns", "final_payoff",
+        "hook", "central_question", "major_turns", "final_payoff", "midpoint_retention_trap",
         "comment_trigger", "suggested_section_count", "suggested_title",
     ],
 }
@@ -478,7 +491,7 @@ def generate_story_blueprint(
         f"Script format: {script_format}\n\n"
         f"Story title: {story.title}\n"
         f"Story URL: {story.url}\n\n"
-        f"Story body:\n{story.body[:8000]}"
+        f"Story body:\n{story.body[:MAX_SOURCE_EXCERPT_CHARS]}"
     )
     result = call_claude_structured(
         task="story_blueprint",
@@ -486,7 +499,11 @@ def generate_story_blueprint(
         user_message=user_message,
         schema_name="story_blueprint",
         input_schema=_STORY_BLUEPRINT_SCHEMA,
-        max_tokens=768,
+        # 768 was sized before midpoint_retention_trap became a required
+        # schema field (roadmap 4.3); a detailed 5-turn blueprint can approach
+        # that. max_tokens is a cap, not a spend — 1024 is free headroom
+        # against a truncated forced-tool-use response.
+        max_tokens=1024,
     )
     major_turns = result.get("major_turns") or []
     if len(major_turns) < 2:
@@ -502,10 +519,24 @@ def generate_story_blueprint(
 # ── Section Generation ───────────────────────────────────────────────────────
 
 _SECTION_GENERATION_SYSTEM_PROMPT = """\
-You are a YouTube documentary scriptwriter generating ONE narration section at a time.
+You are a YouTube scriptwriter generating ONE narration section at a time for a spoken,
+direct-to-viewer video — not a book or a documentary voiceover read from a page.
 
 Your output is a single narration block — not a complete script. Every word will be read
 aloud by a TTS voice directly to the viewer.
+
+Spoken-video delivery — apply to every section, this is heard, not read silently as prose:
+  - Default to present tense for story events wherever the story allows it ("She opens the
+    door", "He turns around") instead of past tense — present tense creates immediacy and
+    matches how YouTube/social narration is actually delivered. Use past tense only when
+    present tense would be confusing or factually wrong (e.g. explicit historical framing).
+  - Speak directly to the viewer at least once per section: address them as "you", or ask
+    a rhetorical question aimed at the viewer ("Would you have noticed it?"), not at the void.
+  - Use contractions wherever natural speech would ("doesn't", "can't", "it's", "wasn't") —
+    formal, contraction-free prose reads as robotic when a TTS voice speaks it aloud.
+  - Read-aloud test: before finalizing a sentence, check whether a person would actually
+    say it out loud telling this story to a friend. If a sentence sounds like it belongs in
+    a book rather than in spoken conversation, rewrite it in spoken language.
 
 Blueprint constraint: every section must advance the story toward the final_payoff and
 comment_trigger provided in the blueprint. Do not veer off-story.
@@ -677,6 +708,7 @@ def generate_section(
     future_uncovered_turns: list[str] | None = None,
     visual_style: str = "",
     image_style: str = "",
+    midpoint_retention_trap: str | None = None,
 ) -> dict:
     """Generate a single narration section guided by the story blueprint.
 
@@ -699,6 +731,12 @@ def generate_section(
                                  one turn". None for INTRO and OUTRO (no constraint).
         future_uncovered_turns:  Remaining uncovered turns after the primary. Injected as
                                  "do NOT fully resolve these yet". None if ≤1 turn remains.
+        midpoint_retention_trap: The blueprint's midpoint_retention_trap text, passed only
+                                 for the one body section the caller has identified as the
+                                 approximate halfway point (roadmap 4.3 / audit S-3, §6).
+                                 Injected as a MUST-deliver-now clause. None for every other
+                                 section — this is a targeted, one-section directive on top
+                                 of the passive full-blueprint JSON already in every call.
 
     Returns:
         Dict with script_text, summary, reveals, open_questions, suggests_outro, visual_intent.
@@ -727,7 +765,7 @@ def generate_section(
         f"Blueprint:\n{blueprint_json}\n\n"
         f"Prior sections summary:\n{prior_json}\n\n"
         f"Visual concepts already used (do not repeat):\n{avoid_json}\n\n"
-        f"Story source (for fact-grounding):\n{story.body[:4000]}\n\n"
+        f"Story source (for fact-grounding):\n{story.body[:MAX_SOURCE_EXCERPT_CHARS]}\n\n"
         f"Now generate: {label}"
     )
     if primary_required_turn:
@@ -738,6 +776,12 @@ def generate_section(
         future_json = json.dumps(future_uncovered_turns, ensure_ascii=False)
         user_message += (
             f"\n\nFuture turns (do NOT fully resolve these yet — they belong in later sections):\n{future_json}"
+        )
+    if midpoint_retention_trap:
+        user_message += (
+            f"\n\nThis section is the story's midpoint — it MUST deliver the blueprint's "
+            f"midpoint_retention_trap now, as a reveal or counterintuitive fact that "
+            f"recontextualizes what the viewer thought they knew so far:\n{midpoint_retention_trap}"
         )
     if override_instruction:
         user_message += f"\n\nIMPORTANT: {override_instruction}"
@@ -1275,7 +1319,7 @@ _SCORING_DIMENSIONS: list[str] = [
     "emotional_specificity",
     "title_thumbnail_potential",
     "visual_range",
-    "stock_media_feasibility",
+    "image_generation_feasibility",
     "short_form_clip_potential",
     "comment_section_potential",
     "series_potential",
@@ -1323,7 +1367,7 @@ Dimensions:
   emotional_specificity          Emotion tied to a specific named person in a specific moment?
   title_thumbnail_potential      Compelling title AND strong nameable visual together?
   visual_range                   Multiple genuinely different visual contexts/environments?
-  stock_media_feasibility        Visuals findable on Pexels/Unsplash/Pixabay stock platforms?
+  image_generation_feasibility   Key moments can be depicted as distinct concrete generated images?
   short_form_clip_potential      At least one self-contained punchy 30–90 second moment?
   comment_section_potential      Viewers feel compelled to share strong opinions?
   series_potential               Could generate multiple follow-up videos?
@@ -1565,8 +1609,9 @@ def auto_correct_script(
         language:        BCP-47 language code (e.g. "fr", "en").
         channel:         Channel ORM object (provides niche and tone).
         script_format:   Format key from ``channel_config.script_format``.
-        source_excerpt:  Up to 8 000 chars of original source material — injected into
-                         the correction prompt when minimum_length is among the issues.
+        source_excerpt:  Up to MAX_SOURCE_EXCERPT_CHARS of original source material —
+                         injected into the correction prompt when minimum_length is
+                         among the issues.
         tts_model:       TTS model ID for this language's voice.
         tts_provider:    TTS provider ("cartesia" | "elevenlabs").
 
@@ -1597,7 +1642,7 @@ def auto_correct_script(
         user_message += (
             f"\n\nSource material excerpt — use this to expand the script. "
             f"Do not invent any fact not present here or already in the script:\n"
-            f"{source_excerpt[:8000]}"
+            f"{source_excerpt[:MAX_SOURCE_EXCERPT_CHARS]}"
         )
 
     correction_prompt = with_tts_block(_CORRECTION_SYSTEM_PROMPT_BASE, tts_provider, tts_model)
@@ -1651,7 +1696,8 @@ Rules:
 - total_parts must be between 3 and 5 (inclusive). Never fewer than 3 or more than 5.
 - Split at narrative boundaries: reveals, discoveries, reversals, or escalations.
   Never split primarily by time — narrative logic is paramount.
-- Each part covers 60–90 seconds of spoken narration (≈160–250 words at Cartesia sonic-2 speed).
+- Each part covers 60–90 seconds of spoken narration (≈125–180 words at the measured
+  ~120 wpm real Short narration rate).
 - Every part must be independently watchable: a viewer who starts on Part 3 must
   understand the situation from the first 5 seconds without having seen prior parts.
 - opening_hook: 1–2 sentences, each ≤15 words, drops the viewer mid-story. No recap.
@@ -1759,16 +1805,24 @@ You are writing a TikTok episode script — one standalone part of a multi-part 
 This is NOT a cut of a longer video. It is purpose-built for TikTok.
 
 Rules:
-- Hard limit: 160–250 words. Count every word in voice_script before returning.
-  If voice_script exceeds 250 words, cut it — remove the least essential sentences
-  until the count is at or below 250. Do not return until the word count is ≤250.
-  (250 words ≈ 83 seconds at Cartesia sonic-2 speed.)
+- Hard limit: 125–180 words. Count every word in voice_script before returning.
+  If voice_script exceeds 180 words, cut it — remove the least essential sentences
+  until the count is at or below 180. Do not return until the word count is ≤180.
+  (180 words ≈ 90 seconds at the measured ~120 wpm real Short narration rate —
+  calibrated from production audio, not the raw "words per second" of the TTS voice.)
 - First sentence = the opening_hook from the plan, ≤15 words, drops viewer mid-story.
   If opening_hook or main_reveal already states the story's final answer or mechanism,
   do not restate it that directly here — open on the situation or the unresolved
   question instead, and let the reveal land later in this part's narration.
 - Re-hook every 7–10 seconds of narration: a new curiosity gap, question, or micro-reveal
   that prevents the viewer from scrolling away. These are not summaries — they are new angles.
+- Spoken-video delivery — this is heard, not read silently as prose: default to present
+  tense for story events wherever the story allows it ("She opens the door" not "She
+  opened"); speak directly to the viewer at least once as "you" or with a rhetorical
+  question aimed at them; use contractions wherever natural speech would ("doesn't",
+  "can't", "it's") — formal, contraction-free prose reads as robotic when spoken by TTS;
+  read-aloud test — if a sentence wouldn't be said out loud telling this story to a
+  friend, rewrite it in spoken language.
 - Provide only the minimum context needed for a first-time viewer to immediately understand the current situation.
   Do not summarize earlier events unless they are essential to understand the current reveal.
 - One clear main_reveal per part — this is the payoff for watching this part
@@ -1899,7 +1953,7 @@ You are a short-form retention editor reviewing a standalone TikTok/Reels/Shorts
 script BEFORE production. This is flat, unsectioned narration for a vertical short video —
 NOT a long-form documentary script. Do not judge it as one, and do not expect or require
 [INTRO], [SECTION N], [OUTRO] markers, or a 1200-1600 word arc. A complete, well-made Short
-is 160-250 words of flat narration.
+is 125-180 words of flat narration.
 
 Your only job: decide whether a first-time viewer, with no knowledge of any other part of
 this story, would watch this Short all the way through — or whether it needs a rewrite.

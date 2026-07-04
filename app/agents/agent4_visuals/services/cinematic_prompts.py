@@ -1,40 +1,25 @@
-"""Cinematic Flux prompt construction from Agent 4 visual bible data."""
+"""Additive visual-bible continuity enrichment for Flux prompts.
+
+The storyboard model owns the actual image prompt. This module only supplies a
+compact visual-bible context for storyboard generation and appends matched
+character/location continuity clauses after validation. It must never replace a
+Claude-authored ``flux_prompt`` with a template or add negative-prompt text to
+the positive prompt sent to Flux.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
 
-_DEFAULT_NEGATIVES = (
-    "text",
-    "watermark",
-    "logo",
-    "subtitles",
-    "captions",
-    "UI",
-    "extra fingers",
-    "distorted hands",
-    "distorted face",
-    "duplicate limbs",
-    "deformed anatomy",
-    "low quality",
-    "blurry",
-    "overexposed",
-    "underexposed",
-    "cartoonish unless configured",
-    "random character changes",
-)
 _REQUIRED_METADATA_FIELDS = (
-    "shot_type",
-    "subject",
-    "action",
-    "emotion",
-    "environment",
-    "camera",
-    "lighting",
-    "composition",
+    "base_prompt_preserved",
+    "continuity_tags",
+    "visual_bible_refs",
 )
 _GENERIC_TERMS = ("scary", "creepy", "spooky", "horror scene", "dark room", "hallway at night")
+_MAX_COMPACT_ITEMS = 6
+_MAX_COMPACT_LIST_ITEMS = 4
 
 
 @dataclass(frozen=True)
@@ -42,6 +27,66 @@ class PromptQualityIssue:
     severity: str
     code: str
     message: str
+
+
+def compact_visual_bible_for_storyboard(visual_bible: dict | None) -> dict:
+    """Return a compact JSON-safe bible subset for ``generate_storyboard_batch``.
+
+    The subset gives Claude stable continuity inputs before it writes each
+    ``flux_prompt``. It intentionally omits global ``camera_language`` and
+    ``lighting_rules`` arrays: Phase 2.1 moves style guidance upstream, but does
+    not permit verbatim camera/lighting-rule injection into final prompts.
+    """
+    bible = visual_bible or {}
+    if not isinstance(bible, dict) or not bible:
+        return {}
+
+    global_style = _dict_or_empty(bible.get("global_style"))
+    config = _dict_or_empty(bible.get("config_context"))
+    compact: dict[str, Any] = {}
+
+    summary = str(bible.get("story_visual_summary") or "").strip()
+    if summary:
+        compact["story_visual_summary"] = summary
+
+    style = {
+        key: value
+        for key, value in {
+            "visual_style": _first(config.get("visual_style"), global_style.get("visual_style")),
+            "image_style": _first(config.get("image_style"), global_style.get("image_style")),
+            "realism_level": global_style.get("realism_level"),
+            "color_grade": _first(config.get("video_color_grade"), global_style.get("color_grade")),
+            "composition_rules": _compact_list(global_style.get("composition_rules")),
+        }.items()
+        if value
+    }
+    if style:
+        compact["style"] = style
+
+    characters = [_compact_character(item) for item in _dict_items(bible.get("characters"))]
+    characters = [item for item in characters if item]
+    if characters:
+        compact["characters"] = characters[:_MAX_COMPACT_ITEMS]
+
+    locations = [_compact_location(item) for item in _dict_items(bible.get("locations"))]
+    locations = [item for item in locations if item]
+    if locations:
+        compact["locations"] = locations[:_MAX_COMPACT_ITEMS]
+
+    motifs = [_compact_motif(item) for item in _dict_items(bible.get("recurring_motifs"))]
+    motifs = [item for item in motifs if item]
+    if motifs:
+        compact["recurring_motifs"] = motifs[:_MAX_COMPACT_ITEMS]
+
+    first15 = _compact_list(bible.get("first_15_seconds_rules"))
+    if first15:
+        compact["first_15_seconds_rules"] = first15
+
+    forbidden = _compact_list(bible.get("forbidden_generic_shots"))
+    if forbidden:
+        compact["forbidden_generic_shots"] = forbidden
+
+    return compact
 
 
 def build_cinematic_flux_prompt(
@@ -54,13 +99,12 @@ def build_cinematic_flux_prompt(
     beat_index: int,
     total_beats: int,
 ) -> dict:
-    """Return cinematic prompt data for one visual beat without side effects."""
+    """Return additive continuity data for one beat without side effects."""
+    del channel_config_context, content_kind, total_beats
+
     bible = visual_bible or {}
-    config = channel_config_context or _dict_or_empty(bible.get("config_context"))
-    global_style = _dict_or_empty(bible.get("global_style"))
     characters = [c for c in bible.get("characters", []) if isinstance(c, dict)]
     locations = [loc for loc in bible.get("locations", []) if isinstance(loc, dict)]
-    motifs = [motif for motif in bible.get("recurring_motifs", []) if isinstance(motif, dict)]
 
     text_context = " ".join([
         str(narration_excerpt or ""),
@@ -75,113 +119,44 @@ def build_cinematic_flux_prompt(
 
     character = _match_by_text(characters, text_context, ("name", "role", "continuity_tags"))
     location = _match_by_text(locations, text_context, ("name", "description", "continuity_tags"))
-    motif = _match_by_text(motifs, text_context, ("name", "visual_description", "symbolic_role"))
 
-    is_first_15 = int(beat.get("audio_start_ms") or 0) < 15000
-    shot_type = _shot_type(beat, beat_index, is_first_15)
-    subject = _subject(beat, character, narration_excerpt)
-    action = _short_phrase(beat.get("visual_intent") or narration_excerpt or beat.get("script_text") or "tense story moment", 150)
-    emotion = _emotion(beat, narration_excerpt)
-    environment = _environment(beat, location)
-    camera = _join_unique([
-        shot_type,
-        _first(global_style.get("lens_style"), "35mm natural perspective"),
-        *_list(global_style.get("camera_language"))[:2],
-    ])
-    lighting = _join_unique([
-        _first(location.get("lighting") if location else None, ""),
-        *_list(global_style.get("lighting_rules"))[:2],
-        _first(config.get("video_color_grade"), global_style.get("color_grade"), beat.get("color_grade"), "muted cinematic color grade"),
-    ])
-    composition = _join_unique([
-        *_list(global_style.get("composition_rules"))[:2],
-        "clear subject silhouette",
-        "image-generation-ready realistic composition",
-    ])
-    continuity_tags = _continuity_tags(character, location)
-    visual_bible_refs = _visual_bible_refs(character, location, motif)
-
-    first_15_guidance = ""
-    if is_first_15:
-        first_15_guidance = " First 15 seconds: " + _join_unique(_list(bible.get("first_15_seconds_rules"))[:3])
-
-    style_bits = _join_unique([
-        _first(global_style.get("realism_level"), "photorealistic"),
-        _first(config.get("visual_style"), global_style.get("visual_style")),
-        _first(config.get("image_style"), global_style.get("image_style")),
-    ])
-    character_detail = _character_detail(character)
-    location_detail = _location_detail(location)
-    motif_detail = _motif_detail(motif)
-    negative_prompt = build_negative_prompt(visual_bible=bible)
-
-    prompt_parts = [
-        f"Cinematic {shot_type} of {subject}",
-        f"action: {action}",
-        f"emotion: {emotion}",
-        f"environment: {environment}",
-        character_detail,
-        location_detail,
-        motif_detail,
-        f"camera/lens/framing: {camera}",
-        f"lighting/color grade: {lighting}",
-        f"composition: {composition}",
-        f"style: {style_bits}",
-    ]
-    if continuity_tags:
-        prompt_parts.append("continuity tags: " + ", ".join(continuity_tags))
-    if first_15_guidance:
-        prompt_parts.append(first_15_guidance.strip())
-
-    flux_prompt = ". ".join(part.strip(" .") for part in prompt_parts if part).strip() + "."
-    flux_prompt += " Avoid: " + negative_prompt + "."
+    base_prompt = " ".join(str(beat.get("flux_prompt") or "").split()).strip()
+    continuity_clauses = _continuity_clauses(character, location)
+    flux_prompt = _append_continuity_clauses(base_prompt, continuity_clauses)
 
     metadata = {
-        "shot_type": shot_type,
-        "subject": subject,
-        "action": action,
-        "emotion": emotion,
-        "environment": environment,
-        "camera": camera,
-        "lighting": lighting,
-        "composition": composition,
-        "continuity_tags": continuity_tags,
-        "visual_bible_refs": visual_bible_refs,
-        "is_first_15_seconds": is_first_15,
+        "base_prompt_preserved": True,
+        "continuity_tags": _continuity_tags(character, location),
+        "visual_bible_refs": _visual_bible_refs(character, location),
+        "is_first_15_seconds": int(beat.get("audio_start_ms") or 0) < 15000,
         "character": character.get("name", "") if character else str(beat.get("character") or ""),
         "location": location.get("name", "") if location else str(beat.get("location") or ""),
+        "continuity_clause_count": len(continuity_clauses),
+        "beat_index": beat_index,
     }
     prompt_data = {
         "flux_prompt": flux_prompt,
-        "negative_prompt": negative_prompt,
         "prompt_metadata": metadata,
+        "continuity_clauses": continuity_clauses,
     }
     prompt_data["prompt_quality_warnings"] = [issue.__dict__ for issue in inspect_flux_prompt_quality(prompt_data)]
     return prompt_data
 
 
-def build_negative_prompt(*, visual_bible: dict | None) -> str:
-    bible = visual_bible or {}
-    rules = _list(bible.get("negative_prompt_rules"))
-    forbidden = _list(bible.get("forbidden_generic_shots"))
-    return ", ".join(_dedupe([*rules, *_DEFAULT_NEGATIVES, *forbidden]))
-
-
 def inspect_flux_prompt_quality(prompt_data: dict) -> list[PromptQualityIssue]:
     prompt = str(prompt_data.get("flux_prompt") or "")
     metadata = _dict_or_empty(prompt_data.get("prompt_metadata"))
-    negative_prompt = str(prompt_data.get("negative_prompt") or "")
     issues: list[PromptQualityIssue] = []
-    if len(prompt.split()) < 35:
-        issues.append(PromptQualityIssue("WARNING", "prompt_too_short", "Flux prompt has fewer than 35 words."))
+    if len(prompt.split()) < 20:
+        issues.append(PromptQualityIssue("WARNING", "prompt_too_short", "Flux prompt has fewer than 20 words."))
     for field in _REQUIRED_METADATA_FIELDS:
-        if not str(metadata.get(field) or "").strip():
+        if field not in metadata:
             issues.append(PromptQualityIssue("WARNING", f"missing_{field}", f"Prompt metadata missing {field}."))
-    if not metadata.get("continuity_tags"):
-        issues.append(PromptQualityIssue("WARNING", "missing_continuity_tags", "No continuity tags included."))
-    if not negative_prompt.strip():
-        issues.append(PromptQualityIssue("WARNING", "missing_negative_prompt", "No negative prompt supplied."))
     lowered = prompt.lower()
+    if "avoid:" in lowered:
+        issues.append(PromptQualityIssue("WARNING", "positive_prompt_contains_avoid", "Flux prompt contains an Avoid clause."))
+    if prompt.lstrip().lower().startswith("cinematic"):
+        issues.append(PromptQualityIssue("WARNING", "prompt_starts_with_cinematic", "Flux prompt starts with forbidden mood shorthand."))
     if any(term in lowered for term in _GENERIC_TERMS) and len(prompt.split()) < 60:
         issues.append(PromptQualityIssue("WARNING", "generic_horror_prompt", "Prompt may still be generic horror shorthand."))
     if metadata.get("is_first_15_seconds") is None:
@@ -196,7 +171,6 @@ def apply_cinematic_prompts_to_beats(
     content_kind: str,
 ) -> list[dict]:
     total = len(beats)
-    config = _dict_or_empty((visual_bible or {}).get("config_context"))
     enriched: list[dict] = []
     for index, beat in enumerate(beats):
         new_beat = dict(beat)
@@ -204,19 +178,48 @@ def apply_cinematic_prompts_to_beats(
             beat=new_beat,
             narration_excerpt=str(new_beat.get("script_text") or ""),
             visual_bible=visual_bible,
-            channel_config_context=config,
+            channel_config_context=None,
             content_kind=content_kind,
             beat_index=index,
             total_beats=total,
         )
         new_beat["flux_prompt"] = prompt_data["flux_prompt"]
-        new_beat["negative_prompt"] = prompt_data["negative_prompt"]
         metadata = prompt_data["prompt_metadata"]
-        for key, value in metadata.items():
-            new_beat[key] = value
+        for key in (
+            "continuity_tags",
+            "visual_bible_refs",
+            "is_first_15_seconds",
+            "character",
+            "location",
+            "continuity_clause_count",
+            "base_prompt_preserved",
+        ):
+            new_beat[key] = metadata.get(key)
         new_beat["prompt_quality_warnings"] = prompt_data["prompt_quality_warnings"]
         enriched.append(new_beat)
     return enriched
+
+
+def _continuity_clauses(character: dict, location: dict) -> list[str]:
+    clauses: list[str] = []
+    character_detail = _character_detail(character)
+    if character_detail:
+        clauses.append("Character continuity: " + character_detail)
+    location_detail = _location_detail(location)
+    if location_detail:
+        clauses.append("Location continuity: " + location_detail)
+    return clauses
+
+
+def _append_continuity_clauses(base_prompt: str, clauses: list[str]) -> str:
+    prompt = base_prompt
+    lowered = prompt.lower()
+    for clause in clauses:
+        if clause.lower() not in lowered:
+            separator = " " if prompt.endswith(".") or not prompt else ". "
+            prompt = f"{prompt}{separator}{clause}." if prompt else f"{clause}."
+            lowered = prompt.lower()
+    return prompt
 
 
 def _match_by_text(items: list[dict], text_context: str, keys: tuple[str, ...]) -> dict:
@@ -233,77 +236,76 @@ def _match_by_text(items: list[dict], text_context: str, keys: tuple[str, ...]) 
     return {}
 
 
-def _shot_type(beat: dict, beat_index: int, is_first_15: bool) -> str:
-    visual_type = str(beat.get("visual_type") or "").replace("_", " ")
-    category = str(beat.get("visual_category") or "")
-    if beat.get("shot_type"):
-        return str(beat["shot_type"])
-    if is_first_15 or beat_index == 0:
-        return "high-tension establishing close-up"
-    if category == "person":
-        return "medium close-up"
-    if visual_type and visual_type not in {"b-roll", "generated visual"}:
-        return visual_type
-    return "cinematic medium shot"
-
-
-def _subject(beat: dict, character: dict, narration_excerpt: str) -> str:
-    if character:
-        clothing = _first(character.get("clothing"), "")
-        appearance = _first(character.get("appearance"), "")
-        return _join_unique(["the same " + str(character.get("name", "character")), appearance, clothing])
-    if beat.get("subject"):
-        return str(beat["subject"])
-    return _short_phrase(beat.get("visual_intent") or narration_excerpt or "the story subject", 100)
-
-
-def _emotion(beat: dict, narration_excerpt: str) -> str:
-    text = " ".join([str(beat.get("visual_intent") or ""), narration_excerpt]).lower()
-    for word in ("dread", "fear", "confusion", "grief", "anger", "shock", "relief", "suspicion"):
-        if word in text:
-            return word
-    intensity = str(beat.get("beat_intensity") or "medium")
-    return "controlled dread" if intensity == "high" else "tense uncertainty"
-
-
-def _environment(beat: dict, location: dict) -> str:
-    if location:
-        return _join_unique([location.get("name", ""), location.get("description", ""), location.get("time_of_day", "")])
-    return _first(beat.get("location"), beat.get("environment"), "story-specific environment")
-
-
 def _character_detail(character: dict) -> str:
     if not character:
         return ""
-    return _join_unique(["character continuity", character.get("appearance"), character.get("clothing"), character.get("body_language")])
+    return _join_unique([
+        _first(character.get("name"), "same character"),
+        character.get("appearance"),
+        character.get("clothing"),
+        character.get("body_language"),
+    ])
 
 
 def _location_detail(location: dict) -> str:
     if not location:
         return ""
     details = location.get("recurring_details") if isinstance(location.get("recurring_details"), list) else []
-    return _join_unique(["location continuity", location.get("description"), location.get("color_palette"), *details[:3]])
+    return _join_unique([
+        _first(location.get("name"), "same location"),
+        location.get("description"),
+        location.get("time_of_day"),
+        location.get("color_palette"),
+        *details[:3],
+    ])
 
 
-def _motif_detail(motif: dict) -> str:
-    if not motif:
-        return ""
-    return _join_unique(["recurring motif", motif.get("name"), motif.get("visual_description"), motif.get("usage_rule")])
-
-
-def _visual_bible_refs(character: dict, location: dict, motif: dict) -> list[str]:
+def _visual_bible_refs(character: dict, location: dict) -> list[str]:
     refs: list[str] = []
     if character.get("name"):
         refs.append(f"character:{character['name']}")
     if location.get("name"):
         refs.append(f"location:{location['name']}")
-    if motif.get("name"):
-        refs.append(f"motif:{motif['name']}")
     return refs
 
 
 def _continuity_tags(character: dict, location: dict) -> list[str]:
     return _dedupe([*_list(character.get("continuity_tags")), *_list(location.get("continuity_tags"))])
+
+
+def _compact_character(item: dict) -> dict:
+    return _drop_empty({
+        "name": item.get("name"),
+        "role": item.get("role"),
+        "appearance": item.get("appearance"),
+        "clothing": item.get("clothing"),
+        "body_language": item.get("body_language"),
+        "continuity_tags": _compact_list(item.get("continuity_tags")),
+    })
+
+
+def _compact_location(item: dict) -> dict:
+    return _drop_empty({
+        "name": item.get("name"),
+        "description": item.get("description"),
+        "time_of_day": item.get("time_of_day"),
+        "color_palette": item.get("color_palette"),
+        "recurring_details": _compact_list(item.get("recurring_details")),
+        "continuity_tags": _compact_list(item.get("continuity_tags")),
+    })
+
+
+def _compact_motif(item: dict) -> dict:
+    return _drop_empty({
+        "name": item.get("name"),
+        "visual_description": item.get("visual_description"),
+        "symbolic_role": item.get("symbolic_role"),
+        "usage_rule": item.get("usage_rule"),
+    })
+
+
+def _dict_items(value: Any) -> list[dict]:
+    return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
 
 
 def _dict_or_empty(value: Any) -> dict:
@@ -318,9 +320,13 @@ def _list(value: Any) -> list[str]:
     return []
 
 
+def _compact_list(value: Any) -> list[str]:
+    return _list(value)[:_MAX_COMPACT_LIST_ITEMS]
+
+
 def _first(*values: Any) -> str:
     for value in values:
-        if value not in (None, ""):
+        if value not in (None, "", []):
             return str(value)
     return ""
 
@@ -340,8 +346,5 @@ def _dedupe(values: list[str]) -> list[str]:
     return result
 
 
-def _short_phrase(value: Any, limit: int) -> str:
-    text = " ".join(str(value or "").split())
-    if len(text) <= limit:
-        return text
-    return text[: limit - 1].rstrip() + "…"
+def _drop_empty(data: dict) -> dict:
+    return {key: value for key, value in data.items() if value not in (None, "", [])}
