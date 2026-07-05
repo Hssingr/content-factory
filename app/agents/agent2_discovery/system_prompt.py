@@ -1,7 +1,7 @@
 import logging
 import re
 
-from app.services.claude_client import call_claude, call_claude_structured, parse_claude_json
+from app.services.claude_client import call_claude_structured
 from app.agents.agent2_discovery.services.story import MAX_SOURCE_EXCERPT_CHARS
 
 logger = logging.getLogger(__name__)
@@ -1089,6 +1089,19 @@ def build_telegram_message(
     return "\n".join(lines)
 
 
+_NATIVE_ADAPTATION_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "voice_script": {
+            "type": "string",
+            "description": "The fully adapted narration text in the target language.",
+        },
+    },
+    "required": ["voice_script"],
+    "additionalProperties": False,
+}
+
+
 def generate_native_script(
     voice_script: str,
     target_language: str,
@@ -1154,15 +1167,37 @@ def generate_native_script(
     user_message += f"\nSource voice script:\n{voice_script}"
     if override_instruction:
         user_message += f"\n\n{override_instruction}"
-    # Intentional free-form JSON path: native script adaptation is a large text payload.
-    # parse_claude_json validates required and allowed keys.
-    response = call_claude(prompt, user_message, max_tokens=8192, task="native_adaptation")
-    return parse_claude_json(
-        response,
-        required_keys=["voice_script"],
-        type_checks={"voice_script": str},
-        allowed_keys=["voice_script"],
+    return call_claude_structured(
+        task="native_adaptation",
+        system_prompt=prompt,
+        user_message=user_message,
+        schema_name="native_adaptation_output",
+        input_schema=_NATIVE_ADAPTATION_SCHEMA,
+        max_tokens=8192,
     )
+
+
+_REVISION_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "title":        {"type": "string"},
+        "voice_script": {"type": "string"},
+        "changes": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "section":         {"type": "string"},
+                    "before_summary":  {"type": "string"},
+                    "after_summary":   {"type": "string"},
+                },
+                "required": ["section", "before_summary", "after_summary"],
+            },
+        },
+    },
+    "required": ["title", "voice_script", "changes"],
+    "additionalProperties": False,
+}
 
 
 def generate_revised_scripts(
@@ -1200,15 +1235,37 @@ def generate_revised_scripts(
         f"Current voice script:\n{current_scripts.get('voice_script', '')}\n\n"
         f"User feedback:\n{feedback}"
     )
-    # Intentional free-form JSON path: user-driven revisions may return large scripts.
-    # parse_claude_json validates required and allowed keys.
-    response = call_claude(prompt, user_message, max_tokens=8192, task="revision")
-    return parse_claude_json(
-        response,
-        required_keys=["title", "voice_script", "changes"],
-        type_checks={"title": str, "voice_script": str, "changes": list},
-        allowed_keys=["title", "voice_script", "changes"],
+    return call_claude_structured(
+        task="revision",
+        system_prompt=prompt,
+        user_message=user_message,
+        schema_name="revision_output",
+        input_schema=_REVISION_SCHEMA,
+        max_tokens=8192,
     )
+
+
+_SCRIPT_QUALITY_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "status": {"type": "string", "enum": ["PASSED", "NEEDS_REWRITE"]},
+        "issues": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "severity":    {"type": "string", "enum": ["HIGH", "MEDIUM", "LOW"]},
+                    "category":    {"type": "string"},
+                    "description": {"type": "string"},
+                    "fix":         {"type": "string"},
+                },
+                "required": ["severity", "category", "description", "fix"],
+            },
+        },
+    },
+    "required": ["status", "issues"],
+    "additionalProperties": False,
+}
 
 
 def assess_script_quality(scripts: dict, channel, script_format: str = "youtube_long") -> dict:
@@ -1232,16 +1289,13 @@ def assess_script_quality(scripts: dict, channel, script_format: str = "youtube_
         f"Title: {scripts.get('title', '')}\n\n"
         f"Voice script:\n{scripts.get('voice_script', '')}"
     )
-    # Intentional free-form JSON path: retained to avoid changing quality-gate
-    # prompt behavior in this rule-cleanup pass. parse_claude_json validates keys.
-    response = call_claude(
-        _SCRIPT_QUALITY_SYSTEM_PROMPT, user_message, max_tokens=1536, task="script_quality_check"
-    )
-    result = parse_claude_json(
-        response,
-        required_keys=["status", "issues"],
-        type_checks={"status": str, "issues": list},
-        allowed_keys=["status", "issues"],
+    result = call_claude_structured(
+        task="script_quality_check",
+        system_prompt=_SCRIPT_QUALITY_SYSTEM_PROMPT,
+        user_message=user_message,
+        schema_name="script_quality_output",
+        input_schema=_SCRIPT_QUALITY_SCHEMA,
+        max_tokens=1536,
     )
     if result["status"] not in {"PASSED", "NEEDS_REWRITE"}:
         raise ValueError(f"assess_script_quality: unexpected status {result['status']!r}")
@@ -1846,6 +1900,17 @@ Return ONLY valid JSON. No markdown. No code fence. No extra keys.
 """
 
 
+_SHORT_EPISODE_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "title":        {"type": "string", "description": "Part N title (≤60 chars, TikTok-optimized)."},
+        "voice_script": {"type": "string", "description": "Full flat narration text, 125-180 words."},
+    },
+    "required": ["title", "voice_script"],
+    "additionalProperties": False,
+}
+
+
 def generate_short_episode_script(
     part_plan: dict,
     long_voice_script: str,
@@ -1903,16 +1968,13 @@ def generate_short_episode_script(
     if override_instruction:
         user_message += f"\n\nIMPORTANT: {override_instruction}"
 
-    # Intentional free-form JSON path: retained to avoid changing short-script
-    # generation behavior in this rule-cleanup pass. parse_claude_json validates keys.
-    response = call_claude(
-        system_prompt, user_message, max_tokens=1024, task="short_script"
-    )
-    return parse_claude_json(
-        response,
-        required_keys=["title", "voice_script"],
-        type_checks={"title": str, "voice_script": str},
-        allowed_keys=["title", "voice_script"],
+    return call_claude_structured(
+        task="short_script",
+        system_prompt=system_prompt,
+        user_message=user_message,
+        schema_name="short_episode_script_output",
+        input_schema=_SHORT_EPISODE_SCHEMA,
+        max_tokens=1024,
     )
 
 

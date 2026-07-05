@@ -41,7 +41,12 @@ def parse_claude_json(
     """
     cleaned = re.sub(r"```(?:json)?\s*([\s\S]*?)```", r"\1", text).strip()
     try:
-        data = json.loads(cleaned)
+        # strict=False tolerates raw control characters (literal newlines/tabs)
+        # inside JSON string values — a real, observed model quirk where
+        # multi-paragraph text (e.g. voice_script) is emitted with actual line
+        # breaks instead of escaped \n, which json.loads(strict=True) rejects
+        # even though the surrounding structure is otherwise valid JSON.
+        data = json.loads(cleaned, strict=False)
     except json.JSONDecodeError as exc:
         logger.error("Claude JSON parse error: %s | Raw (first 300): %.300s", exc, text)
         raise ValueError(f"Claude returned invalid JSON: {exc}") from exc
@@ -196,12 +201,36 @@ def _call_claude_core(
                 usage["input_tokens"], usage["output_tokens"],
                 usage["cache_read_input_tokens"], cached_hit,
             )
-            block = response.content[0]
-            if not isinstance(block, anthropic.types.TextBlock):
-                raise ValueError(f"Unexpected response block type '{type(block).__name__}'")
-            result = block.text.strip()
+            if not response.content:
+                raise ValueError(f"Empty content list from Claude (stop_reason={response.stop_reason})")
+
+            # Scan every content block rather than assuming response.content[0]
+            # is the answer — mirrors call_claude_with_tools()'s own extraction
+            # loop below. A real production run consistently (12/12 real API
+            # calls, one task) returned content[0] as a text block with empty
+            # text while output_tokens showed real generation had happened,
+            # meaning the actual answer was in a later block content[0]-only
+            # indexing never looked at (e.g. a leading empty/thinking-adjacent
+            # block ahead of the real text). Duck-typed on `.type` rather than
+            # `isinstance(..., TextBlock)` for the same reason
+            # call_claude_with_tools() does: a block type this SDK version
+            # doesn't model as a distinct class must not be misread as fatal
+            # when a later block still carries the real text.
+            block_types: dict[str, int] = {}
+            result = ""
+            for b in response.content:
+                t = getattr(b, "type", type(b).__name__)
+                block_types[t] = block_types.get(t, 0) + 1
+                if t == "text":
+                    candidate = getattr(b, "text", None)
+                    if candidate and candidate.strip():
+                        result = candidate.strip()
+
             if not result:
-                raise ValueError("Empty response from Claude")
+                raise ValueError(
+                    f"Claude returned no usable text block (stop_reason={response.stop_reason}, "
+                    f"block_types={block_types})"
+                )
             return result, usage
 
         except (anthropic.RateLimitError, anthropic.APITimeoutError) as exc:
@@ -210,6 +239,19 @@ def _call_claude_core(
                 wait = _BACKOFF_BASE ** attempt
                 logger.warning("Transient error (%s), retrying in %ds", type(exc).__name__, wait)
                 _time.sleep(wait)
+        except ValueError as exc:
+            if "no usable text block" in str(exc) or "Empty content list" in str(exc):
+                last_exc = exc
+                if attempt < _MAX_RETRIES - 1:
+                    wait = _BACKOFF_BASE ** attempt
+                    logger.warning(
+                        "call_claude task=%s got an empty/malformed response block (%s), "
+                        "retrying in %ds (attempt %d/%d)",
+                        task, exc, wait, attempt + 1, _MAX_RETRIES,
+                    )
+                    _time.sleep(wait)
+                    continue
+            raise
         except anthropic.APIConnectionError as exc:
             logger.error("Connection error (config issue, not retrying): %s", exc)
             raise

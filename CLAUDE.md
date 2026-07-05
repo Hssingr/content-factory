@@ -504,6 +504,41 @@ the extra usage-dict return value. If a future caller needs token-usage
 diagnostics from a free-form (non-structured) call, reintroduce it deliberately
 rather than assuming it still exists from this section.
 
+**`_call_claude_core()` scans every content block instead of indexing
+`content[0]` (live-canary fix):** a real `--confirm` run hit `'NoneType'
+object has no attribute 'strip'` because `response.content[0].text` came
+back `None`/empty on an otherwise normal, non-tool-use `call_claude()` call
+(`task=short_script`). An initial patch (retry on empty/null with the same
+backoff `RateLimitError` gets) did not fix the underlying issue: a follow-up
+real run reproduced the identical empty-`content[0]` symptom on 12/12
+consecutive real API calls (4 short-script parts x 3 retries each), each
+with real non-zero `output_tokens` — proof the failure was systematic, not
+transient, and no amount of retrying the identical request would help. The
+real mechanical bug: `_call_claude_core()` assumed `response.content[0]` was
+always the answer, exactly the assumption `call_claude_with_tools()` (same
+file) had already learned not to make for this model — it scans every block
+for the first `type=="text"` entry with non-empty `.text` rather than
+indexing `[0]`. `_call_claude_core()` now does the same scan, duck-typed on
+`.type` rather than `isinstance(..., anthropic.types.TextBlock)` for the same
+reason: a block type this SDK version doesn't model as a distinct class must
+not be misread as fatal when a later block still carries the real text. Only
+if no block yields usable text does it raise `ValueError` (`"Claude returned
+no usable text block"`, including `stop_reason` and a `block_types` count
+breakdown for diagnosis) and retry up to `_MAX_RETRIES` with the same backoff
+the `RateLimitError`/`APITimeoutError` branch uses, as a safety net for a
+genuinely transient case. Runtime proof:
+`tests/test_claude_call_empty_block_retry.py`.
+
+**`parse_claude_json()` tolerates raw control characters (live-canary fix):**
+the same run hit `Claude JSON parse error: Invalid control character at: line
+1 column 186` on an otherwise well-formed `short_script` response — a
+multi-paragraph `voice_script` value contained a literal newline instead of
+an escaped `\n`. `json.loads(cleaned, strict=False)` is now used instead of
+strict parsing, which accepts raw control characters (tabs/newlines) inside
+JSON string values without otherwise loosening validation — a genuinely
+malformed JSON document still raises `ValueError` exactly as before. Runtime
+proof: `tests/test_claude_call_empty_block_retry.py`.
+
 Rules:
 
 - Agents must never instantiate Anthropic clients directly.
@@ -2692,6 +2727,29 @@ Removed fields (Phase 6D-1, `STORYBOARD_SCHEMA_VERSION` 6.0 → 6.1):
   required-key presence), or to `storyboard_validator.py` (confirmed, again,
   to reference neither field anywhere).
 
+**`storyboard_status`/`overall_style`/`global_notes` made optional, defaulted
+in place (live-canary fix, same dead-schema-weight pattern as the Phase 6D-1
+removal above):** a real `--confirm` run's parent visual pass hit
+`STORYBOARD_SHAPE_INVALID segment=[INTRO] key=storyboard_status
+issue=missing present_keys=['beats']` on both the initial attempt and the one
+shape-retry, aborting storyboard generation entirely and failing the whole
+content item — despite the response carrying a complete, valid `beats`
+array. Grepping confirmed the same zero-downstream-consumer pattern Phase
+6D-1 found: `storyboard_status` is never read past this shape check,
+`global_notes` is never read anywhere, and `overall_style` only feeds one
+cost/diagnostic log line in `storyboard.py`. `_STORYBOARD_BATCH_SCHEMA`'s
+`required` list is now `["beats"]` only; `_check_shape()` still strictly
+requires and type-checks (with the existing string-coercion fallback)
+**only** `beats` — the one field every downstream consumer
+(`_build_beat_section()`, `validate_storyboard()`, Flux generation) actually
+reads. A missing or wrong-typed auxiliary field is defaulted in place
+(`""`/`""`/`[]`) with a logged `STORYBOARD_SHAPE_AUX_FIELD_MISSING`/
+`STORYBOARD_SHAPE_AUX_FIELD_WRONG_TYPE` warning rather than raising — this is
+a logged fallback on genuinely inert fields, not a silent one, and does not
+loosen validation on `beats` itself (still fatal + retried if missing or
+wrong-typed, exactly as before). Runtime proof:
+`tests/test_storyboard_batch_auxiliary_field_defaults.py`.
+
 #### `map_storyboard_beats_to_timestamps`
 
 File:
@@ -4846,6 +4904,29 @@ Rules:
 - Use `call_claude()` only for free-form text where code does not require structured fields.
 - Log prompt length, token usage, elapsed time, and truncation.
 - If a response hits `max_tokens`, log and reduce scope or retry safely.
+
+**Free-form-JSON migration (live-canary follow-up):** four functions in
+`app/agents/agent2_discovery/system_prompt.py` used to call `call_claude()` +
+`parse_claude_json()` to produce JSON that code parses/validates
+(`generate_native_script()` — `task=native_adaptation`;
+`generate_revised_scripts()` — `task=revision`; `assess_script_quality()` —
+`task=script_quality_check`; `generate_short_episode_script()` —
+`task=short_script`) — a direct violation of the "any JSON output used by
+code" rule above, each flagged in its own code comment as
+`"Intentional free-form JSON path: retained to avoid changing behavior in a
+rule-cleanup pass"` (i.e. already identified and deliberately deferred by an
+earlier pass). Two real `--confirm` run failures (§7.1's empty-text-block and
+raw-control-character fixes) were both traced to exactly this free-form path,
+on `generate_short_episode_script()` specifically — concrete evidence the
+deferral was no longer free. All four now use `call_claude_structured()`
+with a dedicated `input_schema` (`_NATIVE_ADAPTATION_SCHEMA`,
+`_REVISION_SCHEMA`, `_SCRIPT_QUALITY_SCHEMA`, `_SHORT_EPISODE_SCHEMA`) —
+forced tool-use has neither failure mode: it scans every content block for
+the named `tool_use` block (never assumes `content[0]`), and the SDK
+delivers `block.input` as an already-parsed dict, so there is no markdown-fence
+stripping or JSON parsing of free text at all. `call_claude`/`parse_claude_json`
+are no longer imported in that file. Runtime proof:
+`tests/test_agent2_structured_json_migration.py`.
 
 ---
 

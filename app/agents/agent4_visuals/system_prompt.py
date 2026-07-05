@@ -504,7 +504,16 @@ _STORYBOARD_BATCH_SCHEMA: dict = {
         "beats":             {"type": "array", "items": _BEAT_SCHEMA},
         "global_notes":      {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["storyboard_status", "overall_style", "beats", "global_notes"],
+    # Only `beats` is required. `storyboard_status`/`overall_style`/`global_notes`
+    # are administrative scaffolding with zero downstream consumers (confirmed by
+    # grep: storyboard_status is never read past shape validation, global_notes is
+    # never read at all, overall_style only feeds one cost/diagnostic log line —
+    # the same "dead schema weight" pattern as the why_this_visual/
+    # story_progression_role removal in CLAUDE.md §11.4). A real production run
+    # hit a model response with a complete, valid `beats` array but none of these
+    # three fields, which aborted the entire segment and failed the content —
+    # discarding good beat data over administrative fields nothing reads.
+    "required": ["beats"],
 }
 
 
@@ -654,14 +663,30 @@ def generate_storyboard_batch(
             )
         return parsed, ""
 
-    def _check_shape(storyboard: dict) -> None:
-        """Raise ValueError on the first required key that is missing or wrong-typed.
+    _AUXILIARY_FIELD_DEFAULTS: dict = {
+        "storyboard_status": ("", str),
+        "overall_style":     ("", str),
+        "global_notes":      ([], list),
+    }
 
-        Before treating a wrong-typed value as a failure, attempt one narrow
+    def _check_shape(storyboard: dict) -> None:
+        """Raise ValueError only if ``beats`` is missing or wrong-typed.
+
+        ``beats`` is the sole load-bearing field in this schema — every other
+        field (``storyboard_status``, ``overall_style``, ``global_notes``) is
+        administrative scaffolding with zero real downstream consumers
+        (confirmed by grep: ``storyboard_status`` is never read past this
+        shape check, ``global_notes`` is never read at all, ``overall_style``
+        only feeds one cost/diagnostic log line). A real production response
+        arrived with a complete, valid ``beats`` array but none of the other
+        three keys — treating that as fatal discarded good beat data over
+        fields nothing reads. Auxiliary fields are defaulted in place with a
+        logged warning rather than aborting the segment.
+
+        Before treating ``beats`` itself as wrong-typed, attempt one narrow
         coercion via ``_coerce_string_to_expected_type``: a real, observed
-        model quirk returns ``beats`` (or another array/object field) as a
-        JSON-encoded string instead of a native list/dict, on an otherwise
-        complete, non-truncated response (e.g.
+        model quirk returns ``beats`` as a JSON-encoded string instead of a
+        native list, on an otherwise complete, non-truncated response (e.g.
         ``'[\\n  {"beat_order": 0, ...}\\n]'`` instead of the parsed array) —
         sometimes wrapped in a markdown code fence, or followed by trailing
         non-JSON commentary. If recovery succeeds, the parsed value is
@@ -677,48 +702,61 @@ def generate_storyboard_batch(
         runs raised the same ValueError with no record of what Claude actually
         returned, making the failure unreproducible/undiagnosable after the fact.
         """
-        for key, expected_type in (
-            ("storyboard_status", str), ("overall_style", str),
-            ("beats", list), ("global_notes", list),
-        ):
+        for key, (default, expected_type) in _AUXILIARY_FIELD_DEFAULTS.items():
             if key not in storyboard:
-                logger.error(
-                    "STORYBOARD_SHAPE_INVALID segment=%s key=%s issue=missing "
-                    "present_keys=%s",
-                    segment_label, key, sorted(storyboard.keys()),
+                logger.warning(
+                    "STORYBOARD_SHAPE_AUX_FIELD_MISSING segment=%s key=%s — "
+                    "administrative field absent, defaulting to %r (never read "
+                    "downstream beyond this check)",
+                    segment_label, key, default,
                 )
-                raise ValueError(f"storyboard_batch response missing required key '{key}'")
+                storyboard[key] = default
+            elif not isinstance(storyboard[key], expected_type):
+                logger.warning(
+                    "STORYBOARD_SHAPE_AUX_FIELD_WRONG_TYPE segment=%s key=%s "
+                    "expected=%s got=%s — defaulting to %r",
+                    segment_label, key, expected_type.__name__,
+                    type(storyboard[key]).__name__, default,
+                )
+                storyboard[key] = default
 
-            actual = storyboard[key]
-            if not isinstance(actual, expected_type):
-                coercion_failure_reason = ""
-                if expected_type is not str and isinstance(actual, str):
-                    parsed, coercion_failure_reason = _coerce_string_to_expected_type(actual, expected_type)
-                    if parsed is not None:
-                        logger.warning(
-                            "STORYBOARD_SHAPE_COERCED segment=%s key=%s — value was a "
-                            "JSON-encoded string instead of a native %s; parsed and "
-                            "substituted in place",
-                            segment_label, key, expected_type.__name__,
-                        )
-                        storyboard[key] = parsed
-                        continue
-                    logger.error(
-                        "STORYBOARD_SHAPE_COERCION_FAILED segment=%s key=%s reason=%s "
-                        "value_length=%d",
-                        segment_label, key, coercion_failure_reason, len(actual),
+        if "beats" not in storyboard:
+            logger.error(
+                "STORYBOARD_SHAPE_INVALID segment=%s key=beats issue=missing "
+                "present_keys=%s",
+                segment_label, sorted(storyboard.keys()),
+            )
+            raise ValueError("storyboard_batch response missing required key 'beats'")
+
+        actual = storyboard["beats"]
+        if not isinstance(actual, list):
+            coercion_failure_reason = ""
+            if isinstance(actual, str):
+                parsed, coercion_failure_reason = _coerce_string_to_expected_type(actual, list)
+                if parsed is not None:
+                    logger.warning(
+                        "STORYBOARD_SHAPE_COERCED segment=%s key=beats — value was a "
+                        "JSON-encoded string instead of a native list; parsed and "
+                        "substituted in place",
+                        segment_label,
                     )
-
+                    storyboard["beats"] = parsed
+                    return
                 logger.error(
-                    "STORYBOARD_SHAPE_INVALID segment=%s key=%s issue=wrong_type "
-                    "expected=%s got=%s value=%r",
-                    segment_label, key, expected_type.__name__, type(actual).__name__,
-                    actual if not isinstance(actual, str) else actual[:200],
+                    "STORYBOARD_SHAPE_COERCION_FAILED segment=%s key=beats reason=%s "
+                    "value_length=%d",
+                    segment_label, coercion_failure_reason, len(actual),
                 )
-                raise ValueError(
-                    f"storyboard_batch key '{key}' expected {expected_type.__name__}, "
-                    f"got {type(actual).__name__}"
-                )
+
+            logger.error(
+                "STORYBOARD_SHAPE_INVALID segment=%s key=beats issue=wrong_type "
+                "expected=list got=%s value=%r",
+                segment_label, type(actual).__name__,
+                actual if not isinstance(actual, str) else actual[:200],
+            )
+            raise ValueError(
+                f"storyboard_batch key 'beats' expected list, got {type(actual).__name__}"
+            )
 
     _t0 = time.monotonic()
     storyboard, usage = _run(target_beat_count)
