@@ -110,11 +110,10 @@ _DOCUMENT_SATURATION_RATIO = 0.15
 _DOCUMENT_WINDOW_SIZE = 10
 _DOCUMENT_MAX_PER_WINDOW = 2
 
-# Two beats within this many positions of each other that share environment,
-# motif, AND camera effect simultaneously are flagged as a near-duplicate shot
-# (a stronger, multi-field signal than the single-field environment checks
-# below, which only ever look at one dimension at a time).
-_NEAR_DUPLICATE_PROXIMITY = 2
+# Beats anywhere in the same storyboard/Short that share environment, motif,
+# AND camera effect simultaneously are flagged as near-duplicate shots (a
+# stronger, multi-field signal than the single-field environment checks below,
+# which only ever look at one dimension at a time).
 
 # A run of this many or more consecutive beats sharing the same value for any
 # single field (environment, motif, or effect) is flagged as AI-slideshow-risk
@@ -737,9 +736,9 @@ def _find_motif_repetition_issues(beats: list[dict]) -> list[StoryboardIssue]:
 
 
 def _find_near_duplicate_issues(beats: list[dict]) -> list[StoryboardIssue]:
-    """Flag beats whose environment, motif, AND effect all match another beat
-    within `_NEAR_DUPLICATE_PROXIMITY` positions — a likely visually-redundant
-    shot. At most one issue per beat (the first match found), not one per pair.
+    """Flag beats whose environment, motif, AND effect all match anywhere in
+    the same beat list — a likely visually-redundant shot. At most one issue
+    per beat (the first match found), not one per pair.
     """
     issues: list[StoryboardIssue] = []
     n = len(beats)
@@ -748,7 +747,7 @@ def _find_near_duplicate_issues(beats: list[dict]) -> list[StoryboardIssue]:
         a_env, a_motif, a_effect = a.get("environment"), a.get("motif"), a.get("effect")
         if not (a_env and a_motif and a_effect):
             continue
-        for j in range(i + 1, min(i + 1 + _NEAR_DUPLICATE_PROXIMITY, n)):
+        for j in range(i + 1, n):
             b = beats[j]
             if (
                 b.get("environment") == a_env
@@ -763,8 +762,8 @@ def _find_near_duplicate_issues(beats: list[dict]) -> list[StoryboardIssue]:
                         f"beat_order={a.get('beat_order', i)} and beat_order="
                         f"{b.get('beat_order', j)} share the same environment "
                         f"('{a_env}'), motif ('{a_motif}'), and camera effect "
-                        f"('{a_effect}') within {_NEAR_DUPLICATE_PROXIMITY} beats of "
-                        "each other — likely a visually redundant shot. Vary the "
+                        f"('{a_effect}') in the same storyboard — likely a visually "
+                        "redundant shot. Vary the "
                         "setting, subject, or camera treatment."
                     ),
                 ))
@@ -1041,9 +1040,10 @@ def _find_excessive_reuse_issues(beats: list[dict]) -> list[StoryboardIssue]:
 # checks (`_find_flux_prompt_duplicate_issues` always names the first
 # occurrence of a prompt as "the original" and flags every later match), the
 # earlier of the two positions for `near_duplicate_beat` (its own convention —
-# see `_find_near_duplicate_issues`). Only PENDING beats are ever modified
-# (see `repair_duplicate_flux_prompts`), so a beat whose media is already
-# resolved elsewhere is never touched by either convention.
+# see `_find_near_duplicate_issues`). Callers that will regenerate already-
+# resolved beats in the same run may opt into repairing those prompts too;
+# callers preserving existing media keep the default pending-only behavior so
+# stored prompt metadata never drifts from an already persisted image.
 _DUPLICATE_REPAIR_CHECKS: frozenset[str] = frozenset({
     "flux_prompt_exact_duplicate", "flux_prompt_near_duplicate", "near_duplicate_beat",
 })
@@ -1065,6 +1065,15 @@ _COMPOSITION_ROTATION: tuple[str, ...] = tuple(
 )
 
 
+def composition_slot_variation(occurrence: int) -> str:
+    """Return the deterministic composition variation for a duplicate repair.
+
+    Shared by prompt-level duplicate repair and post-generation pixel collision
+    rerolls so both anti-duplicate paths draw from one stable rotation.
+    """
+    return _COMPOSITION_ROTATION[occurrence % len(_COMPOSITION_ROTATION)]
+
+
 def find_duplicate_prompt_beat_orders(beats: list[dict]) -> dict[int, str]:
     """Return ``{beat_order: check}`` for beats validate_storyboard() flags as
     a visual duplicate — the exact set of beats ``repair_duplicate_flux_prompts()``
@@ -1078,20 +1087,24 @@ def find_duplicate_prompt_beat_orders(beats: list[dict]) -> dict[int, str]:
     return targets
 
 
-def repair_duplicate_flux_prompts(beats: list[dict]) -> tuple[list[dict], list[dict]]:
+def repair_duplicate_flux_prompts(
+    beats: list[dict],
+    *,
+    include_resolved: bool = False,
+) -> tuple[list[dict], list[dict]]:
     """Deterministically vary the flux_prompt of beats flagged as visual duplicates.
 
-    Only beats still PENDING Flux generation (``media_url`` empty) are ever
-    modified — a beat that already has a resolved `media_url` (a deliberate
-    parent-image reuse on the child remap path, or an already-rendered parent
-    beat) reflects a decision already made elsewhere; rewriting its
-    descriptive `flux_prompt` after the fact would desync stored metadata
-    from the actual persisted image. Repairing the PENDING duplicate's own
-    prompt is what actually changes what gets generated next.
+    By default, only beats still PENDING Flux generation (``media_url`` empty)
+    are modified. A caller that is about to regenerate already-resolved beats
+    in the same run (the child Short portrait path) passes
+    ``include_resolved=True`` so those prompts receive the same append-only
+    variation before the new provider call.
 
     Args:
         beats: Full beat list, in beat_order sequence, as it will be passed to
             Flux generation.
+        include_resolved: When True, repair duplicate prompts even if the beat
+            currently has ``media_url`` because the caller will regenerate it.
 
     Returns:
         ``(repaired_beats, repairs)`` — a new list (beats are shallow-copied,
@@ -1113,10 +1126,10 @@ def repair_duplicate_flux_prompts(beats: list[dict]) -> tuple[list[dict], list[d
         check = targets.get(order)
         if check is None:
             continue
-        if beat.get("media_url"):
-            continue  # already resolved elsewhere — never rewritten
+        if beat.get("media_url") and not include_resolved:
+            continue  # existing image is being preserved — never rewrite metadata
 
-        variation = _COMPOSITION_ROTATION[occurrence % len(_COMPOSITION_ROTATION)]
+        variation = composition_slot_variation(occurrence)
         occurrence += 1
 
         original_prompt = str(beat.get("flux_prompt", "") or "").rstrip(". ")

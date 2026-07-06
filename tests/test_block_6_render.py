@@ -78,14 +78,15 @@ class TestVerifyRender:
         _make_mp4(mp4)
 
         with patch("subprocess.run") as mock_run:
-            # ffprobe, blackdetect, duration probe, silencedetect
+            # ffprobe(mp4), ffprobe(audio duration), blackdetect, duration probe, silencedetect
             mock_run.side_effect = [
-                _ffprobe_result(GOOD_FFPROBE_JSON),   # _check_ffprobe
+                _ffprobe_result(GOOD_FFPROBE_JSON),   # _check_ffprobe (mp4)
+                _ffprobe_result("120.5\n"),            # _check_ffprobe's audio-file duration probe
                 _ffmpeg_result(""),                    # _check_blackdetect (no black lines)
-                _ffprobe_result("120.5\n"),            # _probe_duration_sec
+                _ffprobe_result("120.5\n"),            # _probe_duration_sec (mp4, for silencedetect)
                 _ffmpeg_result(""),                    # _check_silencedetect (no silence)
             ]
-            issues = verify_render(mp4, expected_duration_ms=120_500, fmt="main")
+            issues = verify_render(mp4, audio_file_path="/media/audio/cid/en.mp3", fmt="main")
 
         assert issues == [], f"Expected no issues, got: {issues}"
 
@@ -200,7 +201,7 @@ class TestVerifyRender:
         mp4 = str(tmp_path / "drift.mp4")
         _make_mp4(mp4)
 
-        # Actual = 80 s, expected = 120 s → 33% drift > 2% threshold
+        # Actual = 80 s, expected (audio file) = 120 s → 33% drift > 2% threshold
         with patch("subprocess.run") as mock_run:
             mock_run.side_effect = [
                 _ffprobe_result(json.dumps({
@@ -210,11 +211,12 @@ class TestVerifyRender:
                         {"codec_type": "audio"},
                     ],
                 })),
+                _ffprobe_result("120.0\n"),   # _check_ffprobe's audio-file duration probe
                 _ffmpeg_result(""),
                 _ffprobe_result("80.0\n"),
                 _ffmpeg_result(""),
             ]
-            issues = verify_render(mp4, expected_duration_ms=120_000, fmt="main")
+            issues = verify_render(mp4, audio_file_path="/media/audio/cid/en.mp3", fmt="main")
 
         assert any("duration_drift" in i for i in issues), f"Got: {issues}"
 

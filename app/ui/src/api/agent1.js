@@ -43,7 +43,6 @@ export const api = {
   suggestTiming:       (id)         => req('POST',   `/channels/${id}/suggest-timing`),
 
   // Voices
-  getVoices:           (language, useCase) => req('GET', `/voices?language=${language}&use_case=${useCase}`),
 
   // AI suggestions
   suggest:             (field, ctx) => req('POST',   '/suggest', { field, context: ctx }),

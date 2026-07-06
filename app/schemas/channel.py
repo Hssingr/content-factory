@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict
 ContentMode  = Literal["single_story", "limited_series", "ongoing_series"]
 ScriptSource = Literal["reddit", "ai_generated", "user_provided", "hybrid"]
 OutputMode   = Literal["youtube_and_shorts", "youtube_long_only", "shorts_only"]
+NarrationPov = Literal["third_person", "first_person_storytime"]
 
 
 class ChannelCreate(BaseModel):
@@ -36,15 +37,16 @@ class ChannelConfigUpsert(BaseModel):
     subtitle_style_shorts: str = "karaoke"
     subtitle_karaoke_active_color: str = "#FFD700"
     shorts_part_label_style: str = "default"
-    video_style_type: str = "documentary"
+    video_style_type: str = "story_driven"
     video_color_grade: str | None = None
     runway_enabled: bool = False
     # V3 groundwork fields — additive, not yet consumed downstream (see CLAUDE.md §8.1).
     content_mode: ContentMode = "single_story"
     script_source: ScriptSource = "reddit"
     output_mode: OutputMode = "youtube_and_shorts"
-    visual_style: str = "documentary"
+    visual_style: str = "story_driven"
     image_style: str = "photorealistic"
+    narration_pov: NarrationPov = "third_person"
 
 
 class LanguageEntry(BaseModel):
@@ -112,6 +114,7 @@ class ChannelConfigResponse(BaseModel):
     output_mode: OutputMode
     visual_style: str
     image_style: str
+    narration_pov: NarrationPov
 
 
 class LanguageResponse(BaseModel):

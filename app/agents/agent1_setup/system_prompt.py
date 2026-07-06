@@ -6,7 +6,18 @@ from app.services.claude_client import call_claude, call_claude_structured
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "1.3"  # v1.3: research_channel_ideas schema gains references_used array;
+PROMPT_VERSION = "1.4"  # v1.4: post-roadmap deep audit — suggest prompt's tone vocabulary
+                        #        expanded to include tension registers (suspenseful/ominous/
+                        #        dramatic/...) matching the UI TONES dropdown, closing the
+                        #        P1-9 root cause (horror channels were forced into
+                        #        documentary/educational tones). Dead suggest fields removed
+                        #        (voice_use_case/voice_emotion/music_style/voice_id/
+                        #        publish_timing — no UI requests them; publish timing has its
+                        #        own dedicated prompt). research_channel_ideas visual_style/
+                        #        image_style constrained to the canonical preset values so
+                        #        "Use this recommendation" can never set a value the setup
+                        #        dropdowns cannot display.
+                        # v1.3: research_channel_ideas schema gains references_used array;
                         #        system prompt instructs Claude to include any relevant
                         #        URLs or named sources it knows about. Web search not wired
                         #        yet — references_used is populated from Claude's training
@@ -41,11 +52,6 @@ Sub-60s videos grow followers but earn zero revenue — avoid for monetized chan
 Monetization via Ads on Reels — no strict minimum length but 30s+ performs better.
   • Facebook: community angle, longer descriptions, news-adjacent content performs well.
 
-Voice & audio
-  • ElevenLabs voice emotions: neutral, enthusiastic, calm, authoritative, dramatic, warm.
-  • Music styles: cinematic, upbeat, ambient, dramatic, minimal, electronic, orchestral.
-  • Match voice emotion and music to niche tone (e.g. true crime → calm + dramatic).
-
 Content sources
   • RSS feeds, Reddit communities, YouTube channels, Hacker News, newsapi.org topics.
   • Always prefer sources that publish frequently and have high signal-to-noise ratio.
@@ -79,18 +85,13 @@ Oct 2024. Long-form (8–15 min) drives higher RPM. Publish Shorts first, then l
                    trending social media topic as the channel concept — specific, timely, high-interest.
                    Otherwise describe the channel's value proposition clearly and concisely.
   niche          — Specific topic area. Be precise (e.g. "cold war espionage" not "history").
-  tone           — Delivery tone: documentary | conversational | educational | entertaining | investigative
-  voice_use_case — Best ElevenLabs use case for the channel's content style. Respond with ONLY one of:
-                   conversational | narrative_story | characters_animation | social_media | informative_educational | advertisement | entertainment_tv
-  voice_emotion  — TTS narrator emotion: neutral | enthusiastic | calm | authoritative | dramatic | warm
-  music_style    — Background music: cinematic | upbeat | ambient | dramatic | minimal | electronic | orchestral
-  voice_id       — Select the single best voice from the `available_voices` list provided in the context.
-                   Each voice has: voice_id, name, gender, age, descriptive, description.
-                   Choose based on the channel niche, tone, and target audience.
-                   Respond with ONLY the voice_id string — no name, no explanation.
+  tone           — Delivery tone. Pick the value that matches the niche's actual register:
+                   suspenseful | ominous | dramatic | conversational | documentary | educational |
+                   entertaining | investigative | humorous | inspirational
+                   Tension/dread niches (horror, true crime, mystery, thriller) need a tension
+                   tone (suspenseful/ominous/dramatic) — never documentary/educational for those.
   source         — A real, working content source (full RSS URL, subreddit "r/name", or site URL).
                    Must match the channel's source language and niche.
-  publish_timing — Return valid JSON only: {"days": [...], "hour_start": int, "hour_end": int}
 
 == Rules ==
 
@@ -101,8 +102,7 @@ Oct 2024. Long-form (8–15 min) drives higher RPM. Publish Shorts first, then l
    in that target language (the channel name must be in the channel's own language).
 3. For `source` fields, provide a real working URL or subreddit — never a placeholder. \
    The context may include `existing_sources` — never repeat a value already in that list.
-4. For `publish_timing`, return raw JSON with no code fence.
-5. Never suggest the same value twice if the user provides prior attempts in context.\
+4. Never suggest the same value twice if the user provides prior attempts in context.\
 """
 
 
@@ -219,6 +219,20 @@ def suggest_publish_timing(
 
 # ── Channel idea research ─────────────────────────────────────────────────────
 
+# Canonical style presets — mirror app/ui/src/constants.js VISUAL_STYLE_OPTIONS /
+# IMAGE_STYLE_OPTIONS values exactly. The research schema constrains Claude's
+# style recommendations to these so "Use this recommendation" always produces a
+# value the setup dropdowns can display (the ChannelConfig columns themselves
+# stay free-form).
+_VISUAL_STYLE_VALUES = [
+    "story_driven", "documentary", "true_crime", "investigative", "cinematic",
+    "historical", "noir", "suspense_thriller", "nature", "educational", "retro",
+]
+_IMAGE_STYLE_VALUES = [
+    "photorealistic", "cinematic_realism", "dark_realistic", "vintage_film",
+    "digital_art", "oil_painting", "watercolor", "anime",
+]
+
 _RESEARCH_IDEAS_SYSTEM_PROMPT = """\
 You are a combined YouTube strategist, short-form content strategist,
 monetization analyst, and content production advisor for Content Factory.
@@ -244,8 +258,9 @@ Important limits:
    "ai_generated" only. If explaining the source to the user, "ai_generated"
    means Claude Generated.
 8. Prefer executable values when practical: content_mode single_story,
-   script_source reddit, output_mode youtube_and_shorts. Recommend shorts_only
-   only when the concept is genuinely short-form-first and note the tradeoff.
+   script_source reddit, output_mode youtube_and_shorts (or youtube_long_only
+   when Shorts genuinely do not fit the concept). Recommend shorts_only only
+   when the concept is short-form-first and note that it is not executable yet.
 9. If script_source is reddit, include concrete subreddit names like r/name.
    If script_source is ai_generated, include a story_generation_prompt instead.
 10. Recommended languages must be BCP-47-style short codes from this set when
@@ -293,9 +308,9 @@ _RESEARCH_IDEAS_SCHEMA = {
                     },
                 },
                 "best_script_source": {"type": "string", "enum": ["reddit", "claude_generated"]},
-                "recommended_output_mode": {"type": "string", "enum": ["youtube_and_shorts", "shorts_only"]},
-                "recommended_visual_style": {"type": "string"},
-                "recommended_image_style": {"type": "string"},
+                "recommended_output_mode": {"type": "string", "enum": ["youtube_and_shorts", "youtube_long_only", "shorts_only"]},
+                "recommended_visual_style": {"type": "string", "enum": _VISUAL_STYLE_VALUES},
+                "recommended_image_style": {"type": "string", "enum": _IMAGE_STYLE_VALUES},
                 "recommended_tone": {"type": "string"},
                 "recommended_target_languages": {"type": "array", "items": {"type": "string"}},
                 "recommended_platforms": {
@@ -315,9 +330,9 @@ _RESEARCH_IDEAS_SCHEMA = {
                         "niche": {"type": "string"},
                         "tone": {"type": "string"},
                         "script_source": {"type": "string", "enum": ["reddit", "ai_generated"]},
-                        "output_mode": {"type": "string", "enum": ["youtube_and_shorts", "shorts_only"]},
-                        "visual_style": {"type": "string"},
-                        "image_style": {"type": "string"},
+                        "output_mode": {"type": "string", "enum": ["youtube_and_shorts", "youtube_long_only", "shorts_only"]},
+                        "visual_style": {"type": "string", "enum": _VISUAL_STYLE_VALUES},
+                        "image_style": {"type": "string", "enum": _IMAGE_STYLE_VALUES},
                         "languages": {"type": "array", "items": {"type": "string"}},
                         "platforms": {
                             "type": "array",

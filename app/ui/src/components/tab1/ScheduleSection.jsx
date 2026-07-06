@@ -1,6 +1,4 @@
-import {
-  SHORTS_RULES, LANGUAGES,
-} from '../../constants'
+import { LANGUAGES } from '../../constants'
 
 const ALL_DAYS = ['monday','tuesday','wednesday','thursday','friday','saturday','sunday']
 
@@ -28,7 +26,6 @@ function DayPicker({ selected, onChange }) {
 
 export default function ScheduleSection({
   videosPerWeek, setVideosPerWeek,
-  shortsRule, setShortsRule,
   timings, setTimings,
   onSuggestTiming, suggestingTiming,
   languagesSaved,
@@ -54,20 +51,6 @@ export default function ScheduleSection({
           style={{ maxWidth: 100 }}
         />
       </div>
-      <div className="field">
-        <label className="field-label">Shorts rule</label>
-        <select
-          className="field-select"
-          value={shortsRule}
-          onChange={e => setShortsRule(e.target.value)}
-          style={{ maxWidth: 280 }}
-        >
-          {SHORTS_RULES.map(r => (
-            <option key={r.value} value={r.value}>{r.label}</option>
-          ))}
-        </select>
-      </div>
-
       {/* ── Timing suggestion ───────────────────────── */}
       {channelId && (
         <div className="field">

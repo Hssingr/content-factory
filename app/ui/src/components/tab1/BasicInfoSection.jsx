@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import AISuggestionField from '../AISuggestionField'
 import { api } from '../../api/agent1'
-import { TONES, OUTPUT_MODES, OUTPUT_MODE_DESCRIPTIONS, VISUAL_STYLE_OPTIONS, IMAGE_STYLE_OPTIONS, SCRIPT_SOURCES } from '../../constants'
+import { TONES, OUTPUT_MODES, OUTPUT_MODE_DESCRIPTIONS, VISUAL_STYLE_OPTIONS, IMAGE_STYLE_OPTIONS, NARRATION_POV_OPTIONS, SCRIPT_SOURCES } from '../../constants'
 
 const LOADING_STEPS = [
   'Analyzing niche opportunities…',
@@ -125,6 +125,7 @@ export default function BasicInfoSection({
   outputMode, setOutputMode,
   visualStyle, setVisualStyle,
   imageStyle, setImageStyle,
+  narrationPov, setNarrationPov,
   scriptSource, setScriptSource,
   sources, setSources,
   // Flow control props — wired by App.jsx to drive the StepShell button
@@ -360,6 +361,25 @@ export default function BasicInfoSection({
                 </p>
               )}
             </div>
+          </div>
+
+          <div className="field">
+            <label className="field-label">Narration POV</label>
+            <select
+              className="field-select"
+              value={narrationPov}
+              onChange={e => setNarrationPov(e.target.value)}
+              style={{ maxWidth: 340 }}
+            >
+              {NARRATION_POV_OPTIONS.map(o => (
+                <option key={o.value} value={o.value}>{o.label}</option>
+              ))}
+            </select>
+            {NARRATION_POV_OPTIONS.find(o => o.value === narrationPov)?.description && (
+              <p className="voice-description" style={{ marginTop: 4 }}>
+                {NARRATION_POV_OPTIONS.find(o => o.value === narrationPov).description}
+              </p>
+            )}
           </div>
 
           {/* ── Script source ─────────────────────── */}

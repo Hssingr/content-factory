@@ -24,7 +24,7 @@ class ChannelConfig(Base):
     subtitle_style_shorts: Mapped[str] = mapped_column(String(32), nullable=False, default="karaoke")
     subtitle_karaoke_active_color: Mapped[str] = mapped_column(String(16), nullable=False, default="#FFD700")
     shorts_part_label_style: Mapped[str] = mapped_column(String(32), nullable=False, default="default")
-    video_style_type: Mapped[str] = mapped_column(String(64), nullable=False, default="documentary")
+    video_style_type: Mapped[str] = mapped_column(String(64), nullable=False, default="story_driven", server_default="story_driven")
     video_color_grade: Mapped[str] = mapped_column(String(64), nullable=True)
     # Runway is the absolute last resort; disabled by default
     runway_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
@@ -64,12 +64,13 @@ class ChannelConfig(Base):
     # (reserved).
     output_mode: Mapped[str] = mapped_column(String(32), nullable=False, server_default="youtube_and_shorts")
     # Free-form descriptor, same looseness as video_style_type above (no DB-level
-    # enum). Defaults to the same value video_style_type already defaults to, so
-    # existing channels stay default-compatible. Distinct column from
-    # video_style_type intentionally — see CLAUDE.md §8.1 for why both exist and
-    # which one a future phase should reconcile/deprecate.
-    visual_style: Mapped[str] = mapped_column(Text, nullable=False, server_default="documentary")
+    # enum). Distinct column from video_style_type intentionally — see CLAUDE.md
+    # §8.1 for why both exist and which one a future phase should reconcile/deprecate.
+    visual_style: Mapped[str] = mapped_column(Text, nullable=False, server_default="story_driven")
     # Free-form descriptor for the Flux image-generation look.
     image_style: Mapped[str] = mapped_column(Text, nullable=False, server_default="photorealistic")
+    # 'third_person' | 'first_person_storytime' — narration perspective/register
+    # threaded into Agent 2 prompt boundaries alongside visual_style/image_style.
+    narration_pov: Mapped[str] = mapped_column(String(32), nullable=False, server_default="third_person")
 
     channel: Mapped["Channel"] = relationship("Channel", back_populates="config")

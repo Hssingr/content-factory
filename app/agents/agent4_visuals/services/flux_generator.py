@@ -28,9 +28,11 @@ from pathlib import Path
 
 import fal_client
 import httpx
+from PIL import Image, UnidentifiedImageError
 
 from app.config import settings
 from app.agents.agent4_visuals.services import image_router
+from app.agents.agent4_visuals.subagents.storyboard_validator import composition_slot_variation
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +43,8 @@ _RETRY_DELAY_SEC = 2.0
 _INTER_BEAT_SLEEP_SEC = 0.5  # conservative until rate limits confirmed
 _GENERATION_TIMEOUT_SEC = 60.0
 _DOWNLOAD_TIMEOUT_SEC = 20.0
+_PIXEL_HASH_SIZE = 8
+_PIXEL_HASH_COLLISION_MAX_DISTANCE = 3
 
 # ── Safe fallback prompts by environment ───────────────────────────────────────
 # Used as attempt 3 when the Claude-written flux_prompt and its shortened form both
@@ -107,31 +111,6 @@ _ENV_SAFE_PROMPTS: dict[str, str] = {
     ),
 }
 
-# Concrete per-environment scene vocabulary — used by the text-prop prompt
-# sanitizer below to anchor a sanitized prompt in a physical setting.
-_ENVIRONMENT_SCENE_HINTS: dict[str, str] = {
-    "underwater": "clear underwater pool tiles and rippling light patterns",
-    "indoor_office": "office desk surface with lamp glow, folders, and practical workspace details",
-    "indoor_domestic": "quiet home interior with furniture, shelves, and warm window light",
-    "forest_nature": "forest path with leaves, tree trunks, and natural daylight",
-    "urban_street": "city sidewalk, parked cars, storefront shapes, and overcast daylight",
-    "corridor_interior": "long interior corridor with doors, floor reflections, and overhead lights",
-    "abstract_dark": "close textured wall surface with geometric shadows and visible material grain",
-    "open_landscape": "open field horizon with grass, sky, and distant landscape detail",
-    "laboratory": "laboratory bench with glassware, instruments, and clean overhead light",
-    "industrial": "warehouse interior with concrete floor, metal beams, and skylight panels",
-    "vehicle": "vehicle interior with dashboard, windshield, and road shapes outside",
-    "other": "real-world tabletop scene with story-relevant objects and natural side light",
-}
-_CONTEXT_WORD_LIMIT = 24
-_CONTEXT_WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9'’-]*")
-
-
-def _compact_context(raw: str) -> str:
-    words = _CONTEXT_WORD_RE.findall(str(raw or "").replace('"', " "))
-    return " ".join(words[:_CONTEXT_WORD_LIMIT]).strip()
-
-
 # ── Text-prop detection and sanitization (Phase 14.7, prompt half) ──────────
 # Ordinary generated beats (visual_type e.g. "document", "screenshot",
 # "b-roll") whose subject is a real-world prop that would naturally carry
@@ -163,45 +142,17 @@ _TEXT_PROP_KEYWORD_PATTERNS: tuple[tuple[str, "re.Pattern[str]"], ...] = tuple(
     (kw, re.compile(r"\b" + re.escape(kw) + r"\b")) for kw in _TEXT_PROP_KEYWORDS
 )
 
-_TEXT_PROP_NO_TEXT_CLAUSE = (
-    "blank and unmarked, no readable text, no legible letters, no legible "
-    "numbers, no legible words, no readable typography, no readable logos, "
-    "no readable names, no readable dates, illegible or blank surface only"
-)
+# Elimination Mandate (code_report/forensic_output_audit_borrasca_run.md,
+# D2.2/D2.3): the previous sanitizer rewrote the subject entirely (environment
+# scene hint + detected prop label + a selected ANGLE/DISTANCE/LIGHTING/DETAIL
+# framing clause + a 10-clause negative wall), which produced broken English
+# ("corkboard-less wide shot"), self-contradictions ("Sam's hands... his
+# expression" alongside "no people"), and identical sanitized prompts for
+# distinct beats (since the template ignored most of the original prompt) —
+# directly causing duplicate images. Claude's own flux_prompt is never
+# rewritten now; exactly one short clause is appended.
+_TEXT_PROP_NO_TEXT_CLAUSE = "no readable text or legible words in the frame"
 
-# Positive framing techniques (audit G-3 / roadmap 2.9) — the same ANGLE /
-# DISTANCE / LIGHTING / DETAIL taxonomy the storyboard prompt teaches Claude,
-# enforced here deterministically as a belt-and-suspenders fix for any
-# text-prop beat that reaches this sanitizer anyway (Claude's own framing
-# choice was too direct, or the beat came from the child remap path, which
-# has no equivalent storyboard-prompt guidance of its own). FLUX prompting
-# guidance is explicit that positive description outperforms negative
-# instruction — Flux has no true negative-prompt channel — so this clause is
-# additive alongside (never a replacement for) _TEXT_PROP_NO_TEXT_CLAUSE.
-_TEXT_PROP_FRAMING_CLAUSES: tuple[str, ...] = (
-    "photographed from a low side-on angle, the text-bearing surface turned "
-    "away from camera",
-    "the text-bearing surface a small distant element within a wider shot, "
-    "not the focal subject",
-    "lit with raking side light across the surface, texture and glare "
-    "obscuring the surface rather than clear reading light",
-    "extreme close-up on physical texture and material detail only, the "
-    "full surface not in frame",
-)
-
-
-def _select_text_prop_framing(beat: dict, prop_label: str) -> str:
-    """Deterministically choose one framing technique for a text-prop beat.
-
-    Never random: the same beat always selects the same clause (keyed off
-    beat_order + prop_label + environment), so retries and segment-level
-    regeneration reproduce byte-identical sanitized prompts.
-    """
-    key = f"{prop_label}:{beat.get('beat_order', 0)}:{beat.get('environment', '')}"
-    index = int(hashlib.sha256(key.encode("utf-8")).hexdigest(), 16) % len(
-        _TEXT_PROP_FRAMING_CLAUSES
-    )
-    return _TEXT_PROP_FRAMING_CLAUSES[index]
 
 def is_text_prop_beat(beat: dict) -> bool:
     """True for a beat whose prop would naturally carry readable text —
@@ -211,45 +162,17 @@ def is_text_prop_beat(beat: dict) -> bool:
     return any(pattern.search(haystack) for _, pattern in _TEXT_PROP_KEYWORD_PATTERNS)
 
 
-def _detect_text_prop_label(beat: dict) -> str:
-    """Return the first matching prop keyword — used only to keep the
-    sanitized prompt's described object specific (a "calendar", not a vague
-    "object"). Tuple order in `_TEXT_PROP_KEYWORDS` is most-specific-first
-    so "missing person poster" is preferred over the generic "poster".
-    """
-    haystack = " ".join(str(beat.get(f, "") or "") for f in _TEXT_PROP_FIELDS).lower()
-    for kw, pattern in _TEXT_PROP_KEYWORD_PATTERNS:
-        if pattern.search(haystack):
-            return kw
-    return "document"
-
-
 def derive_text_prop_prompt(beat: dict) -> str:
-    """Build a sanitized Flux prompt for a text-prop beat.
+    """Return Claude's own flux_prompt verbatim, plus one no-readable-text clause.
 
-    Describes the physical prop and scene only — never the literal text it
-    would carry. Combines a positive ANGLE/DISTANCE/LIGHTING/DETAIL framing
-    clause (audit G-3 / roadmap 2.9 — the same taxonomy the storyboard
-    prompt teaches Claude, selected deterministically per beat) with the
-    existing explicit "no readable text" clause — belt-and-suspenders, not
-    either/or. Under subtitles-only rendering no overlay replaces that text:
-    the narration itself already conveys what the prop said.
+    Never rewrites the subject — see the Elimination Mandate note above this
+    function. Falls back to visual_intent only if flux_prompt is genuinely
+    empty (never fabricates new subject text).
     """
-    environment = str(beat.get("environment") or "other")
-    env_scene = _ENVIRONMENT_SCENE_HINTS.get(environment, _ENVIRONMENT_SCENE_HINTS["other"])
-    context = (
-        _compact_context(beat.get("visual_intent", ""))
-        or _compact_context(beat.get("flux_prompt", ""))
-        or _compact_context(beat.get("script_text", ""))
-    )
-    prop_label = _detect_text_prop_label(beat)
-    subject = f"{context}, a physical {prop_label} prop" if context else f"a physical {prop_label} prop"
-    framing = _select_text_prop_framing(beat, prop_label)
-    return (
-        f"{subject} in the scene, {env_scene}, {framing}, photorealistic, "
-        "natural practical lighting, textured surfaces, sharp focus, no people, "
-        f"{_TEXT_PROP_NO_TEXT_CLAUSE}"
-    )
+    original = str(beat.get("flux_prompt") or beat.get("visual_intent") or "").strip()
+    if not original:
+        return _TEXT_PROP_NO_TEXT_CLAUSE
+    return f"{original}, {_TEXT_PROP_NO_TEXT_CLAUSE}"
 
 
 def _call_fal(
@@ -332,7 +255,6 @@ def generate_beat_image(
     beat_index: int,
     content_id: str,
     environment: str = "other",
-    purpose: str = "beat_image",
     cache_key_extra: str = "",
     model_key: image_router.ModelKey = _DEFAULT_MODEL_KEY,
     width: int = _DEFAULT_WIDTH,
@@ -354,9 +276,6 @@ def generate_beat_image(
         beat_index:   Beat index for logging only.
         content_id:   Content UUID string for logging only.
         environment:  Beat's environment field — selects the safe fallback prompt.
-        purpose:      Log label for the generation purpose; does not itself change
-                       which model is used — the caller (image_router.select_route())
-                       decides ``model_key`` before calling this function.
         cache_key_extra: Optional cache namespace; used so text-card backgrounds do not reuse a prior beat image.
         model_key:    Which fal.ai Flux model/endpoint to use for every tier of this
                        cascade. Defaults to ``"schnell"`` — every pre-Phase-14.6 caller
@@ -393,9 +312,9 @@ def generate_beat_image(
         if not prompt:
             continue
         logger.debug(
-            "Flux beat=%d content=%s purpose=%s endpoint=%s model=%s tier=%s prompt_words=%d "
+            "Flux beat=%d content=%s endpoint=%s model=%s tier=%s prompt_words=%d "
             "size=%dx%d",
-            beat_index, content_id, purpose, endpoint, model_key, tier, len(prompt.split()),
+            beat_index, content_id, endpoint, model_key, tier, len(prompt.split()),
             width, height,
         )
         path = _call_fal(
@@ -443,7 +362,6 @@ def generate_beat_image_with_routing(
     """
     route = image_router.select_route(
         beat, content_id,
-        purpose="beat_image",
         routing_enabled=settings.image_routing_enabled,
         allow_dev=settings.image_routing_allow_dev,
         allow_pro=settings.image_routing_allow_pro,
@@ -486,6 +404,126 @@ def generate_beat_image_with_routing(
         prompt, idx, content_id, environment=environment, model_key=model_key,
         width=width, height=height,
     )
+
+
+def _append_composition_variation(prompt: str, occurrence: int) -> tuple[str, str]:
+    variation = composition_slot_variation(occurrence)
+    base = str(prompt or "").rstrip(". ")
+    return (f"{base}, {variation}." if base else f"{variation}.", variation)
+
+
+def _average_pixel_hash(media_url: str, media_path: Path) -> int | None:
+    path = Path(media_url)
+    image_path = path if path.is_absolute() else media_path / path
+    try:
+        with Image.open(image_path) as image:
+            gray = image.convert("L").resize((_PIXEL_HASH_SIZE, _PIXEL_HASH_SIZE))
+            pixels = list(gray.getdata())
+    except (FileNotFoundError, UnidentifiedImageError, OSError, ValueError) as exc:
+        logger.warning(
+            "PIXEL_HASH_UNAVAILABLE media_url=%s exception_type=%s exception_message=%s",
+            media_url, type(exc).__name__, str(exc),
+        )
+        return None
+
+    avg = sum(pixels) / len(pixels)
+    value = 0
+    for pixel in pixels:
+        value = (value << 1) | int(pixel >= avg)
+    return value
+
+
+def _hamming_distance(left: int, right: int) -> int:
+    return (left ^ right).bit_count()
+
+
+def _find_pixel_collision(
+    media_url: str,
+    pixel_ledger: list[dict],
+    *,
+    media_path: Path,
+) -> tuple[int, dict, int] | None:
+    image_hash = _average_pixel_hash(media_url, media_path)
+    if image_hash is None:
+        return None
+    for entry in pixel_ledger:
+        distance = _hamming_distance(image_hash, entry["hash"])
+        if distance <= _PIXEL_HASH_COLLISION_MAX_DISTANCE:
+            return image_hash, entry, distance
+    return None
+
+
+def _record_pixel_hash(
+    media_url: str,
+    pixel_ledger: list[dict],
+    *,
+    media_path: Path,
+    beat_order: int,
+) -> None:
+    image_hash = _average_pixel_hash(media_url, media_path)
+    if image_hash is not None:
+        pixel_ledger.append({"hash": image_hash, "media_url": media_url, "beat_order": beat_order})
+
+
+def _dedupe_generated_image_once(
+    beat: dict,
+    path: str,
+    content_id: str,
+    tier_counts: dict[str, int],
+    pixel_ledger: list[dict],
+    *,
+    width: int,
+    height: int,
+) -> str:
+    """Reroll one generated image if its perceptual hash collides in this run.
+
+    This is an anti-duplicate guard, not a quality loop: it compares only local
+    pixels against earlier accepted images in the same generation call and makes
+    at most one deterministic prompt variation.
+    """
+    media_path = Path(settings.media_path)
+    idx = beat.get("beat_order", beat.get("section_order", 0))
+    collision = _find_pixel_collision(path, pixel_ledger, media_path=media_path)
+    if collision is None:
+        _record_pixel_hash(path, pixel_ledger, media_path=media_path, beat_order=idx)
+        return path
+
+    _current_hash, prior, distance = collision
+    reroll_prompt, variation = _append_composition_variation(
+        str(beat.get("flux_prompt", "") or ""),
+        len(pixel_ledger),
+    )
+    reroll_beat = dict(beat)
+    reroll_beat["media_url"] = ""
+    reroll_beat["flux_prompt"] = reroll_prompt
+    logger.warning(
+        "PIXEL_DUPLICATE_REROLL content=%s beat=%s prior_beat=%s distance=%d "
+        "variation=%r",
+        content_id, idx, prior.get("beat_order"), distance, variation,
+    )
+
+    reroll_path = generate_beat_image_with_routing(
+        reroll_beat, content_id, tier_counts, width=width, height=height,
+    )
+    if reroll_path:
+        beat["flux_prompt"] = reroll_prompt
+        post_collision = _find_pixel_collision(reroll_path, pixel_ledger, media_path=media_path)
+        if post_collision is not None:
+            _hash, post_prior, post_distance = post_collision
+            logger.error(
+                "PIXEL_DUPLICATE_REROLL_STILL_COLLIDES content=%s beat=%s "
+                "prior_beat=%s distance=%d media_url=%s",
+                content_id, idx, post_prior.get("beat_order"), post_distance, reroll_path,
+            )
+        _record_pixel_hash(reroll_path, pixel_ledger, media_path=media_path, beat_order=idx)
+        return reroll_path
+
+    logger.error(
+        "PIXEL_DUPLICATE_REROLL_FAILED content=%s beat=%s original_media_url=%s",
+        content_id, idx, path,
+    )
+    _record_pixel_hash(path, pixel_ledger, media_path=media_path, beat_order=idx)
+    return path
 
 
 def fill_failed_beats_from_neighbors(beats: list[dict], content_id: str) -> int:
@@ -569,6 +607,7 @@ def generate_all_beat_images(beats: list[dict], content_id: str) -> list[dict]:
     # routing-conservatism contract. Safe to share across the thread pool
     # below because max_workers=1 (beats are generated one at a time).
     tier_counts: dict[str, int] = {}
+    pixel_ledger: list[dict] = []
 
     def _generate_one(beat: dict) -> dict:
         idx = beat.get("beat_order", beat.get("section_order", 0))
@@ -589,6 +628,10 @@ def generate_all_beat_images(beats: list[dict], content_id: str) -> list[dict]:
                 cache_key_extra=f"hard_retry:{idx}",
             )
         if path:
+            path = _dedupe_generated_image_once(
+                beat, path, content_id, tier_counts, pixel_ledger,
+                width=_DEFAULT_WIDTH, height=_DEFAULT_HEIGHT,
+            )
             beat["media_url"]  = path
             beat["media_type"] = "image"
 

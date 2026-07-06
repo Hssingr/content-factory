@@ -98,7 +98,7 @@ class TestPropsEmitNoTextFields(unittest.TestCase):
                     content_id="cid", language="en",
                     audio_file_path=f"{tmp}/audio.mp3", duration_ms=9000,
                     sections=self._sections(),
-                    standard_subtitles=[{"text": "hello", "start_ms": 0, "end_ms": 900}],
+                    standard_subtitles=[{"text": "hello", "start_ms": 0, "end_ms": 8900}],
                     karaoke_subtitles=[],
                 )
                 props = json.loads(Path(path).read_text())
@@ -152,12 +152,18 @@ class TestBeatBuildNormalization(unittest.TestCase):
         self.assertEqual(out["flux_prompt"], raw["flux_prompt"])
 
     def test_text_prop_sanitized_without_overlay(self):
-        raw = _beat(0, flux_prompt='missing person poster that reads "LOST"',
+        # Elimination Mandate (D2.2/D2.3): the sanitizer no longer rewrites
+        # the subject — it appends one no-readable-text clause to Claude's
+        # own flux_prompt verbatim. A literal quote in the original prompt is
+        # a separate concern owned by validate_storyboard() check 19
+        # (ai_text_rendering_requested) and the storyboard prompt's own
+        # quote-ban rule, not by this sanitizer.
+        raw = _beat(0, flux_prompt="missing person poster on a pole",
                     visual_intent="a missing person poster on a pole")
         out = _build_beat_section(raw, 0, 0, 3000, "narration")
         # Prompt sanitization survives (Phase 14.7 prompt half)…
         self.assertIn("no readable text", out["flux_prompt"])
-        self.assertNotIn('"LOST"', out["flux_prompt"])
+        self.assertIn("missing person poster on a pole", out["flux_prompt"])
         # …but the overlay-derivation half is gone: no "MISSING" label.
         self.assertEqual(out["overlay_text"], "")
 

@@ -6,8 +6,8 @@ file within one content's cache directory — a surviving
 finding (all MINOR, so storyboard retry never fires for them) is a guaranteed
 wasted/duplicate image. `repair_duplicate_flux_prompts()` deterministically
 appends a composition-slot variation to the flagged beat before Flux ever
-sees it — no randomness, no AI call, never touching a beat whose media is
-already resolved elsewhere.
+sees it — no randomness, no AI call. Existing media is preserved by default,
+but callers that regenerate those beats in the same run can opt in.
 
 Every test here drives the REAL `validate_storyboard()` →
 `repair_duplicate_flux_prompts()` chain (and the real
@@ -17,6 +17,7 @@ nothing internal is stubbed; this path has no external API to stub.
 
 import logging
 import unittest
+from pathlib import Path
 
 from app.agents.agent4_visuals.services.visual_orchestrator import (
     _repair_duplicate_prompts,
@@ -24,6 +25,7 @@ from app.agents.agent4_visuals.services.visual_orchestrator import (
 from app.agents.agent4_visuals.subagents.storyboard_validator import (
     _COMPOSITION_ROTATION,
     _DUPLICATE_REPAIR_CHECKS,
+    composition_slot_variation,
     find_duplicate_prompt_beat_orders,
     repair_duplicate_flux_prompts,
     validate_storyboard,
@@ -130,7 +132,7 @@ class TestReusedBeatsNeverTouched(unittest.TestCase):
         self.assertEqual(repaired[1]["flux_prompt"], beats[1]["flux_prompt"])
         self.assertEqual(repaired[1]["media_url"], "cache/parent-id/abc123.jpg")
 
-    def test_flagged_beat_itself_already_resolved_is_left_alone(self):
+    def test_flagged_beat_itself_already_resolved_is_left_alone_by_default(self):
         # If the FLAGGED beat_order itself already has media (e.g. a
         # flux-incomplete recovery pass where some beats already succeeded in
         # a prior attempt), it must not be rewritten — its image already
@@ -148,8 +150,42 @@ class TestReusedBeatsNeverTouched(unittest.TestCase):
         self.assertEqual(repairs, [])
         self.assertEqual(repaired[2]["flux_prompt"], beats[2]["flux_prompt"])
 
+    def test_flagged_resolved_beat_can_be_repaired_when_regenerated_same_run(self):
+        # Child Short portrait generation clears media_url and regenerates every
+        # beat after this repair pass. In that path, a duplicate that is
+        # currently "resolved" must still receive the append-only variation.
+        beats = [
+            _beat(0, environment="forest_nature", motif="exterior",
+                  flux_prompt="Ancient forest canopy, wide shot, photorealistic"),
+            _beat(1, environment="urban_street", motif="room", effect="pan",
+                  flux_prompt="Office desk with a brass lamp, documentary photograph"),
+            _beat(2, environment="laboratory", motif="clock", effect="push_in",
+                  media_url="cache/content-id/def456.jpg",
+                  flux_prompt="Office desk with a brass lamp, documentary photograph"),
+        ]
+        repaired, repairs = repair_duplicate_flux_prompts(beats, include_resolved=True)
+        self.assertEqual([r["beat_order"] for r in repairs], [2])
+        self.assertNotEqual(repaired[2]["flux_prompt"], beats[2]["flux_prompt"])
+        self.assertIn(composition_slot_variation(0), repaired[2]["flux_prompt"])
+
+
 
 class TestNearDuplicateBeatRepair(unittest.TestCase):
+
+    def test_near_duplicate_scans_beyond_two_positions_for_short_wide_repeats(self):
+        beats = [
+            _beat(0, flux_prompt="Office desk first view",
+                  environment="indoor_office", motif="object", effect="cut"),
+            _beat(1, flux_prompt="Forest path",
+                  environment="forest_nature", motif="exterior", effect="pan"),
+            _beat(2, flux_prompt="Laboratory bench",
+                  environment="laboratory", motif="clock", effect="push_in"),
+            _beat(3, flux_prompt="Office desk distant repeat",
+                  environment="indoor_office", motif="object", effect="cut"),
+        ]
+        targets = find_duplicate_prompt_beat_orders(beats)
+        self.assertEqual(targets, {0: "near_duplicate_beat"})
+
     def test_metadata_near_duplicate_pair_gets_repaired(self):
         # near_duplicate_beat flags the EARLIER of a close pair sharing
         # environment+motif+effect (opposite convention from the flux_prompt
@@ -275,9 +311,7 @@ class TestStaticSurface(unittest.TestCase):
         self.assertEqual(len(set(_COMPOSITION_ROTATION)), 24)
 
     def test_orchestrator_call_sites_present(self):
-        src = open(
-            "app/agents/agent4_visuals/services/visual_orchestrator.py"
-        ).read()
+        src = Path("app/agents/agent4_visuals/services/visual_orchestrator.py").read_text()
         self.assertEqual(src.count("_repair_duplicate_prompts("), 4)  # def + 3 call sites
 
 

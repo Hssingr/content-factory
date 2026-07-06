@@ -96,16 +96,33 @@ class TestBeatBuildDowngrade(unittest.TestCase):
         out = _build_beat_section(raw, 0, 0, 3000, "narration")
         self.assertEqual(out["color_grade"], "neutral")
 
-    def test_sanitized_text_prop_prompt_keeps_grade(self):
-        # Text-prop sanitization appends "natural practical lighting" — the
-        # final prompt (what Flux receives) carries lighting evidence, so the
-        # grade survives. The guard must evaluate the FINAL prompt.
+    def test_sanitized_text_prop_prompt_with_lighting_evidence_keeps_grade(self):
+        # Elimination Mandate (D2.2/D2.3): the text-prop sanitizer no longer
+        # rewrites the subject or appends boilerplate lighting language — it
+        # returns Claude's own flux_prompt verbatim plus one no-readable-text
+        # clause. The guard must still evaluate the FINAL (sanitized) prompt:
+        # since the original prompt already carries lighting evidence, that
+        # evidence survives verbatim through sanitization, so the grade
+        # survives too.
+        raw = _beat(0, color_grade="dark_contrast",
+                    flux_prompt="old case file document under a bright desk lamp",
+                    visual_intent="a case file document")
+        out = _build_beat_section(raw, 0, 0, 3000, "narration")
+        self.assertIn("bright desk lamp", out["flux_prompt"])
+        self.assertEqual(out["color_grade"], "dark_contrast")
+
+    def test_sanitized_text_prop_prompt_without_lighting_evidence_downgrades(self):
+        # Same verbatim-passthrough sanitizer: an original prompt with NO
+        # lighting evidence has none after sanitization either (no more
+        # auto-injected "natural practical lighting" boilerplate to
+        # artificially exempt every text-prop beat), so the guard correctly
+        # downgrades it like any other unlit dark_contrast beat.
         raw = _beat(0, color_grade="dark_contrast",
                     flux_prompt="old case file document on a desk",
                     visual_intent="a case file document")
         out = _build_beat_section(raw, 0, 0, 3000, "narration")
-        self.assertIn("practical lighting", out["flux_prompt"])
-        self.assertEqual(out["color_grade"], "dark_contrast")
+        self.assertNotIn("lighting", out["flux_prompt"])
+        self.assertEqual(out["color_grade"], "desaturated")
 
 
 class TestChainProof(unittest.TestCase):

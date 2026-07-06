@@ -38,23 +38,35 @@ _EXPECTED_RESOLUTION: dict[str, tuple[int, int]] = {
 
 def verify_render(
     mp4_path: str,
-    expected_duration_ms: int | None,
+    audio_file_path: str | None,
     fmt: str,
 ) -> list[str]:
     """Run post-render verification on an MP4 file before saving to DB.
 
     Checks applied in order:
-      1. ffprobe: duration ±2% (if expected_duration_ms provided); exactly one
-         audio stream; resolution matches fmt (1920×1080 main / 1080×1920 short).
+      1. ffprobe: duration ±2% against the SOURCE AUDIO FILE (if
+         audio_file_path provided); exactly one audio stream; resolution
+         matches fmt (1920×1080 main / 1080×1920 short).
       2. blackdetect: no black interval ≥ 3 s anywhere in the file.
       3. silencedetect: no interior silence ≥ 4 s (ignores first/last 1 s).
 
     Args:
-        mp4_path:             Absolute path to the rendered MP4.
-        expected_duration_ms: Expected audio duration in ms, or None to skip
-                              the duration check (e.g. Shorts with unknown
-                              bookend padding).
-        fmt:                  "main" or "short" — selects expected resolution.
+        mp4_path:        Absolute path to the rendered MP4.
+        audio_file_path: Absolute path to the source audio file used for this
+                         render, or None to skip the duration check. Expected
+                         duration is measured directly via ffprobe on this
+                         file (roadmap 2c / audit P2-5,
+                         code_report/forensic_output_audit_borrasca_run.md)
+                         — never the DB's ``AudioFile.duration_ms``, which is
+                         exactly the value this check exists to audit; a
+                         corrupted DB row would otherwise let a render
+                         "verify" against itself. Enabled for both formats —
+                         P2-6 found Shorts previously skipped this check
+                         entirely ("no bookend padding"), disabling the one
+                         deterministic check that would catch a child
+                         timeline corruption on the format with the least
+                         margin for error.
+        fmt:             "main" or "short" — selects expected resolution.
 
     Returns:
         List of failure description strings.  Empty list means all checks passed.
@@ -65,7 +77,7 @@ def verify_render(
         return [f"file not found: {mp4_path}"]
 
     # ── Step 1: ffprobe structural checks ────────────────────────────────────
-    issues.extend(_check_ffprobe(mp4_path, expected_duration_ms, fmt))
+    issues.extend(_check_ffprobe(mp4_path, audio_file_path, fmt))
 
     # ── Step 2: black-frame detection ────────────────────────────────────────
     issues.extend(_check_blackdetect(mp4_path))
@@ -90,7 +102,7 @@ def verify_render(
 
 def _check_ffprobe(
     mp4_path: str,
-    expected_duration_ms: int | None,
+    audio_file_path: str | None,
     fmt: str,
 ) -> list[str]:
     """Run ffprobe and return structural issues."""
@@ -111,19 +123,26 @@ def _check_ffprobe(
     except Exception as exc:
         return [f"ffprobe exception: {exc}"]
 
-    # Duration check
-    if expected_duration_ms is not None:
-        try:
-            actual_sec = float(info["format"]["duration"])
-            expected_sec = expected_duration_ms / 1000.0
-            drift = abs(actual_sec - expected_sec) / max(expected_sec, 0.001)
-            if drift > _DURATION_TOLERANCE:
-                issues.append(
-                    f"duration_drift={drift:.1%} actual={actual_sec:.1f}s "
-                    f"expected={expected_sec:.1f}s"
-                )
-        except (KeyError, ValueError, TypeError) as exc:
-            issues.append(f"duration_parse_error: {exc}")
+    # Duration check — expected duration is measured directly from the
+    # source audio file via ffprobe (roadmap 2c / audit P2-5), never the DB's
+    # AudioFile.duration_ms: a corrupted DB row would otherwise let a render
+    # "verify" against itself, exactly the failure mode a real production
+    # run hit (the 161.7s DB value made a 161.7s corrupted render pass).
+    if audio_file_path is not None:
+        expected_sec = _probe_duration_sec(audio_file_path)
+        if expected_sec <= 0:
+            issues.append(f"audio_duration_probe_failed: could not measure {audio_file_path}")
+        else:
+            try:
+                actual_sec = float(info["format"]["duration"])
+                drift = abs(actual_sec - expected_sec) / max(expected_sec, 0.001)
+                if drift > _DURATION_TOLERANCE:
+                    issues.append(
+                        f"duration_drift={drift:.1%} actual={actual_sec:.1f}s "
+                        f"expected={expected_sec:.1f}s"
+                    )
+            except (KeyError, ValueError, TypeError) as exc:
+                issues.append(f"duration_parse_error: {exc}")
 
     streams = info.get("streams", [])
 

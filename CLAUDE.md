@@ -576,15 +576,22 @@ Current model tier (roadmap 4.2 / audit S-2, exec-6):
 
 - `app/config.py`'s `primary_model`/`secondary_model` defaults are both
   Sonnet-class (`"claude-sonnet-5"` / `"claude-sonnet-4-6"`) — no
-  `MODEL_ROUTING` task defaults to Haiku anymore, including the
-  `SECONDARY_MODEL`-tier quality gates (`script_quality_check`,
-  `short_quality_check`) the audit specifically flagged as "the arbiter of
-  your #1 priority is your weakest model." The `PRIMARY_MODEL`-tier creative
-  tasks (`script_generation`, `native_adaptation`, `quality_rewrite`,
-  `storyboard`, `visual_bible_generation`, `story_blueprint`,
-  `section_generation`, `short_script`, plus `story_research`/
-  `channel_suggestion`/`channel_research`/`story_gate_scoring`/`revision`)
-  resolve to the configured primary model.
+  `MODEL_ROUTING` task defaults to Haiku anymore. At the time of this audit,
+  that included the `SECONDARY_MODEL`-tier quality gates
+  (`script_quality_check`, `short_quality_check`) the audit specifically
+  flagged as "the arbiter of your #1 priority is your weakest model" — both
+  task keys, along with `quality_rewrite` and `global_validation`, were
+  subsequently retired entirely by the Elimination Mandate
+  (`code_report/forensic_output_audit_borrasca_run.md`, D1.1/D1.2/D1.3; see
+  §9.3/§9.4) — they no longer exist in `MODEL_ROUTING` at all, on any tier.
+  `visual_bible_generation` was likewise retired by the same mandate's D2.1
+  (see §11.4/§13) — the visual-bible layer it routed is deleted entirely,
+  replaced by a deterministic, no-AI-call continuity line. The
+  `PRIMARY_MODEL`-tier creative tasks (`script_generation`,
+  `native_adaptation`, `storyboard`, `story_blueprint`, `section_generation`,
+  `short_script`, plus `story_research`/`channel_suggestion`/
+  `channel_research`/`story_gate_scoring`/`revision`) resolve to the
+  configured primary model.
 - `model_routing.DEFAULT_PRIMARY_MODEL`/`DEFAULT_SECONDARY_MODEL` are kept in
   sync with `config.py`'s defaults as a documentation reference, but are not
   themselves read by `resolve_model()`/`_configured_model()` — those always
@@ -610,6 +617,8 @@ Responsibilities:
 - Sentence rhythm variance checks (Phase 11.1).
 - Completeness checks.
 - Length checks.
+- Source-material floor check (roadmap 4b / audit P1-5 —
+  `check_source_material_floor()`; see §9.3's `fetch_batch` entry).
 - Deterministic cleanup utilities.
 
 This file has no per-function check inventory table (unlike Agent 4's
@@ -770,31 +779,37 @@ acts on it.
 |---|---|---|---|---|
 | `content_mode` | `str` (Pydantic `Literal`) | `"single_story"` | `"single_story"` — matches today's only real behavior (one discovery → one parent + standalone shorts per cycle) | `"limited_series"`, `"ongoing_series"` — reserved; no Agent 2 execution logic exists for either |
 | `script_source` | `str` (Pydantic `Literal`) | `"reddit"` | `"reddit"` — matches Agent 2's current discovery default | `"ai_generated"`, `"user_provided"`, `"hybrid"` — reserved; Agent 2 always runs the same discovery→blueprint→script flow regardless of this value today |
-| `output_mode` | `str` (Pydantic `Literal`) | `"youtube_and_shorts"` | `"youtube_and_shorts"` — matches today's only real behavior (parent render + standalone shorts via `run_shorts_planner`, per §9.4) | `"youtube_long_only"`, `"shorts_only"` — reserved; no agent currently branches on this value |
-| `visual_style` | `str` (free-form, no DB enum) | `"documentary"` | **Read by Agent 2 and Agent 4** — Agent 2 injects it into `generate_story_blueprint()`, `generate_section()`, and `generate_short_episode_script()` user messages as "Visual style:" so narration and hook framing align with the channel's visual aesthetic; Agent 4 injects it into every `generate_storyboard_batch()` call as "Global visual direction:" applying a consistent mood/color/lighting constraint across all beats. See §11 (Agent 4) for the Agent 4 injection contract. | Intentionally a **separate column from `video_style_type`** (§19's existing field, same default); a future phase should decide whether to reconcile/deprecate one of them — do not silently merge them without updating this section |
+| `output_mode` | `str` (Pydantic `Literal`) | `"youtube_and_shorts"` | `"youtube_and_shorts"` (parent render + standalone shorts via `run_shorts_planner`, per §9.4) and `"youtube_long_only"` (same parent pipeline; `run_script_workflow()` skips the shorts planner, logged `SHORTS_PLANNER_SKIPPED` — post-roadmap deep audit, the first runtime consumer of this column) | `"shorts_only"` — reserved; Agent 5 always renders the parent main video, no switch exists to skip the long-form half |
+| `visual_style` | `str` (free-form, no DB enum) | `"story_driven"` (roadmap 4a / audit P1-9 — was `"documentary"`) | **Read by Agent 2 and Agent 4** — Agent 2 injects it into `generate_story_blueprint()`, `generate_section()`, and `generate_short_episode_script()` user messages as "Visual style:" so narration and hook framing align with the channel's visual aesthetic; Agent 4 injects it into every `generate_storyboard_batch()` call as "Global visual direction:" applying a consistent mood/color/lighting constraint across all beats. See §11 (Agent 4) for the Agent 4 injection contract. | Intentionally a **separate column from `video_style_type`** (§19's existing field, same default); a future phase should decide whether to reconcile/deprecate one of them — do not silently merge them without updating this section |
 | `image_style` | `str` (free-form, no DB enum) | `"photorealistic"` | **Read by Agent 2 and Agent 4** — Agent 2 injects it into the same three prompt functions as `visual_style` as "Image style:"; Agent 4 injects it into every `generate_storyboard_batch()` call as "Global image style:" applying a consistent Flux rendering approach across all beats. See §11 (Agent 4) for the Agent 4 injection contract. | No per-beat `image_style` override exists; the channel-level setting applies uniformly to every `flux_generated` beat |
+| `narration_pov` | `str` (Pydantic `Literal`, roadmap 4a / audit P1-9) | `"third_person"` | **Read by Agent 2 only** — `"third_person"` (standard narrator voice) or `"first_person_storytime"` (narrate as the protagonist, "I"/"me"/"my" — the r/nosleep storytime format). Threaded via `ScriptWorkflowContext` into `generate_story_blueprint()`, `generate_section()`, `generate_short_episode_script()`, and `generate_native_script()` (native adaptation is instructed to preserve the source's POV, never convert it) as "Narration POV:". Real behavioral rules exist in `_STORY_BLUEPRINT_SYSTEM_PROMPT`, `_SECTION_GENERATION_SYSTEM_PROMPT`, and `_SHORT_EPISODE_SYSTEM_PROMPT` — this is not a passthrough label. | Not read by Agent 4 — visual storyboard direction does not depend on narration person |
 
 Rules:
 
-- `visual_style` and `image_style` are now wired into **both Agent 2 and
-  Agent 4** — do not treat them as unread. Agent 2 receives them in
-  `generate_story_blueprint()`, `generate_section()`, and
-  `generate_short_episode_script()` via the `ScriptWorkflowContext`
-  threading chain; Agent 4 receives them in
-  `generate_storyboard_batch()` via `split_into_beats()` (see §11.4).
-  All other fields (`content_mode`, `script_source`, `output_mode`)
-  remain schema-only; do not make any other agent read them until a
-  dedicated phase explicitly wires them in, documents the new behavior
-  here, and proves it with a runtime test (§19.4).
-- `content_mode`/`script_source`/`output_mode` are Pydantic `Literal`
-  types in `app/schemas/channel.py` (`ContentMode`/`ScriptSource`/
-  `OutputMode`) — the API rejects any value outside the table above.
-  `visual_style`/`image_style` are plain strings (no enum), matching the
-  existing looseness of `video_style_type`/`video_color_grade`.
-- All five columns are `NOT NULL` with a `server_default` (migration
-  `alembic/versions/004_add_v3_channel_config_fields.py`) — additive and
-  backwards-compatible; every existing channel row is backfilled with the
-  same default a brand-new row gets, with no manual data migration step.
+- `visual_style`, `image_style`, and `narration_pov` are now wired into
+  **both Agent 2 and Agent 4** (narration_pov: Agent 2 only) — do not treat
+  them as unread. Agent 2 receives them in `generate_story_blueprint()`,
+  `generate_section()`, `generate_short_episode_script()`, and (for
+  `visual_style`/`image_style`/`narration_pov`) `generate_native_script()`
+  via the `ScriptWorkflowContext` threading chain and
+  `generate_multilingual_scripts()`'s own `ChannelConfig` load; Agent 4
+  receives `visual_style`/`image_style` in `generate_storyboard_batch()` via
+  `split_into_beats()` (see §11.4). All other fields (`content_mode`,
+  `script_source`, `output_mode`) remain schema-only; do not make any other
+  agent read them until a dedicated phase explicitly wires them in,
+  documents the new behavior here, and proves it with a runtime test (§19.4).
+- `content_mode`/`script_source`/`output_mode`/`narration_pov` are Pydantic
+  `Literal` types in `app/schemas/channel.py` (`ContentMode`/`ScriptSource`/
+  `OutputMode`/`NarrationPov`) — the API rejects any value outside the table
+  above. `visual_style`/`image_style` are plain strings (no enum), matching
+  the existing looseness of `video_style_type`/`video_color_grade`.
+- All six columns are `NOT NULL` with a `server_default` (migrations
+  `alembic/versions/004_add_v3_channel_config_fields.py` for the first five,
+  `008_add_narration_pov_and_story_driven_default.py` for `narration_pov`
+  plus the `visual_style`/`video_style_type` default change to
+  `"story_driven"`) — additive and backwards-compatible; every existing
+  channel row is backfilled with the same default a brand-new row gets,
+  with no manual data migration step.
 - Do not add execution logic for `limited_series`/`ongoing_series`,
   or voice/credential verification under this section — those are
   explicitly separate, not-yet-scheduled phases per the V3.1 audit's
@@ -825,7 +840,7 @@ save it) but not yet executable:
 |---|---|---|---|
 | `content_mode` | `single_story` | `limited_series`, `ongoing_series` | Agent 2 has no multi-episode or open-ended series planning/execution logic |
 | `script_source` | `reddit` (only when `content_mode="single_story"`) | `ai_generated` (alias: `claude_generated`), `user_provided`, `hybrid` | Agent 2's discovery flow always fetches a real source story today, for every content_mode — there is no AI-improvised, operator-supplied, or mixed script-origin path |
-| `output_mode` | `youtube_and_shorts` | `shorts_only`, `youtube_long_only` | Nothing in Agent 2/Agent 5 reads `output_mode` yet; `run_shorts_planner()` always runs and Agent 5 always renders the parent main video, unconditionally |
+| `output_mode` | `youtube_and_shorts`, `youtube_long_only` | `shorts_only` | `youtube_long_only` skips `run_shorts_planner()` in `run_script_workflow()` (`SHORTS_PLANNER_SKIPPED`); `shorts_only` is not executable — Agent 5 always renders the parent main video, no switch exists to skip the long-form half |
 
 `normalize_script_source()` maps `"claude_generated"` → `"ai_generated"` —
 a pure mapping, never a DB write. The V3.2 schema itself only ever accepts
@@ -906,6 +921,9 @@ performed, all independent (every issue is collected, not just the first):
    one of them.
 9. `output_mode="youtube_and_shorts"` (the only executable output mode
    today) requires a `ChannelPlatform` row with `platform="youtube"`.
+10. A niche↔tone contradiction (roadmap 4a / audit P1-9, §8.7) — collected
+    into `warnings`, `severity="WARNING"`, **never** `issues`. Does not
+    affect the `ready` boolean.
 
 Logging: a blocked activation logs
 `CHANNEL_ACTIVATION_BLOCKED channel_id=<id> issue_codes=[...]` at WARNING,
@@ -993,15 +1011,22 @@ fields and closes the dialog), closes the dialog without applying, or clicks
 previously-inverted flow (Research was disabled when empty, enabled when
 non-empty — the opposite of the intended design).
 
-**`ScheduleSection.jsx` — dropdowns with explanations (Items 16/17):**
-`visual_style` and `image_style` are now `<select>` dropdowns driven by
+**`BasicInfoSection.jsx` (Concept step) — dropdowns with explanations (Items
+16/17; corrected here — these live in `BasicInfoSection.jsx`, not
+`ScheduleSection.jsx`, which owns only publish-timing fields):**
+`visual_style` and `image_style` are `<select>` dropdowns driven by
 `VISUAL_STYLE_OPTIONS`/`IMAGE_STYLE_OPTIONS` in `constants.js` (structured
 `{value, label, description}` objects), replacing the previous
 `<input type="text">` + `<datalist>` pair. A per-option description line
 renders below the selected value. `output_mode` has an `OUTPUT_MODE_DESCRIPTIONS`
 sentence rendered below the dropdown explaining what that mode produces.
-All three constants remain in sync with Agent 4's runtime behavior — the
-dropdown labels match the values Agent 4 receives.
+`narration_pov` (roadmap 4a / audit P1-9) is a fourth dropdown in the same
+row group, driven by `NARRATION_POV_OPTIONS` — "Third Person (default)" or
+"First Person / Storytime", each with a description line. All four constants
+remain in sync with Agent 2/Agent 4's runtime behavior — the dropdown labels
+match the values those agents receive. `VISUAL_STYLE_OPTIONS`'s first entry
+is `story_driven` (the current `ChannelConfig.visual_style` default); the
+prior default value, `documentary`, remains selectable as an ordinary option.
 
 **`VoicesSection.jsx` — honest voice status labels:** "Validated ✓" and
 "Not validated" (implying a provider API had been called) were replaced by
@@ -1092,8 +1117,47 @@ Rules:
   visual direction:"/"Global image style:" lines in the storyboard user
   message). Adding a new option here that neither agent's prompts
   explicitly document causes silent prompt mismatch.
+- Keep `NARRATION_POV_OPTIONS` in sync with the `NarrationPov` Pydantic
+  `Literal` in `app/schemas/channel.py` — unlike `VISUAL_STYLE_OPTIONS`/
+  `IMAGE_STYLE_OPTIONS`, `narration_pov` is a closed enum on the backend
+  (only `"third_person"`/`"first_person_storytime"` validate), so a UI
+  option value outside that pair would be rejected by the API, not silently
+  ignored.
 - Research results open in a modal dialog (`ResearchDialog`) — do not
   reinline them below the textarea; that was an explicitly-fixed UX defect.
+
+Post-roadmap deep audit changes to this wizard (all implemented):
+
+- **`TONES` covers tension registers**: the dropdown previously offered only
+  documentary/conversational/educational/entertaining/investigative — for a
+  horror/true-crime niche, the audited P1-9 misconfiguration
+  (tone=documentary) was effectively *forced* by the UI, while the
+  niche↔tone warning (§8.7) recommended values the dropdown didn't offer.
+  It now includes `suspenseful`/`ominous`/`dramatic`/`humorous`/
+  `inspirational` as well, and the Agent 1 suggest prompt's tone vocabulary
+  (`system_prompt.py`, PROMPT_VERSION 1.4) matches it, with an explicit
+  "tension niches need a tension tone" rule. Keep the two lists in sync.
+- **`AISuggestionField`'s select renders out-of-list values**: an AI
+  suggestion or research recommendation can legitimately set a value outside
+  the preset list (the backend columns are free-form) — the select now shows
+  it as a "(custom)" option instead of silently displaying the wrong entry.
+- **The `shorts_rule` dropdown is removed**: `ChannelConfig.shorts_rule` was
+  persisted but read by nothing at runtime — "Never create Shorts" still
+  created Shorts (a lying control), and it overlapped `output_mode`. Shorts
+  on/off is now controlled by `output_mode` alone (see §8.1/§8.2 —
+  `youtube_long_only` is executable and skips the planner). The DB column
+  and schema field remain (default `"auto"`, legacy, no migration) but no
+  UI control writes them; do not reintroduce the dropdown.
+- **Dead constants removed** from `constants.js`: `EMOTIONS`, `MUSIC_STYLES`
+  (no music layer exists — §11A.7 is design-only), `SHORTS_RULES`, and
+  `USE_CASES` — none had a JSX consumer.
+- **The ElevenLabs voice-browser chain is removed**: `VoicePicker.jsx` had
+  zero importers, so the whole dead chain went with it —
+  `api.getVoices`, the `GET /api/agent1/voices` router
+  (`routers/voices.py`), and `services/elevenlabs.py`
+  (`get_shared_voices()`). Voice IDs remain operator-provided hard inputs
+  (§8). The `ChannelVoice.music_style`/`use_case` columns remain as legacy
+  nullable columns (no migration); nothing reads them.
 
 ### 8.5 Research Ideas UX (Agent 1 V3.5c)
 
@@ -1204,6 +1268,17 @@ Rules:
   this section.
 - Do not make `channel_description` required when `mode="explore"` — the
   entire point of explore mode is that the operator has nothing to describe yet.
+- `recommended_visual_style`/`recommended_image_style` and
+  `editable_config.visual_style`/`.image_style` are **enum-constrained** in
+  `_RESEARCH_IDEAS_SCHEMA` to the canonical preset values
+  (`_VISUAL_STYLE_VALUES`/`_IMAGE_STYLE_VALUES` in
+  `agent1_setup/system_prompt.py`, mirroring `constants.js`'s
+  `VISUAL_STYLE_OPTIONS`/`IMAGE_STYLE_OPTIONS`) — post-roadmap deep audit:
+  a free-string recommendation could previously set a value the setup
+  dropdowns could not display. Keep the Python lists and the JS lists in
+  sync when adding a preset. `recommended_output_mode`/
+  `editable_config.output_mode` accept `youtube_long_only` now that it is
+  executable (§8.2).
 
 ### 8.6 Channel Configuration Snapshot Foundation (Phase Agent1-V3.6)
 
@@ -1297,6 +1372,51 @@ Rules:
 - A snapshot, once attached, must never be mutated or re-attached — any
   future change to a content row's effective configuration belongs in a
   new content run, not a rewritten snapshot.
+
+### 8.7 Niche/Tone Contradiction Check (roadmap 4a / audit P1-9)
+
+File:
+
+```text
+app/agents/agent1_setup/services/niche_tone_check.py
+```
+
+A real production run showed `Channel.tone="documentary"` configured
+alongside `Channel.niche="Reddit horror story narration"`. Every script and
+storyboard prompt received "Channel tone: documentary" and correctly obeyed
+it — register threading works exactly as designed (§9.3/§21.3) — producing
+a neutral, observational script for a channel whose actual content is
+horror narration. Nothing validated niche↔tone coherence at configuration
+time.
+
+`detect_niche_tone_contradiction(niche, tone) -> list[dict]` is a pure,
+deterministic, keyword-based heuristic — no AI call, no DB access. It
+matches `niche` against a fixed list of tension/dread keywords (`horror`,
+`thriller`, `true crime`, `mystery`, `nosleep`, etc.) and flags a
+contradiction only when at least one matches **and** `tone` (case-insensitive,
+trimmed) is one of a fixed set of neutral/informational values
+(`documentary`, `educational`, `informational`, `neutral`, `analytical`,
+`news`, `calm`). Returns an empty list when either input is empty or no
+contradiction is detected — never invents a finding.
+
+Wired into `activation_readiness.check_activation_readiness()` (§8.3) as
+item 10 — appended to the response's `warnings` list with
+`severity="WARNING"`, never `issues`. **This never blocks activation** —
+unlike every other check in that function, a niche/tone contradiction is a
+flag for operator awareness, not a gate. `ActivationStep.jsx`'s pre-flight
+checklist may surface `warnings` entries for operator visibility, but the
+backend's `ready` boolean is computed from `issues` only.
+
+Rules:
+
+- Never promote a niche/tone finding from `warnings` to `issues` — that
+  would block activation on a heuristic guess, which this module explicitly
+  is (keyword matching has known false positives/negatives, same accepted
+  tradeoff as the deterministic storyboard-validator heuristics in §11.4).
+- Do not add an AI call to this check — the entire point is a free,
+  deterministic, no-tokens-spent flag at setup time.
+- Do not call this module from Agent 2/3/4/5 — like `check_activation_readiness()`
+  itself, it is Agent 1 setup-time tooling only.
 
 ---
 
@@ -1413,7 +1533,7 @@ Full source-material fetch (roadmap 4.1 / audit S-1, exec-2):
 - **Problem:** discovery previously asked Claude for a `"200-500 word factual
   summary"` as `Story.body`. That summary became the *only* fact source for
   `generate_story_blueprint()`, every `generate_section()` call, the
-  length-correction expansion path (`auto_correct_script()`), and Shorts
+  since-deleted length-correction expansion path, and Shorts
   grounding — a 9-minute documentary written from a paragraph, with every
   downstream truncation (`story.body[:4000]`/`[:8000]`) a no-op since the
   body was never that long to begin with.
@@ -1443,9 +1563,10 @@ Full source-material fetch (roadmap 4.1 / audit S-1, exec-2):
   Story-construction time), `Content.source_excerpt` persistence
   (`discovery.py`, `validation.py` — no migration needed, the column is
   already `Text`), and every Claude-call site that used to cap the body at
-  4,000/6,000/8,000 chars (`generate_story_blueprint()`,
-  `generate_section()`, `auto_correct_script()` in `system_prompt.py`, and
-  `_apply_length_correction()` in `scripts.py`). `score_story_for_gate()`'s
+  4,000/6,000/8,000 chars (`generate_story_blueprint()` and
+  `generate_section()` in `system_prompt.py`; the auto-correction call sites
+  this list originally included were deleted by the post-roadmap deep
+  audit). `score_story_for_gate()`'s
   own `[:6000]` cap is deliberately untouched — gate scoring judges fit/
   quality, not narrative grounding, and does not need the full body.
 - `call_claude_with_tools()`'s `max_tokens` for `story_research` raised from
@@ -1475,6 +1596,64 @@ Full source-material fetch (roadmap 4.1 / audit S-1, exec-2):
   `stock_media_feasibility` payloads into the new dimension for backward
   compatibility, but new Claude scoring schemas must require
   `image_generation_feasibility`.
+- Story gate rights/IP dimension (roadmap Phase 5 P3-5): new scoring
+  payloads must include `rights_ip_risk` (0 = low apparent rights risk,
+  100 = high apparent monetized-adaptation/takedown risk such as famous
+  authored fiction, franchises, named characters/worlds, or rights-managed
+  creepypasta). It is **not** part of `_DIMENSION_WEIGHTS`, does not affect
+  `overall_score`, and never adds a `failed_gates` entry. When
+  `rights_ip_risk >= 70`, `score_story_assessment()` emits an
+  `operator_review_flags` entry and `build_telegram_message()` surfaces a
+  separate rights/IP review line so the operator can decide before approval.
+  Do not turn this heuristic into an automatic legal/copyright rejection gate.
+
+Source-material floor at the discovery→script handoff (roadmap 4b / audit
+P1-5): the roadmap-4.1 fix above ("relay the full verbatim post text, do NOT
+condense") did not survive contact with reality — a real production run
+still logged `body_chars=3070` for a ~45,000-word novella (`web_search`
+returns snippets and the model summarizes regardless of the prompt
+instruction), and no floor existed downstream to catch it. Consequence: a
+1,384-word documentary was expanded from a ~560-word summary — every "detail"
+beyond that thin source was necessarily model-invented, and no validator can
+check faithfulness against a source that isn't there.
+
+- `app/services/script_checks.py`'s `check_source_material_floor(source_excerpt,
+  language, script_format)` is a pure, deterministic word-count check —
+  mirrors `check_minimum_length()`'s own per-format floor immediately above it
+  in that file: the source must carry at least as many words as the shortest
+  acceptable script (900 words for `script_format="youtube_long"`, 420 for
+  any other format). A script cannot be responsibly grounded in a source
+  thinner than the shortest script it is itself allowed to produce.
+- Wired into `app/agents/agent2_discovery/services/script_workflow.py`'s
+  `generate_parent_source_script()` — the single shared blueprint→sections→
+  quality-gate→persist entrypoint (see below) — via
+  `_passes_source_material_floor()`, called first, before `_build_story()`,
+  before `_mark_generating_scripts()`, and before any Claude call. On a
+  failing check it logs `SOURCE_MATERIAL_FLOOR_FAILED` at ERROR, sets
+  `Content.status = "FAILED"`, commits, and returns `None` — the
+  discovery→script handoff fails loud rather than spending a blueprint/
+  section/quality-gate Claude call grounding a full script in material that
+  cannot support it. This is the "fail the handoff" branch of the roadmap's
+  documented either/or; deterministic duration-scaling ("scale duration to
+  source volume" — i.e. dynamically shrinking the target word count instead
+  of failing) was not implemented, since it would require threading a
+  per-content word-count ceiling through blueprint generation, section-count
+  planning, and every quality-gate length constant, for a channel-level
+  target the operator explicitly configured — failing loud and letting
+  discovery try the next candidate story is the simpler, lower-blast-radius
+  fix consistent with this phase's scope.
+- Deterministic Reddit `.json` fetch remains **not implemented**, unchanged
+  from the roadmap-4.1 rationale above (no Reddit API key available, and
+  unauthenticated/datacenter-IP requests are increasingly blocked) — this
+  phase does not revisit that trade-off; it only stops a too-thin source from
+  silently reaching script generation.
+- Runtime proof: `tests/test_source_material_floor.py` — unit coverage for
+  `check_source_material_floor()`'s per-format floor, and a full-chain proof
+  that a thin `source_excerpt` reaches `generate_parent_source_script()` and
+  fails before `generate_story_blueprint()`/`generate_script_sections()`/
+  `run_script_quality_gate()` are ever called (each poisoned to raise if
+  touched), while a well-grounded source proceeds to `GENERATING_SCRIPTS`
+  exactly as before this change.
 
 #### `send_for_validation`
 
@@ -1552,7 +1731,9 @@ Responsibilities:
 - Persist validated source script.
 - Generate and validate required multilingual scripts.
 - Mark parent `SCRIPTS_VALIDATED` only after the complete required script set exists.
-- Call `run_shorts_planner` after parent `SCRIPTS_VALIDATED`.
+- Call `run_shorts_planner` after parent `SCRIPTS_VALIDATED` — unless
+  `ChannelConfig.output_mode == "youtube_long_only"`, which skips the
+  planner entirely (`SHORTS_PLANNER_SKIPPED`, post-roadmap deep audit).
 
 #### `generate_story_blueprint`
 
@@ -1587,6 +1768,13 @@ research identifies, missing from the existing 25%/60% mini-hook cadence.
 (unlike `major_turns`'s ≥2-entry check) — an empty value is tolerated
 fail-open by `generate_script_sections()` below (no constraint is injected).
 
+`narration_pov` (roadmap 4a / audit P1-9): threaded alongside
+`visual_style`/`image_style` as "Narration POV:" in the user message. The
+system prompt instructs phrasing `hook`/`central_question`/`final_payoff` so
+they can be delivered in the configured POV — first-person ("I heard it
+three nights in a row") for `"first_person_storytime"`, or the default
+third-person register otherwise. See §8.1 for the full threading chain.
+
 #### `generate_script_sections`
 
 File:
@@ -1603,10 +1791,27 @@ Responsibilities:
 - Enforce TTS cleanup.
 - Track coverage.
 - Avoid collapsing multiple major turns into one section.
-- Retry only when required.
 - Preserve section progression.
 - Inject the blueprint's `midpoint_retention_trap` into exactly one body
   section (roadmap 4.3 / audit S-3, §6).
+
+**No section-level regeneration retry (Elimination Mandate, roadmap
+`code_report/forensic_output_audit_borrasca_run.md` D1.4):** each section
+(`_generate_section_once()`) is exactly one Claude call. A real production run
+showed the deleted retry loop's corrective override instruction (built from
+TTS/hook/rhythm/transition findings) pushed every retried section toward
+shorter, choppier sentences, producing a machine-gun monotone across the whole
+script — the retry mechanism was actively hurting narration quality, not
+improving it. The deterministic TTS backstop (`normalize_tts_chars`/
+`split_long_sentences`) still runs on every section — a mechanical text fix,
+not a regeneration. TTS/hook/rhythm/transition findings from
+`_collect_section_issues()` are logged (WARNING for MAJORs, INFO for MINOR
+rhythm/transition findings) and never trigger a second generation call. The
+narrative-completeness retry pass (which used to regenerate INTRO/OUTRO/a
+body section targeted at whichever `check_narrative_completeness()` finding
+failed) is deleted for the same reason — see
+`_log_narrative_completeness_telemetry()`: the pure-Python completeness check
+still runs and its findings are logged, but never regenerate a section.
 
 Midpoint retention trap wiring:
 
@@ -1621,7 +1826,7 @@ Midpoint retention trap wiring:
 - `_run_body_section_loop()` compares the current `body_index` against
   `context["midpoint_body_index"]`; only on that exact match does it pass
   `blueprint.get("midpoint_retention_trap")` through to
-  `_generate_section_with_retry()` → `_call_section_generation()` →
+  `_generate_section_once()` → `_call_section_generation()` →
   `generate_section()`. Every other section receives `None`.
 - `generate_section()` injects it as a targeted "this section MUST deliver
   the blueprint's midpoint_retention_trap now" clause — additive to (not a
@@ -1633,6 +1838,22 @@ Midpoint retention trap wiring:
   in both `_generate_intro_section()` and `_generate_outro_section()`) — only
   the body-section loop computes and injects it.
 
+Narration POV wiring (roadmap 4a / audit P1-9): `narration_pov` is threaded
+the same way `visual_style`/`image_style` already were, not as a new
+per-function parameter chain of its own —
+`_build_section_generation_context()` stores it in the shared `context`
+dict, and `_generate_intro_section()`/`_run_body_section_loop()`/
+`_generate_outro_section()` all read `context.get("narration_pov",
+"third_person")` when calling `_generate_section_once()` →
+`_call_section_generation()` → `generate_section()`. Every section of one
+script receives the same value — there is no per-section POV override.
+`_SECTION_GENERATION_SYSTEM_PROMPT` carries a real behavioral rule (not a
+passthrough label): `"third_person"` narrates about the story's people
+using third-person pronouns and names; `"first_person_storytime"` narrates
+AS the protagonist using "I"/"me"/"my" throughout, with other people in the
+story still referred to in third person from the protagonist's perspective.
+Never mixed within one section.
+
 Spoken-video delivery rules (roadmap 4.3 / audit S-3, §6): both
 `_SECTION_GENERATION_SYSTEM_PROMPT` and `_SHORT_EPISODE_SYSTEM_PROMPT` (system_prompt.py)
 now instruct: present tense for story events wherever the story allows it (vs.
@@ -1643,13 +1864,62 @@ prompt-only change — no deterministic Python check enforces register (unlike
 the existing TTS/word-count/hook checks), since spoken-register quality is a
 subjective judgment call, not a pass/fail structural property.
 
+Hook by construction, not by validator (roadmap 4c / audit P1-4): a real
+production run showed the blueprint's own `hook` generated — already shaped
+to pass `check_hook_quality()`'s rules (≤15 words, concrete, withheld
+mechanism) — but buried at sentence 6 of the assembled INTRO, with the
+script instead opening on a "character roster" sentence
+("A boy named Sam Walker moved to Drisking, Missouri as a kid. He had a
+sister named Whitney...") that `check_hook_quality()` passed anyway, since
+it too was concrete and ≤15 words. The validator checks the *shape* of
+whichever sentence happens to come first, not *which* sentence that should
+be — a false negative by design.
+
+- `_apply_hook_by_construction(result, hook)` (`scripts.py`) is a pure,
+  deterministic transform: it prepends the blueprint's `hook` string as the
+  script's literal first sentence (adding terminal punctuation if missing),
+  and is a no-op when `hook` is empty or the generated text already opens
+  with it verbatim (avoids a duplicated hook). It never removes or rewrites
+  any of Claude's generated content — the previous opening sentence(s) simply
+  move to second position onward, exactly like the audited roster sentence
+  now would.
+- Wired into `_generate_section_once()` — called immediately after the raw
+  Claude section result is returned and before `_clean_generated_section()`'s
+  TTS backstop, gated on the same `check_hook: bool` flag that already
+  identifies "this is the INTRO" (only `_generate_intro_section()` passes
+  `check_hook=True`; body sections and OUTRO pass `check_hook=False` and are
+  untouched). Running it before the TTS backstop means the prepended hook
+  text is normalized/length-checked along with the rest of the section, not
+  bypassed.
+- `check_hook_quality()` itself is unchanged and keeps running as telemetry
+  inside `_collect_section_issues()`/`_collect_quality_gate_issues()`/
+  `check_narrative_completeness()` — per the Elimination Mandate (D1.4/D1.5),
+  none of these call sites have triggered a regeneration since before this
+  phase. This phase does not change that; it only makes the sentence the
+  check observes deterministic instead of left to Claude's discretion. Even
+  a blueprint `hook` that itself fails the check's own ≤15-word rule is still
+  constructed as the opening line and still never triggers a retry — the
+  check remains observability-only, exactly as the roadmap requires.
+- Runtime proof: `tests/test_hook_by_construction.py` — unit coverage for
+  `_apply_hook_by_construction()`, plus a full-chain proof through the real
+  `_generate_intro_section()` reproducing the exact audited defect shape
+  (Claude opens on a roster sentence) and confirming the assembled INTRO
+  opens with the blueprint hook instead, with exactly one Claude call (no
+  retry) in every case including the failing-hook case.
+
 Rules:
 
 - One body section should primarily advance one major turn.
 - Future turns may be foreshadowed, not resolved.
 - TTS checks are deterministic.
 - Major business decisions live in Python.
-- Narrative completeness retry must not create infinite loops.
+- No section-generation retry of any kind (TTS/hook/rhythm/transition/
+  narrative-completeness) — every finding is telemetry only. Do not
+  reintroduce a corrective-override regeneration loop without a new
+  operator decision superseding the Elimination Mandate.
+- The INTRO's opening line is constructed from the blueprint's `hook`
+  deterministically — do not revert to relying on `check_hook_quality()`
+  (or any other validator) to enforce which sentence comes first.
 
 #### `run_script_quality_gate`
 
@@ -1659,95 +1929,77 @@ File:
 app/agents/agent2_discovery/services/scripts.py
 ```
 
-Responsibilities:
+**No AI call of any kind (Elimination Mandate, roadmap
+`code_report/forensic_output_audit_borrasca_run.md` D1.1/D1.2 — supersedes
+the former AI assess/rewrite loop and global validation described below).**
+`run_script_quality_gate(scripts, script_format="youtube_long",
+language="source")` now:
 
-- Run final deterministic cleanup.
-- Run quality assessment.
-- Run global narrative-coherence validation (`validate_script_globally`,
-  Haiku) exactly once per quality-gate pass, on attempt 1 only.
-- Skip expensive rewrite when issues are TTS-only and fixable in Python.
-- Log cost estimates.
+- Applies the deterministic TTS backstop (`_apply_final_tts_backstop()` —
+  mechanical `normalize_tts_chars`/`split_long_sentences`, not a regeneration).
+- Runs deterministic structural checks (`_collect_quality_gate_issues()`):
+  `check_tts_compliance()`, `check_hook_quality()`, `check_maximum_length()`,
+  `check_retention_structure()`.
+- Logs any MAJOR finding as telemetry (`"telemetry only, no rewrite"`) —
+  never triggers a rewrite, never blocks.
+- Logs a cost estimate (`SCRIPT_COST_ESTIMATE`, now section-generation calls
+  only — there is no rewrite-call cost to add).
+- Returns the (TTS-backstopped) script unchanged otherwise.
 
-Rules:
+**Deleted entirely — not capped, not demoted:** `assess_script_quality()`,
+`rewrite_script_for_quality()`, both their prompts
+(`_SCRIPT_QUALITY_SYSTEM_PROMPT`, `_SCRIPT_QUALITY_REWRITE_BASE`) and schemas
+(`_SCRIPT_QUALITY_SCHEMA`, `_QUALITY_REWRITE_SCHEMA`), the up-to-2-rewrite
+loop (`_MAX_QUALITY_REWRITES`), `_has_tts_only_high_issues()`,
+`_apply_tts_only_quality_cleanup()`, `_apply_post_rewrite_cleanup()`,
+`_apply_final_quality_cleanup()`, `validate_script_globally()` (plus
+`_GLOBAL_VALIDATION_SYSTEM_PROMPT`/`_GLOBAL_VALIDATION_SCHEMA`) and its
+caller `_run_global_script_validation()`. Task keys `script_quality_check`,
+`quality_rewrite`, and `global_validation` were removed from
+`model_routing.py`'s `MODEL_ROUTING` table — calling `resolve_model()` with
+any of them now raises `ValueError`.
 
-- Do not call expensive rewrite for cheap deterministic issues.
-- Clean before assessment and before final return.
-- Log hash/trace when scripts move across stages.
+Why: a real production run showed two paid rewrites still left the script
+`NEEDS_REWRITE`, with the flagged repetitions (duplicated reveals, an
+unresolved open loop, a continuity contradiction between sections) shipped
+unfixed in the final script regardless — pure cost, zero effect. The rewrite
+persona was also hardcoded `"documentary scriptwriter"`, actively pulling
+every channel's register toward documentary style irrespective of the
+channel's configured tone (see the register-fix note under §8.1/§9.3's
+`visual_style`/tone discussion). `validate_script_globally()`'s own findings
+(4 real issues in the audited run) shipped unfixed too, for the same reason:
+folding a finding into a rewrite-issue list does not guarantee the rewrite
+call actually fixes it, and the mechanism paid for the diagnosis twice
+(assessment + rewrite) without a corresponding quality gain.
 
-Maximum-length gate (roadmap 3.8 / audit G-7):
+Maximum-length check (roadmap 3.8 / audit G-7) still runs, as telemetry:
 
-- Before this phase, the quality gate only ever checked a *minimum* word
-  count (`check_minimum_length()`) — nothing capped the upper end. A real
-  production script reached 1,799 words against the documented 1,200-1,600
-  word spec (§9.3's `_BASE_YOUTUBE_LONG_FORM_NATIVE`), producing a
-  13.3-minute video instead of the intended ~9-10 minutes.
-  `check_maximum_length()` (`app/services/script_checks.py`) closes this gap:
-  MAJOR at 1,750 words (1,600 target + 150 tolerance) for
-  `script_format="youtube_long"`, or 800 words (700 target + 100 tolerance)
-  for any other format (matching `_BASE_SHORT_FORM_NATIVE`'s own 420-700
-  word spec).
-- Wired into `_collect_quality_gate_issues()` alongside `check_tts_compliance()`
-  and `check_hook_quality()` — a MAJOR is converted to the same `HIGH`-severity
-  rewrite-issue shape and folded into `all_issues`, so an over-length script
-  goes through the exact same `rewrite_script_for_quality()` mechanism as any
-  other quality-gate finding. No second rewrite path, no second retry counter.
-- Applies to the source-language parent script only (`run_script_quality_gate()`'s
-  own call, from `script_workflow.py`) — translated parent scripts have their
-  own separate `length_parity` ratio check against the source
+- `check_maximum_length()` (`app/services/script_checks.py`) flags MAJOR at
+  1,750 words (1,600 target + 150 tolerance) for `script_format="youtube_long"`,
+  or 800 words (700 target + 100 tolerance) for any other format — real
+  production evidence showed a script reaching 1,799 words against the
+  documented 1,200-1,600 word spec, producing a 13.3-minute video instead of
+  the intended ~9-10 minutes. The finding is now logged
+  (`QUALITY_GATE_BREAKDOWN`'s `det_length_maj` field) but no longer triggers
+  a rewrite — see Phase C (§6 of the audit roadmap) for the planned
+  deterministic-trim replacement.
+- Applies to the source-language parent script only — translated parent
+  scripts have their own separate `length_parity` ratio check
   (`_generate_validated_translated_parent_script()`, Phase 13.4), and child
-  Shorts have their own separate `_MIN_SHORT_WORDS`/`_MAX_SHORT_WORDS` gate
-  (see `run_shorts_planner` below) — neither is affected by this check.
-- Logged via `QUALITY_GATE_BREAKDOWN`'s new `det_length_maj` field, alongside
-  the pre-existing `det_tts_maj`/`det_hook_maj` counts.
+  Shorts have their own separate `_MIN_SHORT_WORDS`/`_MAX_SHORT_WORDS` check
+  (see `run_shorts_planner` below) — neither is affected by this section.
 
-Retention-structure telemetry (roadmap 6.3 / audit §6, §7):
+Retention-structure telemetry (roadmap 6.3 / audit §6, §7) — unchanged by
+the mandate, since it was already telemetry-only before this phase:
 
 - `check_retention_structure()` (`app/services/script_checks.py`) flags a
   chapter/section ending on a summary-pattern sentence (e.g. "So...",
   "Thus...", "In conclusion...") — dead air before the next section that
-  research identifies as a completion-rate risk. It previously had no real
-  caller (only reachable through the now-deleted `run_deterministic_checks()`
-  orchestrator, §7.3).
-- `_collect_quality_gate_issues()` now calls it directly and stores the
-  result under `retention_det` — **always MINOR, always observability only**.
-  Unlike `check_maximum_length()` above, its findings are never converted to
-  a `HIGH`-severity rewrite issue and never counted in `det_majors`; they
-  cannot trigger a rewrite or block the gate.
+  research identifies as a completion-rate risk.
+- `_collect_quality_gate_issues()` calls it directly and stores the result
+  under `retention_det` — **always MINOR, always observability only**; never
+  counted in `det_majors`, cannot trigger anything.
 - Logged via `QUALITY_GATE_RETENTION_STRUCTURE` (one line per finding).
-
-Global validation wiring (Phase 10A-0):
-
-- `validate_script_globally()` used to run inside `generate_script_sections()`
-  (before the quality gate ever saw the script) with its result only logged,
-  never persisted, never acted on. It now runs once inside
-  `run_script_quality_gate()` itself, via `_run_global_script_validation()`,
-  which:
-  - persists the result to the content's existing `ContentValidation` row —
-    `script_validation_status` (`"PASSED"` | `"AUTO_CORRECTED"` |
-    `"NEEDS_REVIEW"`) and `script_issues_log` (the raw issues list) — fields
-    that existed on the model but were unused for this purpose before this
-    phase;
-  - returns its issues converted to the rewrite-issue shape
-    (`severity="HIGH"`, `category="global_narrative"`), merged into the
-    *same* `all_issues` list `_collect_quality_gate_issues()` already builds
-    from Claude's quality-gate review and converted deterministic MAJORs —
-    there is no second, parallel rewrite mechanism and no second retry
-    counter; the existing `_MAX_QUALITY_REWRITES` cap bounds both issue
-    sources together.
-- `status_validation_status` mapping: `"PASSED"` when
-  `validate_script_globally()` returns `status="PASS"`; `"AUTO_CORRECTED"`
-  when it returns `status="NEEDS_FIX"` (since those issues are
-  unconditionally forwarded into this same gate pass's rewrite mechanism,
-  regardless of whether that specific rewrite attempt later succeeds);
-  `"NEEDS_REVIEW"` if the Claude call itself fails (non-blocking — the gate
-  continues with the script as-is, exactly as before this phase).
-- Global-validation issues are folded into the rewrite issue list on attempt
-  1 only — they are not re-added on subsequent attempts within the same
-  gate pass, since the underlying global-coherence check is not re-run
-  per attempt.
-- A `ContentValidation` row is expected to already exist for the content by
-  this point (created at discovery time, `run_discovery()`) — if missing,
-  the result is logged and not persisted, but the gate does not fail.
 
 #### `generate_multilingual_scripts`
 
@@ -1772,6 +2024,20 @@ Rules:
 - Must not write `SCRIPTS_READY` or any terminal status.
 - Must fail the script step rather than allowing `SCRIPTS_VALIDATED` when any
   required configured language is missing or unvalidated.
+- Preserve the source script's narration POV — never convert first-person to
+  third-person or vice versa during translation/adaptation.
+
+`narration_pov` threading (roadmap 4a / audit P1-9): this function already
+loads its own `ChannelConfig` row (for `script_format`), so it reads
+`config.narration_pov` directly from that same load rather than accepting a
+new parameter — no signature change was needed. The value is passed to
+`_generate_validated_translated_parent_script()` /
+`_generate_validated_translated_short_script()`, which forward it to
+`generate_native_script()` as "Narration POV:". Unlike `generate_section()`,
+this is **not** an instruction to write in that POV — it is an instruction
+to **preserve whatever POV the source script already uses** (both native
+base prompts carry a "never convert one to the other" rule); the value only
+tells the adapter what to look for and protect during translation.
 
 Existing-row reuse on retry (roadmap 4.4 / audit S-4, exec-7): a pre-existing
 `Script` row for a required non-source language is reused unconditionally
@@ -1802,6 +2068,15 @@ parameters (visual/image style, audio tags, TTS block) and versioning cannot
 diverge between harness reruns and Celery reruns. Multilingual generation,
 the `SCRIPTS_VALIDATED` transition, and the shorts planner stay caller-owned
 (the harness interleaves its own reuse checks and reporting between them).
+
+Before any of that sequence runs, `generate_parent_source_script()` first
+calls `_passes_source_material_floor()` (roadmap 4b / audit P1-5 — see the
+"Source-material floor" entry under `fetch_batch` above), which runs
+`check_source_material_floor()` against `content.source_excerpt`. A failing
+check sets `Content.status = "FAILED"` and returns `None` immediately —
+before `_build_story()`, before `Content.status` moves to
+`GENERATING_SCRIPTS`, and before any Claude call — so both callers (Celery
+and the harness) already get this protection with no change of their own.
 
 Parent vs. child native-adaptation prompt selection (Phase 12.4):
 
@@ -1839,15 +2114,19 @@ Parent vs. child native-adaptation prompt selection (Phase 12.4):
   `check_tts_compliance()`, the shared `_MIN_SHORT_WORDS` calibrated floor,
   the shared `_MAX_SHORT_WORDS` hard cap, and a length-parity ratio against
   the source word count) and generated through
-  `_generate_validated_translated_short_script()`, which retries up to
-  `_MAX_SHORT_CORRECTION_ROUNDS` times with a corrective
-  `override_instruction` on MAJOR findings — the same retry-and-log
-  convention `_generate_validated_short_script()` already uses for the
-  source-language Short script. On retry exhaustion the latest attempt is
-  used non-blocking (logged `FAIL_USING_LATEST`), never silently dropped.
-  This closes the gap where, before Phase 12.4, a translated child Short's
-  output was persisted as `validated=True` with no length or
-  section-marker check of any kind.
+  `_generate_validated_translated_short_script()` — a **single**
+  `generate_native_script()` call per language (Elimination Mandate
+  extension, post-roadmap deep audit): the former retry loop (up to
+  `_MAX_SHORT_CORRECTION_ROUNDS` corrective re-generations with an
+  `override_instruction`) is deleted — it was the identical
+  full-regeneration + corrective-override mechanism audit P1-6 measured
+  making source-language Short drafts worse across rounds, and it always
+  ended in FAIL_USING_LATEST (non-blocking) anyway. MAJOR findings are now
+  telemetry only (`CHILD_SHORT_TRANSLATION_ISSUES`); a hard generation
+  exception still returns `None` (transport failure, that language counts
+  as missing). This preserves the Phase 12.4 gap-closure (before it, a
+  translated child Short was persisted `validated=True` with no check of
+  any kind) — the checks still run, they just never buy a re-roll.
 - Fixes the Phase 12.3-identified defect: before this phase, every child
   Short's multilingual adaptation used `_BASE_YOUTUBE_LONG_FORM_NATIVE` in
   real operation (no code path ever set `ChannelConfig.script_format` to
@@ -1861,10 +2140,12 @@ Parent translated-script validation (Phase 13.4):
   `generate_native_script()` directly and persisted its result as
   `validated=True` with **zero** deterministic check — confirmed by direct
   code reading, not assumed. Phase 13.4 closes this remaining gap with
-  `_generate_validated_translated_parent_script()`, mirroring Phase 12.4's
-  retry-and-validate pattern exactly, with its own separate retry budget
-  (`_MAX_PARENT_TRANSLATION_CORRECTION_ROUNDS`, independent of
-  `_MAX_SHORT_CORRECTION_ROUNDS`).
+  `_generate_validated_translated_parent_script()`. Like the child-Short
+  path above, it is a **single** `generate_native_script()` call per
+  language since the post-roadmap deep audit — the former
+  `_MAX_PARENT_TRANSLATION_CORRECTION_ROUNDS` retry budget is deleted;
+  MAJOR findings are telemetry only
+  (`PARENT_TRANSLATION_VALIDATION_ISSUES`).
 - `_collect_translated_parent_script_issues()` reuses `check_completeness()`
   and `check_tts_compliance()` from `app/services/script_checks.py` — the
   same functions already run for the source-language script
@@ -1897,9 +2178,9 @@ Parent translated-script validation (Phase 13.4):
   touching an already-accepted sibling language to fix, which is out of
   scope for a single language's generation/retry pass.
 - Logs: `PARENT_TRANSLATION_VALIDATION_PASS`,
-  `PARENT_TRANSLATION_VALIDATION_RETRY`, `PARENT_TRANSLATION_VALIDATION_FAIL`
-  (both the `FAIL_USING_LATEST` exhaustion case and the
-  `reason=generation_error` case), `MULTILINGUAL_LENGTH_COHERENCE_PASS`/`_FAIL`.
+  `PARENT_TRANSLATION_VALIDATION_ISSUES` (telemetry only, no retry),
+  `PARENT_TRANSLATION_VALIDATION_FAIL` (`reason=generation_error` — the
+  transport-failure case), `MULTILINGUAL_LENGTH_COHERENCE_PASS`/`_FAIL`.
 - Does not touch Phase 12.4's child Short translation path
   (`_generate_validated_translated_short_script()`,
   `_collect_translated_short_script_issues()`) or Phase 13.2/13.3's child
@@ -1939,6 +2220,10 @@ Parent SCRIPTS_VALIDATED
 
 Rules:
 
+- `run_script_workflow()` skips this planner entirely when
+  `ChannelConfig.output_mode == "youtube_long_only"` (logged
+  `SHORTS_PLANNER_SKIPPED`) — the first real runtime consumer of
+  `output_mode` (post-roadmap deep audit; see §8.1/§8.2).
 - Child short scripts are standalone.
 - Child short scripts are not parent cuts.
 - Child short source scripts and all required child multilingual scripts must
@@ -1948,94 +2233,81 @@ Rules:
   C-2): a re-run against a parent whose Shorts already exist costs zero API
   calls, not one discarded planning call.
 - Existing child rows in `SCRIPTS_VALIDATED` are picked up by normal Agent 3 audio pickup.
+- Reads `config.narration_pov` (falling back to `"third_person"` when
+  `config` is `None`) alongside `visual_style`/`image_style` and forwards it
+  to `_generate_short_script()` → `generate_short_episode_script()` — same
+  channel-wide value every other Agent 2 call site uses (roadmap 4a / audit
+  P1-9; see §9.3's `generate_multilingual_scripts` entry for the full
+  threading rationale).
 - No child with MAJOR deterministic script issues may be marked ready.
 
-Short Quality Gate (Phase 13.2) and Parent/Child Overlap Detector (Phase 13.3):
+Structural checks and Parent/Child Overlap Detector — single generation call,
+telemetry only (Elimination Mandate, roadmap
+`code_report/forensic_output_audit_borrasca_run.md` D1.3 — supersedes Phase
+13.2's AI Short Quality Gate and the correction-round retry loop):
 
-- `_generate_validated_short_script()` (`scripts.py`) runs three gates per
-  generation attempt, in order, sharing one `_MAX_SHORT_CORRECTION_ROUNDS`
-  retry budget — no separate or expanded retry counter exists for either
-  the overlap detector or the AI gate:
-  1. **Structural** (`_collect_short_script_major_issues()`): calibrated
-     `_MIN_SHORT_WORDS` floor (125 words, roadmap 3.6 / audit S-5), word cap,
-     TTS compliance, hook opener, and — as of Phase 13.2 — section-marker
-     presence (`_SHORT_TRANSLATION_MARKER_RE`, shared with the translated-Short
-     check below). A structural MAJOR retries immediately; neither later
-     gate is reached for that attempt.
-  2. **Parent/child overlap** (`detect_parent_child_overlap()`, Phase 13.3):
-     deterministic exact word-sequence reuse check between the child
-     Short's narration and the parent long-form `voice_script`. Real
-     production data showed some Shorts reused 21-24% of exact word
-     sequences from the parent despite `_SHORT_EPISODE_SYSTEM_PROMPT`'s
-     existing ORIGINALITY rule ("never lift a run of 6 or more consecutive
-     words directly from it") — this is that same rule's deterministic
-     Python-side enforcement (CLAUDE.md §15: business rules live in
-     Python). Compares normalized (lowercased, punctuation-stripped) word
-     tokens using `_OVERLAP_NGRAM_LENGTH`-word (6) sliding windows; any
-     child-token position covered by an exact-match window against the
-     parent is flagged, adjacent/overlapping matches are merged into one
-     span, and `overlap_ratio = (total flagged child words) / (total child
-     words)`. A ratio at or above `_OVERLAP_MAX_RATIO` (15% — comfortably
-     below the 21-24% real-defect range, comfortably above what a few
-     shared names/places could ever produce on their own) is one MAJOR
-     `parent_child_overlap` issue, with up to `_OVERLAP_MAX_EXCERPTS` (3)
-     concrete overlapping excerpts quoted directly in the issue description
-     fed into `override_instruction`. An overlap MAJOR retries immediately;
-     the AI quality gate is never reached for that attempt. If the parent
-     `voice_script` is missing/empty, the check is skipped entirely
-     (`PARENT_CHILD_OVERLAP_SKIPPED`, logged) — never crashes, never counts
-     as a pass or a fail. Applies only to source-language Short generation
-     against the parent long-form script — not to parent long-form
-     generation itself, and not to Phase 12.4's multilingual child-Short
-     translation/adaptation path (which compares a Short against its own
-     source-language version in a different language, an unrelated
-     comparison this detector does not apply to).
-  3. **AI quality** (`_run_short_quality_gate()` →
-     `assess_short_script_quality()`, `system_prompt.py`): a holistic,
-     Haiku-judged retention review for flat short-form narration — hook
-     strength in the first 1-2 sentences, clarity for a first-time viewer,
-     emotional pull/curiosity gap, exactly one clear main reveal,
-     cliffhanger intent preserved (skipped for the final part, which ends on
-     a comment-trigger question instead), no over-recapping, no generic
-     filler, TTS readability, and short-form retention pacing (re-hook every
-     7-10 seconds). Only reached once a draft is structurally clean AND has
-     passed the overlap detector — the same ordering `run_script_quality_gate()`
-     already uses for parent scripts (deterministic checks before the
-     holistic AI pass), extended one step further for Shorts.
-- The Short quality prompt (`_SHORT_QUALITY_SYSTEM_PROMPT`) explicitly
-  forbids requiring or suggesting `[INTRO]`/`[SECTION N]`/`[OUTRO]` markers
-  or a long-form word arc — it judges flat narration on its own terms, not
-  as a short documentary section. Deterministic code owns the hard duration
-  band: `_MIN_SHORT_WORDS` (125) through `_MAX_SHORT_WORDS` (180 — recalibrated
-  from 250 by roadmap 3.8 / audit G-7, since real Shorts measured ~120 wpm,
-  not the previously-assumed 180 wpm / "3 words per second"), and both
-  the source-language and translated/adapted Short validators emit MAJOR
-  issues below the minimum or above the cap.
-- On `NEEDS_REWRITE`, the AI gate's issues feed the same
-  `override_instruction` mechanism the structural retry loop already uses —
-  there is no separate rewrite-from-scratch call (unlike the parent gate's
-  `rewrite_script_for_quality()`); the next attempt simply regenerates via
-  `generate_short_episode_script()` with the issues appended.
-- If the AI assessment call itself fails (malformed JSON, API error), the
-  structurally-valid draft is accepted as-is and logged
-  (`SHORT_AI_QUALITY_VALIDATION_FAIL reason=assessment_error`) — mirrors
-  `run_script_quality_gate()`'s own fail-safe convention of never retrying
-  against a failed assessment.
-- On retry exhaustion, the latest attempt is used non-blocking, logged at
-  WARNING — never silently dropped, never raises.
-- Logs: `SHORT_AI_QUALITY_VALIDATION_PASS`, `SHORT_AI_QUALITY_VALIDATION_FAIL`
-  (both the assessment-error and the NEEDS_REWRITE case).
+- `_generate_short_script()` (`scripts.py`) calls `generate_short_episode_script()`
+  exactly **once** per part. A real production run showed the deleted
+  correction loop made drafts *worse* across rounds (word count went
+  205 → 196 → **218**, still over the 180-word cap, and shipped anyway), and
+  the deleted AI Short Quality Gate's `status=="PASSED"` + non-empty `issues`
+  contract mismatch burned a retry into a worse draft. Both are gone —
+  `_MAX_SHORT_CORRECTION_ROUNDS` and `_run_short_quality_gate()` no longer
+  exist, and `assess_short_script_quality()` /
+  `_SHORT_QUALITY_SYSTEM_PROMPT` / `_SHORT_QUALITY_SCHEMA` /
+  `task="short_quality_check"` were deleted from `system_prompt.py` and
+  `model_routing.py` entirely — not disabled, not capped, removed.
+- **Structural checks** (`_collect_short_script_major_issues()`): calibrated
+  `_MIN_SHORT_WORDS` floor (125 words, roadmap 3.6 / audit S-5), word cap
+  (`_MAX_SHORT_WORDS` = 180), TTS compliance, hook opener, and section-marker
+  presence (`_SHORT_TRANSLATION_MARKER_RE`, shared with the translated-Short
+  check below) still run on the single generated draft. Any MAJOR is logged
+  at WARNING (`"telemetry only, no retry"`) — it never triggers regeneration.
+- **Parent/child overlap** (`detect_parent_child_overlap()`, Phase 13.3):
+  deterministic exact word-sequence reuse check between the child Short's
+  narration and the parent long-form `voice_script`, unchanged in its own
+  detection logic — compares normalized (lowercased, punctuation-stripped)
+  word tokens using `_OVERLAP_NGRAM_LENGTH`-word (6) sliding windows;
+  `overlap_ratio` at or above `_OVERLAP_MAX_RATIO` (15%) is logged as a
+  MAJOR finding. It still runs once on the single draft and is still
+  skipped entirely (`PARENT_CHILD_OVERLAP_SKIPPED`, logged) when the parent
+  `voice_script` is missing/empty — it no longer feeds an
+  `override_instruction` for a next attempt, because there is no next
+  attempt. Applies only to source-language Short generation against the
+  parent long-form script — not to parent long-form generation itself, and
+  not to Phase 12.4's multilingual child-Short translation/adaptation path.
+- Deterministic code still owns the hard duration band: `_MIN_SHORT_WORDS`
+  (125) through `_MAX_SHORT_WORDS` (180 — recalibrated from 250 by roadmap
+  3.8 / audit G-7, since real Shorts measured ~120 wpm, not the
+  previously-assumed 180 wpm / "3 words per second") — both the
+  source-language and translated/adapted Short validators still emit MAJOR
+  findings below the minimum or above the cap; they are logged, not enforced
+  by regeneration.
+- A hard exception from the single `generate_short_episode_script()` call
+  (bad JSON, API error) returns `None` immediately — the caller
+  (`run_shorts_planner()`) removes that child content row
+  (`_remove_failed_short_content()`) rather than retrying. This is a
+  transport failure, not a quality judgment, and is unaffected by the
+  Elimination Mandate — the mandate deletes content-quality re-roll loops
+  (retry because a draft wasn't good enough), not transport-failure handling
+  (a hard exception on the one attempt made).
 - Post-audio assertion (roadmap 3.6 / audit S-5, exec-8): Agent 3 enforces
   `_MIN_SHORT_AUDIO_DURATION_MS = 61_000` immediately after child Short audio
   duration is known and before Whisper/persistence. A child language below
   the floor logs `CHILD_SHORT_AUDIO_TOO_SHORT`, rolls back that language, and
   is not counted as successful; if every language misses/fails, the child
   content becomes `FAILED`.
-- Parent long-form quality validation (`run_script_quality_gate`,
-  `assess_script_quality`, `rewrite_script_for_quality`) is untouched by this
-  gate — it is a separate function, separate prompt, separate task key
-  (`short_quality_check`, Haiku — see `model_routing.py`), reusing no part of
-  the parent gate's rewrite mechanism.
+- Parent long-form quality validation (`run_script_quality_gate`) is a
+  separate mechanism — see §9.3 above. It was independently stripped of its
+  own AI assess/rewrite loop by the same Elimination Mandate (D1.1/D1.2);
+  this section's D1.3 changes did not need to touch it since it was already
+  addressed there.
+- The translated/adapted child Short path
+  (`_generate_validated_translated_short_script()`, Phase 12.4) was outside
+  D1.3's named scope but has since been brought in line by the post-roadmap
+  deep audit: it too is now a single generation call with telemetry-only
+  findings — see §9.3's `generate_multilingual_scripts` entry. No
+  quality-judging retry loop remains anywhere in Agent 2.
 
 Naming rule:
 
@@ -2139,38 +2411,18 @@ Rules:
 - Child short audio is picked up from `SCRIPTS_VALIDATED` like any other content.
 - Do not open unnecessary second sessions for critical orchestration if the current session has the needed state.
 
-Temporary compatibility:
-
-- `run_agent4_for_content` remains as a Celery task alias for old queued messages only.
-- New code must call `run_agent3_audio_for_content`.
-
-#### `ensure_child_short_audio_enqueued`
-
-File:
-
-```text
-app/scheduler/tasks.py
-```
-
-Responsibilities:
-
-- Temporary compatibility no-op for old imports or queued code paths.
-- Return `0` and log that the parent-audio child gate has been removed.
-
-Rules:
-
-- Must not release, flip, or enqueue child short audio.
-- Must not depend on parent `AUDIO_DONE`.
-- New code must use `pickup_scripts_validated` for child audio pickup.
-
-Deliberately kept during the roadmap 6.3 dead-code cleanup: this function and
-`pickup_short_episodes_awaiting_parent` are listed in the audit's dead-code
-table with the explicit caveat "delete once queues are confirmed drained" —
-unlike every other item removed in that cleanup, deleting these two is an
-operational judgment call (whether any already-enqueued Celery message from
-before this architecture still references these task names) that cannot be
-verified from source alone. Do not delete either without operator
-confirmation that the relevant queues are drained.
+Removed compatibility shims (post-roadmap deep audit): the old-queued-message
+aliases `run_agent4_for_content` (→ `run_agent3_audio_for_content`),
+`run_agent5_for_content` (→ `run_agent5_render_for_content`), the
+`pickup_short_episodes_awaiting_parent` no-op task, and the
+`ensure_child_short_audio_enqueued` no-op helper are deleted. None was in the
+Beat schedule, none had a caller anywhere in the repo, and the architecture
+is self-healing against a stale queued message referencing them: every
+pickup task is status-driven and re-polls every 15 minutes, so a dropped
+unknown-task message costs at most one Beat cycle of latency. This resolves
+the "delete once queues are confirmed drained" caveat from the roadmap 6.3
+dead-code cleanup — the operator authorized removal in the post-roadmap
+deep audit.
 
 #### `run_audio_generation`
 
@@ -2197,6 +2449,25 @@ Rules:
 - Child content uses its own script, audio, and Whisper.
 - TTS skip-on-disk must still update/confirm `AudioFile` consistency.
 
+**Whisper resume skips re-transcription when a transcript already exists
+(Elimination Mandate D1.6, `code_report/forensic_output_audit_borrasca_run.md`):**
+when the audio file for a (content, language) pair is already on disk (the
+existing TTS-skip branch) *and* an `AudioFile` row already exists for that
+pair with both a non-zero `duration_ms` and a non-empty `whisper_transcript`,
+`run_audio_generation()` reuses those stored values verbatim and skips both
+the ffprobe duration re-measurement and the `transcribe()` call entirely
+(logged as `RESUME_TRANSCRIPT_REUSED`). A real production run showed a
+resumed/retried content item paying for Whisper transcription of the same
+616-second audio file up to 3 times with zero new information each time —
+the audio on disk had not changed, so re-transcribing it could never produce
+a different result. If the existing row is missing a transcript or duration
+(e.g. an interrupted prior run), the code falls through to the
+`measure_audio_duration_ms()` + `transcribe()` path unchanged (roadmap 2a —
+`measure_audio_duration_ms()` itself replaced the mutagen header read this
+paragraph used to describe; see `generate_audio`/§10.4 below) — this is a
+reuse shortcut for the unchanged-audio case only, not a new
+skip-Whisper-always behavior.
+
 Per-language hard assertions (roadmap 3.6/3.9, audit S-5/A-3, exec-8/exec-10)
 — both run immediately after the step they gate, both roll back and
 `continue` (skip that language, not counted toward `success_count`) rather
@@ -2215,6 +2486,79 @@ than persisting a known-bad `AudioFile` row:
   `agent5_render.services.video._collect_technical_blockers()`'s
   `empty_whisper_transcript_short` blocker (§11A.4) — each half is an
   independent safety net.
+
+#### `measure_audio_duration_ms`
+
+File:
+
+```text
+app/agents/agent3_audio/services/storage.py
+```
+
+**The single duration-measurement point for every caller** (roadmap 2a /
+audit P0-1, `code_report/forensic_output_audit_borrasca_run.md`) — used by
+both `save_audio()` (fresh generation) and the on-disk resume path in
+`run_audio_generation()`. Root cause this replaces: a real production run
+stored `duration_ms=161724` for a real 616,835 ms audio file. The prior
+measurement (`mutagen.MP3(path).info.length`) reads only the first frame
+header it finds; combined with a since-deleted raw-byte-concat fallback (see
+`generate_audio` below), a multi-chunk mp3 with several concatenated headers
+was measured as just its first chunk's length. That corrupted duration then
+poisoned every downstream timeline: Agent 4's beat budget, timestamp
+mapping, the hold cap, Remotion's composition length (the final video cut
+off 71% of the narration), and the WPM calibration rolling window
+(`script_estimator`).
+
+`measure_audio_duration_ms(path)` shells out to `ffprobe -show_format` and
+reads `format.duration` — the container's real stream length, not a single
+frame header — so it is correct regardless of how many chunks were
+concatenated into the file. It raises `RuntimeError` (fail loud) if ffprobe
+is unavailable, exits non-zero, or reports no parseable duration, rather
+than silently returning a wrong value — a corrupting fallback is worse than
+a failed run. `mutagen` is no longer a dependency of this codebase (removed
+from `requirements.txt`); no code path reads an audio file header directly
+for duration.
+
+#### `_assert_duration_transcript_alignment`
+
+File:
+
+```text
+app/agents/agent3_audio/services/audio.py
+```
+
+**Cross-timeline invariant (roadmap 2b / audit P0-2,
+`code_report/forensic_output_audit_borrasca_run.md`).** Three independent
+timelines flow into a render: `AudioFile.duration_ms`, Whisper word
+timestamps, and `VideoSection` spans derived from them. A real production
+run shipped with `duration_ms=161724` and the SAME row's
+`whisper_transcript` already showing a last word ending at ~616,580 ms —
+nothing anywhere compared the two, so the corrupted duration silently
+poisoned Agent 4's beat budget, timestamp mapping, the hold cap, Remotion's
+composition length, and the WPM calibration rolling window. One assertion —
+`duration_ms` within ~2% of Whisper's last word end, fail loud otherwise —
+stops this class of corruption at Agent 3, before any Claude, Flux, or
+render spend.
+
+Called in `run_audio_generation()` immediately after the final `transcript`
+value is known (whether freshly transcribed or reused from D1.6's resume
+path — see §10.4's Whisper resume rule above), before `_upsert_audio_file()`
+persists anything:
+
+- `transcript` empty → returns `True` unconditionally (a no-op pass). This
+  is not a rule exemption: parent long-form content already tolerates a
+  missing transcript (falls back to proportional timing downstream, see
+  `_assert_short_audio_has_transcript`); there is nothing to compare
+  `duration_ms` against when no transcript exists.
+- `transcript` non-empty → `drift = |duration_ms − last_word.end_ms| /
+  duration_ms`. `drift > 0.02` (2%) fails that language: logs
+  `AUDIO_DURATION_TRANSCRIPT_MISMATCH` at ERROR, rolls back, `continue`s
+  (not counted toward `success_count`) — the same fail-that-language,
+  not-the-whole-run convention `_assert_short_audio_min_duration()` and
+  `_assert_short_audio_has_transcript()` already use.
+- Applies to **both parent and child content** — unlike the two Shorts-only
+  assertions above, the corruption this guards against hit *parent* audio
+  in the audited run, not just Shorts.
 
 #### `generate_audio`
 
@@ -2253,7 +2597,18 @@ Rules:
   markers are sent as one TTS request per section so deterministic section
   delivery can vary emotion/intensity across the narrative arc.
 - Multi-chunk TTS audio stitching uses ffmpeg re-encoding and inserts a short
-  deterministic silence pad between chunks to avoid abrupt section-boundary joins.
+  deterministic silence pad between chunks to avoid abrupt section-boundary
+  joins. **ffmpeg re-encoding is mandatory whenever there is more than one
+  chunk (roadmap 2a / audit P0-1,
+  `code_report/forensic_output_audit_borrasca_run.md`)** — there is no raw
+  byte-concat fallback: `_concat_mp3_chunks()` raises `RuntimeError` if
+  ffmpeg is missing, or if the silence-pad generation or concat step fails.
+  A real production run showed the deleted fallback (used when ffmpeg was
+  missing) produce an mp3 with multiple concatenated headers, which a
+  header-reading duration measurement then silently read as just the first
+  chunk's length (161.7s stored for a real 616.8s file) — corrupting every
+  downstream timeline. A failed run is recoverable; a silently corrupting
+  fallback is not.
 - Section delivery is selected in Python from section metadata only: INTRO uses
   a restrained curious delivery; early body sections use tense buildup;
   reveal/climax-titled sections use scared/faster delivery, including common
@@ -2262,7 +2617,7 @@ Rules:
 - Missing/unknown section metadata and child-short flat narration fall back to
   the configured channel-level emotion and speed profile; audio generation must
   not fail solely because section delivery cannot be inferred.
-- ElevenLabs remains supported only as configured provider/legacy path.
+- ElevenLabs v3 uses the same deterministic section delivery selector as Cartesia, resolves `VoiceSettings` per section, and adds one deterministic v3 audio tag per marked section; non-v3 ElevenLabs models remain the configured provider/legacy char-chunk path.
 - Voice, model, pronunciation dictionary, and fallback delivery choices come from `channel_voices`.
 
 #### `ChannelVoice.cartesia_pronunciation_dict_id`
@@ -2410,16 +2765,20 @@ _concat_mp3_chunks()                 — ffmpeg re-encode + a short deterministi
 final MP3 audio bytes
 ```
 
-The ElevenLabs path (`provider="elevenlabs"`) differs: it chunks by character
-limit (`_chunk_script_at_sections()`), not section units, so Phase 11.4's
-per-section delivery selection and Phase 11.3's Cartesia request-shape
-branching do not apply to it. It still runs every chunk through
-`prepare_script_for_tts()` (so Phase 11.5's reveal-gated deterministic
-pacing applies identically), uses ElevenLabs's own
-native text-conditioning (`previous_text`/`next_text`) for cross-chunk
-continuity instead of a silence pad, and still passes through
-`_concat_mp3_chunks()` (Phase 11.6) for final concatenation when more than
-one chunk exists.
+The ElevenLabs path (`provider="elevenlabs"`) now branches by model. For
+`eleven_v3`, long-form section-marked scripts use `_split_script_into_section_units()`
+just like Cartesia, run `_select_section_delivery()` for each section, resolve
+per-section `VoiceSettings`, and prefix one deterministic v3 audio tag per
+section (`[whispers]` for intro/early buildup, `[dramatic pause]` for late
+buildup, `[gasps]` for climax-titled sections, `[sighs]` for outro). This keeps
+horror/reveal/somber delivery from being silently discarded when an operator
+chooses ElevenLabs v3. Non-v3 ElevenLabs models keep the legacy character-limit
+chunking path (`_chunk_script_at_sections()`) and channel-level delivery.
+Every ElevenLabs chunk still runs through `prepare_script_for_tts()` (so Phase
+11.5's reveal-gated deterministic pacing applies identically). Text-conditioning
+(`previous_text`/`next_text`) remains non-v3 only when the SDK supports it, and
+all multi-chunk/multi-section output still passes through `_concat_mp3_chunks()`
+(Phase 11.6) for final concatenation.
 
 #### Phase 11 Deliverables
 
@@ -2576,51 +2935,75 @@ Responsibilities:
 - Ask Claude for structured visual beats.
 - Return schema-validated storyboard batch.
 
-**Storyboard prompt inputs (`PROMPT_VERSION` 4.1):**
+**Storyboard prompt inputs (`PROMPT_VERSION` 4.4):**
 `generate_storyboard_batch()` accepts optional `visual_style`, `image_style`,
-and `visual_bible_context` arguments. `split_into_beats()` threads those from
-the parent visual path and from the validation retry path, so both the first
-storyboard pass and a MAJOR-finding retry see the same continuity context.
+and `continuity_line` arguments. `split_into_beats()` threads those from the
+parent visual path and from the validation retry path, so both the first
+storyboard pass and a MAJOR-finding retry see the same continuity hint.
 
 When visual style fields are non-empty, `_build_message()` prepends:
 
 ```
-Global visual direction: <visual_style or "documentary">
+Global visual direction: <visual_style or "story_driven">
 Global image style: <image_style or "photorealistic">
 ```
 
-When a visual bible exists, `_build_message()` also prepends:
+**De-hardcoded "documentary" (roadmap 4a / audit P1-9):** the storyboard
+prompt's identity line used to open "You are a visual director and editor
+for an automated multilingual **documentary** video production system" —
+regardless of the channel's actual configured niche/tone/visual_style. It
+now reads "...for an automated multilingual video production system",
+dropping the assumed format entirely, since the actual style is always
+channel-configured via the "Global visual direction"/"Global image style"
+lines above, never assumed by the identity line. Both runtime fallback
+defaults (`visual_style or "documentary"` in the Python f-string above, and
+the prompt's own "when no global direction is specified... default to
+documentary/photorealistic" instruction) changed to `"story_driven"` —
+matching `ChannelConfig.visual_style`'s new default (§8.1). `"documentary"`/
+`"realistic_documentary"` remain listed as legitimate example values in the
+style-vocabulary section (§11.4's checks table below is unaffected) — only
+the assumed-when-unconfigured default changed.
+
+When `continuity_line` is non-empty, `_build_message()` also prepends that
+one plain line verbatim (no JSON, no compaction) — e.g.:
 
 ```
-Visual continuity bible (compact JSON):
-{...compact JSON...}
+Visual continuity: these names recur throughout this story — give each a
+stable, consistent physical identity/appearance across beats: Sam, Whitney,
+Borrasca.
 ```
 
-The compact JSON is produced by
-`cinematic_prompts.compact_visual_bible_for_storyboard()`. It keeps
-story summary, style/config summary, character/location/motif continuity,
-first-15 rules, and forbidden generic shots, but intentionally omits raw
-`camera_language` and `lighting_rules` arrays. The storyboard system prompt
-instructs Claude to write character/location continuity into the native
-`flux_prompt` it returns, without copying JSON field names, camera-rule lists,
-lighting-rule lists, or negative-prompt/Avoid text into the positive Flux
-prompt. It also treats generated `FORBIDDEN environments...` and
-`FORBIDDEN motifs...` lines in previous-segment context as hard diversity
-constraints for the current batch.
+**The entire visual-bible layer is deleted (Elimination Mandate, roadmap
+`code_report/forensic_output_audit_borrasca_run.md` D2.1):** the Claude
+generation call, `cinematic_prompts.compact_visual_bible_for_storyboard()`,
+`apply_cinematic_prompts_to_beats()` enrichment, and first-15
+enhancement/validation are all gone — `app/agents/agent4_visuals/services/cinematic_prompts.py`
+and `.../first15_validator.py` no longer exist as files. A real production
+run showed the bible return 0 locations, 0 recurring motifs, and 0 first-15
+rules — a paid Claude call and token cost on every storyboard batch for a
+total no-op. `continuity_line` (see `storyboard.build_continuity_line_from_blueprint()`)
+replaces it: a pure-Python, no-AI-call extraction of proper nouns (character
+names, named places/objects) that recur at least twice across the blueprint's
+own text fields (`hook`, `major_turns`, `final_payoff`,
+`midpoint_retention_trap`, `central_question`) — the one continuity signal
+genuinely worth carrying into every storyboard batch. Built once per content
+in `visual_orchestrator._run_visual_pass()` from `content.story_blueprint`
+and threaded as a plain string through both the fresh-generation and
+segment-level retry calls in `storyboard.py` — never regenerated per segment,
+never persisted as a separate artifact.
 
-**Final prompt validation (`PROMPT_VERSION` 4.1 / roadmap 2.2):** after
-`apply_cinematic_prompts_to_beats()` enriches the storyboard and before
-`apply_first15_enhancement_and_validation()`,
-`visual_orchestrator._check_final_prompt_issues()` reruns the prompt-only
-validator subset against the enriched `flux_prompt` values. Because first15
-enhancement can also append to `flux_prompt`, the same gate runs again after
-first15 and immediately before any fal.ai call. The subset is check 4
-(`forbidden_flux_word`), checks 12-16 (`subject_presence`,
-`environment_presence`, `low_information_prompt`, `flux_prompt_exact_duplicate`,
-`flux_prompt_near_duplicate`), and check 19 (`ai_text_rendering_requested`).
-MINOR findings are warning-only; any MAJOR finding fails that parent visual pass
-or skips that child-short language before Flux generation. Logs use
-`FINAL_PROMPT_VALIDATION_*`.
+**Final prompt validation is deleted (D2.4):**
+`visual_orchestrator._check_final_prompt_issues()` and its
+`_FINAL_PROMPT_VALIDATION_CHECKS` constant no longer exist. That function
+existed only to re-validate `flux_prompt` after the bible-enrichment and
+first15-enhancement mutation passes — with both of those passes deleted,
+there is nothing between storyboard generation and Flux that mutates
+`flux_prompt`, so there is nothing left to re-validate. The single
+deterministic `validate_storyboard()` call that already runs right after
+storyboard generation (`_run_storyboard_validation()` /
+`_check_storyboard_issues()`) remains as the sole validator, per D3 of the
+mandate ("the single deterministic `validate_storyboard()` remains as
+telemetry").
 
 Rules:
 
@@ -2837,18 +3220,34 @@ Visual hold cap (third frozen-frame guard — the last-line guarantee):
   never creates synthetic beats and never touches audio/subtitle timing; a
   terminal beat with no later beat to absorb the remainder is exempt.
 - The cap is deliberately applied in `split_into_beats()` (parent path) and
-  `remap_beats_for_short()` (child path), never inside the shared
-  `map_storyboard_beats_to_timestamps()` — the two paths need different
-  ceilings.
+  `remap_beats_for_short()` (child path), after the shared
+  `map_storyboard_beats_to_timestamps()` cleanup/micro-merge step — the two
+  paths need different ceilings and both must cap after cleanup.
+- Parent hold-cap telemetry must include the real `content_id` when called
+  from Agent 4 orchestration; `content_id=unknown` is allowed only for
+  direct unit/helper calls that do not have content context.
+- `map_storyboard_beats_to_timestamps()` receives the caller's cap as
+  `max_hold_ms` for deterministic fail-loud invariants only; it still does
+  not mutate the holds itself. After micro-beat cleanup,
+  `beats_after_cleanup * max_hold_ms` must be at least `duration_ms`, or the
+  mapper returns `None` and logs `VISUAL_DENSITY_INVARIANT_FAILED`. This is
+  the missing `beat_count × max_hold ≥ duration` guard from audit P1-1.
+- Micro-beat cleanup clamps every boundary to the real audio duration and
+  counts how many beats collapsed to zero-length after cleanup. If more than
+  30% are effectively discarded, mapping fails loud with
+  `MICRO_MERGE_FAIL_DISCARD_RATIO` instead of shipping a sparse visual plan.
+  Non-fatal discard telemetry is logged as `MICRO_MERGE_DISCARDED`.
 - Logs: `PARENT_VISUAL_HOLD_CAP_APPLIED` (parent) /
   `SHORT_VISUAL_HOLD_CAP_APPLIED` (child), with cap, capped-beat count,
   terminal exemption, and before/after max hold.
 - Runtime proof: `tests/test_parent_visual_hold_cap.py` (shared-core unit
   checks plus the real `split_into_beats` chain — segment split, hint
   hardening, mapping with the guards above, cap — with only the paid
-  `generate_storyboard_batch` Claude call stubbed).
+  `generate_storyboard_batch` Claude call stubbed) and
+  `tests/test_visual_density_invariant.py` (density invariant, >30%
+  micro-merge discard, and post-cleanup cap behavior).
 
-#### `_run_parent_visuals` — stale-visuals guard (audit V-6b)
+#### `_run_parent_visuals` — stale-visuals guard (audit V-6b + roadmap 2d / audit P0-3)
 
 File:
 
@@ -2857,13 +3256,13 @@ app/agents/agent4_visuals/services/visual_orchestrator.py
 ```
 
 The shared `__visual__` `VideoSection` rows are keyed only by `content_id` —
-nothing ties them to the source-language narration they were built from.
-Before this guard, `_run_parent_visuals()` reused any existing `__visual__`
-rows unconditionally; if the parent's source script was regenerated after
-the visual pass already ran (operator `--force-scripts`, or any retry that
-produces a materially different script), the OLD beats — hints, timings,
-`flux_prompt` subject matter, all describing narration that no longer
-exists — were silently reused against the NEW script.
+nothing ties them to the source-language narration or audio they were built
+from. Before this guard, `_run_parent_visuals()` reused any existing
+`__visual__` rows unconditionally; if the parent's source script was
+regenerated after the visual pass already ran (operator `--force-scripts`,
+or any retry that produces a materially different script), the OLD beats —
+hints, timings, `flux_prompt` subject matter, all describing narration that
+no longer exists — were silently reused against the NEW script.
 
 - `_source_script_hash(content, scripts_by_lang)` returns the SHA-256 hex
   digest of `scripts_by_lang[content.source_language].voice_script`, or
@@ -2879,21 +3278,49 @@ exists — were silently reused against the NEW script.
   classifies loaded `__visual__` beats into three outcomes:
   - `"fresh"` — stored hash matches `current_hash` (or `current_hash` is
     `None`, i.e. nothing is comparable) → reuse exactly as before.
-  - `"stale"` — stored hash present and differs → `_run_parent_visuals()`
-    discards `shared_beats` entirely and calls `_run_visual_pass()` fresh
-    (passing `script_hash=current_hash` so the new beats carry the new
-    fingerprint), logged as `PARENT_VISUALS_STALE_SCRIPT_HASH`.
+  - `"stale"` — stored hash present and differs → discard.
   - `"backfill"` — beats predate this guard (no stored hash at all) →
-    stamped with `current_hash` and re-saved unchanged, `logged as
-    STALE_VISUALS_CHECK_BACKFILL` — no regeneration is forced for
-    pre-existing content; the next run has a baseline to compare against.
-- Runtime proof: `tests/test_stale_visuals_guard.py` — unit tests for the
-  three helpers, plus an integration test driving the real
-  `_run_parent_visuals()` against a fake in-memory `VideoSection` table
-  (real ORM instances, real `_beat_extras()`/`_save_video_sections()`/
-  `load_video_sections()` (shared loader, roadmap 6.5) JSON round trip — only `_run_visual_pass()`,
-  the paid Claude/fal.ai boundary, is stubbed) proving all three outcomes,
-  including that the backfill save/reload round trip is real.
+    stamped with `current_hash` and re-saved unchanged; no regeneration is
+    forced for pre-existing content; the next run has a baseline to compare
+    against.
+
+**Second, independent fingerprint — source audio duration (roadmap 2d /
+audit P0-3, `code_report/forensic_output_audit_borrasca_run.md`):** the
+script-hash fingerprint alone does not catch a duration correction on an
+*unchanged* script — exactly the audited incident's own repair scenario: the
+19 corrupt-timing `__visual__` beats carried a matching `source_script_sha256`,
+so a re-run after fixing a corrupted `duration_ms` in place would still say
+"fresh" and silently reuse the broken timeline.
+
+- `_source_audio_duration_ms(content, audio_by_lang)` returns the
+  source-language `AudioFile.duration_ms`, or `None` when unavailable
+  (same fail-open contract as the script hash).
+- `_tag_beats_with_audio_duration(beats, duration_ms)` stamps
+  `source_audio_duration_ms` onto every beat — same `_beat_extras()`
+  persistence convention as the script hash.
+- `_check_audio_duration_staleness(content_id, shared_beats, current_duration_ms)`
+  — identical `"fresh"`/`"stale"`/`"backfill"` contract, logged as
+  `PARENT_VISUALS_STALE_AUDIO_DURATION` on a mismatch.
+
+`_run_parent_visuals()` runs **both** classifications independently and
+combines them: **either** fingerprint being `"stale"` discards `shared_beats`
+entirely and calls `_run_visual_pass()` fresh (passing both `script_hash` and
+tagging the fresh `source_duration_ms`, logged
+`PARENT_VISUALS_STALE_SCRIPT_HASH` / `PARENT_VISUALS_STALE_AUDIO_DURATION`
+respectively); any `"backfill"` outcome stamps just that missing fingerprint
+and re-saves (logged `STALE_VISUALS_CHECK_BACKFILL`) without forcing a
+regeneration. The two dimensions are independent — a script-hash match does
+not exempt a beat from the duration check, and vice versa.
+
+Runtime proof: `tests/test_stale_visuals_guard.py` (script-hash dimension,
+pre-existing) and `tests/test_stale_visuals_audio_fingerprint_and_props_rebuild.py`
+(audio-duration dimension and the combined guard) — unit tests for each
+helper, plus integration tests driving the real `_run_parent_visuals()`
+against a fake in-memory `VideoSection` table (real ORM instances, real
+`_beat_extras()`/`_save_video_sections()`/`load_video_sections()` (shared
+loader, roadmap 6.5) JSON round trip — only `_run_visual_pass()`, the paid
+Claude/fal.ai boundary, is stubbed), including the exact P0-3 repair
+scenario: matching script hash, corrected duration → regenerates.
 
 #### `validate_storyboard`
 
@@ -2914,14 +3341,29 @@ There is exactly one implementation, called through the shared
 `_collect_storyboard_issues()` / `_check_storyboard_issues()` helpers in
 `app/agents/agent4_visuals/services/visual_orchestrator.py` — used by both
 the parent storyboard path and the child short remap path. Neither path
-forks or re-implements the validator. Parent MAJOR remediation is
-segment-level: storyboard beats carry `storyboard_batch_label` provenance from
-`split_into_beats()` through `_merge_batches()` and timestamp mapping, then
-`_run_storyboard_validation()` retries only offending batch labels by passing
-`retry_segment_constraints` plus `existing_beats` back into `split_into_beats()`;
-unaffected batches are reused and the merged storyboard is remapped once. If
-provenance is missing, the code logs `STORYBOARD_SEGMENT_RETRY_FALLBACK` and
-falls back to the older full-storyboard retry behavior.
+forks or re-implements the validator.
+
+**MAJOR findings are telemetry only on both paths (Elimination Mandate D1.5,
+`code_report/forensic_output_audit_borrasca_run.md`):** `_run_storyboard_validation()`
+(parent) and the MAJOR-handling block in `_run_child_short_visuals()` (child)
+both log MAJOR findings and return the storyboard unchanged — neither
+triggers a regeneration of any kind. This replaces two deleted mechanisms:
+the parent's segment-level storyboard retry (beats carried
+`storyboard_batch_label` provenance from `split_into_beats()` so
+`_run_storyboard_validation()` could regenerate only the offending batch
+labels via `retry_segment_constraints`/`existing_beats`, falling back to a
+full-storyboard retry via `STORYBOARD_SEGMENT_RETRY_FALLBACK` when
+provenance was missing) and the child's deterministic beat-level prompt
+remediation (`remediate_child_major_storyboard_issues()`, which stripped
+forbidden/readable-text language and regenerated `flux_prompt` from
+`visual_intent` for `forbidden_flux_word`/`ai_text_rendering_requested`
+MAJORs). A real production run showed a failed retry/remediation already
+just logged and proceeded with the original beats — since MAJOR findings
+never gated the pipeline either way, both mechanisms were surgical
+regeneration effort with no provable quality gain. `storyboard_batch_label`
+and the rest of the batch-provenance fields (`storyboard_segment_label`,
+`storyboard_segment_index`, `storyboard_batch_local_order`) are no longer
+stamped onto beats at all — they had no consumer beyond the deleted retry.
 
 Checks (current full inventory):
 
@@ -2936,7 +3378,7 @@ Checks (current full inventory):
 | 7 | *(retired — subtitles-only rendering: text cards no longer exist)* | — |
 | 8 | `low_intensity_run` — no 3 consecutive beats may all be `beat_intensity="low"` | MINOR |
 | 9 | `motif_repetition_in_window` — no `motif` may repeat more than 2 times in any 10-beat sliding window | MINOR |
-| 10 | `near_duplicate_beat` — two beats within 2 positions sharing `environment`, `motif`, and `effect` simultaneously | MINOR |
+| 10 | `near_duplicate_beat` — two beats anywhere in the same storyboard/Short share `environment`, `motif`, and `effect` simultaneously | MINOR |
 | 11 | `ai_slideshow_risk` — 5+ consecutive beats sharing one value for `environment`, `motif`, or `effect` | MINOR |
 | 12 | `subject_presence` — `flux_prompt` has fewer than 2 concrete-subject words after removing style/filler/technical boilerplate | MINOR |
 | 13 | `environment_presence` — `flux_prompt` contains none of its declared `environment`'s expected keywords | MINOR |
@@ -2948,7 +3390,7 @@ Checks (current full inventory):
 | 19 | `ai_text_rendering_requested` — `flux_generated` `flux_prompt` contains a quoted phrase or a "the text reads"/"sign that says"-style instruction asking the image model to render readable text (Phase 14.7) | MAJOR |
 | 20 | `dark_contrast_unlit_prompt` — a beat uses `color_grade="dark_contrast"` while its `flux_prompt` names no bright light source (`has_bright_lighting_evidence()`); defense-in-depth only — `_build_beat_section()` already downgrades such beats to `desaturated` in place (`DARK_CONTRAST_GRADE_DOWNGRADED`), so this fires only on beats that bypassed beat building (audit G-6) | MINOR |
 | 21 | `document_saturation` — document-ish beats (`motif="document"` or `visual_type="document"`) exceed 15% globally or more than 2 in any 10-beat window (roadmap 2.3 / audit G-2) | MAJOR |
-| 22 | `visual_monotony` — aggregate retry trigger when `consecutive_same_environment` findings exceed 10, `ai_slideshow_risk` findings exceed 2, or `document_saturation` fires (roadmap 2.5 / audit G-5.2) | MAJOR |
+| 22 | `visual_monotony` — aggregate MAJOR finding when `consecutive_same_environment` findings exceed 10, `ai_slideshow_risk` findings exceed 2, or `document_saturation` fires (roadmap 2.5 / audit G-5.2); telemetry only, per D1.5 below — no longer a retry trigger | MAJOR |
 
 Checks 12–16 validate `flux_prompt` *text quality* (subject/environment/
 information clarity, exact/near duplication) — distinct from check 4, which
@@ -2965,17 +3407,16 @@ keyword detector missed, not on the normal sanitized happy path. Check 21
 `motif="document"` and `visual_type="document"` as document-ish, then applies
 both a global >15% cap and a local >2-per-10-beat-window cap. Check 22
 (roadmap 2.5 / audit G-5.2) preserves the individual repetition findings as
-MINOR diagnostics, then emits one aggregate MAJOR `visual_monotony` retry
-reason when `consecutive_same_environment` findings exceed 10,
-`ai_slideshow_risk` findings exceed 2, or `document_saturation` fires. All
-checks live in the same function; none is a second validator.
+MINOR diagnostics, then emits one aggregate MAJOR `visual_monotony` finding
+when `consecutive_same_environment` findings exceed 10, `ai_slideshow_risk`
+findings exceed 2, or `document_saturation` fires. All checks live in the
+same function; none is a second validator.
 
 Rules:
 
-- MAJOR issues never hard-block the pipeline directly — the caller decides
-  what to do (parent: retry once via full storyboard regeneration, then
-  proceed regardless; child: no regeneration primitive, logs and proceeds
-  immediately).
+- MAJOR issues never hard-block the pipeline, and never trigger any
+  regeneration on either path (Elimination Mandate D1.5, see above) — the
+  caller only logs and proceeds, on both the parent and child paths alike.
 - MINOR issues are always logged at WARNING and never trigger a retry. Three
   of them — checks 10, 15, 16 (`near_duplicate_beat`,
   `flux_prompt_exact_duplicate`, `flux_prompt_near_duplicate`) — are the
@@ -2988,12 +3429,22 @@ Rules:
   never random, never an AI call) to exactly the beat_order each check
   flags. Two beats with byte-identical `flux_prompt` text hash to the SAME
   cache file within one content's cache directory (audit G-5.3) — this
-  closes that waste without spending a retry on a MINOR finding. Only
-  beats still pending Flux generation (`media_url` empty) are ever
-  rewritten; a beat whose media is already resolved elsewhere (a
-  deliberate parent-image reuse, or an already-generated beat from a prior
-  partial run) is never touched, by either check's flagging convention.
-  Runtime proof: `tests/test_duplicate_prompt_repair.py`.
+  closes that waste without spending a retry on a MINOR finding. Parent
+  paths preserve the pending-only default (`media_url` empty) so prompt
+  metadata cannot drift from an already-generated image. The child Short
+  path passes `include_resolved=True` because it clears every inherited
+  parent `media_url` and regenerates the beat as a new portrait image in
+  the same run; resolved parent-reuse prompts therefore receive the same
+  append-only variation before that new provider call. Runtime proof:
+  `tests/test_duplicate_prompt_repair.py`.
+- After each newly generated local Flux image, Agent 4 computes a deterministic
+  64-bit average pixel hash and compares it with earlier accepted images from
+  the same generation call. A Hamming distance of 3 or less triggers exactly
+  one reroll with the same composition-slot variation rotation above, then
+  accepts/logs the result with no loop and no quality judgment. This runs in
+  both parent `generate_all_beat_images()` and child Short portrait
+  `generate_pending_beat_images()`, and only compares local pixels already on
+  disk. Runtime proof: `tests/test_pixel_duplicate_reroll.py`.
 - Every `validate_storyboard()` call logs `VISUAL_REPEAT_RATE`,
   `AI_SLIDESHOW_RISK`, `FLUX_PROMPT_QUALITY`, `FLUX_DUPLICATE_RATE`,
   `CHILD_SHORT_REUSE_RATE`, and `CHILD_SHORT_REUSE_CLUSTERING` (all always,
@@ -3034,8 +3485,10 @@ Responsibilities:
   one language) and run deterministic existence/integrity checks: missing
   path, remote URL, the legacy `__text_card__` sentinel, unsafe path
   (outside the media root/run root), missing/zero-byte/unreadable/
-  unsupported-extension local file, and `PIL`-unreadable image — all
-  `BLOCKING` (they fail the content, setting `Content.status = "FAILED"`).
+  unsupported-extension local file, `PIL`-unreadable image, and image aspect
+  mismatches (parent expects 16:9; Shorts expect 9:16, with small fal rounding
+  tolerance) — all `BLOCKING` (they fail the content, setting
+  `Content.status = "FAILED"`).
 - Optional `beats_by_lang: dict[str, list[dict]] | None` parameter — when
   the caller (`run_visual_generation_for_content()`) passes
   `result["beats_by_lang"]` from `run_visual_generation()`, this also runs
@@ -3087,6 +3540,19 @@ back from a persisted row — only the local HTML review page
 (`visual_review.py`) did — yet they were re-serialized on every
 delete-then-insert, for every language, bloating the DB row for a
 local-debug-only purpose.
+
+**Update (Elimination Mandate D2.1, `code_report/forensic_output_audit_borrasca_run.md`):**
+the first15 diagnostics and cinematic continuity fields (`continuity_tags`,
+`visual_bible_refs`, first15's fields) are no longer produced by anything —
+`cinematic_prompts.py` and `first15_validator.py` (the two generators of
+these fields) are deleted entirely, not just skipped. `visual_review.py`'s
+`_REVIEW_METADATA_FIELDS` list and its HTML rendering still reference these
+keys, degrading gracefully to empty/dash for any content generated after
+this change while still rendering correctly for pre-existing
+`beat_review_metadata.json` files left by older runs — the same read-only
+legacy-display pattern used for `visual_bible.py` below. This is intentional
+and requires no further cleanup: `visual_review.py` is local-debug-only
+tooling (§13), not a production consumer.
 
 - `_beat_extras()` (`visual_orchestrator.py`) now only serializes the fields
   something downstream actually consumes: `visual_intent`, `visual_type`,
@@ -3184,10 +3650,11 @@ Rules:
 - Threshold is enforced in Python, not prompt.
 - Child Shorts have a hard parent-reuse budget of 60% (roadmap 3.3 / audit G-4.2): after thresholding, `remap_beats_for_short()` demotes the lowest-scoring reused beats to `media_url=""` until reuse is at or below 60%, forcing those beats into new portrait generation via `generate_pending_beat_images()`. Log marker: `CHILD_SHORT_REUSE_BUDGET_APPLIED`.
 - The `short_storyboard_remap` schema includes `new_image_prompt` (roadmap 3.4 / audit V-3). For assignments with `match_score < 70`, it must be a complete portrait-safe Flux prompt for a new child Short image. `remap_beats_for_short()` uses that prompt for child-new beats and fails the remap with `CHILD_REMAP_NEW_PROMPT_MISSING` if it is empty, rather than inheriting a rejected parent prompt or falling back to raw narration. Reused beats may keep the parent prompt; high-score candidates forced into new generation by non-reusable parent media or the 60% reuse budget use `new_image_prompt` when supplied, otherwise a deterministic physical fallback prompt.
-- Child remap MAJOR remediation is deterministic and child-only (roadmap 3.5 / audit G-4.3): after `validate_storyboard()` finds child MAJORs, `_run_child_short_visuals()` calls `remediate_child_major_storyboard_issues()` before logging-and-proceeding. The primitive only repairs beat-level prompt MAJORs (`forbidden_flux_word`, `ai_text_rendering_requested`) by stripping forbidden/readable-text language and regenerating that beat's `flux_prompt` from `visual_intent`, environment, and motif. It then re-runs `validate_storyboard()`; only remaining MAJORs are logged as proceed-anyway diagnostics. No Claude, Flux, or internal remap retry is invoked. Log markers: `CHILD_STORYBOARD_MAJOR_REMEDIATED`, `CHILD_STORYBOARD_MAJOR_REMEDIATION_DONE`.
+- Child remap MAJOR handling is telemetry only (Elimination Mandate D1.5, `code_report/forensic_output_audit_borrasca_run.md` — supersedes the former roadmap 3.5 / audit G-4.3 deterministic remediation primitive): after `validate_storyboard()` finds child MAJORs, `_run_child_short_visuals()` logs them and proceeds with the beats unchanged. The deleted primitive (`remediate_child_major_storyboard_issues()`) used to strip forbidden/readable-text language and regenerate `flux_prompt` from `visual_intent`/environment/motif for `forbidden_flux_word`/`ai_text_rendering_requested` MAJORs — removed because MAJOR findings never blocked the pipeline either way, so the repair pass added complexity without a provable quality gain. No Claude, Flux, or internal remap retry is invoked (unchanged).
 - Log reuse stats.
 - Child Short visual sections use `settings.short_visual_max_hold_ms` (default
-  6000 ms) as a maximum non-terminal image hold target after timestamp mapping.
+  6000 ms) as a maximum non-terminal image hold target after timestamp mapping
+  and micro-beat cleanup.
   If a non-terminal beat exceeds the cap, Agent 4 shortens that beat and
   advances the next existing visual beat earlier to cover the remaining
   narration span. It never creates fake beats, never changes child audio,
@@ -3356,9 +3823,11 @@ whichever fal.ai Flux endpoint is selected. It does not call fal.ai —
 
 Core exports:
 
-- `ImageRequest` / `ImageResult` / `ImageRoute` — pipeline-level dataclasses
-  (provider-agnostic on the request/route side; `ImageResult.media_url` is
-  always a local `cache/...` path or `None`, never a remote URL).
+- `ImageRoute` — the routing decision returned by `select_route()`
+  (model/source/reason only, no payload). The former `ImageRequest`/
+  `ImageResult` dataclasses were removed by the post-roadmap deep audit —
+  they had zero users anywhere (speculative abstraction from Phase 14.6
+  that no caller ever adopted).
 - `MODEL_CAPABILITIES` — capability table keyed by `schnell`, `dev`,
   `pro_1_1`, `pro_1_1_ultra`, `flux_2_pro`. Each entry declares `endpoint`,
   `size_mode` (`"image_size"` or `"aspect_ratio"`), `supports_steps`,
@@ -3369,7 +3838,10 @@ Core exports:
 - `build_fal_payload(model_key, prompt, ...)` — pure payload builder; emits
   only the fields the chosen model's capability entry supports (Pro-family
   never receives a Schnell-shaped field, Flux 2 Pro never receives
-  `num_inference_steps`/`guidance_scale`).
+  `num_inference_steps`/`guidance_scale`). It must also normalize requested
+  dimensions into fal-legal values per tier: Flux Pro v1.1 is scaled into its
+  1440px max-side envelope while preserving aspect, and aspect-ratio models
+  derive portrait/landscape orientation from the requested frame.
 - `build_cache_key_material(model_key, prompt, ...)` — model-aware cache
   hash input, backward-compatible with every pre-Phase-14.6 cache entry for
   the Schnell tier (see Cache keys below).
@@ -3377,10 +3849,10 @@ Core exports:
 Conservative-by-default contract (the load-bearing invariant of this
 section — do not relax without an explicit operator config change):
 
-- **The `purpose="text_card_background"` short-circuit in `select_route()`
-  is legacy-inert**: text cards are removed (§11.6), no live caller passes
-  that purpose anymore. The branch is retained only as a defensive guard;
-  do not build new behavior on it.
+- The former `purpose="text_card_background"` short-circuit in
+  `select_route()` (and the `purpose` parameter itself) is deleted — text
+  cards are removed product-wide (§11.6) and no live caller ever passed a
+  non-default purpose (post-roadmap deep audit).
 - **Ordinary generated beats route to Schnell** unless
   `settings.image_routing_enabled` is `True` **and** the relevant tier flag
   (`image_routing_allow_dev` / `image_routing_allow_pro`) is `True` **and**
@@ -3486,8 +3958,8 @@ Rules:
 
 - Agent 5 still receives only local `cache/...` `media_url` values from
   `VideoSection` rows — the router changes nothing about that contract;
-  every `ImageResult`/generated path is downloaded to local disk before
-  persistence, exactly as before this phase.
+  every generated path is downloaded to local disk before persistence,
+  exactly as before this phase.
 - Do not add a second fal.ai integration point — all endpoint selection and
   payload construction stays inside `image_router.py`'s capability table
   and `flux_generator.py`'s single `_call_fal()` call site.
@@ -3544,19 +4016,23 @@ What remains — prompt-side sanitization (the surviving half of Phase 14.7):
   Word-boundary matters: plain substring matching once made "document"
   match inside "documentary photograph", silently rewriting valid prompts.
 - Sanitization — `flux_generator.derive_text_prop_prompt(beat)`, wired into
-  `storyboard._build_beat_section()` (shared by parent and child paths):
-  derives a fresh prompt from `visual_intent` plus the detected prop label
-  and environment scene words, injects the SAME ANGLE/DISTANCE/LIGHTING/
-  DETAIL taxonomy as a positive framing clause
-  (`flux_generator._select_text_prop_framing()`, chosen deterministically
-  per beat — never random, so retries and segment-level regeneration stay
-  byte-identical), and always appends the explicit no-readable-text clause
-  alongside it (additive, not either/or — Flux prompting guidance favors
-  positive description since Flux has no true negative-prompt channel).
-  This is belt-and-suspenders behind the storyboard prompt's own guidance:
-  it also fires for a child-remap beat, which has no storyboard-prompt
-  pass of its own to apply the taxonomy at the source. Logged as
-  `TEXT_PROP_PROMPT_SANITIZED`.
+  `storyboard._build_beat_section()` (shared by parent and child paths).
+  **Simplified by the Elimination Mandate (D2.2/D2.3,
+  `code_report/forensic_output_audit_borrasca_run.md`):** the previous
+  version discarded Claude's own `flux_prompt` and rebuilt a new one from
+  `visual_intent` plus a detected prop label and environment scene words,
+  injected a second copy of the ANGLE/DISTANCE/LIGHTING/DETAIL taxonomy as a
+  framing clause, and appended a 10-clause negative-style wall
+  (`_TEXT_PROP_NO_TEXT_CLAUSE`) — this produced broken English,
+  self-contradictory prompts, and duplicate images in production. The
+  function now keeps Claude's `flux_prompt` **verbatim** and appends exactly
+  **one** short clause (`"no readable text or legible words in the frame"`).
+  It never rewrites the subject and never re-derives framing — the taxonomy
+  above is taught to Claude directly in the storyboard system prompt (still
+  unchanged) rather than re-injected here after the fact. It still falls
+  back to `visual_intent` only when `flux_prompt` is genuinely empty, and it
+  still fires for a child-remap beat (no storyboard-prompt pass of its own).
+  Logged as `TEXT_PROP_PROMPT_SANITIZED`.
 - Validator — check 19 (`ai_text_rendering_requested`, MAJOR) in
   `validate_storyboard()` fires on any beat whose prompt contains a quoted
   phrase or a literal-text-rendering instruction. No exemptions exist (text
@@ -3709,6 +4185,20 @@ Current boundary (Phase 4D-C — fully implemented):
   interior-silence intervals. It is not AI quality verification and does not
   judge storyboard quality, Flux prompt quality, image quality, visual taste,
   narrative alignment, or creative continuity.
+- **Duration drift is checked against the source audio file, not the DB
+  (roadmap 2c / audit P2-5, `code_report/forensic_output_audit_borrasca_run.md`),
+  and is enabled for Shorts too (roadmap 2c / audit P2-6).**
+  `verify_render(mp4_path, audio_file_path, fmt)` measures expected duration
+  by running ffprobe directly on `audio_file_path` — it never reads
+  `AudioFile.duration_ms`. A real production run showed why this matters:
+  `expected_duration_ms=audio.duration_ms` meant a corrupted DB row made a
+  161.7s corrupted render "verify" against itself — circular validation that
+  a real ffprobe measurement of the actual audio file would have caught.
+  Both Short render call sites (`_run_short_render()`) now pass
+  `audio_file_path=audio.file_path` instead of the previous
+  `expected_duration_ms=None` ("no bookend padding") — Shorts get the same
+  duration-drift check parent renders always got, closing the gap on the
+  format with the least margin for error.
 
 ### 11A.2 Parent Agent 5 Render Flow
 
@@ -3806,10 +4296,8 @@ Responsibilities:
 - Requires `Content.status` to already be `PARENT_VISUALS_DONE`,
   `CHILD_SHORT_VISUALS_DONE`, or `RENDERING`; never calls Agent 4.
 
-Temporary compatibility:
-
-- `run_agent5_for_content` remains as a Celery task alias for old queued messages only.
-- New code must call `run_agent5_render_for_content`.
+(The old `run_agent5_for_content` Celery alias was removed by the
+post-roadmap deep audit — see §10.3's removed-shims note.)
 
 #### `run_video_generation`
 
@@ -3835,6 +4323,45 @@ Rules:
 - Child renders only `format="short"`.
 - Parent must not create short props or short renders.
 
+#### `_props_are_stale`
+
+File:
+
+```text
+app/agents/agent5_render/services/video.py
+```
+
+**Second reuse trap fixed by the same phase (roadmap 2d / audit P0-3,
+`code_report/forensic_output_audit_borrasca_run.md`)** — independent of the
+stale-visuals guard above, since it catches staleness at a different layer.
+`_process_language()`'s "props on disk → skip to render" phase check
+previously trusted an existing props JSON file unconditionally: a real
+production run logged "Props found on disk — skipping to render" and
+rendered a prior run's stale props file verbatim, even after the underlying
+`VideoSection`/`AudioFile` data had since changed (the audited repair
+scenario: a corrected `duration_ms`).
+
+Neither `VideoSection` nor `AudioFile` carries a row-level modification
+timestamp, so `_props_are_stale(existing_props_file, beats, duration_ms)`
+compares three cheap, deterministic proxies for "the underlying data changed
+since these props were written" — the props file's own persisted
+`duration_ms`, its section count, and its last section's `audio_end_ms` —
+against the same three values freshly computed from the current DB-backed
+`beats`/`duration_ms`. Any mismatch, or a missing/unparseable props file, is
+treated as stale (logged `PROPS_STALE_REBUILDING` /
+`PROPS_STALENESS_CHECK_FAILED`). `_process_language()` calls this before
+taking the existing-props shortcut: a stale result skips
+`_render_from_existing_props()` entirely and falls through to the normal
+rebuild path (technical blockers → props sanity check → fresh
+`build_main_props()`/`build_short_props()` → render) instead of reusing the
+stale file.
+
+Runtime proof: `tests/test_stale_visuals_audio_fingerprint_and_props_rebuild.py`
+— unit tests for every mismatch dimension plus the missing/corrupt-file
+cases, and a wiring-level test proving `_process_language()` actually skips
+`_render_from_existing_props()` when `_props_are_stale()` returns `True` and
+takes the shortcut when it returns `False`.
+
 #### `build_main_props`
 
 File:
@@ -3848,6 +4375,9 @@ Rules:
 - Parent main props only.
 - Validate media paths.
 - Fail fast if remote URLs are present.
+- Fail fast (`ValueError`) if the last section end or last caption end
+  drifts from `duration_ms` by more than 2% — see
+  `_assert_timeline_alignment` below (roadmap 2b / audit P0-2).
 
 #### `build_short_props`
 
@@ -3866,6 +4396,35 @@ Rules:
 - Subtitles-only rendering: no overlay/text-card key is emitted; every
   section is a plain local image clip.
 - Do not add rehook/bridge audio unless a future architecture explicitly reintroduces standalone short bookends.
+- Fail fast (`ValueError`) if the last section end or last filtered caption
+  end drifts from `duration_ms` (= `end_ms − start_ms`) by more than 2% —
+  see `_assert_timeline_alignment` below (roadmap 2b / audit P0-2).
+
+#### `_assert_timeline_alignment`
+
+File:
+
+```text
+app/agents/agent5_render/services/remotion_builder.py
+```
+
+**Mirrors Agent 3's cross-timeline invariant at the props-building layer**
+(roadmap 2b / audit P0-2, `code_report/forensic_output_audit_borrasca_run.md`
+— see `_assert_duration_transcript_alignment` in §10.3). Called at the top
+of both `build_main_props()` and `build_short_props()`, before
+`_ensure_props_dir()`/any file write, so a violation never produces a
+partial or corrupted props file on disk.
+
+Compares `duration_ms` against `max(audio_end_ms)` across `sections` and
+`max(end_ms)` across `captions` (2% tolerance each, independently). Raises
+`ValueError` — not a logged-and-continue warning — since this is the last
+checkpoint before a corrupted timeline reaches Remotion; the caller
+(`_process_language()` in `agent5_render/services/video.py`) already wraps
+per-language props building in a `try/except Exception` that rolls back and
+skips just that language, matching the same fail-that-language convention
+Agent 3's mirror uses. A `duration_ms <= 0` or an empty `sections`/`captions`
+list is a no-op pass (nothing to compare against) — this check adds a
+disaster guard, it does not invent a new structural requirement.
 
 #### `render_main_video`
 
@@ -4106,70 +4665,52 @@ renders/
 `run_manifest.json` is created in the run root when the local run folders are
 ensured.
 
-Before visual beat generation, Agent 4 creates or loads a local visual bible:
+**The visual-bible layer is deleted (Elimination Mandate D2.1,
+`code_report/forensic_output_audit_borrasca_run.md`).** No new
+`visual_bible.json` is ever generated — a real production run showed it
+returning 0 locations, 0 recurring motifs, and 0 first-15 rules, a paid
+Claude call and token cost for a total no-op on every storyboard batch. It
+is replaced by `continuity_line`
+(`storyboard.build_continuity_line_from_blueprint()`, §11.4): a pure-Python,
+no-AI-call extraction of proper nouns that recur across the blueprint's own
+text, threaded as one plain sentence into every `generate_storyboard_batch()`
+call. `app/agents/agent4_visuals/services/cinematic_prompts.py` and
+`.../first15_validator.py` — the enrichment and first-15
+enhancement/validation modules that consumed the old bible — no longer
+exist as files, and `visual_orchestrator._check_final_prompt_issues()` (the
+re-validation pass that existed only to re-check `flux_prompt` after those
+two mutation passes) is deleted with them. `app/agents/agent4_visuals/services/visual_bible.py`
+keeps only two read-only helpers (`get_visual_bible_path()`,
+`load_visual_bible_for_content()`) so `visual_review.html` can still render
+a `visual_bible.json` left on disk by a run from before this change; no
+current code path writes that file.
 
-```text
-{media_path}/runs/{content_id}/visuals/visual_bible.json
-```
-
-Agent 4 also writes review-only beat metadata to the same `visuals/`
-subfolder (roadmap 6.5 / audit AR-3 — moved out of the DB's
-`generation_prompt` blob, which nothing in the live pipeline queried back):
+Agent 4 still writes review-only beat metadata to the `visuals/` subfolder
+(roadmap 6.5 / audit AR-3 — moved out of the DB's `generation_prompt` blob,
+which nothing in the live pipeline queried back):
 
 ```text
 {media_path}/runs/{content_id}/visuals/beat_review_metadata.json
 ```
 
-First15 diagnostics, cinematic continuity tags/references, prompt-quality
-warnings, and per-beat descriptive fields (`subject`, `emotion`, `camera`,
-etc.) live here instead, keyed by language then `section_order`. Written by
-`save_beat_review_metadata()` once per language, alongside every
-`_save_video_sections()` call. Local-debug/review infrastructure only —
-`visual_review.html` reads it; nothing else does, and Agent 5 never depends
-on it.
+Prompt-quality telemetry and per-beat descriptive fields (`subject`,
+`emotion`, `camera`, etc.) live here, keyed by language then
+`section_order`. Written by `save_beat_review_metadata()` once per language,
+alongside every `_save_video_sections()` call. Local-debug/review
+infrastructure only — `visual_review.html` reads it; nothing else does, and
+Agent 5 never depends on it. Its `continuity_tags`/`visual_bible_refs` and
+first15 diagnostic fields are dead going forward (nothing generates them
+any more) but degrade gracefully to empty/dash for new content while still
+rendering correctly for pre-existing files — see §11.4's `_beat_extras` /
+`save_beat_review_metadata` entry.
 
-The visual bible defines story-level visual continuity: stable characters,
-locations, motifs, global style, lighting rules, camera language, negative
-prompt rules, first-15-seconds visual rules, and forbidden generic shots. It is
-generated from the validated script, `Content.story_blueprint` when available,
-and non-secret channel configuration such as `visual_style`, `image_style`,
-`video_style_type`, `video_color_grade`, content mode, output mode, target
-languages, and target platforms. If `Content.channel_config_snapshot` is
-present, Agent 4 uses it as the config source; otherwise it reads live
-non-secret channel/config rows. Parent content creates the canonical visual
-bible. Child shorts reuse the parent visual bible when available so they do not
-create separate visual worlds. The bible is local-debug/quality infrastructure;
-it does not replace `VideoSection` rows and Agent 5 does not depend on it.
-
-Agent 4 uses `visual_bible.json` as storyboard input, not as a replacement
-template after validation. Parent storyboard generation passes a compact bible
-JSON block into every `generate_storyboard_batch()` call; validation retries do
-the same. After validation, `apply_cinematic_prompts_to_beats()` is append-only:
-it preserves the Claude-authored `flux_prompt`, adds at most matched
-character/location continuity clauses, and stores continuity metadata
-(`continuity_tags`, `visual_bible_refs`, first-15 flag) on the in-memory beat
-dict — as of roadmap 6.5, these are review-only fields that end up in
-`beat_review_metadata.json` (see above), not in `VideoSection.generation_prompt`.
-It must never prepend "Cinematic", add
-`Avoid:`/negative-prompt lists, truncate phrases with ellipses, or inject raw
-`camera_language` / `lighting_rules` entries. The enriched prompts are re-validated by `_check_final_prompt_issues()` before
-first15, then re-validated again after first15 because that step can append to
-`flux_prompt`; both passes use only checks 4, 12-16, and 19. MAJOR final-prompt
-findings stop the parent pass or skip the affected child language. Agent 5 does
-not generate, repair, or validate prompts.
-
-Agent 4 also validates and strengthens first-15-second visual hooks with
-deterministic checks before Flux generation. The check uses the Visual Bible
-`first_15_seconds_rules`, forbidden generic shots, negative prompt rules,
-global style, and config context to look for strong opening subjects, actions,
-emotions, mysterious objects, specific horror clues, and story-specific
-locations while avoiding generic dark streets, forests, empty rooms, abstract
-symbols, and low-tension filler openings. Clearly unusable openings fail using
-the existing Agent 4 failure convention; weak but usable openings are warnings.
-The result is stored in existing `VideoSection.generation_prompt` metadata and
-displayed in `visual_review.html`. Agent 5 does not own or repair
-first-15-second visual quality. This is not the general visual
-repetition/rhythm validator.
+Storyboard generation now flows straight from Claude's structured output
+into `validate_storyboard()` (`_run_storyboard_validation()` /
+`_check_storyboard_issues()`) with no intermediate enrichment or mutation
+pass — that single deterministic validator is the sole
+validation/telemetry step between storyboard generation and Flux
+generation, per D3 of the mandate. Agent 5 still does not generate, repair,
+or validate prompts.
 
 After successful Agent 4 visual generation, Agent 4 also writes a local review
 page:
@@ -4298,8 +4839,6 @@ Important tasks:
 | `run_agent2_scripts_for_content` | run Agent 2 script workflow task wrapper |
 | `pickup_scripts_validated` | enqueue Agent 3 audio |
 | `run_agent3_audio_for_content` | generate audio/Whisper |
-| `pickup_short_episodes_awaiting_parent` | compatibility no-op for old queued child-release messages |
-| `ensure_child_short_audio_enqueued` | compatibility no-op for old parent-audio child-release imports |
 | `pickup_audio_done` | enqueue Agent 4 visual generation |
 | `run_agent4_visual_generation_for_content` | generate storyboard/Flux visuals or child remap; persist `VideoSection` rows |
 | `pickup_visual_ready` | enqueue Agent 5 render once status is `PARENT_VISUALS_DONE`/`CHILD_SHORT_VISUALS_DONE` |
@@ -4773,6 +5312,14 @@ Script prompts must:
 - Keep TTS constraints visible.
 - Avoid long sentences.
 - End with a strong, relevant comment trigger when required.
+- Comment triggers and Short final CTAs must be story-specific, not reusable
+  channel boilerplate. Child Shorts must not copy the parent's
+  `blueprint.comment_trigger` verbatim or near-verbatim; prompt guidance handles
+  diversity, not a retry loop.
+- Short title spoiler checks are telemetry-only: deterministic token overlap
+  against the part reveal/cliffhanger and blueprint final payoff logs
+  `SHORT_TITLE_SPOILER_TELEMETRY`, but never rewrites, retries, or blocks the
+  generated child script.
 - Favor spoken-video delivery over book/documentary-page register (roadmap
   4.3 / audit S-3, §6): present tense for story events wherever the story
   allows it, direct address to the viewer at least once per section,
@@ -4781,6 +5328,17 @@ Script prompts must:
 - Deliver the blueprint's `midpoint_retention_trap` — a reveal placed near
   the story's halfway point — as a targeted constraint on the one body
   section nearest that point, not just passively present in the blueprint.
+- Honor the channel's configured `narration_pov` (roadmap 4a / audit P1-9):
+  third-person narrator voice by default, or first-person "storytime"
+  narration ("I"/"me"/"my") when configured — never mixed within one
+  section, and never hardcoded to one register regardless of config.
+- Trust construction, not the prompt alone, for hook placement (roadmap 4c /
+  audit P1-4): the blueprint's `hook` is deterministically prepended as the
+  INTRO's literal opening line in Python (`_apply_hook_by_construction()`),
+  regardless of where Claude itself chose to place similar content. Do not
+  rely on `check_hook_quality()` (shape-only: ≤15 words, no forbidden
+  opener) to guarantee which sentence opens the script — it cannot and must
+  not be asked to.
 
 Script prompts must not:
 
@@ -4863,6 +5421,8 @@ Short episode scripts must:
 - pass TTS checks before validation
 - follow the same spoken-video delivery rules as long-form sections (§21.3):
   present tense, direct address, contractions, read-aloud test
+- follow the same channel-configured `narration_pov` as the parent long-form
+  script (roadmap 4a / audit P1-9)
 
 Short episode visual remap prompts must:
 
@@ -4926,7 +5486,12 @@ the named `tool_use` block (never assumes `content[0]`), and the SDK
 delivers `block.input` as an already-parsed dict, so there is no markdown-fence
 stripping or JSON parsing of free text at all. `call_claude`/`parse_claude_json`
 are no longer imported in that file. Runtime proof:
-`tests/test_agent2_structured_json_migration.py`.
+`tests/test_agent2_structured_json_migration.py`. (Historical note:
+`assess_script_quality()` and `_SCRIPT_QUALITY_SCHEMA`, migrated here, were
+later deleted entirely by the Elimination Mandate — §9.3's
+`run_script_quality_gate` entry — not just re-migrated again; this
+structured-call migration history remains accurate for the other three
+functions, which are still live.)
 
 ---
 
@@ -4941,17 +5506,24 @@ High-quality/complex tasks:
 - story blueprint when quality is critical
 - section generation
 - short script generation
-- quality rewrite
 - storyboard generation
 
 Fast/cheap tasks:
 
-- global validation
-- script quality check
 - shorts planner
 - short storyboard remap
 - content reformat
 - simple suggestions
+
+Retired tasks (Elimination Mandate, `code_report/forensic_output_audit_borrasca_run.md`
+D1.1/D1.2/D1.3/D2.1, extended by the post-roadmap deep audit) — do not
+reintroduce without a new operator decision superseding the mandate:
+`quality_rewrite`, `global_validation`, `script_quality_check`,
+`short_quality_check`, `visual_bible_generation`, `auto_correction` (the
+auto_correct_script prompt-repair layer, deleted with its caller), and
+`script_generation` (never had a call site — section generation uses
+`section_generation`). None of these exist in `MODEL_ROUTING` anymore;
+`resolve_model()` raises `ValueError` for all seven.
 
 Rules:
 
@@ -4981,7 +5553,6 @@ Important log families:
 
 ```text
 SCRIPT_COST_ESTIMATE
-QUALITY_REWRITE_SKIPPED
 FINAL_TTS_BACKSTOP
 STORYBOARD_ESTIMATE
 STORYBOARD_RETRY_COST
@@ -5006,9 +5577,14 @@ BEAT_IMAGE_NEIGHBOR_REUSED
 DARK_CONTRAST_GRADE_DOWNGRADED
 DUPLICATE_PROMPT_REPAIRED
 PARENT_VISUALS_STALE_SCRIPT_HASH
+PARENT_VISUALS_STALE_AUDIO_DURATION
 STALE_VISUALS_CHECK_BACKFILL
 TTS_SECTION_DELIVERY_SELECTED
 TTS_SECTION_DELIVERY_FALLBACK
+RESUME_TRANSCRIPT_REUSED
+AUDIO_DURATION_TRANSCRIPT_MISMATCH
+PROPS_STALE_REBUILDING
+PROPS_STALENESS_CHECK_FAILED
 ```
 
 Rules:
@@ -5046,6 +5622,11 @@ Rules:
 - Log prompt length and estimated token count.
 - For storyboards, monitor output tokens per beat.
 - If a batch approaches token limit, reduce target beats or split earlier.
+- Storyboard beat-count overshoot is handled deterministically after each
+  batch returns: if `len(beats) > target_beat_count + 2`, keep the earliest
+  `target_beat_count + 2` beats, trim the tail, and log
+  `STORYBOARD_BEAT_COUNT_OVERSHOOT_TRIMMED`. Do not regenerate or retry solely
+  for overshoot.
 
 ---
 
@@ -5054,9 +5635,16 @@ Rules:
 ### 27.1 Images
 
 - Flux images must be stored locally.
+- Downloaded image dimensions must match the render format aspect ratio: parent
+  16:9, Shorts 9:16. A 4:3 generated image is a blocking media-validation
+  failure, not a crop-at-render fallback.
 - `media_url` must be local.
 - HTTP image URLs must never reach Remotion.
 - Text cards are removed (subtitles-only rendering, §11.6/Golden Rule 11):
+- Storyboard timestamp fallback beats must keep `script_text=""` and set
+  `script_text_source="empty_fallback_no_transcript_span"` plus
+  `script_text_missing=true`; never copy `visual_intent` into `script_text`.
+  `STORYBOARD_SCRIPT_TEXT_EMPTY_FALLBACK` logs the affected beat orders.
   every beat is a Flux-generated image, Flux is never asked to render
   readable text, and Remotion draws no text except the subtitle track.
 - Flux prompt hash caching is allowed.
@@ -5075,6 +5663,10 @@ Rules:
 - Parent props must not contain parent-cut shorts.
 - Validate props before render.
 - Fail fast on remote URLs.
+- Fail fast if the last section end or last caption end drifts from
+  `duration_ms` by more than 2% (roadmap 2b / audit P0-2,
+  `_assert_timeline_alignment` in §11A.4) — the props-building mirror of
+  Agent 3's cross-timeline invariant (§10.3).
 
 ### 27.3 Rendering
 
@@ -5101,6 +5693,10 @@ Rules:
 - Verify rendered files with deterministic technical checks when render
   verification is enabled: file existence, ffprobe duration/stream/resolution
   checks, blackdetect, and silencedetect.
+- Duration verification's expected value comes from ffprobe on the source
+  audio file, never `AudioFile.duration_ms` (roadmap 2c / audit P2-5) —
+  applies to both `main` and `short` formats (roadmap 2c / audit P2-6; Shorts
+  are no longer exempt).
 - Render verification is not AI quality verification; visual quality and
   creative continuity belong to Agent 4 validation and diagnostics.
 - Do not publish unverified renders.
@@ -5297,7 +5893,7 @@ These are current engineering risks to monitor, not future feature promises.
 | Area | Risk |
 |---|---|
 | Duplicate task dispatch | Beat and inline orchestration may enqueue same child if guards fail |
-| Stale props | Existing props files may hide newer DB/script/audio changes |
+| Stale props | Mitigated (roadmap 2d / audit P0-3): `_props_are_stale()` rebuilds when the props file's duration/section-count/last-section-end no longer match the current DB beats. Heuristic, not a full content hash — a change that doesn't move any of those three proxies (e.g. `flux_prompt` text edited with identical timing) would not be caught |
 | Visual quality | Character identity and visual continuity need stronger controls |
 | Storyboard cost | Storyboard output tokens per beat can be high |
 | Child short script quality | Short scripts must not validate with remaining MAJOR TTS issues |

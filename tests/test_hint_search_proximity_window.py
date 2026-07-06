@@ -111,9 +111,11 @@ class TestProximityWindowRegression(unittest.TestCase):
             sections = self._run()
         self.assertIsNotNone(sections)
 
-        # Beat 2 must be a fallback (script_text degrades to visual_intent),
+        # Beat 2 must be a fallback with empty, flagged script_text,
         # NOT anchored at the 120 s duplicate.
-        self.assertEqual(sections[2]["script_text"], "intent 2")
+        self.assertEqual(sections[2]["script_text"], "")
+        self.assertEqual(sections[2]["script_text_source"], "empty_fallback_no_transcript_span")
+        self.assertTrue(sections[2]["script_text_missing"])
         self.assertLess(sections[2]["audio_start_ms"], 30_000)
 
         # The old bug: beat 1 absorbed the whole gap (would end at 120_000 ms).
@@ -158,7 +160,7 @@ class TestShrinkPrefixDemotion(unittest.TestCase):
             allow_legacy_fallback=True,
         )
         self.assertEqual(sections[1]["audio_start_ms"], 16_000)
-        self.assertNotEqual(sections[1]["script_text"], "intent 1")
+        self.assertNotEqual(sections[1]["script_text"], "")
 
     def test_three_token_match_beyond_15s_is_rejected(self):
         # Only the 3-token prefix exists, at t=28 s — beyond expected(3s)+15s.
@@ -175,7 +177,7 @@ class TestShrinkPrefixDemotion(unittest.TestCase):
             beats, _transcript(words), duration_ms=200 * _WORD_MS,
             allow_legacy_fallback=True,
         )
-        self.assertEqual(sections[1]["script_text"], "intent 1")   # fallback
+        self.assertEqual(sections[1]["script_text"], "")   # fallback
         # Not anchored at the rejected 28 s match — it gets a proportional
         # position from _resolve_boundaries instead (trailing interpolation).
         self.assertNotEqual(sections[1]["audio_start_ms"], 28_000)
@@ -196,7 +198,7 @@ class TestShrinkPrefixDemotion(unittest.TestCase):
             allow_legacy_fallback=True,
         )
         self.assertEqual(sections[1]["audio_start_ms"], 4_000)
-        self.assertNotEqual(sections[1]["script_text"], "intent 1")
+        self.assertNotEqual(sections[1]["script_text"], "")
 
     def test_short_full_hint_gets_tight_window_too(self):
         # A hint whose FULL form is 3 tokens is as ambiguous as a 3-token

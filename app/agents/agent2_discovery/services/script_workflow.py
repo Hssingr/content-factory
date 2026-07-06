@@ -17,6 +17,7 @@ from app.agents.agent2_discovery.services.story import Story
 from app.agents.agent2_discovery.system_prompt import generate_story_blueprint
 from app.models import Channel, ChannelConfig, ChannelVoice, Content, Script
 from app.services.local_run_paths import ensure_run_dirs
+from app.services.script_checks import check_source_material_floor
 from app.services.script_estimator import estimate_duration_sec
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,7 @@ class ScriptWorkflowContext:
     tts_provider: str
     visual_style: str
     image_style: str
+    narration_pov: str
 
 
 def generate_parent_source_script(
@@ -55,6 +57,13 @@ def generate_parent_source_script(
     planner — those remain caller-owned so the harness can interleave its own
     reuse checks and reporting.
 
+    Source-material floor (roadmap 4b / audit P1-5): before any Claude call
+    or status transition, fails the discovery→script handoff — sets
+    ``Content.status = "FAILED"`` and returns ``None`` — when
+    ``content.source_excerpt`` is too thin to ground a full script of the
+    channel's configured ``script_format`` (see
+    ``app.services.script_checks.check_source_material_floor``).
+
     Args:
         content: Approved parent `Content` row.
         db:      SQLAlchemy session managed by the caller.
@@ -65,10 +74,13 @@ def generate_parent_source_script(
 
     Returns:
         The persisted source voice_script text, or ``None`` when the channel
-        context could not be loaded.
+        context could not be loaded or the source-material floor failed.
     """
     context = context or _load_script_workflow_context(content, db)
     if context is None:
+        return None
+
+    if not _passes_source_material_floor(content, context, db):
         return None
 
     if story is None:
@@ -81,6 +93,7 @@ def generate_parent_source_script(
         script_format=context.script_format,
         visual_style=context.visual_style,
         image_style=context.image_style,
+        narration_pov=context.narration_pov,
     )
     logger.info(
         "Blueprint generated for content %s — %d major_turns, suggested_sections=%d",
@@ -101,6 +114,7 @@ def generate_parent_source_script(
         audio_tags_enabled=context.audio_tags_enabled,
         visual_style=context.visual_style,
         image_style=context.image_style,
+        narration_pov=context.narration_pov,
     )
 
     hook_excerpt = scripts.get("voice_script", "").strip()[:300].replace("\n", " ")
@@ -108,20 +122,39 @@ def generate_parent_source_script(
 
     scripts = run_script_quality_gate(
         scripts,
-        context.channel,
-        content=content,
-        db=db,
-        blueprint=blueprint,
         script_format=context.script_format,
         language=content.source_language,
-        tts_model=context.tts_model,
-        tts_provider=context.tts_provider,
     )
     _script_trace("tasks_post_quality_gate", scripts.get("voice_script", ""))
 
     src_voice_script = _persist_source_script(content, scripts, db)
     _merge_visual_intent_history(content, scripts, db)
     return src_voice_script
+
+
+def _passes_source_material_floor(
+    content: Content,
+    context: ScriptWorkflowContext,
+    db: Session,
+) -> bool:
+    """Fail the discovery→script handoff when source_excerpt is too thin
+    (roadmap 4b / audit P1-5) to ground a full script — before any Claude
+    call or status transition into GENERATING_SCRIPTS is spent on it.
+    """
+    issues = check_source_material_floor(
+        content.source_excerpt or "", content.source_language, context.script_format,
+    )
+    if not issues:
+        return True
+
+    issue = issues[0]
+    logger.error(
+        "SOURCE_MATERIAL_FLOOR_FAILED content=%s script_format=%s: %s",
+        content.id, context.script_format, issue["description"],
+    )
+    content.status = "FAILED"
+    db.commit()
+    return False
 
 
 def run_script_workflow(content: Content, db: Session) -> None:
@@ -153,6 +186,19 @@ def run_script_workflow(content: Content, db: Session) -> None:
     content.status = "SCRIPTS_VALIDATED"
     db.commit()
     logger.info("Content %s — SCRIPTS_VALIDATED", content.id)
+
+    # output_mode="youtube_long_only" skips standalone Shorts entirely — the
+    # first config-driven branch on ChannelConfig.output_mode (post-roadmap
+    # deep audit; previously the value was accepted by the schema but nothing
+    # read it, and run_shorts_planner() ran unconditionally for every parent).
+    output_mode = getattr(context.config, "output_mode", "youtube_and_shorts") \
+        if context.config else "youtube_and_shorts"
+    if output_mode == "youtube_long_only":
+        logger.info(
+            "SHORTS_PLANNER_SKIPPED content=%s reason=output_mode_youtube_long_only",
+            content.id,
+        )
+        return
 
     try:
         run_shorts_planner(content.id, context.channel, context.config, db)
@@ -202,6 +248,7 @@ def _load_script_workflow_context(
     tts_provider = src_voice.provider if src_voice else "cartesia"
     visual_style = config.visual_style if config else ""
     image_style = config.image_style if config else ""
+    narration_pov = config.narration_pov if config else "third_person"
 
     return ScriptWorkflowContext(
         channel=channel,
@@ -213,6 +260,7 @@ def _load_script_workflow_context(
         tts_provider=tts_provider,
         visual_style=visual_style,
         image_style=image_style,
+        narration_pov=narration_pov,
     )
 
 

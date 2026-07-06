@@ -21,8 +21,9 @@ class Content(Base):
     # pipeline state machine — see CLAUDE.md §Agent descriptions for full list
     # VARCHAR(64) leaves room for recoverable orchestration/status labels.
     status: Mapped[str] = mapped_column(String(64), nullable=False, default="DRAFT")
-    # raw source body stored at discovery time (≤8 000 chars) — used by Agent 3
-    # auto_correct_script() to expand minimum_length corrections from source facts
+    # Raw source body stored at discovery time (≤ MAX_SOURCE_EXCERPT_CHARS) —
+    # the single fact source for blueprint/section generation and the
+    # source-material floor check (roadmap 4b / audit P1-5).
     source_excerpt: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Blueprint JSON persisted immediately after generate_story_blueprint() — used as constraint
     # for per-section generation and stored with visual_intent_history for Agent 4 visual continuity.

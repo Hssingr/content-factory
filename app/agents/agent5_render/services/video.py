@@ -124,7 +124,7 @@ def run_video_generation(content_id: uuid.UUID, db: Session) -> bool:
         logger.info("RENDER_START content_id=%s", content_id)
 
     config: ChannelConfig | None = db.get(ChannelConfig, channel.id)
-    channel_style         = config.video_style_type              if config else "documentary"
+    channel_style         = config.video_style_type              if config else "story_driven"
     channel_color_grade   = config.video_color_grade             if config else "desaturated"
     karaoke_color         = config.subtitle_karaoke_active_color if config else "#FFD700"
 
@@ -334,13 +334,15 @@ def _process_language(
         )
         return True
 
-    # ── Phase check 2: props on disk → skip to render ─────────────────────────
+    # ── Phase check 2: props on disk → skip to render (unless stale) ──────────
     if is_short_episode:
         existing_props_file = props_dir / f"{cid_str}_{language}_short_{short_order}.json"
     else:
         existing_props_file = props_dir / f"{cid_str}_{language}_main.json"
 
-    if existing_props_file.exists():
+    if existing_props_file.exists() and not _props_are_stale(
+        existing_props_file, beats, audio.duration_ms,
+    ):
         logger.info("Props found on disk for language=%s — skipping to render", language)
         try:
             return _render_from_existing_props(
@@ -651,6 +653,57 @@ def _check_props_sanity(sections: list[dict], duration_ms: int) -> tuple[bool, s
     return True, ""
 
 
+def _props_are_stale(existing_props_file: Path, beats: list[dict], duration_ms: int) -> bool:
+    """Return True when an on-disk props file no longer matches the current
+    DB-backed beats/duration (roadmap 2d / audit P0-3,
+    code_report/forensic_output_audit_borrasca_run.md).
+
+    A real production run logged "Props found on disk — skipping to render"
+    and rendered a prior run's stale props verbatim after the underlying
+    VideoSection/AudioFile data had changed (the audited repair scenario: a
+    corrupted `duration_ms` corrected in place). Neither `VideoSection` nor
+    `AudioFile` carries a row-level modification timestamp, so this compares
+    three cheap, deterministic proxies for "the underlying data changed
+    since these props were written": the props file's own persisted
+    `duration_ms`, its section count, and its last section's `audio_end_ms`
+    — against the same three values freshly computed from the current
+    `beats`/`duration_ms` this call was given. Any mismatch is treated as
+    stale. A missing or unparseable props file is also treated as stale
+    (rebuild rather than crash on a corrupt file).
+    """
+    try:
+        with open(existing_props_file, encoding="utf-8") as fh:
+            existing_props = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning(
+            "PROPS_STALENESS_CHECK_FAILED path=%s error=%s — treating as stale, rebuilding",
+            existing_props_file, exc,
+        )
+        return True
+
+    existing_sections = existing_props.get("sections") or []
+    existing_last_end_ms = max(
+        (s.get("audio_end_ms", 0) for s in existing_sections), default=0,
+    )
+    current_last_end_ms = max((b.get("audio_end_ms", 0) for b in beats), default=0)
+
+    stale = (
+        existing_props.get("duration_ms") != duration_ms
+        or len(existing_sections) != len(beats)
+        or existing_last_end_ms != current_last_end_ms
+    )
+    if stale:
+        logger.warning(
+            "PROPS_STALE_REBUILDING path=%s existing_duration_ms=%s current_duration_ms=%d "
+            "existing_sections=%d current_sections=%d existing_last_end_ms=%d "
+            "current_last_end_ms=%d — DB beats/duration no longer match the on-disk "
+            "props file; rebuilding instead of reusing",
+            existing_props_file, existing_props.get("duration_ms"), duration_ms,
+            len(existing_sections), len(beats), existing_last_end_ms, current_last_end_ms,
+        )
+    return stale
+
+
 def _audit_props_for_remote_urls(props_path: str, label: str) -> list[str]:
     """Scan a props JSON file and return all remote URLs found (http/https).
 
@@ -764,7 +817,7 @@ def _run_short_render(
     if settings.verify_renders:
         issues = verify_render(
             mp4_path=result["file_path"],
-            expected_duration_ms=None,   # Shorts skip duration check (no bookend padding)
+            audio_file_path=audio.file_path,   # roadmap 2c / audit P2-6: Shorts get the duration check too
             fmt="short",
         )
         if issues:
@@ -844,7 +897,7 @@ def _render_from_existing_props(
         if settings.verify_renders:
             issues = verify_render(
                 mp4_path=main_result["file_path"],
-                expected_duration_ms=audio.duration_ms,
+                audio_file_path=audio.file_path,
                 fmt="main",
             )
             if issues:
@@ -935,7 +988,7 @@ def _run_renders(
     if settings.verify_renders:
         main_issues = verify_render(
             mp4_path=main_result["file_path"],
-            expected_duration_ms=audio.duration_ms,
+            audio_file_path=audio.file_path,
             fmt="main",
         )
         if main_issues:

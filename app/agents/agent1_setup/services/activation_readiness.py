@@ -26,13 +26,15 @@ from typing import TypedDict
 
 from app.models import Channel
 from app.agents.agent1_setup.services.v3_config_rules import validate_v3_channel_config
+from app.agents.agent1_setup.services.niche_tone_check import detect_niche_tone_contradiction
 
 
 class ReadinessIssue(TypedDict):
-    """One reason a channel is not (yet) ready to activate."""
-    severity: str   # "BLOCKING" — every issue this module returns is blocking;
-                     # no WARNING-level issue currently exists, but the field
-                     # is kept for parity with V3ConfigIssue and future use.
+    """One reason a channel is not (yet) ready to activate, or a non-blocking
+    flag surfaced alongside readiness."""
+    severity: str   # "BLOCKING" (returned in `issues`, prevents activation) or
+                     # "WARNING" (returned in `warnings`, e.g. the niche<->tone
+                     # contradiction check — never prevents activation).
     code:     str    # short, machine-readable reason code
     message:  str    # human-readable detail
 
@@ -58,7 +60,8 @@ def check_activation_readiness(channel: Channel) -> dict:
         {
           "ready":    bool,
           "issues":   list[ReadinessIssue],   # every reason activation is blocked
-          "warnings": list[ReadinessIssue],   # non-blocking observations (currently always [])
+          "warnings": list[ReadinessIssue],   # non-blocking observations — e.g. a
+                                               # niche<->tone contradiction (item 10)
         }
 
     Checks performed (each independent — all issues are collected, not
@@ -80,11 +83,19 @@ def check_activation_readiness(channel: Channel) -> dict:
       8. EVERY existing ChannelPlatform row is verified=True — not just
          one of them. This is the fix for the V3.1-audited frontend/backend
          mismatch.
-      9. output_mode="youtube_and_shorts" (the only executable output mode
-         today) requires a ChannelPlatform row with platform="youtube"
-         among the selected platforms.
+      9. YouTube-producing output modes ("youtube_and_shorts" and
+         "youtube_long_only") require a ChannelPlatform row with
+         platform="youtube" among the selected platforms.
+
+    Also collects (roadmap 4a / audit P1-9, non-blocking):
+      10. A niche<->tone contradiction (e.g. niche="Reddit horror story
+          narration" + tone="documentary") via
+          `niche_tone_check.detect_niche_tone_contradiction()` — surfaced
+          as a WARNING, never BLOCKING; activation is never prevented by
+          this check alone.
     """
     issues: list[ReadinessIssue] = []
+    warnings: list[ReadinessIssue] = []
 
     # 1 & 2 — config existence + V3 executability
     if channel.config is None:
@@ -149,13 +160,19 @@ def check_activation_readiness(channel: Channel) -> dict:
                 message=f"Platform '{p.platform}' ({p.language}) credentials are not verified yet.",
             ))
 
-    # 9 — output_mode="youtube_and_shorts" requires a youtube platform row
+    # 9 — YouTube-producing output modes require a youtube platform row
     output_mode = getattr(channel.config, "output_mode", "youtube_and_shorts") if channel.config else "youtube_and_shorts"
-    if output_mode == "youtube_and_shorts" and not any(p.platform == "youtube" for p in channel.platforms):
+    if output_mode in ("youtube_and_shorts", "youtube_long_only") and not any(p.platform == "youtube" for p in channel.platforms):
         issues.append(ReadinessIssue(
             severity="BLOCKING", code="youtube_required_for_output_mode",
-            message="output_mode='youtube_and_shorts' requires a YouTube platform credential — "
+            message=f"output_mode='{output_mode}' requires a YouTube platform credential — "
                     "save credentials for YouTube in Tab 2.",
         ))
 
-    return {"ready": not issues, "issues": issues, "warnings": []}
+    # 10 — niche<->tone contradiction (non-blocking flag only)
+    for finding in detect_niche_tone_contradiction(channel.niche, channel.tone):
+        warnings.append(ReadinessIssue(
+            severity="WARNING", code=finding["code"], message=finding["message"],
+        ))
+
+    return {"ready": not issues, "issues": issues, "warnings": warnings}

@@ -14,8 +14,15 @@ delivers an already-parsed dict.
 
 Only the paid Claude API boundary (``anthropic.Anthropic``) is stubbed — the
 real ``generate_native_script()`` / ``generate_revised_scripts()`` /
-``assess_script_quality()`` / ``generate_short_episode_script()`` functions
-run unmodified, including their real system-prompt assembly.
+``generate_short_episode_script()`` functions run unmodified, including their
+real system-prompt assembly.
+
+NOTE: this file originally also covered ``assess_script_quality()``'s
+migration to the structured-call path. That function (along with the rest of
+the parent AI quality gate) was deleted entirely by the Elimination Mandate
+(code_report/forensic_output_audit_borrasca_run.md, D1.1) — its structured-call
+coverage is moot since the function no longer exists, not because the
+migration regressed.
 """
 
 from __future__ import annotations
@@ -90,42 +97,6 @@ class TestRevisionUsesStructuredCall(unittest.TestCase):
             )
 
         self.assertEqual(result, payload)
-
-
-class TestScriptQualityUsesStructuredCall(unittest.TestCase):
-    def test_passed_status_returns_empty_issues(self):
-        response = SimpleNamespace(
-            content=[_tool_use_block("script_quality_output", {"status": "PASSED", "issues": []})],
-            usage=_usage(), stop_reason="tool_use",
-        )
-        fake_client = MagicMock()
-        fake_client.messages.create.return_value = response
-
-        with patch("app.services.claude_client._get_client", return_value=fake_client):
-            result = system_prompt.assess_script_quality(
-                scripts={"title": "T", "voice_script": "[INTRO] Text. [OUTRO] End."},
-                channel=_Channel(),
-            )
-
-        self.assertEqual(result["status"], "PASSED")
-        self.assertEqual(result["issues"], [])
-
-    def test_unexpected_status_value_still_raises(self):
-        """The post-hoc status check must survive the migration unchanged —
-        proves the enum in the schema doesn't silently swallow this guard."""
-        response = SimpleNamespace(
-            content=[_tool_use_block("script_quality_output", {"status": "MAYBE", "issues": []})],
-            usage=_usage(), stop_reason="tool_use",
-        )
-        fake_client = MagicMock()
-        fake_client.messages.create.return_value = response
-
-        with patch("app.services.claude_client._get_client", return_value=fake_client):
-            with self.assertRaises(ValueError) as ctx:
-                system_prompt.assess_script_quality(
-                    scripts={"title": "T", "voice_script": "text"}, channel=_Channel(),
-                )
-        self.assertIn("unexpected status", str(ctx.exception))
 
 
 class TestShortEpisodeScriptUsesStructuredCall(unittest.TestCase):

@@ -52,13 +52,13 @@ export default function App() {
 
   // ── Schedule + Content Factory V3 fields ────────────────────
   const [videosPerWeek, setVideosPerWeek] = useState(3)
-  const [shortsRule, setShortsRule] = useState('auto')
   const [timings, setTimings] = useState([])
   const [suggestingTime, setSuggestingTime] = useState(false)
   const [scriptSource, setScriptSource] = useState('reddit')
   const [outputMode, setOutputMode] = useState('youtube_and_shorts')
-  const [visualStyle, setVisualStyle] = useState('documentary')
+  const [visualStyle, setVisualStyle] = useState('story_driven')
   const [imageStyle, setImageStyle] = useState('photorealistic')
+  const [narrationPov, setNarrationPov] = useState('third_person')
 
   // ── Sources ──────────────────────────────────────────────────
   const [sources, setSources] = useState([])
@@ -103,11 +103,11 @@ export default function App() {
       setVoices(voicesObj)
       if (ch.config) {
         setVideosPerWeek(ch.config.videos_per_week ?? 3)
-        setShortsRule(ch.config.shorts_rule ?? 'auto')
         setScriptSource(ch.config.script_source ?? 'reddit')
         setOutputMode(ch.config.output_mode ?? 'youtube_and_shorts')
-        setVisualStyle(ch.config.visual_style ?? 'documentary')
+        setVisualStyle(ch.config.visual_style ?? 'story_driven')
         setImageStyle(ch.config.image_style ?? 'photorealistic')
+        setNarrationPov(ch.config.narration_pov ?? 'third_person')
         setContentMode(ch.config.content_mode ?? 'single_story')
       }
 
@@ -154,7 +154,6 @@ export default function App() {
     languages,
     language_names: langNames,
     videos_per_week: videosPerWeek,
-    shorts_rule: shortsRule,
   })
 
   const markDone = (step) => setCompletedSteps(prev => prev.includes(step) ? prev : [...prev, step])
@@ -232,8 +231,8 @@ export default function App() {
       output_mode: outputMode,
       visual_style: visualStyle,
       image_style: imageStyle,
+      narration_pov: narrationPov,
       videos_per_week: videosPerWeek,
-      shorts_rule: shortsRule,
     })
     const sourceEntries = sources
       .filter(s => s.source_value.trim())
@@ -301,7 +300,7 @@ export default function App() {
 
   const handleSchedule = () => run(async () => {
     await api.upsertConfig(channelId, {
-      videos_per_week: videosPerWeek, shorts_rule: shortsRule,
+      videos_per_week: videosPerWeek,
     })
     if (timings.length > 0) {
       const entries = timings.map(t => ({
@@ -439,6 +438,7 @@ export default function App() {
                 outputMode={outputMode} setOutputMode={setOutputMode}
                 visualStyle={visualStyle} setVisualStyle={setVisualStyle}
                 imageStyle={imageStyle} setImageStyle={setImageStyle}
+                narrationPov={narrationPov} setNarrationPov={setNarrationPov}
                 scriptSource={scriptSource} setScriptSource={setScriptSource}
                 sources={sources} setSources={setSources}
                 initialShowEditable={!!channelId}
@@ -495,7 +495,6 @@ export default function App() {
             >
               <ScheduleSection
                 videosPerWeek={videosPerWeek} setVideosPerWeek={setVideosPerWeek}
-                shortsRule={shortsRule} setShortsRule={setShortsRule}
                 timings={timings} setTimings={setTimings}
                 onSuggestTiming={suggestTiming} suggestingTiming={suggestingTime}
                 languagesSaved={completedSteps.includes('languages')}

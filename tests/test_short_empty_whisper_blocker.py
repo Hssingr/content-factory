@@ -218,7 +218,7 @@ class TestRunAudioGenerationEmptyTranscript(unittest.TestCase):
 
     def test_child_short_with_real_transcript_succeeds(self) -> None:
         content, db = _build_content_channel_script(is_short_episode=True)
-        real_transcript = [{"word": "hello", "start": 0.0, "end": 0.4}]
+        real_transcript = [{"word": "hello", "start": 0.0, "end": 65.9}]
 
         with (
             patch.object(audio, "audio_path", return_value=MissingAudioPath()),

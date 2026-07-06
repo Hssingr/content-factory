@@ -99,11 +99,10 @@ class TestRetentionStructureWiredAsTelemetryOnly(unittest.TestCase):
 
     def test_retention_minor_surfaces_in_retention_det_only(self):
         voice_script = self._script_with_summary_pattern_ending()
-        review = {"status": "PASSED", "issues": []}
         current = {"voice_script": voice_script}
 
         issue_group = scripts._collect_quality_gate_issues(
-            review=review, current=current, language="source", script_format="youtube_long",
+            current=current, language="source", script_format="youtube_long",
         )
 
         retention_minors = [
@@ -114,12 +113,10 @@ class TestRetentionStructureWiredAsTelemetryOnly(unittest.TestCase):
             {i["category"] for i in retention_minors}, {"retention_structure"}
         )
 
-        # Telemetry only: never promoted into all_issues (which drives the
-        # rewrite loop), and status stays PASSED.
-        all_categories = {i.get("category") for i in issue_group["all_issues"]}
-        self.assertNotIn("retention_structure", all_categories)
-        self.assertEqual(issue_group["status"], "PASSED")
-        self.assertEqual(issue_group["converted_det"], [])
+        # Telemetry only: never promoted into det_majors (the only category
+        # of finding this gate still surfaces beyond raw per-check lists).
+        det_major_categories = {i.get("category") for i in issue_group["det_majors"]}
+        self.assertNotIn("retention_structure", det_major_categories)
 
     def test_clean_script_has_no_retention_findings(self):
         voice_script = (
@@ -127,11 +124,10 @@ class TestRetentionStructureWiredAsTelemetryOnly(unittest.TestCase):
             "[SECTION 1]\nThe witness saw a light flicker and called the police immediately.\n"
             "[OUTRO]\nThe truth finally came out and everyone was shocked.\n"
         )
-        review = {"status": "PASSED", "issues": []}
         current = {"voice_script": voice_script}
 
         issue_group = scripts._collect_quality_gate_issues(
-            review=review, current=current, language="source", script_format="youtube_long",
+            current=current, language="source", script_format="youtube_long",
         )
         self.assertEqual(issue_group["retention_det"], [])
 
@@ -152,10 +148,7 @@ class TestStoryboardFailureAlwaysFailsLoud(unittest.TestCase):
         )
         channel = SimpleNamespace(niche="horror", tone="tense", id="chan-1")
 
-        with (
-            patch.object(vo, "split_into_beats", return_value=None),
-            patch.object(vo, "load_visual_bible_for_content", return_value=None),
-        ):
+        with patch.object(vo, "split_into_beats", return_value=None):
             beats, tokens = vo._run_visual_pass(
                 content_id=content_id,
                 scripts_by_lang={"en": source_script},

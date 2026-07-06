@@ -3,7 +3,6 @@ import logging
 import re
 import time
 
-from app.agents.agent4_visuals.services.cinematic_prompts import compact_visual_bible_for_storyboard
 from app.services.claude_client import (
     call_claude,
     call_claude_structured_with_usage,
@@ -12,7 +11,39 @@ from app.services.claude_client import (
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "4.2"  # v4.2: Phase 2.9 (audit G-3) — reworked "Every beat is a
+PROMPT_VERSION = "4.4"  # v4.4: roadmap 4a / audit P1-9 — de-hardcoded "documentary" from the
+                        #        storyboard prompt's identity line ("visual director ... for an
+                        #        automated multilingual documentary video production system" ->
+                        #        drops "documentary" entirely, since the actual style is always
+                        #        channel-configured via Global Visual Direction, never assumed)
+                        #        and from both runtime fallback defaults (the "no global
+                        #        direction specified" instruction and the visual_style Python
+                        #        fallback), both now "story_driven" — matching the new
+                        #        ChannelConfig.visual_style default. "documentary"/
+                        #        "realistic_documentary" remain as legitimate example values in
+                        #        the style-vocabulary list — only the assumed-when-unconfigured
+                        #        default changed.
+                        # v4.3: Elimination Mandate (code_report/
+                        #        forensic_output_audit_borrasca_run.md, D2.1/D2.2/D2.3)
+                        #        — the entire visual-bible layer (Claude generation call,
+                        #        compact_visual_bible_for_storyboard(), bible injection into
+                        #        every storyboard batch, apply_cinematic_prompts_to_beats()
+                        #        enrichment, first-15 enhancement/validation) is deleted: a
+                        #        real production run showed it return 0 locations, 0 motifs,
+                        #        0 first-15 rules — a paid no-op. generate_storyboard_batch()
+                        #        now takes a plain `continuity_line` string (see
+                        #        storyboard.build_continuity_line_from_blueprint()) — a
+                        #        deterministic, no-AI-call line naming proper nouns that
+                        #        recur across the blueprint, replacing the v4.1 compact-JSON
+                        #        bible block below. flux_generator.derive_text_prop_prompt()
+                        #        (the v4.2 entry below) no longer rewrites the subject at
+                        #        all: it now returns Claude's own flux_prompt verbatim plus
+                        #        ONE short no-readable-text clause — the previous template
+                        #        substitution (environment scene hint + detected prop label +
+                        #        selected framing clause + a 10-clause negative wall) produced
+                        #        broken English, self-contradictions, and identical prompts
+                        #        for distinct beats, directly causing duplicate images.
+                        # v4.2: Phase 2.9 (audit G-3) — reworked "Every beat is a
                         #        generated image" into a named, generalizable
                         #        text-prop framing taxonomy (ANGLE / DISTANCE /
                         #        LIGHTING / DETAIL) so Claude can apply the
@@ -123,8 +154,8 @@ STORYBOARD_SCHEMA_VERSION = "7.0"  # v7.0: subtitles-only rendering (audit G-0/G
                                    # v2.4: stock_query + broad_query fields
 
 _STORYBOARD_SYSTEM_PROMPT = """\
-You are a visual director and editor for an automated multilingual documentary \
-video production system. Think like a human video editor, not a stock-search generator.
+You are a visual director and editor for an automated multilingual video \
+production system. Think like a human video editor, not a stock-search generator.
 
 You design the storyboard ONE NARRATION SEGMENT AT A TIME — a single [INTRO],
 [SECTION N], or [OUTRO] block — never the whole video in one pass. You receive:
@@ -223,7 +254,7 @@ message, apply them as consistent stylistic constraints across every beat:
     (match the mood), and effect choices — NEVER at the cost of Principle A
     (narrative relevance) or the anti-slideshow rules.
   - When no global direction is specified in the user message, default to
-    documentary / photorealistic.
+    story_driven / photorealistic.
 
 == Beat category rotation (sequence diversity) ==
 Use the EXISTING visual_category / visual_type / motif fields below to express
@@ -526,10 +557,9 @@ def generate_storyboard_batch(
     script_format: str = "youtube_long",
     previous_segment_summary: str = "",
     target_beat_count: int = 0,
-    override_instructions: str = "",
     visual_style: str = "",
     image_style: str = "",
-    visual_bible_context: dict | None = None,
+    continuity_line: str = "",
 ) -> tuple[dict, dict, dict]:
     """Ask Claude to design the storyboard for ONE narration segment only.
 
@@ -547,12 +577,11 @@ def generate_storyboard_batch(
         script_format:    Format key — controls beat-pacing guidance.
         previous_segment_summary: Continuity note from the prior segment.
         target_beat_count: Expected number of beats for this segment.
-        override_instructions: Optional constraint text appended to the user
-            message — used for validation-gate retries to pass MAJOR issue
-            descriptions back to Claude so it can correct them.
-        visual_bible_context: Optional visual-bible dict. Serialized as compact
-            JSON in the user message so Claude can author continuity directly
-            in the storyboard prompts.
+        continuity_line: Optional deterministic continuity hint — see
+            ``storyboard.build_continuity_line_from_blueprint()`` — appended
+            as a plain line in the user message. No AI call, no compaction;
+            replaces the deleted visual-bible layer (Elimination Mandate,
+            code_report/forensic_output_audit_borrasca_run.md, D2.1).
 
     Returns:
         ``(storyboard, usage, diag)`` — storyboard has keys ``storyboard_status``,
@@ -569,29 +598,19 @@ def generate_storyboard_batch(
             f"Target beat count for this segment: {beat_count} beats (aim for this count, ±2)\n"
             if beat_count > 0 else ""
         )
-        constraint_line = (
-            f"\nRETRY REQUIRED — fix these issues before responding:\n{override_instructions}\n"
-            if override_instructions else ""
-        )
         direction_lines = ""
         if visual_style or image_style:
             direction_lines = (
-                f"Global visual direction: {visual_style or 'documentary'}\n"
+                f"Global visual direction: {visual_style or 'story_driven'}\n"
                 f"Global image style: {image_style or 'photorealistic'}\n"
             )
-        compact_bible = compact_visual_bible_for_storyboard(visual_bible_context)
-        bible_lines = ""
-        if compact_bible:
-            bible_lines = (
-                "Visual continuity bible (compact JSON):\n"
-                f"{json.dumps(compact_bible, ensure_ascii=True, sort_keys=True, separators=(',', ':'))}\n"
-            )
+        continuity_lines = f"{continuity_line}\n" if continuity_line else ""
         return (
             f"Channel niche: {channel.niche}\n"
             f"Channel tone: {channel.tone}\n"
             f"Script format: {script_format}\n"
             + direction_lines
-            + bible_lines
+            + continuity_lines
             + f"Segment: {segment_label} — {segment_index} of {segment_count} narration segments in this video\n"
             + count_line
             + (
@@ -600,7 +619,6 @@ def generate_storyboard_batch(
                 if previous_segment_summary else ""
             )
             + f"\nNarration for THIS segment only (design beats for this text alone):\n{segment_text}"
-            + constraint_line
         )
 
     def _run(beat_count: int) -> tuple[dict, dict]:

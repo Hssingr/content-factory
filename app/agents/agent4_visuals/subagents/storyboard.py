@@ -37,6 +37,7 @@ import math
 import re
 import unicodedata
 import uuid
+from dataclasses import dataclass
 
 from sqlalchemy.orm import Session
 
@@ -49,6 +50,7 @@ from app.agents.agent4_visuals.system_prompt import (
 from app.models import VideoSection
 from app.services.claude_client import call_claude_structured_with_usage
 from app.agents.agent4_visuals.services.flux_generator import (
+    _dedupe_generated_image_once,
     derive_text_prop_prompt,
     fill_failed_beats_from_neighbors,
     generate_beat_image_with_routing,
@@ -117,25 +119,6 @@ _DEFAULT_VISUAL_CATEGORY  = "place"
 _DEFAULT_ENVIRONMENT      = "other"
 _DEFAULT_MOTIF            = "other"
 
-# Child MAJOR remediation is deterministic and local: no Claude retry, no Flux
-# call, just repair prompt text before the child path's existing log-and-proceed
-# behavior.
-_CHILD_REPAIR_FORBIDDEN_WORDS = frozenset({
-    "atmospheric", "cinematic", "mysterious", "eerie", "ominous",
-    "dramatic", "moody", "haunting", "brooding", "foreboding",
-    "unsettling", "ethereal", "dark",
-})
-_CHILD_REPAIR_TEXT_RENDERING_PHRASES = (
-    "the text reads", "text that reads", "label reading", "label that reads",
-    "words that say", "stamped with the words", "engraved with the words",
-    "handwritten text saying", "caption reading", "headline reads",
-    "sign that reads", "sign reading", "name tag reading", "that reads",
-)
-_CHILD_REPAIR_TARGET_CHECKS = frozenset({
-    "forbidden_flux_word", "ai_text_rendering_requested",
-})
-_CHILD_REPAIR_WORD_RE = re.compile(r"[A-Za-zÀ-ɏ0-9][A-Za-zÀ-ɏ0-9'-]*")
-_CHILD_REPAIR_QUOTED_TEXT_RE = re.compile(r'"[A-Za-z][^"]{1,80}"')
 
 # Phrase-locating prefix lengths, longest first — tolerates Whisper transcription drift
 _PREFIX_LENGTHS = (None, 5, 3)
@@ -202,6 +185,17 @@ _SHORT_VISUAL_MAX_HOLD_MS = settings.short_visual_max_hold_ms
 # map_storyboard_beats_to_timestamps itself, which the child remap path shares
 # and caps separately with the tighter Short ceiling above).
 _PARENT_VISUAL_MAX_HOLD_MS = settings.parent_visual_max_hold_ms
+_MICRO_MERGE_DISCARD_FAIL_RATIO = 0.30
+
+
+@dataclass(frozen=True)
+class _MicroMergeStats:
+    before: int
+    after: int
+    discarded: int
+    discard_ratio: float
+    zero_width_corrected: int
+
 
 # Word-count window for child remap alignment hints — mirrors the parent
 # storyboard schema's own start_hint/end_hint convention (system_prompt.py
@@ -318,6 +312,67 @@ _MOTIF_MAX_PER_WINDOW = 2
 # failure point while only rarely triggering a split for normal segments.
 _MAX_BEATS_PER_BATCH = 20
 
+# ── Deterministic continuity line (Elimination Mandate, D2.1) ───────────────
+# Replaces the entire visual-bible layer (Claude generation call, compaction,
+# injection, cinematic-prompt enrichment, first-15 enhancement/validation) —
+# code_report/forensic_output_audit_borrasca_run.md: a real production run
+# showed the bible return 0 locations, 0 recurring motifs, and 0 first-15
+# rules, a total no-op that still cost a Claude call and tokens on every
+# storyboard batch. This is the one continuity signal genuinely worth
+# carrying forward: proper nouns (character names, named places/objects)
+# that recur across the blueprint's own text — built in pure Python, no AI
+# call, no persisted artifact.
+_CONTINUITY_ENTITY_RE = re.compile(r"\b[A-Z][a-z]{2,}\b")
+_CONTINUITY_STOPWORDS = frozenset({
+    "The", "This", "That", "These", "Those", "There", "Then", "But", "And",
+    "For", "Not", "Now", "When", "What", "Why", "How", "Where", "Who",
+    "Would", "Could", "Should", "Every", "Some", "Someone", "Something",
+    "Years", "Each", "Once", "After", "Before", "Until", "While", "Even",
+    "Still", "Just", "Only", "Never", "Always", "Maybe", "Perhaps", "Their",
+    "They", "She", "His", "Her", "Him", "Its", "Instead", "Inside", "Outside",
+})
+_CONTINUITY_MIN_REPEATS = 2
+_CONTINUITY_MAX_ENTITIES = 5
+
+
+def build_continuity_line_from_blueprint(blueprint: dict | None) -> str:
+    """Return a one-line visual-continuity hint built deterministically from
+    the story blueprint, or "" if nothing recurs. No AI call — see the module
+    note above this function for why the AI-generated visual bible it
+    replaces was deleted.
+    """
+    if not blueprint:
+        return ""
+    text_fields = [
+        str(blueprint.get("hook") or ""),
+        str(blueprint.get("final_payoff") or ""),
+        str(blueprint.get("midpoint_retention_trap") or ""),
+        str(blueprint.get("central_question") or ""),
+        *[str(turn) for turn in (blueprint.get("major_turns") or [])],
+    ]
+    combined = " ".join(field for field in text_fields if field)
+    if not combined:
+        return ""
+
+    counts: dict[str, int] = {}
+    for word in _CONTINUITY_ENTITY_RE.findall(combined):
+        if word in _CONTINUITY_STOPWORDS:
+            continue
+        counts[word] = counts.get(word, 0) + 1
+
+    recurring = sorted(
+        (word for word, count in counts.items() if count >= _CONTINUITY_MIN_REPEATS),
+        key=lambda word: (-counts[word], word),
+    )[:_CONTINUITY_MAX_ENTITIES]
+    if not recurring:
+        return ""
+
+    return (
+        "Visual continuity: these names recur throughout this story — give "
+        "each a stable, consistent physical identity/appearance across beats: "
+        + ", ".join(recurring) + "."
+    )
+
 
 def split_into_beats(
     voice_script: str,
@@ -327,12 +382,10 @@ def split_into_beats(
     whisper_transcript: list[dict],
     allow_legacy_fallback: bool = False,
     language: str = "en",
-    storyboard_constraints: str = "",
     visual_style: str = "",
     image_style: str = "",
-    visual_bible_context: dict | None = None,
-    retry_segment_constraints: dict[str, str] | None = None,
-    existing_beats: list[dict] | None = None,
+    continuity_line: str = "",
+    content_id: str | None = None,
     db: Session | None = None,
 ) -> list[dict] | None:
     """Generate a storyboard with Claude (batched per segment) and map it onto real audio timestamps.
@@ -355,19 +408,11 @@ def split_into_beats(
             ``True`` accepts the result regardless.
         language:           BCP-47 language code (e.g. "fr", "en") — used by
             ``normalize_for_matching`` for digit-to-word expansion in hint matching.
-        storyboard_constraints: Optional text appended to every segment's user
-            message via ``generate_storyboard_batch(override_instructions=...)``.
-            Used by the validation-gate retry pass in ``video.py`` to pass MAJOR
-            issue descriptions back to Claude so it can correct them.
-        visual_bible_context: Optional visual-bible dict forwarded to every
-            storyboard batch so Claude authors continuity into ``flux_prompt``
-            before validation.
-        retry_segment_constraints: Optional map of ``storyboard_batch_label`` to
-            retry-only constraint text. When provided with ``existing_beats``,
-            only those batch labels are regenerated; all other batches reuse the
-            existing storyboard beats and are remapped with the merged result.
-        existing_beats: Previous storyboard result carrying provenance fields
-            from this function. Required for segment-level retry mode.
+        continuity_line: Optional deterministic continuity hint (see
+            ``build_continuity_line_from_blueprint()``) forwarded to every
+            storyboard batch as a plain line — no AI call, no compaction.
+        content_id: Optional caller-supplied content id used only in telemetry
+            logs such as ``PARENT_VISUAL_HOLD_CAP_APPLIED``.
         db: Optional session; when provided, the diagnostic "estimated beat
             count" log uses the real per-language calibrated wpm
             (``script_estimator.get_calibrated_wpm()``, roadmap 3.8) instead
@@ -413,15 +458,6 @@ def split_into_beats(
     )
 
     raw_batches: list[list[dict]] = []
-    retry_segment_constraints = retry_segment_constraints or {}
-    existing_batches = _group_existing_beats_by_batch(existing_beats or [])
-    if retry_segment_constraints and not existing_batches:
-        logger.warning(
-            "STORYBOARD_SEGMENT_RETRY_FALLBACK reason=missing_existing_provenance "
-            "retry_labels=%s — regenerating all batches",
-            sorted(retry_segment_constraints),
-        )
-        retry_segment_constraints = {}
 
     overall_style = ""
     previous_summary = ""
@@ -462,84 +498,65 @@ def split_into_beats(
         for sub_label, sub_text, sub_target_beat_count in _split_segment_for_batching(
             label, text, target_beat_count
         ):
-            should_retry_batch = (
-                not retry_segment_constraints
-                or sub_label in retry_segment_constraints
-                or sub_label not in existing_batches
+            try:
+                storyboard, usage, diag = generate_storyboard_batch(
+                    segment_label=sub_label,
+                    segment_text=sub_text,
+                    segment_index=index,
+                    segment_count=len(segments),
+                    channel=channel,
+                    script_format=script_format,
+                    previous_segment_summary=previous_summary,
+                    target_beat_count=sub_target_beat_count,
+                    visual_style=visual_style,
+                    image_style=image_style,
+                    continuity_line=continuity_line,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Storyboard batch failed for segment %s (%d/%d) — aborting storyboard "
+                    "generation entirely (fail-loud: a partial storyboard would leave gaps "
+                    "in the narration with no designed visuals): %s",
+                    sub_label, index, len(segments), exc,
+                )
+                return None
+
+            total_output_tokens      += usage.get("output_tokens", 0)
+            total_input_tokens       += diag.get("input_tokens", 0)
+            total_generation_time_ms += diag.get("elapsed_ms", 0)
+            total_claude_calls       += diag.get("attempt_count", 1)
+            if diag.get("was_truncated"):
+                _truncation_count += 1
+                _retry_count      += 1
+            _requested_beats += sub_target_beat_count
+            beats = storyboard.get("beats") or []
+            if not beats:
+                logger.warning(
+                    "Storyboard batch for segment %s (%d/%d) returned no beats — aborting "
+                    "storyboard generation entirely",
+                    sub_label, index, len(segments),
+                )
+                return None
+
+            # Hint hardening: fix any hints that are out-of-range or contain digits
+            beats, _seg_hint_stats = _harden_hints(beats, sub_text)
+            _hint_total   += _seg_hint_stats["total_hints"]
+            _hint_valid   += _seg_hint_stats["valid_hints"]
+            _hint_invalid += _seg_hint_stats["invalid_hints"]
+
+            beats = _trim_beat_count_overshoot(
+                beats,
+                target_beat_count=sub_target_beat_count,
+                segment_label=sub_label,
             )
-            if should_retry_batch:
-                override_text = storyboard_constraints
-                if sub_label in retry_segment_constraints:
-                    override_text = "\n".join(
-                        part for part in (storyboard_constraints, retry_segment_constraints[sub_label])
-                        if part
-                    )
-                    logger.warning(
-                        "STORYBOARD_SEGMENT_RETRY_CALL label=%s target_beats=%d",
-                        sub_label, sub_target_beat_count,
-                    )
-                try:
-                    storyboard, usage, diag = generate_storyboard_batch(
-                        segment_label=sub_label,
-                        segment_text=sub_text,
-                        segment_index=index,
-                        segment_count=len(segments),
-                        channel=channel,
-                        script_format=script_format,
-                        previous_segment_summary=previous_summary,
-                        target_beat_count=sub_target_beat_count,
-                        override_instructions=override_text,
-                        visual_style=visual_style,
-                        image_style=image_style,
-                        visual_bible_context=visual_bible_context,
-                    )
-                except Exception as exc:
-                    logger.error(
-                        "Storyboard batch failed for segment %s (%d/%d) — aborting storyboard "
-                        "generation entirely (fail-loud: a partial storyboard would leave gaps "
-                        "in the narration with no designed visuals): %s",
-                        sub_label, index, len(segments), exc,
-                    )
-                    return None
 
-                total_output_tokens      += usage.get("output_tokens", 0)
-                total_input_tokens       += diag.get("input_tokens", 0)
-                total_generation_time_ms += diag.get("elapsed_ms", 0)
-                total_claude_calls       += diag.get("attempt_count", 1)
-                if diag.get("was_truncated"):
-                    _truncation_count += 1
-                    _retry_count      += 1
-                _requested_beats += sub_target_beat_count
-                beats = storyboard.get("beats") or []
-                if not beats:
-                    logger.warning(
-                        "Storyboard batch for segment %s (%d/%d) returned no beats — aborting "
-                        "storyboard generation entirely",
-                        sub_label, index, len(segments),
-                    )
-                    return None
+            logger.info(
+                "Storyboard batch ok: segment=%s (%d/%d) target_beats=%d actual_beats=%d output_tokens=%d/%d",
+                sub_label, index, len(segments), sub_target_beat_count, len(beats),
+                usage.get("output_tokens", 0), _STORYBOARD_BATCH_MAX_TOKENS_LOG,
+            )
+            overall_style = overall_style or storyboard.get("overall_style", "")
 
-                # Hint hardening: fix any hints that are out-of-range or contain digits
-                beats, _seg_hint_stats = _harden_hints(beats, sub_text)
-                _hint_total   += _seg_hint_stats["total_hints"]
-                _hint_valid   += _seg_hint_stats["valid_hints"]
-                _hint_invalid += _seg_hint_stats["invalid_hints"]
-
-                logger.info(
-                    "Storyboard batch ok: segment=%s (%d/%d) target_beats=%d actual_beats=%d output_tokens=%d/%d",
-                    sub_label, index, len(segments), sub_target_beat_count, len(beats),
-                    usage.get("output_tokens", 0), _STORYBOARD_BATCH_MAX_TOKENS_LOG,
-                )
-                overall_style = overall_style or storyboard.get("overall_style", "")
-            else:
-                beats = [dict(beat) for beat in existing_batches[sub_label]]
-                _requested_beats += len(beats)
-                logger.info(
-                    "STORYBOARD_SEGMENT_RETRY_REUSE label=%s beats=%d",
-                    sub_label, len(beats),
-                )
-
-            _tag_batch_provenance(beats, label, sub_label, index)
             raw_batches.append(beats)
 
             # Update ledger then build the next sub-call's (or next segment's)
@@ -592,6 +609,7 @@ def split_into_beats(
         beats, whisper_transcript, duration_ms,
         allow_legacy_fallback=allow_legacy_fallback,
         language=language,
+        max_hold_ms=_PARENT_VISUAL_MAX_HOLD_MS,
     )
     if mapped is None:
         return None
@@ -602,6 +620,7 @@ def split_into_beats(
     return _apply_visual_hold_cap(
         mapped,
         max_hold_ms=_PARENT_VISUAL_MAX_HOLD_MS,
+        content_id=content_id,
         language=language,
         log_prefix="PARENT_VISUAL_HOLD_CAP",
     )
@@ -723,29 +742,6 @@ def _estimate_beat_count(voice_script: str, script_format: str, wpm: float = _WO
     return max(int(narration_seconds / beat_seconds), 1)
 
 
-def _tag_batch_provenance(
-    beats: list[dict],
-    segment_label: str,
-    batch_label: str,
-    segment_index: int,
-) -> None:
-    """Attach segment/batch provenance that survives merge, mapping, and validation."""
-    for local_order, beat in enumerate(beats):
-        beat["storyboard_segment_label"] = segment_label
-        beat["storyboard_batch_label"] = batch_label
-        beat["storyboard_segment_index"] = segment_index
-        beat["storyboard_batch_local_order"] = local_order
-
-
-def _group_existing_beats_by_batch(beats: list[dict]) -> dict[str, list[dict]]:
-    """Group a previous storyboard by provenance for segment-level retry."""
-    grouped: dict[str, list[dict]] = {}
-    for beat in beats:
-        label = str(beat.get("storyboard_batch_label") or "").strip()
-        if not label:
-            continue
-        grouped.setdefault(label, []).append(dict(beat))
-    return grouped
 
 
 def _update_ledger(ledger: dict, beats: list[dict]) -> None:
@@ -893,6 +889,40 @@ def _harden_hints(beats: list[dict], segment_text: str) -> tuple[list[dict], dic
     return beats, _stats
 
 
+def _trim_beat_count_overshoot(
+    beats: list[dict],
+    *,
+    target_beat_count: int,
+    segment_label: str,
+    tolerance: int = 2,
+) -> list[dict]:
+    """Trim storyboard beats that exceed the requested target plus tolerance.
+
+    The storyboard prompt says "aim for target, +/-2", but Claude can return
+    far more beats. This is a deterministic tail trim, not a regeneration loop:
+    keep the earliest beats in narration order and log the discarded local beat
+    orders before downstream merge/timestamp mapping sees them.
+    """
+    target = max(0, int(target_beat_count or 0))
+    allowed = target + max(0, int(tolerance))
+    if allowed <= 0 or len(beats) <= allowed:
+        return beats
+
+    kept = beats[:allowed]
+    trimmed = beats[allowed:]
+    logger.warning(
+        "STORYBOARD_BEAT_COUNT_OVERSHOOT_TRIMMED segment=%s target_beats=%d "
+        "allowed_beats=%d generated_beats=%d trimmed_count=%d trimmed_local_orders=%s",
+        segment_label,
+        target,
+        allowed,
+        len(beats),
+        len(trimmed),
+        [beat.get("beat_order", idx + allowed) for idx, beat in enumerate(trimmed)],
+    )
+    return kept
+
+
 def _merge_batches(raw_batches: list[list[dict]]) -> list[dict]:
     """Concatenate per-segment beat batches into one globally-ordered, sequentially-numbered list.
 
@@ -919,6 +949,7 @@ def map_storyboard_beats_to_timestamps(
     duration_ms: int,
     allow_legacy_fallback: bool = False,
     language: str = "en",
+    max_hold_ms: int | None = None,
 ) -> list[dict] | None:
     """Map each storyboard beat onto real audio timestamps using Whisper words.
 
@@ -941,6 +972,9 @@ def map_storyboard_beats_to_timestamps(
             instead so the caller can apply its fallback policy.
         language:             BCP-47 language code — passed to ``_normalize_phrase``
             for digit-to-word expansion when matching hint phrases.
+        max_hold_ms:          Optional visual hold ceiling used for fail-loud
+            density checks after micro-beat cleanup. Callers still apply the
+            actual cap after mapping.
 
     Returns:
         List of renderable beat-section dicts, or ``None`` if the fallback rate
@@ -1011,6 +1045,11 @@ def map_storyboard_beats_to_timestamps(
             "(%.0f%%) — beat_orders=%s",
             n_fallback, 100 * n_fallback / n, fallback_orders,
         )
+        logger.warning(
+            "STORYBOARD_SCRIPT_TEXT_EMPTY_FALLBACK language=%s count=%d beat_orders=%s "
+            "reason=no_transcript_span_match",
+            language, n_fallback, fallback_orders,
+        )
 
     fallback_ratio = n_fallback / n if n > 0 else 0
     if fallback_ratio > _FALLBACK_FAIL_RATIO:
@@ -1035,18 +1074,32 @@ def map_storyboard_beats_to_timestamps(
             100 * fallback_ratio, 100 * _FALLBACK_WARN_RATIO,
         )
 
-    boundaries = _resolve_boundaries(matches, beats, flat, duration_ms)
+    boundaries, micro_stats = _resolve_boundaries(
+        matches, beats, flat, duration_ms, return_stats=True,
+    )
+    if not _passes_micro_merge_invariants(
+        micro_stats, duration_ms, max_hold_ms=max_hold_ms, language=language,
+    ):
+        return None
 
     sections: list[dict] = []
     for i, beat in enumerate(beats):
         start_ms, end_ms = boundaries[i]
         match = matches[i]
-        script_text = (
-            _join_words(flat, match[0], match[1])
-            if match is not None
-            else str(beat.get("visual_intent", "")).strip()
-        )
-        sections.append(_build_beat_section(beat, i, start_ms, end_ms, script_text))
+        if match is not None:
+            script_text = _join_words(flat, match[0], match[1])
+            script_text_source = "whisper_transcript"
+            script_text_missing = False
+        else:
+            script_text = ""
+            script_text_source = "empty_fallback_no_transcript_span"
+            script_text_missing = True
+        beat_for_section = {
+            **beat,
+            "script_text_source": script_text_source,
+            "script_text_missing": script_text_missing,
+        }
+        sections.append(_build_beat_section(beat_for_section, i, start_ms, end_ms, script_text))
 
     return sections
 
@@ -1297,7 +1350,9 @@ def _resolve_boundaries(
     beats: list[dict],
     flat: list[tuple[str, str, int, int]],
     duration_ms: int,
-) -> list[tuple[int, int]]:
+    *,
+    return_stats: bool = False,
+) -> list[tuple[int, int]] | tuple[list[tuple[int, int]], _MicroMergeStats]:
     """Turn matched/unmatched beat spans into a monotonic, bounds-clean ms timeline.
 
     Matched beats anchor their start to the matched phrase's start_ms. Unmatched
@@ -1368,7 +1423,9 @@ def _resolve_boundaries(
         last_start, _ = boundaries[-1]
         boundaries[-1] = (last_start, max(duration_ms, last_start))
 
-    _cleanup_micro_beats(boundaries, duration_ms, beats)
+    stats = _cleanup_micro_beats(boundaries, duration_ms, beats)
+    if return_stats:
+        return boundaries, stats
     return boundaries
 
 
@@ -1376,7 +1433,7 @@ def _cleanup_micro_beats(
     boundaries: list[tuple[int, int]],
     duration_ms: int,
     beats: list[dict] | None = None,
-) -> None:
+) -> _MicroMergeStats:
     """Mutate ``boundaries`` in place so every beat meets its intensity-aware floor.
 
     Propagates end_ms forward through the list so that extending one beat does
@@ -1395,7 +1452,7 @@ def _cleanup_micro_beats(
     """
     n = len(boundaries)
     if n == 0:
-        return
+        return _MicroMergeStats(0, 0, 0, 0.0, 0)
 
     zero_width_corrected = 0
     for i in range(n):
@@ -1418,15 +1475,63 @@ def _cleanup_micro_beats(
             if next_start < end_ms:
                 boundaries[i + 1] = (end_ms, max(next_end, end_ms))
 
-    # Clamp last beat to duration_ms (never overshoot)
-    last_start, last_end = boundaries[-1]
-    boundaries[-1] = (min(last_start, duration_ms), duration_ms)
+    # Clamp every span to the real audio duration. Earlier versions only
+    # clamped the last beat, which let micro-merged intermediate spans extend
+    # beyond the track and hid how many beats had effectively been discarded.
+    for idx, (start_ms, end_ms) in enumerate(boundaries):
+        clamped_start = min(max(start_ms, 0), duration_ms)
+        clamped_end = min(max(end_ms, clamped_start), duration_ms)
+        boundaries[idx] = (clamped_start, clamped_end)
+
+    positive_after = sum(1 for start, end in boundaries if end > start)
+    discarded = max(0, n - positive_after)
+    discard_ratio = discarded / n if n else 0.0
 
     if zero_width_corrected:
         logger.warning(
             "Storyboard timestamp mapping: %d beat(s) below intensity floor corrected",
             zero_width_corrected,
         )
+    if discarded:
+        logger.warning(
+            "MICRO_MERGE_DISCARDED beats_before=%d beats_after=%d discarded=%d "
+            "discard_ratio=%.1f%%",
+            n, positive_after, discarded, discard_ratio * 100,
+        )
+
+    return _MicroMergeStats(n, positive_after, discarded, discard_ratio, zero_width_corrected)
+
+
+def _passes_micro_merge_invariants(
+    stats: _MicroMergeStats,
+    duration_ms: int,
+    *,
+    max_hold_ms: int | None,
+    language: str,
+) -> bool:
+    if stats.before <= 0:
+        return False
+
+    if stats.discard_ratio > _MICRO_MERGE_DISCARD_FAIL_RATIO:
+        logger.error(
+            "MICRO_MERGE_FAIL_DISCARD_RATIO language=%s beats_before=%d beats_after=%d "
+            "discarded=%d discard_ratio=%.1f%% threshold=%.1f%%",
+            language, stats.before, stats.after, stats.discarded,
+            stats.discard_ratio * 100, _MICRO_MERGE_DISCARD_FAIL_RATIO * 100,
+        )
+        return False
+
+    if max_hold_ms is not None:
+        capacity_ms = stats.after * int(max_hold_ms)
+        if capacity_ms < int(duration_ms):
+            logger.error(
+                "VISUAL_DENSITY_INVARIANT_FAILED language=%s beats=%d max_hold_ms=%d "
+                "capacity_ms=%d duration_ms=%d reason=beats_times_max_hold_lt_duration",
+                language, stats.after, int(max_hold_ms), capacity_ms, int(duration_ms),
+            )
+            return False
+
+    return True
 
 
 def _build_beat_section(beat: dict, index: int, start_ms: int, end_ms: int, script_text: str) -> dict:
@@ -1514,6 +1619,8 @@ def _build_beat_section(beat: dict, index: int, start_ms: int, end_ms: int, scri
         "audio_end_ms":         end_ms,
         "duration_sec":         actual_sec,
         "script_text":          script_text,
+        "script_text_source":   str(beat.get("script_text_source", "provided")),
+        "script_text_missing":  bool(beat.get("script_text_missing", False)),
         "visual_intent":        str(beat.get("visual_intent", "")),
         "visual_type":          resolved_visual_type,
         "visual_category":      _safe_enum(beat.get("visual_category"), _VALID_VISUAL_CATEGORIES, _DEFAULT_VISUAL_CATEGORY),
@@ -1536,10 +1643,6 @@ def _build_beat_section(beat: dict, index: int, start_ms: int, end_ms: int, scri
         "media_type":           beat.get("media_type", "image"),
         "start_hint":           str(beat.get("start_hint", "")),
         "end_hint":             str(beat.get("end_hint", "")),
-        "storyboard_segment_label": beat.get("storyboard_segment_label", ""),
-        "storyboard_batch_label": beat.get("storyboard_batch_label", ""),
-        "storyboard_segment_index": beat.get("storyboard_segment_index", 0),
-        "storyboard_batch_local_order": beat.get("storyboard_batch_local_order", 0),
     }
 
 
@@ -1695,98 +1798,6 @@ def _safe_enum(value, valid: set, default: str) -> str:
 
 
 # ── Short episode storyboard remap ─────────────────────────────────────────────
-
-def _strip_child_prompt_repair_text(value: str) -> str:
-    cleaned = _CHILD_REPAIR_QUOTED_TEXT_RE.sub("", str(value or ""))
-    for phrase in _CHILD_REPAIR_TEXT_RENDERING_PHRASES:
-        cleaned = re.sub(re.escape(phrase), "", cleaned, flags=re.IGNORECASE)
-    words = [
-        word for word in _CHILD_REPAIR_WORD_RE.findall(cleaned)
-        if word.lower().strip("'-") not in _CHILD_REPAIR_FORBIDDEN_WORDS
-    ]
-    return " ".join(words).strip()
-
-
-def _child_environment_phrase(environment: str) -> str:
-    env = str(environment or _DEFAULT_ENVIRONMENT)
-    return {
-        "underwater": "underwater scene",
-        "indoor_office": "office interior",
-        "indoor_domestic": "domestic interior",
-        "forest_nature": "forest trail",
-        "urban_street": "urban street",
-        "corridor_interior": "interior corridor",
-        "abstract_dark": "concrete wall interior",
-        "open_landscape": "open landscape",
-        "laboratory": "laboratory workbench",
-        "industrial": "industrial workspace",
-        "vehicle": "vehicle interior",
-        "other": "real physical location",
-    }.get(env, "real physical location")
-
-
-def _regenerate_child_prompt_from_visual_intent(beat: dict) -> str:
-    visual_intent = _strip_child_prompt_repair_text(beat.get("visual_intent") or "")
-    if not visual_intent:
-        visual_intent = _strip_child_prompt_repair_text(beat.get("script_text") or "")
-    if not visual_intent:
-        visual_intent = "concrete physical clue from this Short moment"
-
-    # Keep the prompt portrait-safe and physical. No readable text, no mood
-    # words, no inherited parent phrasing required.
-    environment = _child_environment_phrase(str(beat.get("environment") or _DEFAULT_ENVIRONMENT))
-    motif = _strip_child_prompt_repair_text(beat.get("motif") or "physical clue") or "physical clue"
-    return (
-        "Vertical documentary photograph of "
-        f"{visual_intent[:180]}, {environment}, {motif} in the foreground, "
-        "practical visible light, portrait composition, no readable text"
-    )
-
-
-def remediate_child_major_storyboard_issues(
-    beats: list[dict],
-    major_issues: list[dict],
-) -> tuple[list[dict], list[dict]]:
-    """Repair child-remap beat-level prompt MAJORs without AI calls.
-
-    Child remap cannot afford a storyboard retry. For the beat-level prompt
-    MAJORs that are deterministic to repair, strip forbidden/readable-text
-    language and regenerate the Flux prompt from ``visual_intent``. Global
-    findings are left untouched for the caller's existing log-and-proceed path.
-    """
-    target_orders: dict[int, str] = {}
-    for issue in major_issues:
-        check = str(issue.get("check") or "")
-        if check not in _CHILD_REPAIR_TARGET_CHECKS:
-            continue
-        try:
-            order = int(issue.get("beat_order", -1))
-        except (TypeError, ValueError):
-            continue
-        if order >= 0 and order not in target_orders:
-            target_orders[order] = check
-    if not target_orders:
-        return beats, []
-
-    repaired = [dict(beat) for beat in beats]
-    repairs: list[dict] = []
-    for beat in repaired:
-        order = int(beat.get("beat_order", -1))
-        check = target_orders.get(order)
-        if not check:
-            continue
-        old_prompt = str(beat.get("flux_prompt") or "")
-        new_prompt = _regenerate_child_prompt_from_visual_intent(beat)
-        beat["flux_prompt"] = new_prompt
-        repairs.append({
-            "beat_order": order,
-            "check": check,
-            "old_prompt": old_prompt,
-            "new_prompt": new_prompt,
-        })
-
-    return repaired, repairs
-
 
 def _derive_child_alignment_hints(narration_phrase: str) -> tuple[str, str]:
     """Derive start_hint/end_hint for a child remap beat from its verbatim narration_phrase.
@@ -2167,6 +2178,7 @@ def remap_beats_for_short(
         duration_ms=short_audio_file.duration_ms,
         allow_legacy_fallback=True,
         language=language,
+        max_hold_ms=_SHORT_VISUAL_MAX_HOLD_MS,
     )
     if not mapped:
         return []
@@ -2240,6 +2252,7 @@ def generate_pending_beat_images(beats: list[dict], content_id: str) -> list[dic
     # persisted — same Pro-tier bookkeeping contract as the parent path's
     # generate_all_beat_images(); see generate_beat_image_with_routing().
     tier_counts: dict[str, int] = {}
+    pixel_ledger: list[dict] = []
 
     for beat in beats:
         # Clear any parent-reused landscape media_url before routing/generation
@@ -2251,6 +2264,10 @@ def generate_pending_beat_images(beats: list[dict], content_id: str) -> list[dic
             width=_SHORT_IMAGE_WIDTH, height=_SHORT_IMAGE_HEIGHT,
         )
         if new_url:
+            new_url = _dedupe_generated_image_once(
+                beat, new_url, content_id, tier_counts, pixel_ledger,
+                width=_SHORT_IMAGE_WIDTH, height=_SHORT_IMAGE_HEIGHT,
+            )
             beat["media_url"] = new_url
             beat["media_type"] = "image"
 

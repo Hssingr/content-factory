@@ -9,8 +9,10 @@ class Settings(BaseSettings):
 
     anthropic_api_key: str = ""
     # Roadmap 4.2 / audit S-2 (exec-6): both slots are Sonnet-class so no
-    # MODEL_ROUTING task — including the SECONDARY_MODEL-tier quality gates
-    # (script_quality_check, short_quality_check) — defaults to Haiku anymore.
+    # MODEL_ROUTING task defaults to Haiku anymore. (The SECONDARY_MODEL-tier
+    # quality gate this note originally referenced, script_quality_check, was
+    # itself deleted by the Elimination Mandate — see
+    # code_report/forensic_output_audit_borrasca_run.md D1.1.)
     primary_model: str = "claude-sonnet-5"
     secondary_model: str = "claude-sonnet-4-6"
     # "dev" forces the configured secondary model for every Claude call except hard quality/tool exceptions.

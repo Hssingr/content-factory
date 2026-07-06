@@ -315,7 +315,7 @@ class TestRealOrchestratorWritesBothHalvesCorrectly(unittest.TestCase):
     def test_review_only_fields_land_in_run_folder_not_in_db(self):
         content_id = uuid.uuid4()
         db = _RealFilterFakeDb()
-        content = SimpleNamespace(id=content_id, source_language="en")
+        content = SimpleNamespace(id=content_id, source_language="en", story_blueprint=None)
         channel = SimpleNamespace(id=uuid.uuid4(), niche="mystery", tone="tense")
         scripts_by_lang = {"en": SimpleNamespace(voice_script="Some narration text")}
         audio_by_lang = {"en": SimpleNamespace(duration_ms=6000, whisper_transcript=[])}

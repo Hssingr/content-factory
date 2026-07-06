@@ -6,7 +6,28 @@ from app.agents.agent2_discovery.services.story import MAX_SOURCE_EXCERPT_CHARS
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "4.4"  # v4.4: spoken-video delivery rules (present tense, direct address,
+PROMPT_VERSION = "4.6"  # v4.6: Elimination Mandate extension (post-roadmap deep audit) —
+                        # auto_correct_script(), _CORRECTION_SYSTEM_PROMPT_BASE, and the
+                        # _corr*/_split_long_sentences_agent2 helper family (used only by
+                        # auto-correction) are deleted: the last remaining AI prompt-repair
+                        # layer in the parent script path. It re-rolled the whole script
+                        # (P1-6 failure mechanism) and could bury the deterministically
+                        # constructed hook (roadmap 4c). Minimum-length findings are now
+                        # telemetry only, like every other deterministic check.
+                        # v4.5: roadmap 4a / audit P1-9 — de-hardcoded "documentary" from the
+                        # native-adaptation translator identity line ("professional translator
+                        # for YouTube documentary content" -> "professional multilingual adapter
+                        # for spoken YouTube narration"); visual_style/image_style fallback
+                        # defaults changed from "documentary" to "story_driven" (matching the
+                        # new ChannelConfig default). Added narration_pov ("third_person" |
+                        # "first_person_storytime") threaded alongside visual_style/image_style
+                        # into generate_story_blueprint/generate_section/generate_native_script/
+                        # generate_short_episode_script, with real behavioral rules (not just a
+                        # passthrough label) in _STORY_BLUEPRINT_SYSTEM_PROMPT,
+                        # _SECTION_GENERATION_SYSTEM_PROMPT, _SHORT_EPISODE_SYSTEM_PROMPT, and a
+                        # "preserve the source's POV, never convert it" rule in all three native
+                        # adaptation base prompts.
+                        # v4.4: spoken-video delivery rules (present tense, direct address,
                         # contractions, read-aloud test) added to _SECTION_GENERATION_SYSTEM_PROMPT
                         # and _SHORT_EPISODE_SYSTEM_PROMPT; blueprint gained midpoint_retention_trap,
                         # wired as a targeted MUST-deliver-now constraint on the one body section
@@ -184,11 +205,10 @@ def with_tts_block(prompt: str, tts_provider: str, tts_model: str) -> str:
 # ── Base native script prompts ─────────────────────────────────────────────────
 
 _BASE_YOUTUBE_LONG_FORM_NATIVE = """\
-You are a professional translator for YouTube documentary content.
+You are a professional multilingual adapter for spoken YouTube narration.
 
-Translate the provided script accurately and naturally into the target language.
-This is a factual YouTube video — all facts, names, dates, and statistics must be
-preserved exactly.
+Adapt the provided script accurately and naturally into the target language.
+All facts, names, dates, and statistics must be preserved exactly.
 
 Rules:
 - Translate naturally and fluently — write as a native speaker would narrate on camera.
@@ -202,6 +222,10 @@ Rules:
 has. If the source withholds an answer until later in the script, the translation must
 withhold it too — even if a more direct phrasing would sound more natural in the
 target language.
+- Preserve the source's narration POV (the "Narration POV" value in the user message
+  describes it): if the source narrates in first person ("I"/"me"/"my"), the
+  translation must too; if it narrates in third person, keep it in third person. Never
+  convert one to the other during translation.
 - Target 1200–1600 words in voice_script (same order of magnitude as source).
 
 HOOK_CONTEXT (if provided below): the opening hook was optimised for retention.
@@ -237,6 +261,10 @@ Cultural adaptation means:
 has. If the source withholds an answer until later in the script, the translation must
 withhold it too — even if a more direct phrasing would sound more natural in the
 target language.
+- Preserve the source's narration POV (the "Narration POV" value in the user message
+  describes it): if the source narrates in first person ("I"/"me"/"my"), the adaptation
+  must too; if it narrates in third person, keep it in third person. Never convert one
+  to the other.
 
 HOOK_CONTEXT (if provided below): preserve the opening hook's concrete specificity and
 directness in your adapted version — the opening must hit with the same force in the
@@ -298,6 +326,10 @@ Standalone Short rules — apply strictly, this is NOT a long-form script:
 - Match the source narration's approximate length. Do not pad, expand, or add material
   to make the adaptation feel longer or more "complete" — a short, punchy source must
   stay short and punchy in the target language.
+- Preserve the source's narration POV (the "Narration POV" value in the user message
+  describes it): if the source narrates in first person ("I"/"me"/"my"), the adaptation
+  must too; if it narrates in third person, keep it in third person. Never convert one
+  to the other.
 
 HOOK_CONTEXT (if provided below): preserve the opening hook's concrete specificity and
 directness in your adapted version — the opening must hit with the same force in the
@@ -351,7 +383,7 @@ def build_native_system_prompt(
         base_name = "child_short_standalone"
     elif script_format == "youtube_long":
         base = _BASE_YOUTUBE_LONG_FORM_NATIVE
-        base_name = "parent_long_form_documentary"
+        base_name = "parent_long_form_spoken_narration"
     else:
         base = _BASE_SHORT_FORM_NATIVE
         base_name = "parent_short_form_sectioned"
@@ -416,6 +448,9 @@ Rules:
   escalations — each one advancing toward the final_payoff. Minimum 2 required.
 - final_payoff: what is revealed or resolved at the end of the story.
 - comment_trigger: ≤20 words, ends with a question mark, forces a strong viewer opinion.
+  It must be story-specific and non-templated: never use a reusable channel CTA like
+  "what would you do?" or a phrasing that could close any other video. Anchor the
+  question in this story's exact dilemma, object, place, or consequence.
 - midpoint_retention_trap: one concrete reveal or counterintuitive fact from the story,
   placed at roughly the halfway point of the video, that recontextualizes what the viewer
   thought they knew so far and gives them a new reason to keep watching. This is distinct
@@ -430,6 +465,11 @@ Rules:
   withheld information, and escalating unease. Documentary/educational: favor
   clarity and context. Match the configured niche — do not default to a neutral
   documentary register regardless of niche.
+- Phrase hook, central_question, and final_payoff so they can be delivered in the
+  Narration POV value provided below: for "first_person_storytime", phrase them as
+  something that happened to the narrator ("I heard it three nights in a row"), not
+  as an observation about someone else. For "third_person" (default), phrase them
+  about the story's people using third-person pronouns and names, as usual.
 
 Never invent facts not present in the story body.\
 """
@@ -459,6 +499,7 @@ def generate_story_blueprint(
     script_format: str = "youtube_long",
     visual_style: str = "",
     image_style: str = "",
+    narration_pov: str = "third_person",
 ) -> dict:
     """Extract the narrative skeleton from a story before any script writing.
 
@@ -470,10 +511,12 @@ def generate_story_blueprint(
         story:         Story object (title, url, body, language).
         channel:       Channel ORM object (niche, tone).
         script_format: Format key — affects suggested_section_count recommendation.
-        visual_style:  Channel visual style guide (e.g. "documentary", "noir"). Forwarded
+        visual_style:  Channel visual style guide (e.g. "story_driven", "noir"). Forwarded
                        from ChannelConfig; informs hook framing and narrative aesthetic.
         image_style:   Channel image rendering style (e.g. "photorealistic"). Forwarded
                        from ChannelConfig for downstream Agent 4 context.
+        narration_pov: Channel narration perspective/register ("third_person" or
+                       "first_person_storytime"). Forwarded from ChannelConfig.
 
     Returns:
         Dict with keys: hook, central_question, major_turns, final_payoff,
@@ -486,8 +529,9 @@ def generate_story_blueprint(
     user_message = (
         f"Channel niche: {channel.niche}\n"
         f"Channel tone: {channel.tone}\n"
-        f"Visual style: {visual_style or 'documentary'}\n"
+        f"Visual style: {visual_style or 'story_driven'}\n"
         f"Image style: {image_style or 'photorealistic'}\n"
+        f"Narration POV: {narration_pov or 'third_person'}\n"
         f"Script format: {script_format}\n\n"
         f"Story title: {story.title}\n"
         f"Story URL: {story.url}\n\n"
@@ -537,6 +581,16 @@ Spoken-video delivery — apply to every section, this is heard, not read silent
   - Read-aloud test: before finalizing a sentence, check whether a person would actually
     say it out loud telling this story to a friend. If a sentence sounds like it belongs in
     a book rather than in spoken conversation, rewrite it in spoken language.
+
+Narration POV — driven by the "Narration POV" value in the user message, not hardcoded:
+  - "third_person" (default): narrate about the people in the story using third-person
+    pronouns (he/she/they) and their names — the standard narrator voice.
+  - "first_person_storytime": narrate AS the protagonist retelling their own experience
+    directly to the viewer — use "I"/"me"/"my" throughout, present every event as
+    something that happened to you personally (the r/nosleep-style storytime format).
+    Only the protagonist's own direct experience is narrated this way; other people in
+    the story are still referred to in third person from the protagonist's perspective.
+  Never mix POV within a section. Every section of the same script must use the same POV.
 
 Blueprint constraint: every section must advance the story toward the final_payoff and
 comment_trigger provided in the blueprint. Do not veer off-story.
@@ -637,6 +691,9 @@ Narrative progression rules — apply to every section:
     temperature should rise toward the question, not fall away from it.
   - The LAST non-empty sentence must be EXACTLY blueprint.comment_trigger (or a minimal
     grammatical adaptation preserving its meaning and question mark).
+  - The comment-trigger sentence must feel unique to this story, not like a reusable
+    channel CTA. Avoid generic endings such as "what would you do?" or "would you
+    go back?" unless the concrete story-specific noun, place, or consequence is included.
   - Must not introduce any new unresolved question.
 
 Output format — return ONLY the tool schema. No prose, no code fence, no extra keys.
@@ -703,11 +760,11 @@ def generate_section(
     tts_model: str = "sonic-2",
     tts_provider: str = "cartesia",
     audio_tags_enabled: bool = False,
-    override_instruction: str = "",
     primary_required_turn: str | None = None,
     future_uncovered_turns: list[str] | None = None,
     visual_style: str = "",
     image_style: str = "",
+    narration_pov: str = "third_person",
     midpoint_retention_trap: str | None = None,
 ) -> dict:
     """Generate a single narration section guided by the story blueprint.
@@ -724,8 +781,6 @@ def generate_section(
         tts_model:               TTS model ID.
         tts_provider:            TTS provider ("cartesia" | "elevenlabs").
         audio_tags_enabled:      ElevenLabs v3 audio tag opt-in.
-        override_instruction:    Optional extra constraint appended to user message
-                                 (used for targeted retry after completeness check failure).
         primary_required_turn:   The single earliest uncovered major_turn this section must
                                  primarily advance. Injected as "MUST primarily advance this
                                  one turn". None for INTRO and OUTRO (no constraint).
@@ -759,8 +814,9 @@ def generate_section(
     user_message = (
         f"Channel niche: {channel.niche}\n"
         f"Channel tone: {channel.tone}\n"
-        f"Visual style: {visual_style or 'documentary'}\n"
+        f"Visual style: {visual_style or 'story_driven'}\n"
         f"Image style: {image_style or 'photorealistic'}\n"
+        f"Narration POV: {narration_pov or 'third_person'}\n"
         f"Script format: {script_format}\n\n"
         f"Blueprint:\n{blueprint_json}\n\n"
         f"Prior sections summary:\n{prior_json}\n\n"
@@ -783,9 +839,6 @@ def generate_section(
             f"midpoint_retention_trap now, as a reveal or counterintuitive fact that "
             f"recontextualizes what the viewer thought they knew so far:\n{midpoint_retention_trap}"
         )
-    if override_instruction:
-        user_message += f"\n\nIMPORTANT: {override_instruction}"
-
     return call_claude_structured(
         task="section_generation",
         system_prompt=system_prompt,
@@ -796,81 +849,14 @@ def generate_section(
     )
 
 
-# ── Global Validation ────────────────────────────────────────────────────────
-
-_GLOBAL_VALIDATION_SYSTEM_PROMPT = """\
-You check ONLY narrative coherence of a fully assembled video script.
-
-Do NOT re-check:
-  - Sentence length or TTS compliance  (already checked per section)
-  - Hook quality or forbidden openers  (already checked per section)
-  - Word count or minimum length       (already checked per section)
-
-Check ONLY:
-  1. Section flow: does each section transition naturally from the previous?
-     Flag abrupt topic jumps where the connection is unclear.
-  2. Fact repetition: is any specific fact, name, or statistic stated more than once?
-  3. Outro resolution: does the outro answer the question the intro raised?
-  4. Open loops: are there questions raised mid-script that the outro never closes?
-
-Use FIXED criteria — identical script must always return identical result.
-Output ONLY the tool schema. No prose, no extra keys.\
-"""
-
-_GLOBAL_VALIDATION_SCHEMA: dict = {
-    "type": "object",
-    "properties": {
-        "status": {"type": "string", "enum": ["PASS", "NEEDS_FIX"]},
-        "issues": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "section":     {"type": "string"},
-                    "description": {"type": "string"},
-                    "suggestion":  {"type": "string"},
-                },
-                "required": ["section", "description", "suggestion"],
-            },
-        },
-    },
-    "required": ["status", "issues"],
-}
-
-
-def validate_script_globally(voice_script: str, blueprint: dict) -> dict:
-    """Run a Haiku narrative coherence check on the fully assembled voice script.
-
-    Checks transitions, repetition, intro/outro resolution, and open loops.
-    Does NOT re-check TTS compliance, hook quality, or word count.
-
-    Args:
-        voice_script: Fully assembled script with [INTRO]/[SECTION N]/[OUTRO] markers.
-        blueprint:    Blueprint dict — used to contextualise intro/outro resolution check.
-
-    Returns:
-        Dict with status ("PASS" | "NEEDS_FIX") and issues list.
-
-    Raises:
-        ValueError: If Claude returns malformed JSON.
-        anthropic.APIError: On non-retryable Claude API errors.
-    """
-    import json
-    user_message = (
-        f"Blueprint (for context):\n{json.dumps(blueprint, ensure_ascii=False)}\n\n"
-        f"Voice script:\n{voice_script}"
-    )
-    result = call_claude_structured(
-        task="global_validation",
-        system_prompt=_GLOBAL_VALIDATION_SYSTEM_PROMPT,
-        user_message=user_message,
-        schema_name="global_validation",
-        input_schema=_GLOBAL_VALIDATION_SCHEMA,
-        max_tokens=1024,
-    )
-    if result.get("status") not in {"PASS", "NEEDS_FIX"}:
-        raise ValueError(f"validate_script_globally: unexpected status {result.get('status')!r}")
-    return result
+# ── Global Validation — REMOVED (Elimination Mandate, D1.2) ─────────────────
+# The global narrative-coherence Claude call (validate_script_globally(),
+# _GLOBAL_VALIDATION_SYSTEM_PROMPT, _GLOBAL_VALIDATION_SCHEMA, task=
+# "global_validation") was deleted per
+# code_report/forensic_output_audit_borrasca_run.md, section D1.2: a real
+# production run found 4 real narrative issues (repeated reveals, an
+# unresolved open loop, a continuity contradiction) and every single one
+# shipped unfixed anyway — pure cost, zero effect on the final script.
 
 
 # ── Telegram message builder (deterministic — no Claude call) ─────────────────
@@ -882,6 +868,7 @@ _TELEGRAM_TEMPLATES: dict[str, dict[str, str]] = {
         "source_lbl":  "Source",
         "signals_lbl": "Signaux principaux",
         "langs_lbl":   "Langues",
+        "rights_lbl":  "Revue droits/IP",
         "action":      "Répondez *APPROVE* pour valider, ou décrivez ce que vous souhaitez changer.",
     },
     "en": {
@@ -890,6 +877,7 @@ _TELEGRAM_TEMPLATES: dict[str, dict[str, str]] = {
         "source_lbl":  "Source",
         "signals_lbl": "Top signals",
         "langs_lbl":   "Languages",
+        "rights_lbl":  "Rights/IP review",
         "action":      "Reply *APPROVE* to proceed, or describe what you would like to change.",
     },
     "es": {
@@ -898,6 +886,7 @@ _TELEGRAM_TEMPLATES: dict[str, dict[str, str]] = {
         "source_lbl":  "Fuente",
         "signals_lbl": "Señales principales",
         "langs_lbl":   "Idiomas",
+        "rights_lbl":  "Revisión derechos/IP",
         "action":      "Responde *APPROVE* para continuar, o describe lo que quieres cambiar.",
     },
     "it": {
@@ -906,6 +895,7 @@ _TELEGRAM_TEMPLATES: dict[str, dict[str, str]] = {
         "source_lbl":  "Fonte",
         "signals_lbl": "Segnali principali",
         "langs_lbl":   "Lingue",
+        "rights_lbl":  "Revisione diritti/IP",
         "action":      "Rispondi *APPROVE* per procedere, o descrivi cosa vorresti cambiare.",
     },
 }
@@ -931,104 +921,6 @@ Rules:
    "before_summary" and "after_summary": one sentence each describing the substance of the change.\
 """
 
-
-# ── Script Quality Gate ────────────────────────────────────────────────────────
-
-_SCRIPT_QUALITY_SYSTEM_PROMPT = """\
-You are a YouTube retention editor reviewing a documentary narration script BEFORE production.
-Your only job: decide whether this script would make a normal viewer keep watching, or whether
-it needs a rewrite. You are not checking facts or technical formatting — another system does that.
-
-Judge the script the way an experienced YouTube editor would judge a first draft, against
-these dimensions:
-  - hook: Does the opening grab attention with something concrete and specific in the
-    first sentence? Would a viewer keep watching past 10 seconds? Does the opening
-    reveal the story's actual ending, answer, or mechanism — rather than creating a
-    question the rest of the video must answer? If it gives away the ending, this is
-    a HIGH severity hook issue regardless of how concrete or well-written it is.
-  - clarity: Is it always clear what is happening, who is involved, and why it matters?
-  - emotional_pull: Does the viewer have a reason to care about the people/events?
-  - narrative_arc: Does tension build toward a payoff, or does it stay flat / meander?
-    Specifically: does any section re-explain a fact or idea already established
-    elsewhere in the script, even in different words? Does any section compress two
-    distinct significant facts (a motive AND a method, a cause AND a consequence)
-    into one or two rushed sentences instead of giving the more important one room
-    to land? Flag both as narrative_arc issues, HIGH severity.
-  - specificity: Are claims grounded in concrete facts, names, numbers, dates — or vague?
-  - generic_language: Does it contain stock AI-documentary phrasing ("This is a story
-    about…", "What happened next…", "Everything changed…", "Little did they know") used
-    as a crutch instead of a grounded specific?
-  - tts_readability: Will this sound natural and human when read aloud by a TTS voice?
-
-Use FIXED, repeatable criteria — do not be lenient or harsh based on mood.
-
-Decision rule:
-  - status = "PASSED" only if the script would plausibly hold a YouTube viewer's
-    attention through the intro, feel like a professionally written documentary,
-    AND contains no HIGH severity issue in any dimension.
-  - status = "NEEDS_REWRITE" if there is at least one HIGH severity issue, or three
-    or more issues of any severity.
-
-For each issue found, report:
-  - severity: "HIGH" (would cause viewers to leave), "MEDIUM", "LOW"
-  - category: "hook" | "clarity" | "pacing" | "generic_language" | "emotional_pull" |
-    "tts_readability" | "narrative_arc"
-  - description: the specific problem, quoting the offending text where useful
-  - fix: a concrete, actionable instruction for how to fix it
-
-Return ONLY valid JSON. No markdown. No code fence. No extra keys.
-{
-  "status": "PASSED" | "NEEDS_REWRITE",
-  "issues": [
-    {"severity": "HIGH" | "MEDIUM" | "LOW", "category": "...", "description": "...", "fix": "..."}
-  ]
-}
-
-Strict rules:
-1. JSON only — the response will be parsed programmatically.
-2. If the script genuinely passes, return an empty issues array.
-3. Be specific — quote the actual sentence and say why it fails.\
-"""
-
-_QUALITY_REWRITE_SCHEMA: dict = {
-    "type": "object",
-    "properties": {
-        "title":        {"type": "string"},
-        "voice_script": {"type": "string"},
-    },
-    "required": ["title", "voice_script"],
-    "additionalProperties": False,
-}
-
-_SCRIPT_QUALITY_REWRITE_BASE = """\
-You are a YouTube documentary scriptwriter rewriting a script to fix specific retention
-problems identified by an editorial review — WITHOUT losing any facts, structure, or language.
-
-You will receive the current title/voice_script and a list of issues with
-concrete fixes. Apply EVERY fix precisely. Do not introduce new problems while fixing old ones.
-
-Rules:
-1. Preserve the source language, factual content, and overall story unless an issue
-   explicitly requires changing it.
-2. Apply the requested fixes fully — especially HIGH severity ones (hook, generic
-   language, narrative arc) — these are non-negotiable.
-3. Never invent facts, names, dates, statistics, or events not present in the
-   current script.
-4. Never send a partial script — always return the FULL title and voice_script.
-5. Preserve [INTRO], [SECTION N], [OUTRO] markers in voice_script, in the same positions
-   unless restructuring is explicitly required by an issue.
-6. The rewritten opening must satisfy: first sentence concrete and self-contained, central
-   tension clear within the first three sentences, no generic AI-documentary phrasing
-   ("This is a story about…", "Everything changed…", "But one question remains…") unless
-   immediately grounded in a specific fact.
-7. When fixing a narrative_arc issue about repeated or re-explained facts: remove the
-   second occurrence entirely rather than rephrasing it. Do not just reword the
-   repeated material — cut it, and let the surrounding sentences flow into each other.
-8. When fixing a hook issue about revealing the ending: rewrite the opening to
-   establish the situation or the sense of danger it creates, without naming what it
-   turns out to be. The reveal must stay withheld for later in the script.
-9. Fill the title and voice_script fields of the provided tool schema exactly.\
-"""
 
 # ── Public functions ───────────────────────────────────────────────────────────
 
@@ -1068,17 +960,28 @@ def build_telegram_message(
 
     if assessment and isinstance(assessment.get("scores"), dict):
         dims: list[tuple[str, int]] = []
+        rights_ip_risk: int | None = None
         for name, val in assessment["scores"].items():
             if isinstance(val, (int, float)):
-                dims.append((name, int(val)))
+                score = int(val)
             elif isinstance(val, dict):
-                dims.append((name, int(val.get("score", 0))))
+                score = int(val.get("score", 0))
+            else:
+                continue
+            if name == "rights_ip_risk":
+                rights_ip_risk = score
+                continue
+            dims.append((name, score))
         dims.sort(key=lambda x: x[1], reverse=True)
         top2 = " · ".join(
             f"{name.replace('_', ' ').title()} ({score}/100)"
             for name, score in dims[:2]
         )
         lines.append(f"*{t['signals_lbl']}:* {top2}")
+        if rights_ip_risk is not None and rights_ip_risk >= 70:
+            lines.append(
+                f"*{t['rights_lbl']}:* rights_ip_risk {rights_ip_risk}/100 — operator decision required"
+            )
 
     if target_languages:
         lines.append(f"*{t['langs_lbl']}:* {' · '.join(lang.upper() for lang in target_languages)}")
@@ -1113,7 +1016,7 @@ def generate_native_script(
     tts_provider: str = "cartesia",
     hook_context: str | None = None,
     content_kind: str = "parent_long_form",
-    override_instruction: str = "",
+    narration_pov: str = "third_person",
 ) -> dict:
     """Adapt a source-language script for a target language and audience.
 
@@ -1138,10 +1041,8 @@ def generate_native_script(
                             Selects the dedicated flat-narration native prompt for
                             standalone child Short episodes — see
                             ``build_native_system_prompt()``.
-        override_instruction: Optional correction instruction appended to the user
-                            message (used by the child-Short translation retry loop
-                            in ``scripts.py``, mirroring ``generate_short_episode_script``'s
-                            existing correction-round pattern).
+        narration_pov:     Channel narration perspective/register, threaded from
+                            ChannelConfig alongside visual_style/image_style.
 
     Returns:
         Dict with key ``voice_script`` in ``target_language``.
@@ -1161,12 +1062,11 @@ def generate_native_script(
         f"Target language: {target_language}\n"
         f"Channel niche: {niche}\n"
         f"Channel tone: {tone}\n"
+        f"Narration POV: {narration_pov or 'third_person'}\n"
     )
     if ctx:
         user_message += f"\nHOOK_CONTEXT:\n{ctx}\n"
     user_message += f"\nSource voice script:\n{voice_script}"
-    if override_instruction:
-        user_message += f"\n\n{override_instruction}"
     return call_claude_structured(
         task="native_adaptation",
         system_prompt=prompt,
@@ -1245,116 +1145,18 @@ def generate_revised_scripts(
     )
 
 
-_SCRIPT_QUALITY_SCHEMA: dict = {
-    "type": "object",
-    "properties": {
-        "status": {"type": "string", "enum": ["PASSED", "NEEDS_REWRITE"]},
-        "issues": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "severity":    {"type": "string", "enum": ["HIGH", "MEDIUM", "LOW"]},
-                    "category":    {"type": "string"},
-                    "description": {"type": "string"},
-                    "fix":         {"type": "string"},
-                },
-                "required": ["severity", "category", "description", "fix"],
-            },
-        },
-    },
-    "required": ["status", "issues"],
-    "additionalProperties": False,
-}
-
-
-def assess_script_quality(scripts: dict, channel, script_format: str = "youtube_long") -> dict:
-    """Run the Script Quality Gate — a YouTube-retention review distinct from Agent 3.
-
-    Args:
-        scripts:       Dict with ``title``, ``voice_script``.
-        channel:       Channel ORM object (provides niche and tone as context).
-        script_format: Format key from ``channel_config.script_format``.
-
-    Returns:
-        Dict with ``status`` ("PASSED" | "NEEDS_REWRITE") and ``issues``.
-
-    Raises:
-        ValueError: If Claude returns malformed JSON or a required key is missing.
-    """
-    user_message = (
-        f"Channel niche: {channel.niche}\n"
-        f"Channel tone: {channel.tone}\n"
-        f"Script format: {script_format}\n\n"
-        f"Title: {scripts.get('title', '')}\n\n"
-        f"Voice script:\n{scripts.get('voice_script', '')}"
-    )
-    result = call_claude_structured(
-        task="script_quality_check",
-        system_prompt=_SCRIPT_QUALITY_SYSTEM_PROMPT,
-        user_message=user_message,
-        schema_name="script_quality_output",
-        input_schema=_SCRIPT_QUALITY_SCHEMA,
-        max_tokens=1536,
-    )
-    if result["status"] not in {"PASSED", "NEEDS_REWRITE"}:
-        raise ValueError(f"assess_script_quality: unexpected status {result['status']!r}")
-    return result
-
-
-def rewrite_script_for_quality(
-    scripts: dict,
-    issues: list[dict],
-    channel,
-    script_format: str = "youtube_long",
-    tts_model: str = "sonic-2",
-    tts_provider: str = "cartesia",
-) -> dict:
-    """Rewrite a full script to fix issues raised by the Script Quality Gate.
-
-    Applies TTS_BLOCK for the given model so the rewrite cannot introduce new
-    TTS compliance violations that would then fail Agent 3's deterministic checks.
-
-    Args:
-        scripts:       Dict with ``title``, ``voice_script``.
-        issues:        Issue list from ``assess_script_quality()``.
-        channel:       Channel ORM object (provides niche and tone as context).
-        script_format: Format key from ``channel_config.script_format``.
-        tts_model:     TTS model ID for writing constraints.
-        tts_provider:  TTS provider ("cartesia" | "elevenlabs").
-
-    Returns:
-        Dict with ``title``, ``voice_script`` — fully rewritten.
-
-    Raises:
-        ValueError: If Claude returns malformed JSON or a required key is missing.
-    """
-    prompt = with_tts_block(_SCRIPT_QUALITY_REWRITE_BASE, tts_provider, tts_model)
-    issue_lines = "\n".join(
-        f"- [{issue.get('severity', '?')}] {issue.get('category', '?')}: "
-        f"{issue.get('description', '')} → FIX: {issue.get('fix', '')}"
-        for issue in issues
-    )
-    user_message = (
-        f"Channel niche: {channel.niche}\n"
-        f"Channel tone: {channel.tone}\n"
-        f"Script format: {script_format}\n\n"
-        f"Current title: {scripts.get('title', '')}\n\n"
-        f"Current voice script:\n{scripts.get('voice_script', '')}\n\n"
-        f"Issues to fix:\n{issue_lines}"
-    )
-    result = call_claude_structured(
-        task="quality_rewrite",
-        system_prompt=prompt,
-        user_message=user_message,
-        schema_name="quality_rewrite",
-        input_schema=_QUALITY_REWRITE_SCHEMA,
-        max_tokens=8192,
-    )
-    for _key in ("title", "voice_script"):
-        if not isinstance(result.get(_key), str):
-            raise ValueError(f"rewrite_script_for_quality: missing or non-string key '{_key}'")
-    return result
+# ── Script Quality Gate assess/rewrite — REMOVED (Elimination Mandate, D1.1) ─
+# assess_script_quality() and rewrite_script_for_quality() (plus their schemas
+# and the _SCRIPT_QUALITY_SYSTEM_PROMPT/_SCRIPT_QUALITY_REWRITE_BASE prompts
+# above) were deleted per code_report/forensic_output_audit_borrasca_run.md,
+# section D1.1: a real production run spent two paid rewrites and the script
+# still came back NEEDS_REWRITE, with the flagged repetitions shipped unfixed
+# regardless — the rewrite persona was also hardcoded "documentary
+# scriptwriter", actively pulling every channel's register toward documentary
+# style irrespective of configured tone (see CLAUDE.md's register-fix note,
+# P1-9). Deterministic structural checks (TTS compliance, hook quality,
+# maximum length, retention structure) still run in
+# run_script_quality_gate() (scripts.py) as telemetry only.
 
 
 # ── Story Scoring Gate (single story) ─────────────────────────────────────────
@@ -1378,6 +1180,7 @@ _SCORING_DIMENSIONS: list[str] = [
     "comment_section_potential",
     "series_potential",
     "episode_two_potential",
+    "rights_ip_risk",
 ]
 
 _SINGLE_STORY_SCORING_SCHEMA: dict = {
@@ -1385,7 +1188,7 @@ _SINGLE_STORY_SCORING_SCHEMA: dict = {
     "properties": {
         "scores": {
             "type": "object",
-            "description": "Integer score 0–100 for each of the 18 dimensions.",
+            "description": "Integer score 0–100 for each story-gate dimension.",
             "properties": {
                 dim: {"type": "integer", "minimum": 0, "maximum": 100}
                 for dim in _SCORING_DIMENSIONS
@@ -1402,10 +1205,17 @@ You are not deciding whether to accept or reject the story — another system ma
 Score strictly using fixed anchors so the same story always receives the same scores.
 Output ONLY the tool schema. No prose, no explanations.
 
-Anchors (apply to all dimensions):
+Anchors for performance dimensions:
   0–30   = weak / absent (actively hurts the video or makes it unclickable)
   31–65  = moderate (present but needs heavy compensation)
   66–100 = strong (clear asset that makes the video noticeably better)
+
+Special inverted operator-review dimension:
+  rights_ip_risk: 0–30 = low apparent risk/public-domain/original personal account;
+  31–65 = uncertain authorship, reposted fiction, or adaptation ambiguity;
+  66–100 = famous authored fiction, named franchise/character/world, rights-managed
+  creepypasta, or source/title that appears commercially claimable. This dimension
+  is not a performance score and does not decide acceptance; it flags operator review.
 
 Dimensions:
   visual_storytelling_potential  Can be SHOWN on screen with 5+ distinct visual categories?
@@ -1426,6 +1236,7 @@ Dimensions:
   comment_section_potential      Viewers feel compelled to share strong opinions?
   series_potential               Could generate multiple follow-up videos?
   episode_two_potential          Clear factual "part two" question left unanswered?
+  rights_ip_risk                 Operator-review risk for monetized adaptation rights/IP claims?
 
 Rules: score strictly; do NOT invent facts; judge only what is in the story body provided.\
 """
@@ -1447,7 +1258,7 @@ def score_story_for_gate(
         script_format: Format key from ``channel_config.script_format``.
 
     Returns:
-        Dict with ``scores`` mapping each of the 18 dimensions to an integer 0–100.
+        Dict with ``scores`` mapping each story-gate dimension to an integer 0–100.
 
     Raises:
         ValueError: If Claude's response is malformed or missing required dimensions.
@@ -1483,261 +1294,6 @@ def score_story_for_gate(
     return result
 
 
-# ── Script auto-correction (moved from agent3_validation) ─────────────────────
-
-_CORRECTION_SYSTEM_PROMPT_BASE = """\
-You are a script editor for an automated multilingual video content system.
-
-Your task: correct a specific language's voice script based on a list of
-identified issues. Apply ONLY the changes needed to fix the listed issues — do not
-rewrite sections that are not affected.
-
-Rules:
-1. Preserve all [SECTION N], [INTRO], and [OUTRO] markers in voice_script.
-2. Keep the voice_script in the same language as the original.
-3. Do not change the story, key facts, or overall narrative. Never invent new facts.
-4. If minimum_length is flagged, expand existing sections with more depth, examples, or
-   context from the source material excerpt provided in the user message (when present).
-   Never pad with filler. The voice_script must reach the minimum word count stated in
-   the user message. Match the declared script format's style (documentary pacing for
-   youtube_long, short punchy sentences for short-form).
-5. When fixing tts_compliance: replace digit-runs with words, remove forbidden characters
-   (parentheses, slashes, percent signs, ampersands), expand abbreviations (Dr. → Doctor,
-   vs. → versus, etc. → and so on, e.g. → for example), rewrite sentences longer than
-   18 words, and convert ALL-CAPS words to mixed case or full form. Fix only the flagged
-   sentences — do not touch others.
-6. When fixing hook_quality: rewrite ONLY the first sentence of voice_script that
-   follows the [INTRO] marker. The replacement sentence must:
-     — be ≤12 words (strict — count every word)
-     — name one specific person, place, or date drawn from facts already in the script
-     — imply an unresolved outcome or open question without stating it explicitly
-     — not start with any forbidden opener: "In", "Today", "Have you", "Welcome",
-       "What if", "Did you", "Imagine", "This is", "I want", "Let me"
-   Do not change any other sentence. Do not add facts not already present in the script.
-7. When fixing linguistic_naturalness: rewrite the affected sentences entirely rather
-   than patching individual words — half-fixed awkward phrasing is worse than the original.
-8. Return ONLY valid JSON. No markdown. No code fence. No extra keys.
-   {"voice_script": "..."}\
-"""
-
-_CORR_MARKER_LINE_RE = re.compile(
-    r"^\s*\[(INTRO|OUTRO|SECTION[^\]]*)\]\s*$",
-    re.IGNORECASE,
-)
-_CORR_SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s+")
-_CORR_SPLIT_CONJUNCTIONS = frozenset({
-    "and", "but", "or", "so", "yet", "nor", "for", "because", "although",
-    "since", "while", "when", "if", "that", "which", "who", "where", "though",
-    "et", "mais", "ou", "car", "donc", "ni", "que", "qui", "si",
-    "y", "pero", "porque", "aunque", "cuando", "e", "ma", "perché",
-})
-_CORR_NONWS_RE = re.compile(r"\S+")
-
-
-def _corr_terminate(s: str) -> str:
-    s = s.rstrip()
-    return s if s and s[-1] in ".!?" else (s + "." if s else s)
-
-
-def _corr_capitalize(s: str) -> str:
-    return s[0].upper() + s[1:] if s else s
-
-
-def _corr_bisect_sentence(sent: str) -> tuple[list[str], int]:
-    em_idx = sent.find("—")
-    if em_idx > 0:
-        left  = sent[:em_idx].rstrip()
-        right = sent[em_idx + 1:].lstrip()
-        if len(left.split()) >= 4 and right:
-            return [_corr_terminate(left), _corr_capitalize(right)], 1
-
-    tokens = list(_CORR_NONWS_RE.finditer(sent))
-    words  = [m.group() for m in tokens]
-    if not words:
-        return [sent], 0
-
-    comma_word_indices = [i for i, m in enumerate(tokens) if m.group().endswith(",")]
-
-    def _comma_char_pos(ci: int) -> int:
-        return tokens[ci].end() - 1
-
-    for ci in comma_word_indices:
-        if ci < 3 or ci >= len(words) - 2:
-            continue
-        next_word = words[ci + 1].lower().rstrip(".!?,")
-        if next_word in _CORR_SPLIT_CONJUNCTIONS:
-            comma_pos = _comma_char_pos(ci)
-            left  = sent[:comma_pos].rstrip()
-            right = sent[comma_pos + 1:].lstrip()
-            if right:
-                return [_corr_terminate(left), _corr_capitalize(right)], 1
-
-    target = min(15, len(words) - 3)
-    best_ci = -1
-    best_dist: float = float("inf")
-    for ci in comma_word_indices:
-        if 3 <= ci <= len(words) - 3:
-            d = abs(ci - target)
-            if d < best_dist:
-                best_dist = d
-                best_ci = ci
-    if best_ci >= 0:
-        comma_pos = _comma_char_pos(best_ci)
-        left  = sent[:comma_pos].rstrip()
-        right = sent[comma_pos + 1:].lstrip()
-        if right:
-            return [_corr_terminate(left), _corr_capitalize(right)], 1
-
-    cut = min(15, len(words) - 1)
-    cut_pos = tokens[cut].start()
-    left  = sent[:cut_pos].rstrip()
-    right = sent[cut_pos:].lstrip()
-    if right:
-        return [_corr_terminate(left), _corr_capitalize(right)], 1
-
-    return [sent], 0
-
-
-def _corr_process_fragment(frag: str, depth: int = 0) -> tuple[list[str], int]:
-    if len(frag.split()) <= 18 or depth >= 3:
-        return [frag], 0
-    parts, n = _corr_bisect_sentence(frag)
-    if len(parts) == 1:
-        return [frag], 0
-    total = n
-    result: list[str] = []
-    for part in parts:
-        sub_parts, sub_n = _corr_process_fragment(part, depth + 1)
-        result.extend(sub_parts)
-        total += sub_n
-    return result, total
-
-
-def _corr_process_line(text: str) -> tuple[str, int]:
-    fragments = _CORR_SENTENCE_END_RE.split(text)
-    result: list[str] = []
-    n_splits = 0
-    for frag in fragments:
-        frag = frag.strip()
-        if not frag:
-            continue
-        parts, n = _corr_process_fragment(frag)
-        result.extend(parts)
-        n_splits += n
-    return " ".join(result), n_splits
-
-
-def _split_long_sentences_agent2(voice_script: str) -> tuple[str, int]:
-    """Post-process voice_script to deterministically split >18-word sentences."""
-    out_lines: list[str] = []
-    total_splits = 0
-    for line in voice_script.split("\n"):
-        if _CORR_MARKER_LINE_RE.match(line):
-            out_lines.append(line)
-            continue
-        processed, n = _corr_process_line(line)
-        total_splits += n
-        out_lines.append(processed)
-    return "\n".join(out_lines), total_splits
-
-
-def auto_correct_script(
-    current_scripts: dict,
-    issues: list[dict],
-    language: str,
-    channel,
-    script_format: str = "youtube_long",
-    source_excerpt: str | None = None,
-    tts_model: str = "sonic-2",
-    tts_provider: str = "cartesia",
-) -> dict:
-    """Correct a single language's voice script based on identified MAJOR issues.
-
-    Called for each auto-correction round after deterministic checks flag MAJOR issues.
-    TTS_BLOCK for the target voice model is appended so corrections cannot reintroduce
-    TTS violations.
-
-    Args:
-        current_scripts: Dict with ``voice_script`` for the language.
-        issues:          List of issue dicts for this language (MAJOR and MINOR).
-        language:        BCP-47 language code (e.g. "fr", "en").
-        channel:         Channel ORM object (provides niche and tone).
-        script_format:   Format key from ``channel_config.script_format``.
-        source_excerpt:  Up to MAX_SOURCE_EXCERPT_CHARS of original source material —
-                         injected into the correction prompt when minimum_length is
-                         among the issues.
-        tts_model:       TTS model ID for this language's voice.
-        tts_provider:    TTS provider ("cartesia" | "elevenlabs").
-
-    Returns:
-        Dict with corrected ``voice_script``.
-
-    Raises:
-        ValueError: If Claude returns malformed JSON.
-    """
-    min_words = 900 if script_format == "youtube_long" else 420
-
-    issue_lines = "\n".join(
-        f"- [{i['severity']}] {i['category']}: {i['description']} → {i['suggestion']}"
-        for i in issues
-    )
-
-    user_message = (
-        f"Language: {language}\n"
-        f"Channel niche: {channel.niche}\n"
-        f"Channel tone: {channel.tone}\n"
-        f"Script format: {script_format} (minimum expected voice_script length: {min_words} words)\n\n"
-        f"Issues to fix:\n{issue_lines}\n\n"
-        f"Current voice script:\n{current_scripts.get('voice_script', '')}"
-    )
-
-    has_min_length_issue = any(i.get("category") == "minimum_length" for i in issues)
-    if source_excerpt and has_min_length_issue:
-        user_message += (
-            f"\n\nSource material excerpt — use this to expand the script. "
-            f"Do not invent any fact not present here or already in the script:\n"
-            f"{source_excerpt[:MAX_SOURCE_EXCERPT_CHARS]}"
-        )
-
-    correction_prompt = with_tts_block(_CORRECTION_SYSTEM_PROMPT_BASE, tts_provider, tts_model)
-
-    result = call_claude_structured(
-        task="auto_correction",
-        system_prompt=correction_prompt,
-        user_message=user_message,
-        schema_name="corrected_scripts",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "voice_script": {
-                    "type": "string",
-                    "description": (
-                        "The corrected voice script in the same language as the original. "
-                        "All issues listed in the prompt must be fixed."
-                    ),
-                },
-            },
-            "required": ["voice_script"],
-        },
-        max_tokens=8192,
-    )
-
-    if not isinstance(result.get("voice_script"), str):
-        raise ValueError(
-            f"corrected_scripts tool response missing required string field: {list(result.keys())}"
-        )
-
-    fixed_voice, n_splits = _split_long_sentences_agent2(result["voice_script"])
-    if n_splits:
-        logger.debug(
-            "TTS backstop: auto_correct_script fixed %d sentence(s) in language=%s",
-            n_splits, language,
-        )
-        result = {**result, "voice_script": fixed_voice}
-
-    return result
-
-
 # ── Standalone short planning: Shorts Planner ──────────────────────────────────────────────────
 
 _SHORTS_PLANNER_SYSTEM_PROMPT = """\
@@ -1758,6 +1314,8 @@ Rules:
   Must reference something SPECIFIC from the story — not a generic "wait for it" tease.
 - Part N's cliffhanger must be directly answered by Part N+1's main_reveal.
   The final part's cliffhanger is replaced by a comment trigger question (ends with "?").
+  That final question must be unique to this story and must not copy blueprint.comment_trigger
+  verbatim or near-verbatim; avoid reusable CTAs such as "what would you do?".
 - Never invent facts not present in the voice script or blueprint.
 - goal, main_content_summary, and main_reveal: one concise sentence each.
 
@@ -1883,10 +1441,21 @@ Rules:
 - Do not state the same fact or implication twice in this script, even in different
   words. Once something is established, move forward — do not circle back to it.
 - End by delivering the planned cliffhanger while preserving its narrative intent — this is what drives the viewer to Part N+1
+- CTA diversity: the final question/CTA must be specific to THIS Short's unresolved
+  moment and must not copy blueprint.comment_trigger verbatim or near-verbatim. Do
+  not reuse generic channel endings such as "what would you do?", "would you go
+  back?", or "what do you think happened?" unless the sentence is anchored in
+  this Short's exact person, object, place, or consequence.
 - Sentence rhythm: short sentences (3–7 words) for tension, longer (8–15 words) for buildup.
   Never 3+ consecutive sentences of the same length.
 - No filler, no recap, no "as I mentioned", no "in Part 1"
 - No [SECTION N] markers — Short scripts are flat narration only
+- Narration POV — driven by the "Narration POV" value in the user message, not
+  hardcoded: "third_person" (default) narrates about the story's people using
+  third-person pronouns and names; "first_person_storytime" narrates AS the
+  protagonist retelling their own experience directly to the viewer, using
+  "I"/"me"/"my" throughout (the r/nosleep-style storytime format). Never mix POV
+  within this part's narration.
 - ORIGINALITY — this is the most strictly enforced rule in this prompt: you will be
   given the long-form voice script for story grounding only. You must NEVER lift a
   run of 6 or more consecutive words directly from it, even when the long-form
@@ -1917,9 +1486,9 @@ def generate_short_episode_script(
     blueprint: dict,
     channel,
     channel_voice,
-    override_instruction: str = "",
     visual_style: str = "",
     image_style: str = "",
+    narration_pov: str = "third_person",
 ) -> dict:
     """Generate a single TikTok episode script from a part plan.
 
@@ -1933,8 +1502,6 @@ def generate_short_episode_script(
         blueprint:          Blueprint dict from generate_story_blueprint().
         channel:            Channel ORM object (provides niche and tone).
         channel_voice:      ChannelVoice ORM object (provides tts_model for TTS_BLOCK).
-        override_instruction: Optional correction instruction appended to user message
-                              (used by the 2-round auto-correction loop in run_shorts_planner).
 
     Returns:
         Dict with keys ``title`` (str) and ``voice_script`` (str).
@@ -1956,17 +1523,18 @@ def generate_short_episode_script(
     user_message = (
         f"Channel niche: {channel.niche}\n"
         f"Channel tone: {channel.tone}\n"
-        f"Visual style: {visual_style or 'documentary'}\n"
+        f"Visual style: {visual_style or 'story_driven'}\n"
         f"Image style: {image_style or 'photorealistic'}\n"
+        f"Narration POV: {narration_pov or 'third_person'}\n"
         f"Part: {part_n} of {total_parts}\n\n"
         f"Part plan:\n{part_json}\n\n"
         f"Blueprint:\n{bp_json}\n\n"
+        f"CTA guardrail: do not copy blueprint.comment_trigger verbatim or near-verbatim; "
+        f"write a story-specific final question for this part only.\n\n"
         f"Long-form voice script (for FACT GROUNDING ONLY — see ORIGINALITY rule above. "
         f"Do not reuse its exact phrasing):\n"
         f"{long_voice_script[:6000]}"
         )
-    if override_instruction:
-        user_message += f"\n\nIMPORTANT: {override_instruction}"
 
     return call_claude_structured(
         task="short_script",
@@ -1977,157 +1545,13 @@ def generate_short_episode_script(
         max_tokens=1024,
     )
 
-
-# ── Short Quality Gate (Phase 13.2) ─────────────────────────────────────────────
-# Holistic AI-judged quality review for standalone child Short narration —
-# the Short-shaped counterpart to _SCRIPT_QUALITY_SYSTEM_PROMPT above. Runs only
-# after a Short draft has already passed deterministic structural checks
-# (_collect_short_script_major_issues — word cap, TTS compliance, hook opener,
-# no section markers); this gate judges retention/narrative quality on a
-# structurally-valid draft, exactly mirroring how run_script_quality_gate() only
-# judges a parent script after its own section-level structural checks pass.
-
-_SHORT_QUALITY_SCHEMA: dict = {
-    "type": "object",
-    "properties": {
-        "status": {"type": "string", "enum": ["PASSED", "NEEDS_REWRITE"]},
-        "issues": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "severity":    {"type": "string", "enum": ["HIGH", "MEDIUM", "LOW"]},
-                    "category":    {"type": "string"},
-                    "description": {"type": "string"},
-                    "fix":         {"type": "string"},
-                },
-                "required": ["severity", "category", "description", "fix"],
-                "additionalProperties": False,
-            },
-        },
-    },
-    "required": ["status", "issues"],
-    "additionalProperties": False,
-}
-
-_SHORT_QUALITY_SYSTEM_PROMPT = """\
-You are a short-form retention editor reviewing a standalone TikTok/Reels/Shorts episode
-script BEFORE production. This is flat, unsectioned narration for a vertical short video —
-NOT a long-form documentary script. Do not judge it as one, and do not expect or require
-[INTRO], [SECTION N], [OUTRO] markers, or a 1200-1600 word arc. A complete, well-made Short
-is 125-180 words of flat narration.
-
-Your only job: decide whether a first-time viewer, with no knowledge of any other part of
-this story, would watch this Short all the way through — or whether it needs a rewrite.
-You are not checking facts or technical formatting — another system does that.
-
-Judge the script against these dimensions, all specific to short-form vertical video:
-  - hook: Does the first 1-2 sentences immediately grab attention with something concrete
-    and specific? Would a viewer keep watching past 3 seconds? Does the opening already
-    state the part's final answer or mechanism instead of creating a question the rest of
-    the Short must answer? If it gives away the reveal early, this is a HIGH severity hook
-    issue regardless of how concrete or well-written it is.
-  - clarity: Could a viewer who has never seen any other part of this story follow what is
-    happening, who is involved, and why it matters, using only this Short's own narration?
-  - emotional_pull: Does the viewer have a concrete reason to care, and does the narration
-    open a curiosity gap (an unanswered question) rather than just stating facts in order?
-  - main_reveal: Is there exactly one clear reveal or payoff in this Short? Flag it as a
-    HIGH severity narrative_arc issue if there is no clear reveal, or if two unrelated
-    reveals are both compressed into one or two rushed sentences instead of giving the
-    more important one room to land.
-  - cliffhanger_intent: If this is not the final part, does the ending preserve a genuine
-    forward-pulling cliffhanger (a specific unresolved element), rather than resolving
-    everything or trailing off on a flat summary? (Only the literal wording may differ
-    from the plan — the narrative intent of the cliffhanger must survive.)
-  - recap: Does the narration over-explain or summarize events beyond the minimum context
-    a first-time viewer needs for this part's own reveal to land? Re-stating an established
-    fact, even in different words, is a HIGH severity recap issue.
-  - generic_language: Does it contain stock AI-narration filler ("This is a story about…",
-    "What happened next…", "Everything changed…", "Little did they know", "But that's not
-    all") used as a crutch instead of a grounded specific?
-  - tts_readability: Will this sound natural and human when read aloud by a TTS voice in
-    roughly 80-90 seconds?
-  - retention_suitability: Does the narration re-hook the viewer every 7-10 seconds with a
-    new fact, twist, or micro-reveal, or does any stretch of the script plateau with no new
-    information?
-
-Use FIXED, repeatable criteria — do not be lenient or harsh based on mood.
-
-Decision rule:
-  - status = "PASSED" only if a first-time viewer would plausibly watch this Short to the
-    end on its own, with no other context, AND contains no HIGH severity issue in any
-    dimension.
-  - status = "NEEDS_REWRITE" if there is at least one HIGH severity issue, or three or
-    more issues of any severity.
-
-For each issue found, report:
-  - severity: "HIGH" (would cause viewers to scroll away), "MEDIUM", "LOW"
-  - category: "hook" | "clarity" | "emotional_pull" | "main_reveal" | "cliffhanger_intent" |
-    "recap" | "generic_language" | "tts_readability" | "retention_suitability"
-  - description: the specific problem, quoting the offending text where useful
-  - fix: a concrete, actionable instruction for how to fix it
-
-Return ONLY valid JSON. No markdown. No code fence. No extra keys.
-{
-  "status": "PASSED" | "NEEDS_REWRITE",
-  "issues": [
-    {"severity": "HIGH" | "MEDIUM" | "LOW", "category": "...", "description": "...", "fix": "..."}
-  ]
-}
-
-Strict rules:
-1. JSON only — the response will be parsed programmatically.
-2. If the script genuinely passes, return an empty issues array.
-3. Be specific — quote the actual sentence and say why it fails.
-4. Never require or suggest adding [INTRO], [SECTION N], [OUTRO], or any other bracketed
-   structural marker — flat narration is correct for a Short, not a defect.\
-"""
-
-
-def assess_short_script_quality(voice_script: str, channel, is_final_part: bool = True) -> dict:
-    """Run the Short Quality Gate — a short-form retention review for one child Short.
-
-    The flat-narration counterpart to ``assess_script_quality()``. Runs only after a
-    Short draft has already passed deterministic structural checks (word cap, TTS
-    compliance, hook opener, no section markers) — see ``_collect_short_script_major_issues()``
-    in ``scripts.py``.
-
-    Args:
-        voice_script:  The Short's flat narration text (no section markers).
-        channel:       Channel ORM object (provides niche and tone as context).
-        is_final_part: Whether this is the last part of the standalone-Short series.
-                      When True, the cliffhanger_intent dimension is not scored — the
-                      final part replaces its cliffhanger with a comment-trigger
-                      question (see ``generate_shorts_plan()``'s schema), so there is
-                      no forward-pulling cliffhanger to judge.
-
-    Returns:
-        Dict with ``status`` ("PASSED" | "NEEDS_REWRITE") and ``issues``.
-
-    Raises:
-        ValueError: If Claude returns malformed JSON or a required key is missing.
-    """
-    cliffhanger_note = (
-        "This is the FINAL part — it ends on a comment-trigger question, not a "
-        "cliffhanger. Do not score cliffhanger_intent for this part."
-        if is_final_part else
-        "This is NOT the final part — it must end on a genuine forward-pulling "
-        "cliffhanger. Score cliffhanger_intent normally."
-    )
-    user_message = (
-        f"Channel niche: {channel.niche}\n"
-        f"Channel tone: {channel.tone}\n"
-        f"{cliffhanger_note}\n\n"
-        f"Voice script:\n{voice_script}"
-    )
-    result = call_claude_structured(
-        task="short_quality_check",
-        system_prompt=_SHORT_QUALITY_SYSTEM_PROMPT,
-        user_message=user_message,
-        schema_name="short_quality_check",
-        input_schema=_SHORT_QUALITY_SCHEMA,
-        max_tokens=1024,
-    )
-    if result["status"] not in {"PASSED", "NEEDS_REWRITE"}:
-        raise ValueError(f"assess_short_script_quality: unexpected status {result['status']!r}")
-    return result
+# ── Short Quality Gate — REMOVED (Elimination Mandate, D1.3) ────────────────────
+# The AI Short Quality Gate (assess_short_script_quality(), _SHORT_QUALITY_SYSTEM_PROMPT,
+# _SHORT_QUALITY_SCHEMA, task="short_quality_check") was deleted per
+# code_report/forensic_output_audit_borrasca_run.md, section D1.3: a real
+# production run showed its PASSED-with-issues contract mismatch burned a retry
+# into a worse draft, and the correction loop it fed made Short scripts worse
+# across attempts, not better. Deterministic structural checks
+# (_collect_short_script_major_issues in scripts.py) and the parent/child
+# overlap detector (detect_parent_child_overlap) remain as telemetry-only checks
+# on the single generated draft — see _generate_short_script() in scripts.py.

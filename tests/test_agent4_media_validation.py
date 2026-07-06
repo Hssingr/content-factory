@@ -64,9 +64,15 @@ def _section(content_id, media_url, *, order=1, visual_type="b-roll", media_stra
     )
 
 
-def _write_image(path: Path):
+def _write_image(path: Path, *, size: tuple[int, int] = (160, 90)):
+    """Write a real local image at the given pixel size.
+
+    Defaults to 160x90 (16:9) — matching the parent aspect ratio the media
+    validator's dimension check (roadmap 3a / audit P1-3) expects for
+    non-Short content. Pass size=(90, 160) (9:16) for Short-content fixtures.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    Image.new("RGB", (8, 8), color="blue").save(path)
+    Image.new("RGB", size, color="blue").save(path)
 
 
 class TestAgent4MediaValidation(unittest.TestCase):

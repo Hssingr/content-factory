@@ -168,7 +168,12 @@ class ShortRemapReusePoolTest(unittest.TestCase):
                 short_content=SimpleNamespace(id=uuid.uuid4()),
                 short_voice_script="Mara checks several hallway clues near the quiet porch.",
                 short_audio_file=SimpleNamespace(
-                    duration_ms=5000,
+                    # 50 transcript words * 250ms/word (see transcript()) = 12500ms —
+                    # duration_ms must cover the real transcript span, or micro-beat
+                    # cleanup correctly clamps/discards every beat past the stated
+                    # audio duration (this is the timestamp mapper's real,
+                    # already-implemented fail-loud density guard, not a bug).
+                    duration_ms=12500,
                     language="en",
                     whisper_transcript=transcript(
                         "Mara checks hallway clue number 0 near the quiet porch "

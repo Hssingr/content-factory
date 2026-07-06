@@ -232,7 +232,11 @@ class TestGenerateParentSourceScriptShared(unittest.TestCase):
         content = Content(
             id=content_id, channel_id=channel_id, is_short_episode=False,
             source_language="en", status="APPROVED", title="T",
-            source_url="https://example.com/x", source_excerpt="Some source body.",
+            source_url="https://example.com/x",
+            # >=900 words: clears the youtube_long source-material floor
+            # (roadmap 4b / audit P1-5, check_source_material_floor()) — this
+            # fixture is testing shared persistence/versioning, not the floor.
+            source_excerpt=" ".join(["word"] * 950),
         )
         db.add(content)
         return db, content
@@ -253,7 +257,7 @@ class TestGenerateParentSourceScriptShared(unittest.TestCase):
             return {"title": "T", "voice_script": "[INTRO]\nGenerated narration.",
                     "visual_intent_history": []}
 
-        def fake_gate(scripts, channel, **kwargs):
+        def fake_gate(scripts, **kwargs):
             return scripts
 
         with (

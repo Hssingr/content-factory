@@ -30,7 +30,6 @@ Render preparation (subtitles, Remotion props, rendering, verification,
 import hashlib
 import json
 import logging
-import re
 import uuid
 
 from sqlalchemy.orm import Session
@@ -38,16 +37,13 @@ from sqlalchemy.orm import Session
 from app.models import AudioFile, Channel, ChannelConfig, Content, Script, VideoSection
 from app.agents.agent4_visuals.subagents.storyboard import (
     split_into_beats, remap_beats_for_short, generate_pending_beat_images,
-    remediate_child_major_storyboard_issues,
+    build_continuity_line_from_blueprint,
 )
 from app.agents.agent4_visuals.subagents.storyboard_validator import (
     validate_storyboard, repair_duplicate_flux_prompts,
 )
 from app.agents.agent4_visuals.services.flux_generator import generate_all_beat_images
-from app.agents.agent4_visuals.services.cinematic_prompts import apply_cinematic_prompts_to_beats
-from app.agents.agent4_visuals.services.first15_validator import apply_first15_enhancement_and_validation
 from app.agents.agent4_visuals.services.media_validation import validate_visual_media_assets
-from app.agents.agent4_visuals.services.visual_bible import generate_visual_bible_for_content, load_visual_bible_for_content
 from app.agents.agent4_visuals.services.visual_review import (
     generate_visual_review_html, save_beat_review_metadata,
 )
@@ -58,16 +54,6 @@ from app.agents.agent4_visuals.system_prompt import (
 )
 
 logger = logging.getLogger(__name__)
-
-_FINAL_PROMPT_VALIDATION_CHECKS: frozenset[str] = frozenset({
-    "forbidden_flux_word",
-    "subject_presence",
-    "environment_presence",
-    "low_information_prompt",
-    "flux_prompt_exact_duplicate",
-    "flux_prompt_near_duplicate",
-    "ai_text_rendering_requested",
-})
 
 # Language sentinel used to store the shared visual-pass beats (generated once,
 # shared by all language renders). Must match the migration's widened varchar(16).
@@ -189,21 +175,6 @@ def run_visual_generation_for_content(content_id: uuid.UUID, db: Session) -> boo
         db.commit()
         return False
 
-    try:
-        visual_bible = generate_visual_bible_for_content(content_id, db)
-        logger.info(
-            "AGENT4_VISUAL_BIBLE_READY content_id=%s characters=%d locations=%d motifs=%d",
-            content_id,
-            len(visual_bible.get("characters") or []),
-            len(visual_bible.get("locations") or []),
-            len(visual_bible.get("recurring_motifs") or []),
-        )
-    except Exception as exc:
-        logger.error("AGENT4_VISUAL_BIBLE_FAILED content_id=%s error=%s", content_id, exc)
-        content.status = "FAILED"
-        db.commit()
-        return False
-
     result = run_visual_generation(
         content=content,
         channel=channel,
@@ -290,26 +261,42 @@ def _run_parent_visuals(
 ) -> dict:
     shared_beats = _load_shared_beats(content_id, db)
     current_script_hash = _source_script_hash(content, scripts_by_lang)
+    current_audio_duration_ms = _source_audio_duration_ms(content, audio_by_lang)
 
-    # Stale-visuals guard (audit V-6b): a script regenerated after the visual
-    # pass already ran (operator --force-scripts, or any retry that changes
-    # the source narration) must never let the OLD beats be silently reused.
-    staleness = (
+    # Stale-visuals guard (audit V-6b + roadmap 2d / audit P0-3): a script
+    # regenerated after the visual pass already ran (operator
+    # --force-scripts, or any retry that changes the source narration) must
+    # never let the OLD beats be silently reused — and neither must a
+    # duration correction on an unchanged script (the audited incident's
+    # actual repair scenario: fixing a corrupted duration_ms in place).
+    # Either fingerprint mismatching is enough to force a regeneration.
+    script_staleness = (
         _check_shared_beats_staleness(content_id, shared_beats, current_script_hash)
         if shared_beats else "fresh"
     )
-    if staleness == "stale":
+    audio_staleness = (
+        _check_audio_duration_staleness(content_id, shared_beats, current_audio_duration_ms)
+        if shared_beats else "fresh"
+    )
+    if "stale" in (script_staleness, audio_staleness):
         shared_beats = []
-    elif staleness == "backfill":
-        logger.info(
-            "STALE_VISUALS_CHECK_BACKFILL content_id=%s beats=%d — no baseline "
-            "script hash stored on these beats yet; stamping current hash "
-            "without forcing a regeneration",
-            content_id, len(shared_beats),
-        )
-        _tag_beats_with_script_hash(shared_beats, current_script_hash)
-        _save_shared_beats(content_id, shared_beats, db)
-        db.commit()
+    else:
+        needs_backfill_save = False
+        if script_staleness == "backfill":
+            _tag_beats_with_script_hash(shared_beats, current_script_hash)
+            needs_backfill_save = True
+        if audio_staleness == "backfill":
+            _tag_beats_with_audio_duration(shared_beats, current_audio_duration_ms)
+            needs_backfill_save = True
+        if needs_backfill_save:
+            logger.info(
+                "STALE_VISUALS_CHECK_BACKFILL content_id=%s beats=%d — no baseline "
+                "staleness fingerprint(s) stored on these beats yet; stamping current "
+                "value(s) without forcing a regeneration",
+                content_id, len(shared_beats),
+            )
+            _save_shared_beats(content_id, shared_beats, db)
+            db.commit()
 
     # Beats saved after storyboard (before Flux) have media_url == "".
     # Detect this: if any beat is missing a media_url, Flux didn't finish last run.
@@ -329,6 +316,7 @@ def _run_parent_visuals(
             visual_style=visual_style,
             image_style=image_style,
             script_hash=current_script_hash,
+            blueprint=content.story_blueprint,
         )
         if shared_beats is None:
             return {"status": "VISUALS_FAILED", "beats_by_lang": {}}
@@ -383,6 +371,7 @@ def _run_visual_pass(
     visual_style: str = "",
     image_style: str = "",
     script_hash: str | None = None,
+    blueprint: dict | None = None,
 ) -> tuple[list[dict] | None, int]:
     """Generate storyboard + Flux images once for this content item.
 
@@ -395,6 +384,10 @@ def _run_visual_pass(
             from `_source_script_hash()`), stamped onto every beat before the
             first save so a later run can detect script staleness (audit
             V-6b) — see `_check_shared_beats_staleness()`.
+        blueprint: ``Content.story_blueprint``, used to build a deterministic
+            continuity line (see ``build_continuity_line_from_blueprint()``)
+            — no AI call, replaces the deleted visual-bible layer (Elimination
+            Mandate, code_report/forensic_output_audit_borrasca_run.md, D2.1).
 
     Returns:
         ``(beats, source_duration_ms)`` on success, ``(None, 0)`` on failure.
@@ -430,7 +423,7 @@ def _run_visual_pass(
         content_id, source_lang, source_duration_ms, _STORYBOARD_SCHEMA_VERSION,
     )
 
-    visual_bible = load_visual_bible_for_content(content_id)
+    continuity_line = build_continuity_line_from_blueprint(blueprint)
 
     # ── 1. Storyboard ─────────────────────────────────────────────────────────
     beats = split_into_beats(
@@ -443,7 +436,8 @@ def _run_visual_pass(
         language=source_lang,
         visual_style=visual_style,
         image_style=image_style,
-        visual_bible_context=visual_bible,
+        continuity_line=continuity_line,
+        content_id=str(content_id),
         db=db,
     )
 
@@ -467,94 +461,25 @@ def _run_visual_pass(
     )
 
     # ── 1b. Storyboard validation gate ────────────────────────────────────────
-    # Runs after storyboard is complete and before any fal.ai calls.
-    beats = _run_storyboard_validation(
-        beats=beats,
-        voice_script=source_script.voice_script,
-        source_audio=source_audio,
-        channel=channel,
-        script_format=script_format,
-        allow_legacy_fallback=allow_legacy_fallback,
-        source_lang=source_lang,
-        visual_style=visual_style,
-        image_style=image_style,
-        db=db,
-        visual_bible=visual_bible,
-    )
-    if beats is None:
-        logger.error(
-            "Agent4 [FAIL] content=%s status=STORYBOARD_VALIDATION_FAILED "
-            "reason=storyboard_validation_gate_returned_None (allow_legacy_fallback=False)",
-            content_id,
-        )
-        return None, 0
-
-    beats = apply_cinematic_prompts_to_beats(
-        beats,
-        visual_bible=visual_bible,
-        content_kind="parent_long_form",
-    )
-    final_prompt_issues = _check_final_prompt_issues(
-        beats,
-        content_id=content_id,
-        stage="parent_after_enrichment",
-        language=source_lang,
-    )
-    if any(issue["severity"] == "MAJOR" for issue in final_prompt_issues):
-        logger.error(
-            "Agent4 [FAIL] content=%s status=FINAL_PROMPT_VALIDATION_FAILED "
-            "stage=parent_after_enrichment",
-            content_id,
-        )
-        return None, 0
-
-    beats, first15_result = apply_first15_enhancement_and_validation(
-        beats,
-        visual_bible=visual_bible,
-        content_kind="parent",
-    )
-    if first15_result.status == "FAIL_BLOCKING":
-        logger.error(
-            "Agent4 [FAIL] content=%s status=FIRST15_VISUAL_HOOK_FAILED "
-            "checked=%d strong=%d generic=%d issues=%s",
-            content_id,
-            first15_result.checked_count,
-            first15_result.strong_hook_count,
-            first15_result.weak_generic_count,
-            [issue.code for issue in first15_result.issues],
-        )
-        return None, 0
-    logger.info(
-        "Agent4 [FIRST15] content=%s status=%s checked=%d strong=%d warnings=%d",
-        content_id,
-        first15_result.status,
-        first15_result.checked_count,
-        first15_result.strong_hook_count,
-        sum(1 for issue in first15_result.issues if issue.severity == "WARNING"),
-    )
-    final_prompt_issues = _check_final_prompt_issues(
-        beats,
-        content_id=content_id,
-        stage="parent_after_first15",
-        language=source_lang,
-    )
-    if any(issue["severity"] == "MAJOR" for issue in final_prompt_issues):
-        logger.error(
-            "Agent4 [FAIL] content=%s status=FINAL_PROMPT_VALIDATION_FAILED "
-            "stage=parent_after_first15",
-            content_id,
-        )
-        return None, 0
+    # Runs after storyboard is complete and before any fal.ai calls. The sole
+    # remaining deterministic validator (Elimination Mandate D2.4 — the bible
+    # enrichment/first15 mutation passes that used to run after this, plus
+    # their re-validation checks, are deleted; there is nothing left to mutate
+    # flux_prompt between this gate and Flux, so nothing left to re-validate).
+    # Telemetry only (D1.5) — MAJOR findings are logged, never trigger a
+    # segment-level retry; the storyboard is always returned unchanged.
+    beats = _run_storyboard_validation(beats)
 
     # ── 1c. Duplicate-prompt repair (audit G-5.3) — last mutation of
-    # flux_prompt before Flux; must run after enrichment/first15, both done. ──
+    # flux_prompt before Flux. ──
     beats = _repair_duplicate_prompts(beats, content_id=content_id, language=source_lang)
 
-    # Stale-visuals guard (audit V-6b): stamp the source-script fingerprint
-    # onto every beat before the FIRST save, so it survives (in-place
-    # mutation) through the post-Flux save below too.
+    # Stale-visuals guard (audit V-6b / roadmap 2d, P0-3): stamp both
+    # staleness fingerprints onto every beat before the FIRST save, so they
+    # survive (in-place mutation) through the post-Flux save below too.
     if script_hash:
         _tag_beats_with_script_hash(beats, script_hash)
+    _tag_beats_with_audio_duration(beats, source_duration_ms)
 
     # ── 2. Save storyboard beats before Flux — protects storyboard work ─────────
     # If Flux crashes mid-run, --from-video can reload these beats and skip straight
@@ -580,58 +505,12 @@ def _run_visual_pass(
     return beats, source_duration_ms
 
 
-def _check_final_prompt_issues(
-    beats: list[dict],
-    *,
-    content_id: uuid.UUID,
-    stage: str,
-    language: str = "",
-) -> list[dict]:
-    """Validate the exact flux_prompt values that will be sent to Flux.
-
-    Phase 2.2 reruns the prompt-only validator subset after visual-bible
-    enrichment, before first15 and before any fal.ai call. This catches any
-    additive continuity clause that reintroduces forbidden mood words,
-    readable-text requests, low-information prompts, or duplicate prompts.
-    """
-    issues = [
-        issue for issue in validate_storyboard(beats)
-        if issue["check"] in _FINAL_PROMPT_VALIDATION_CHECKS
-    ]
-    if not issues:
-        logger.info(
-            "FINAL_PROMPT_VALIDATION_OK content=%s stage=%s language=%s beats=%d checks=%s",
-            content_id, stage, language or "__visual__", len(beats),
-            sorted(_FINAL_PROMPT_VALIDATION_CHECKS),
-        )
-        return []
-
-    majors = [issue for issue in issues if issue["severity"] == "MAJOR"]
-    minors = [issue for issue in issues if issue["severity"] == "MINOR"]
-    for issue in minors:
-        logger.warning(
-            "FINAL_PROMPT_VALIDATION_MINOR content=%s stage=%s language=%s beat_order=%s check=%s description=%s",
-            content_id, stage, language or "__visual__", issue["beat_order"],
-            issue["check"], issue["description"],
-        )
-    for issue in majors:
-        logger.error(
-            "FINAL_PROMPT_VALIDATION_MAJOR content=%s stage=%s language=%s beat_order=%s check=%s description=%s",
-            content_id, stage, language or "__visual__", issue["beat_order"],
-            issue["check"], issue["description"],
-        )
-    logger.warning(
-        "FINAL_PROMPT_VALIDATION_DONE content=%s stage=%s language=%s issues=%d majors=%d minors=%d",
-        content_id, stage, language or "__visual__", len(issues), len(majors), len(minors),
-    )
-    return issues
-
-
 def _repair_duplicate_prompts(
     beats: list[dict],
     *,
     content_id: uuid.UUID,
     language: str = "",
+    include_resolved: bool = False,
 ) -> list[dict]:
     """Deterministically vary surviving duplicate-prompt beats (audit G-5.3).
 
@@ -642,33 +521,26 @@ def _repair_duplicate_prompts(
     repaired text is what actually reaches fal.ai — this is the last mutation
     of `flux_prompt` before generation.
     """
-    repaired, repairs = repair_duplicate_flux_prompts(beats)
+    repaired, repairs = repair_duplicate_flux_prompts(beats, include_resolved=include_resolved)
     if not repairs:
         logger.info(
-            "DUPLICATE_PROMPT_REPAIR_OK content=%s language=%s beats=%d",
-            content_id, language or "__visual__", len(beats),
+            "DUPLICATE_PROMPT_REPAIR_OK content=%s language=%s beats=%d include_resolved=%s",
+            content_id, language or "__visual__", len(beats), include_resolved,
         )
         return repaired
 
     for repair in repairs:
         logger.warning(
             "DUPLICATE_PROMPT_REPAIRED content=%s language=%s beat_order=%s "
-            "check=%s variation=%r",
+            "check=%s include_resolved=%s variation=%r",
             content_id, language or "__visual__", repair["beat_order"],
-            repair["check"], repair["variation"],
+            repair["check"], include_resolved, repair["variation"],
         )
     logger.info(
-        "DUPLICATE_PROMPT_REPAIR_DONE content=%s language=%s beats=%d repaired=%d",
-        content_id, language or "__visual__", len(beats), len(repairs),
+        "DUPLICATE_PROMPT_REPAIR_DONE content=%s language=%s beats=%d repaired=%d include_resolved=%s",
+        content_id, language or "__visual__", len(beats), len(repairs), include_resolved,
     )
     return repaired
-
-
-_SEGMENT_RETRY_SUPPORT_CHECKS: frozenset[str] = frozenset({
-    "consecutive_same_environment",
-    "ai_slideshow_risk",
-    "document_saturation",
-})
 
 
 def _collect_storyboard_issues(beats: list[dict]) -> list[dict]:
@@ -686,12 +558,11 @@ def _check_storyboard_issues(beats: list[dict]) -> list[dict]:
     """Run validate_storyboard() and log MINOR findings; return the MAJOR ones.
 
     This is the single call site for ``validate_storyboard()`` shared by both
-    the parent storyboard path and the child remap path — neither caller
-    forks or re-implements the validator itself, only what happens after a
-    MAJOR finding differs (parent can retry via segment-level storyboard
-    re-generation; child remap has no equivalent regeneration primitive and
-    logs/proceeds immediately, the same terminal behavior the parent falls
-    back to when its own retry still leaves MAJOR issues).
+    the parent storyboard path and the child remap path. Neither caller forks
+    or re-implements the validator itself. MAJOR findings never trigger a
+    regeneration on either path (Elimination Mandate D1.5,
+    code_report/forensic_output_audit_borrasca_run.md) — they are telemetry
+    only; both paths log and proceed.
 
     Returns:
         The MAJOR issues found (empty list if the storyboard is clean).
@@ -699,198 +570,27 @@ def _check_storyboard_issues(beats: list[dict]) -> list[dict]:
     return [i for i in _collect_storyboard_issues(beats) if i["severity"] == "MAJOR"]
 
 
-def _storyboard_batch_labels(beats: list[dict]) -> list[str]:
-    return sorted({
-        str(beat.get("storyboard_batch_label") or "").strip()
-        for beat in beats
-        if str(beat.get("storyboard_batch_label") or "").strip()
-    })
+def _run_storyboard_validation(beats: list[dict]) -> list[dict]:
+    """Run the storyboard validation gate as telemetry only.
 
-
-def _documentish_batch_labels(beats: list[dict]) -> set[str]:
-    labels: set[str] = set()
-    for beat in beats:
-        if (
-            str(beat.get("motif") or "").lower() == "document"
-            or str(beat.get("visual_type") or "").lower() == "document"
-        ):
-            label = str(beat.get("storyboard_batch_label") or "").strip()
-            if label:
-                labels.add(label)
-    return labels
-
-
-def _issue_batch_labels(issue: dict, beats_by_order: dict[int, dict], beats: list[dict]) -> set[str]:
-    order = int(issue.get("beat_order", -1))
-    if order >= 0:
-        label = str(beats_by_order.get(order, {}).get("storyboard_batch_label") or "").strip()
-        return {label} if label else set()
-    if issue.get("check") == "document_saturation":
-        return _documentish_batch_labels(beats)
-    return set()
-
-
-def _storyboard_retry_constraints_by_batch(beats: list[dict], issues: list[dict]) -> dict[str, str]:
-    """Build per-batch retry constraints from MAJOR validation findings."""
-    major_issues = [issue for issue in issues if issue["severity"] == "MAJOR"]
-    if not major_issues:
-        return {}
-
-    beats_by_order = {int(beat.get("beat_order", -1)): beat for beat in beats}
-    all_labels = set(_storyboard_batch_labels(beats))
-    by_label: dict[str, list[dict]] = {}
-
-    for issue in major_issues:
-        labels = _issue_batch_labels(issue, beats_by_order, beats)
-        if issue.get("check") == "visual_monotony":
-            labels = set()
-            for support in issues:
-                if support.get("check") not in _SEGMENT_RETRY_SUPPORT_CHECKS:
-                    continue
-                labels.update(_issue_batch_labels(support, beats_by_order, beats))
-            labels = labels or all_labels
-        if not labels:
-            labels = all_labels
-        for label in labels:
-            by_label.setdefault(label, []).append(issue)
-
-    if any(issue.get("check") == "visual_monotony" for issue in major_issues):
-        for support in issues:
-            if support.get("check") not in _SEGMENT_RETRY_SUPPORT_CHECKS:
-                continue
-            for label in _issue_batch_labels(support, beats_by_order, beats):
-                if label in by_label:
-                    by_label[label].append(support)
-
-    constraints: dict[str, str] = {}
-    for label, label_issues in by_label.items():
-        seen: set[tuple[str, int, str]] = set()
-        lines = [f"Segment-level storyboard retry constraints for {label}:"]
-        for issue in label_issues:
-            key = (issue["check"], int(issue.get("beat_order", -1)), issue["description"])
-            if key in seen:
-                continue
-            seen.add(key)
-            lines.append(
-                f"- [{issue['check']}] beat_order={issue['beat_order']}: {issue['description']}"
-            )
-        constraints[label] = "\n".join(lines)
-    return constraints
-
-
-    return issues
-
-
-def _run_storyboard_validation(
-    beats: list[dict],
-    voice_script: str,
-    source_audio: "AudioFile",
-    channel: Channel,
-    script_format: str,
-    allow_legacy_fallback: bool,
-    source_lang: str,
-    visual_style: str = "",
-    image_style: str = "",
-    visual_bible: dict | None = None,
-    db: Session | None = None,
-) -> list[dict] | None:
-    """Run the storyboard validation gate; retry once on MAJOR issues.
-
-    MAJOR issues trigger one segment-level storyboard retry. Only batches whose
-    provenance intersects the MAJOR issue, or the supporting findings behind an
-    aggregate MAJOR such as ``visual_monotony``, are regenerated; unaffected
-    batches are reused and the merged storyboard is remapped once. If still
-    MAJOR after retry: log ERROR and proceed — the pipeline is never blocked.
-    MINOR issues are logged at WARNING only.
-
-    Returns the (possibly partially re-generated) beat list, or None on
-    catastrophic validation failure (only when allow_legacy_fallback=False and
-    storyboard retry also fails to produce any beats).
+    Elimination Mandate D1.5 (code_report/forensic_output_audit_borrasca_run.md):
+    the segment-level storyboard retry this function used to trigger on MAJOR
+    findings (``retry_segment_constraints`` path in ``split_into_beats()``) is
+    deleted — MAJOR findings never actually blocked the pipeline (a failed
+    retry just logged and proceeded with the original storyboard), so the
+    retry was paid/surgical regeneration driven by advisory findings that
+    never gated anything. MAJOR issues are now logged and the storyboard is
+    returned unchanged; MINOR issues are logged at WARNING only (via
+    ``_collect_storyboard_issues()``).
     """
-    issues = _collect_storyboard_issues(beats)
-    major_issues = [issue for issue in issues if issue["severity"] == "MAJOR"]
-
-    if not major_issues:
-        return beats
-
-    retry_constraints = _storyboard_retry_constraints_by_batch(beats, issues)
-    constraint_lines = "\n".join(
-        f"- [{iss['check']}] beat_order={iss['beat_order']}: {iss['description']}"
-        for iss in major_issues
-    )
-
-    if retry_constraints:
+    major_issues = _check_storyboard_issues(beats)
+    if major_issues:
         logger.warning(
-            "Segment-level storyboard retry triggered due to %d MAJOR issue(s) — "
-            "retrying %d batch(es): %s checks=%s",
-            len(major_issues), len(retry_constraints), sorted(retry_constraints),
-            [i["check"] for i in major_issues],
+            "Storyboard MAJOR issue(s) found — telemetry only, no retry. "
+            "MAJOR_count=%d checks=%s",
+            len(major_issues), [i["check"] for i in major_issues],
         )
-        retry_kwargs = {
-            "retry_segment_constraints": retry_constraints,
-            "existing_beats": beats,
-            "storyboard_constraints": "",
-        }
-    else:
-        n_segments = max(1, len(re.findall(
-            r"^\s*\[(?:INTRO|OUTRO|SECTION[^\]]*)\]", voice_script,
-            re.IGNORECASE | re.MULTILINE,
-        )))
-        logger.warning(
-            "STORYBOARD_SEGMENT_RETRY_FALLBACK reason=no_batch_provenance "
-            "major_count=%d — re-running all %d segment(s) checks=%s",
-            len(major_issues), n_segments, [i["check"] for i in major_issues],
-        )
-        retry_kwargs = {
-            "storyboard_constraints": constraint_lines,
-        }
-
-    logger.error(
-        "Storyboard MAJOR issue(s) found — retrying storyboard with constraints. "
-        "MAJOR_count=%d checks=%s",
-        len(major_issues), [i["check"] for i in major_issues],
-    )
-
-    retry_beats = split_into_beats(
-        voice_script=voice_script,
-        duration_ms=source_audio.duration_ms,
-        channel=channel,
-        script_format=script_format,
-        whisper_transcript=source_audio.whisper_transcript or [],
-        allow_legacy_fallback=allow_legacy_fallback,
-        language=source_lang,
-        visual_style=visual_style,
-        image_style=image_style,
-        visual_bible_context=visual_bible,
-        db=db,
-        **retry_kwargs,
-    )
-
-    if retry_beats is None:
-        logger.error(
-            "Storyboard retry failed to produce beats — proceeding with original storyboard "
-            "despite MAJOR issues (pipeline not blocked per spec)"
-        )
-        return beats
-
-    retry_beats = _cleanup_micro_beats(retry_beats, script_format)
-    retry_issues = validate_storyboard(retry_beats)
-    retry_majors = [i for i in retry_issues if i["severity"] == "MAJOR"]
-
-    if retry_majors:
-        logger.error(
-            "Storyboard still has MAJOR issues after retry (%d remaining) — "
-            "proceeding with retry result (pipeline not blocked per spec). "
-            "checks=%s",
-            len(retry_majors), [i["check"] for i in retry_majors],
-        )
-    else:
-        logger.info(
-            "Storyboard retry resolved all MAJOR issues — %d beats after retry",
-            len(retry_beats),
-        )
-
-    return retry_beats
+    return beats
 
 
 def _load_shared_beats(content_id: uuid.UUID, db: Session) -> list[dict]:
@@ -971,6 +671,66 @@ def _check_shared_beats_staleness(
         "beats=%d — source script changed since these beats were generated; "
         "discarding and regenerating the visual pass",
         content_id, stored_hash[:12], current_hash[:12], len(shared_beats),
+    )
+    return "stale"
+
+
+def _source_audio_duration_ms(
+    content: Content, audio_by_lang: dict[str, AudioFile],
+) -> int | None:
+    """Source-language `AudioFile.duration_ms` — the audio-side staleness
+    fingerprint for the shared `__visual__` beats (roadmap 2d / audit P0-3,
+    `code_report/forensic_output_audit_borrasca_run.md`). The script-hash
+    fingerprint alone does not catch a duration correction on an unchanged
+    script — exactly the audited incident's repair scenario: a corrupted
+    `duration_ms` fixed in place with the narration text untouched, which
+    the script hash could never detect. Returns ``None`` when the
+    source-language audio is unavailable (fail open, never force an
+    unwarranted regeneration).
+    """
+    source_audio = audio_by_lang.get(content.source_language)
+    if not source_audio or not source_audio.duration_ms:
+        return None
+    return source_audio.duration_ms
+
+
+def _tag_beats_with_audio_duration(beats: list[dict], duration_ms: int) -> None:
+    """Stamp `duration_ms` onto every beat in place — same convention as
+    `_tag_beats_with_script_hash()`."""
+    for beat in beats:
+        beat["source_audio_duration_ms"] = duration_ms
+
+
+def _check_audio_duration_staleness(
+    content_id: uuid.UUID,
+    shared_beats: list[dict],
+    current_duration_ms: int | None,
+) -> str:
+    """Classify loaded `__visual__` beats against the current source audio
+    duration — the audio-side half of the stale-visuals guard (roadmap 2d /
+    audit P0-3). Same `"fresh"`/`"stale"`/`"backfill"` contract as
+    `_check_shared_beats_staleness()`.
+    """
+    if current_duration_ms is None:
+        logger.debug(
+            "STALE_VISUALS_CHECK_SKIPPED content_id=%s reason=source_audio_unavailable",
+            content_id,
+        )
+        return "fresh"
+
+    stored_duration_ms = shared_beats[0].get("source_audio_duration_ms") or 0
+    if not stored_duration_ms:
+        return "backfill"
+
+    if stored_duration_ms == current_duration_ms:
+        return "fresh"
+
+    logger.warning(
+        "PARENT_VISUALS_STALE_AUDIO_DURATION content_id=%s stored_ms=%d current_ms=%d "
+        "beats=%d — source audio duration changed since these beats were generated "
+        "(e.g. a corrupted duration_ms was corrected) — discarding and regenerating "
+        "the visual pass",
+        content_id, stored_duration_ms, current_duration_ms, len(shared_beats),
     )
     return "stale"
 
@@ -1160,102 +920,34 @@ def _run_child_short_visuals(
             continue
 
         # Same storyboard validation gate the parent path runs (§ "Parent visual
-        # readiness" above), applied to the remapped child beats. Child remap has
-        # no Claude storyboard retry primitive, but beat-level prompt MAJORs can
-        # be repaired deterministically: strip forbidden/readable-text language,
-        # regenerate the prompt from visual_intent, revalidate, and only then
-        # fall back to the existing log-and-proceed behavior for unresolved MAJORs.
+        # readiness" above), applied to the remapped child beats. Telemetry only
+        # (Elimination Mandate D1.5, code_report/forensic_output_audit_borrasca_run.md):
+        # the deterministic beat-level prompt remediation this used to attempt
+        # on MAJOR findings is deleted — MAJOR issues never blocked the pipeline
+        # either way, so a repair pass gated on them added complexity without a
+        # provable quality gain. MAJOR findings are logged and the child proceeds
+        # unchanged.
         major_issues = _check_storyboard_issues(beats)
         if major_issues:
-            beats, child_repairs = remediate_child_major_storyboard_issues(beats, major_issues)
-            for repair in child_repairs:
-                logger.warning(
-                    "CHILD_STORYBOARD_MAJOR_REMEDIATED content=%s language=%s "
-                    "beat_order=%s check=%s old_prompt=%r new_prompt=%r",
-                    content_id, language, repair["beat_order"], repair["check"],
-                    repair["old_prompt"][:160], repair["new_prompt"][:240],
-                )
-            if child_repairs:
-                logger.info(
-                    "CHILD_STORYBOARD_MAJOR_REMEDIATION_DONE content=%s language=%s "
-                    "repaired=%d original_major_count=%d",
-                    content_id, language, len(child_repairs), len(major_issues),
-                )
-                major_issues = _check_storyboard_issues(beats)
-
-        if major_issues:
             logger.error(
-                "Storyboard MAJOR issue(s) found in child short remap after deterministic remediation — "
-                "proceeding (pipeline not blocked per spec). content=%s language=%s "
-                "MAJOR_count=%d checks=%s",
+                "Storyboard MAJOR issue(s) found in child short remap — telemetry only, "
+                "no remediation attempted, proceeding (pipeline not blocked per spec). "
+                "content=%s language=%s MAJOR_count=%d checks=%s",
                 content_id, language, len(major_issues),
                 [i["check"] for i in major_issues],
             )
 
-        visual_bible = load_visual_bible_for_content(content_id)
-        beats = apply_cinematic_prompts_to_beats(
-            beats,
-            visual_bible=visual_bible,
-            content_kind="child_short",
+        # Duplicate-prompt repair — last mutation of flux_prompt before Flux.
+        # Child Short generation clears every media_url and regenerates portrait
+        # images below, so include already-resolved parent-reuse beats in the
+        # append-only variation pass for this same run. Bible
+        # enrichment and first15 enhancement/validation used to run here —
+        # both deleted per the Elimination Mandate (D2.1): a real production
+        # run showed the bible they depended on returned 0 locations, 0
+        # motifs, 0 first-15 rules, a total no-op paid call.
+        beats = _repair_duplicate_prompts(
+            beats, content_id=content_id, language=language, include_resolved=True,
         )
-        final_prompt_issues = _check_final_prompt_issues(
-            beats,
-            content_id=content_id,
-            stage="child_after_enrichment",
-            language=language,
-        )
-        if any(issue["severity"] == "MAJOR" for issue in final_prompt_issues):
-            logger.error(
-                "Agent4 [FAIL] content=%s language=%s status=FINAL_PROMPT_VALIDATION_FAILED "
-                "stage=child_after_enrichment",
-                content_id, language,
-            )
-            continue
-
-        beats, first15_result = apply_first15_enhancement_and_validation(
-            beats,
-            visual_bible=visual_bible,
-            content_kind="child_short",
-        )
-        if first15_result.status == "FAIL_BLOCKING":
-            logger.error(
-                "Agent4 [FAIL] content=%s language=%s status=FIRST15_VISUAL_HOOK_FAILED "
-                "checked=%d strong=%d generic=%d issues=%s",
-                content_id,
-                language,
-                first15_result.checked_count,
-                first15_result.strong_hook_count,
-                first15_result.weak_generic_count,
-                [issue.code for issue in first15_result.issues],
-            )
-            continue
-        logger.info(
-            "Agent4 [FIRST15] content=%s language=%s status=%s checked=%d strong=%d warnings=%d",
-            content_id,
-            language,
-            first15_result.status,
-            first15_result.checked_count,
-            first15_result.strong_hook_count,
-            sum(1 for issue in first15_result.issues if issue.severity == "WARNING"),
-        )
-        final_prompt_issues = _check_final_prompt_issues(
-            beats,
-            content_id=content_id,
-            stage="child_after_first15",
-            language=language,
-        )
-        if any(issue["severity"] == "MAJOR" for issue in final_prompt_issues):
-            logger.error(
-                "Agent4 [FAIL] content=%s language=%s status=FINAL_PROMPT_VALIDATION_FAILED "
-                "stage=child_after_first15",
-                content_id, language,
-            )
-            continue
-
-        # Duplicate-prompt repair (audit G-5.3) — last mutation of flux_prompt
-        # before Flux; only touches beats still pending (media_url empty), so
-        # a deliberately reused parent image is never rewritten.
-        beats = _repair_duplicate_prompts(beats, content_id=content_id, language=language)
 
         # Generation happens AFTER validation, not before (Phase 4E-E ordering
         # alignment) — the remap step above deliberately left any
@@ -1338,6 +1030,8 @@ def _beat_extras(s: dict) -> dict:
     """
     return {
         "visual_intent":      s.get("visual_intent", ""),
+        "script_text_source": s.get("script_text_source", "provided"),
+        "script_text_missing": bool(s.get("script_text_missing", False)),
         "visual_type":        s.get("visual_type", "b-roll"),
         "visual_category":    s.get("visual_category", "place"),
         "environment":        s.get("environment", "other"),
@@ -1353,4 +1047,7 @@ def _beat_extras(s: dict) -> dict:
         "text_card_style":    s.get("text_card_style", "default"),
         # Stale-visuals guard (audit V-6b) — see _check_shared_beats_staleness().
         "source_script_sha256": s.get("source_script_sha256", ""),
+        # Stale-visuals guard, audio side (roadmap 2d / audit P0-3) — see
+        # _check_audio_duration_staleness().
+        "source_audio_duration_ms": s.get("source_audio_duration_ms", 0),
     }

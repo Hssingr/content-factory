@@ -18,6 +18,9 @@ from app.services.local_run_paths import get_run_root
 SUPPORTED_IMAGE_EXTENSIONS: frozenset[str] = frozenset({".jpg", ".jpeg", ".png", ".webp"})
 TEXT_CARD_SENTINEL = "__text_card__"
 _REMOTE_PREFIXES = ("http://", "https://")
+_PARENT_IMAGE_ASPECT_RATIO = 16 / 9
+_SHORT_IMAGE_ASPECT_RATIO = 9 / 16
+_IMAGE_ASPECT_TOLERANCE = 0.03
 
 
 @dataclass(frozen=True)
@@ -164,7 +167,10 @@ def validate_visual_media_assets(
             continue
 
         assert resolved is not None
-        file_issue = _validate_local_image_file(resolved)
+        file_issue = _validate_local_image_file(
+            resolved,
+            expected_aspect_ratio=_expected_image_aspect_ratio(content),
+        )
         if file_issue is not None:
             if file_issue[0] == "local_media_missing":
                 missing_media_count += 1
@@ -320,7 +326,15 @@ def _resolve_safe_media_path(media_path: str, content_id: int | str | UUID) -> t
     return candidate, None
 
 
-def _validate_local_image_file(path: Path) -> tuple[str, str] | None:
+def _expected_image_aspect_ratio(content: Content) -> float:
+    return _SHORT_IMAGE_ASPECT_RATIO if getattr(content, "is_short_episode", False) else _PARENT_IMAGE_ASPECT_RATIO
+
+
+def _validate_local_image_file(
+    path: Path,
+    *,
+    expected_aspect_ratio: float | None = None,
+) -> tuple[str, str] | None:
     if not path.exists():
         return "local_media_missing", "Local media file does not exist."
     if not path.is_file():
@@ -336,9 +350,34 @@ def _validate_local_image_file(path: Path) -> tuple[str, str] | None:
 
     try:
         with Image.open(path) as image:
+            width, height = image.size
             image.verify()
     except (UnidentifiedImageError, OSError, ValueError) as exc:
         return "local_image_unreadable", f"Local image file cannot be opened/read: {exc}"
+
+    if expected_aspect_ratio is not None:
+        dimension_issue = _validate_image_dimensions(width, height, expected_aspect_ratio)
+        if dimension_issue is not None:
+            return dimension_issue
+    return None
+
+
+def _validate_image_dimensions(
+    width: int,
+    height: int,
+    expected_aspect_ratio: float,
+) -> tuple[str, str] | None:
+    if width <= 0 or height <= 0:
+        return "local_image_invalid_dimensions", f"Local image has invalid dimensions {width}x{height}."
+
+    actual = width / height
+    relative_delta = abs(actual - expected_aspect_ratio) / expected_aspect_ratio
+    if relative_delta > _IMAGE_ASPECT_TOLERANCE:
+        return (
+            "local_image_aspect_mismatch",
+            f"Local image dimensions {width}x{height} have aspect {actual:.3f}; "
+            f"expected {expected_aspect_ratio:.3f} within {_IMAGE_ASPECT_TOLERANCE:.0%}.",
+        )
     return None
 
 

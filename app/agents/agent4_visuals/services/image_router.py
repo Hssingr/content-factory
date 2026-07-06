@@ -8,10 +8,6 @@ for whichever fal.ai Flux endpoint is selected. It does not call fal.ai itself
 
 Conservative-by-default contract (do not relax without an explicit config
 change from the operator):
-  - `purpose="text_card_background"` is LEGACY-INERT: text cards were removed
-    product-wide (subtitles-only rendering, CLAUDE.md §11.6) and no live
-    caller passes this purpose anymore. The Schnell short-circuit branch is
-    retained purely as a defensive guard — do not build new behavior on it.
   - Ordinary generated beats route to Schnell unless
     `settings.image_routing_enabled` is True AND the relevant tier flag
     (`image_routing_allow_dev` / `image_routing_allow_pro`) is True AND the
@@ -28,7 +24,7 @@ for this phase's own report.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal
 
 logger = logging.getLogger(__name__)
@@ -37,9 +33,6 @@ ModelKey = Literal["schnell", "dev", "pro_1_1", "pro_1_1_ultra", "flux_2_pro"]
 SizeMode = Literal["image_size", "aspect_ratio"]
 SafetyMode = Literal["enable_safety_checker", "safety_tolerance", "both"]
 RouteSource = Literal["reuse", "stock", "generated", "fallback"]
-Purpose = Literal["beat_image", "text_card_background"]
-
-_TEXT_CARD_PURPOSE: Purpose = "text_card_background"
 
 # ── Model capability table ──────────────────────────────────────────────────
 # Endpoints verified against official fal.ai docs during Phase 14.5
@@ -87,6 +80,7 @@ MODEL_CAPABILITIES: dict[ModelKey, dict] = {
         "supports_seed": True,
         "safety_mode": "safety_tolerance",
         "output_formats": ("jpeg", "png"),
+        "max_side": 1440,
     },
     "pro_1_1_ultra": {
         "endpoint": "fal-ai/flux-pro/v1.1-ultra",
@@ -113,6 +107,7 @@ MODEL_CAPABILITIES: dict[ModelKey, dict] = {
 }
 
 _DEFAULT_SAFETY_TOLERANCE = "2"  # fal.ai Pro-family enum (1=strictest .. 6=most permissive)
+_FAL_SIZE_MULTIPLE = 16
 
 # Beats that already qualify for Dev/Pro under the heuristic (kept narrow and
 # additive — Phase 14.5's recommended first pass, not a quality/cost policy).
@@ -128,40 +123,12 @@ _REVEAL_KEYWORDS = (
 
 
 @dataclass(frozen=True)
-class ImageRequest:
-    """Pipeline-level description of one image to produce — provider-agnostic."""
-
-    prompt: str
-    content_id: str
-    beat_order: int
-    purpose: Purpose = "beat_image"
-    target_width: int = 1920
-    target_height: int = 1080
-    aspect_ratio: str = "16:9"
-    seed: int | None = None
-    output_format: Literal["jpeg", "png"] = "jpeg"
-    cache_namespace: str = ""
-
-
-@dataclass(frozen=True)
 class ImageRoute:
     """The router's decision for one `ImageRequest` — model/source only, no payload."""
 
     model_key: ModelKey | None     # None when source="reuse" or "stock" (no generation needed)
     source: RouteSource
     reason: str
-
-
-@dataclass(frozen=True)
-class ImageResult:
-    """Normalized outcome of fulfilling an `ImageRequest` — local-only media reference."""
-
-    media_url: str | None          # local cache/... path only; never a remote URL
-    provider: str
-    model_key: ModelKey | None
-    source: RouteSource
-    seed: int | None = None
-    safety: dict[str, object] = field(default_factory=dict)
 
 
 def _heuristic_qualifies_for_higher_tier(beat: dict) -> bool:
@@ -188,7 +155,6 @@ def select_route(
     beat: dict,
     content_id: str,
     *,
-    purpose: Purpose = "beat_image",
     routing_enabled: bool = False,
     allow_dev: bool = False,
     allow_pro: bool = False,
@@ -203,20 +169,12 @@ def select_route(
     """
     beat_order = beat.get("beat_order", beat.get("section_order", 0))
 
-    if purpose == _TEXT_CARD_PURPOSE:
-        route = ImageRoute("schnell", "generated", "text_card_schnell_only")
-        logger.info(
-            "IMAGE_ROUTE_SELECTED content=%s beat=%s purpose=%s model=%s source=%s reason=%s",
-            content_id, beat_order, purpose, route.model_key, route.source, route.reason,
-        )
-        return route
-
     media_url = str(beat.get("media_url") or "")
     if media_url.startswith("cache/"):
         route = ImageRoute(None, "reuse", "beat_already_has_local_media")
         logger.info(
-            "IMAGE_ROUTE_SELECTED content=%s beat=%s purpose=%s model=%s source=%s reason=%s",
-            content_id, beat_order, purpose, route.model_key, route.source, route.reason,
+            "IMAGE_ROUTE_SELECTED content=%s beat=%s model=%s source=%s reason=%s",
+            content_id, beat_order, route.model_key, route.source, route.reason,
         )
         return route
 
@@ -231,16 +189,16 @@ def select_route(
         )
         route = ImageRoute("schnell", "generated", "stock_disabled_fallback_schnell")
         logger.info(
-            "IMAGE_ROUTE_SELECTED content=%s beat=%s purpose=%s model=%s source=%s reason=%s",
-            content_id, beat_order, purpose, route.model_key, route.source, route.reason,
+            "IMAGE_ROUTE_SELECTED content=%s beat=%s model=%s source=%s reason=%s",
+            content_id, beat_order, route.model_key, route.source, route.reason,
         )
         return route
 
     if not routing_enabled or not (allow_dev or allow_pro):
         route = ImageRoute("schnell", "generated", "routing_disabled_default_schnell")
         logger.info(
-            "IMAGE_ROUTE_SELECTED content=%s beat=%s purpose=%s model=%s source=%s reason=%s",
-            content_id, beat_order, purpose, route.model_key, route.source, route.reason,
+            "IMAGE_ROUTE_SELECTED content=%s beat=%s model=%s source=%s reason=%s",
+            content_id, beat_order, route.model_key, route.source, route.reason,
         )
         return route
 
@@ -258,8 +216,8 @@ def select_route(
         route = ImageRoute("schnell", "generated", reason)
 
     logger.info(
-        "IMAGE_ROUTE_SELECTED content=%s beat=%s purpose=%s model=%s source=%s reason=%s",
-        content_id, beat_order, purpose, route.model_key, route.source, route.reason,
+        "IMAGE_ROUTE_SELECTED content=%s beat=%s model=%s source=%s reason=%s",
+        content_id, beat_order, route.model_key, route.source, route.reason,
     )
     return route
 
@@ -288,9 +246,9 @@ def build_fal_payload(
     }
 
     if caps["size_mode"] == "image_size":
-        payload["image_size"] = {"width": width, "height": height}
+        payload["image_size"] = _legal_image_size_for_model(model_key, width, height)
     else:  # "aspect_ratio"
-        payload["aspect_ratio"] = aspect_ratio
+        payload["aspect_ratio"] = _resolve_aspect_ratio(width, height, aspect_ratio)
 
     if caps["supports_steps"]:
         payload["num_inference_steps"] = caps["default_steps"]
@@ -315,6 +273,42 @@ def build_fal_payload(
         model_key, caps["endpoint"], sorted(payload.keys()),
     )
     return payload
+
+
+def _round_to_multiple(value: float, multiple: int = _FAL_SIZE_MULTIPLE) -> int:
+    return max(multiple, int(round(value / multiple)) * multiple)
+
+
+def _legal_image_size_for_model(model_key: ModelKey, width: int, height: int) -> dict[str, int]:
+    """Return fal-legal pixel dimensions for image_size endpoints.
+
+    Flux Pro v1.1 silently clamps oversized custom dimensions to its own
+    max-side envelope and can change aspect ratio while doing it. Keep the
+    requested aspect and scale only that tier into its legal max-side window.
+    Schnell/Dev/Flux 2 Pro preserve their existing requested dimensions.
+    """
+    caps = MODEL_CAPABILITIES[model_key]
+    max_side = caps.get("max_side")
+    if not max_side or max(width, height) <= max_side:
+        return {"width": width, "height": height}
+
+    if width >= height:
+        legal_width = int(max_side)
+        legal_height = _round_to_multiple(legal_width * height / width)
+    else:
+        legal_height = int(max_side)
+        legal_width = _round_to_multiple(legal_height * width / height)
+    return {"width": legal_width, "height": legal_height}
+
+
+def _resolve_aspect_ratio(width: int, height: int, requested: str) -> str:
+    """Resolve aspect_ratio-mode payloads from the actual requested frame."""
+    if width == height:
+        return "1:1"
+    requested = (requested or "").strip()
+    if width > height:
+        return "16:9" if requested in {"", "16:9"} else requested
+    return "9:16" if requested in {"", "16:9"} else requested
 
 
 _DEFAULT_SCHNELL_SIZE = (1920, 1080)  # matches flux_generator._DEFAULT_WIDTH/_HEIGHT

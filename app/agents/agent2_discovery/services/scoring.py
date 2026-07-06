@@ -4,8 +4,9 @@ Replaces the old "relevance + engagement + substance" selection (which never
 checked narrative tension, visual potential, or retention potential, and had
 no reject path) with a deterministic scoring gate:
 
-  Claude scores eighteen fixed dimensions of a candidate story (with justifications).
-  Python computes the weighted overall score and makes the accept/reject call —
+  Claude scores fixed performance dimensions plus an unweighted rights/IP risk
+  signal for operator review. Python computes the weighted overall score and
+  makes the accept/reject call —
   Claude never decides ACCEPTED/REJECTED directly (CLAUDE.md determinism rules:
   business rules belong in Python, prompts only generate/classify content).
 
@@ -24,6 +25,9 @@ fallback fetch flow fully supersedes the simple single-fetch path it used.
 import logging
 
 logger = logging.getLogger(__name__)
+
+_RIGHTS_IP_RISK_DIMENSION = "rights_ip_risk"
+_RIGHTS_IP_REVIEW_THRESHOLD = 70
 
 # Weighted dimensions — must sum to 1.0.
 # opening_scene_strength, social_media_clickability, thumbnail_strength,
@@ -97,6 +101,8 @@ def score_story_assessment(assessment: dict) -> dict:
           ``dimension_scores``: dict[str, int] — each dimension clamped to 0-100
           ``failed_gates``:     list[str] — human-readable description of every
                                 hard-floor check that failed (empty if all passed)
+          ``operator_review_flags``: list[str] — non-blocking flags for human approval,
+                                including high rights/IP risk.
     """
     raw_scores = assessment.get("scores") or {}
     # Support legacy key aliases from older single-candidate Claude responses
@@ -119,6 +125,9 @@ def score_story_assessment(assessment: dict) -> dict:
         dimension: _extract(raw_scores.get(dimension))
         for dimension in _DIMENSION_WEIGHTS
     }
+    dimension_scores[_RIGHTS_IP_RISK_DIMENSION] = _extract(
+        raw_scores.get(_RIGHTS_IP_RISK_DIMENSION)
+    )
 
     overall_score = round(
         sum(dimension_scores[dimension] * weight for dimension, weight in _DIMENSION_WEIGHTS.items()),
@@ -146,10 +155,18 @@ def score_story_assessment(assessment: dict) -> dict:
     _check("visual_range",                 _MIN_VISUAL_RANGE)
     _check("image_generation_feasibility", _MIN_IMAGE_GENERATION_FEASIBILITY)
 
+    operator_review_flags: list[str] = []
+    rights_ip_risk = dimension_scores.get(_RIGHTS_IP_RISK_DIMENSION, 0)
+    if rights_ip_risk >= _RIGHTS_IP_REVIEW_THRESHOLD:
+        operator_review_flags.append(
+            f"rights_ip_risk {rights_ip_risk} >= {_RIGHTS_IP_REVIEW_THRESHOLD} — operator decision required"
+        )
+
     return {
         "overall_score": overall_score,
         "dimension_scores": dimension_scores,
         "failed_gates": failed_gates,
+        "operator_review_flags": operator_review_flags,
     }
 
 
@@ -171,6 +188,12 @@ def decide_story_acceptance(story_score: dict) -> tuple[bool, str]:
     """
     failed_gates = story_score.get("failed_gates", [])
     if not failed_gates:
+        flags = story_score.get("operator_review_flags") or []
+        if flags:
+            return True, (
+                f"passed all gates (overall_score={story_score['overall_score']}; "
+                f"operator_review_flags={len(flags)})"
+            )
         return True, f"passed all gates (overall_score={story_score['overall_score']})"
     return False, "failed: " + "; ".join(failed_gates)
 

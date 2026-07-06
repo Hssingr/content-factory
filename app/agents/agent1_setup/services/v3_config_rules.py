@@ -34,10 +34,14 @@ SUPPORTED_CONTENT_MODES:  frozenset[str] = frozenset({"single_story", "limited_s
 SUPPORTED_SCRIPT_SOURCES: frozenset[str] = frozenset({"reddit", "ai_generated", "user_provided", "hybrid"})
 SUPPORTED_OUTPUT_MODES:   frozenset[str] = frozenset({"youtube_and_shorts", "youtube_long_only", "shorts_only"})
 
-# Only this exact combination matches what Agent 2-5 actually run today.
+# Only these combinations match what Agent 2-5 actually run today.
 _EXECUTABLE_CONTENT_MODE = "single_story"
 _EXECUTABLE_SCRIPT_SOURCE = "reddit"
-_EXECUTABLE_OUTPUT_MODE = "youtube_and_shorts"
+# youtube_and_shorts: the default parent + standalone Shorts architecture.
+# youtube_long_only: same parent pipeline with the Shorts planner skipped —
+# run_script_workflow() branches on ChannelConfig.output_mode (post-roadmap
+# deep audit; the first real runtime consumer of output_mode).
+_EXECUTABLE_OUTPUT_MODES = frozenset({"youtube_and_shorts", "youtube_long_only"})
 
 # script_source aliases that mean the same thing but were spelled
 # differently by an internal caller, a future schema revision, or an
@@ -121,17 +125,17 @@ def is_supported_output_mode(output_mode: str) -> bool:
 
 
 def is_executable_output_mode(output_mode: str) -> bool:
-    """True only for 'youtube_and_shorts' — the existing parent + standalone
-    Shorts architecture (CLAUDE.md §3/§28), which is what every channel
-    actually produces today, unconditionally.
+    """True for 'youtube_and_shorts' (the default parent + standalone Shorts
+    architecture, CLAUDE.md §3/§28) and 'youtube_long_only' (same parent
+    pipeline; run_script_workflow() skips run_shorts_planner() when
+    ChannelConfig.output_mode is 'youtube_long_only' — logged as
+    SHORTS_PLANNER_SKIPPED).
 
-    'shorts_only' and 'youtube_long_only' are schema-supported but NOT
-    executable: nothing in Agent 2/Agent 5 reads `output_mode` at all today
-    — `run_shorts_planner()` always runs for every parent that reaches
-    SCRIPTS_VALIDATED, and Agent 5 always renders the parent's main video.
-    There is no config-driven switch anywhere to skip either half.
+    'shorts_only' is schema-supported but NOT executable: Agent 5 always
+    renders the parent's main video; there is no config-driven switch to
+    skip the long-form half.
     """
-    return output_mode == _EXECUTABLE_OUTPUT_MODE
+    return output_mode in _EXECUTABLE_OUTPUT_MODES
 
 
 # ── Coming-soon reason messages ─────────────────────────────────────────────
@@ -181,12 +185,6 @@ def coming_soon_reason(field: str, value: str) -> str | None:
                 "shorts_only is accepted by the V3 schema but the pipeline cannot yet run "
                 "standalone-Shorts-only generation without a rendered parent video — "
                 "run_shorts_planner() always requires a validated parent source script today."
-            )
-        if value == "youtube_long_only":
-            return (
-                "youtube_long_only is accepted by the V3 schema but nothing in Agent 2/Agent 5 "
-                "reads output_mode yet to skip standalone Shorts planning/rendering — "
-                "every channel produces both today, unconditionally."
             )
         return None
     return None

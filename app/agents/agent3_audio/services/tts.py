@@ -128,6 +128,10 @@ _EMOTION_SETTINGS: dict[str, dict] = {
     "authoritative": {"stability": 0.80, "similarity_boost": 0.85, "style": 0.20, "use_speaker_boost": True, "speed": 0.93},
     "enthusiastic":  {"stability": 0.45, "similarity_boost": 0.75, "style": 0.45, "use_speaker_boost": True, "speed": 1.05},
     "dramatic":      {"stability": 0.30, "similarity_boost": 0.70, "style": 0.60, "use_speaker_boost": True, "speed": 0.92},
+    "curious":       {"stability": 0.55, "similarity_boost": 0.78, "style": 0.35, "use_speaker_boost": True, "speed": 0.93},
+    "tense":         {"stability": 0.38, "similarity_boost": 0.74, "style": 0.58, "use_speaker_boost": True, "speed": 1.02},
+    "scared":        {"stability": 0.28, "similarity_boost": 0.70, "style": 0.70, "use_speaker_boost": True, "speed": 1.08},
+    "somber":        {"stability": 0.78, "similarity_boost": 0.82, "style": 0.22, "use_speaker_boost": True, "speed": 0.88},
 }
 _DEFAULT_EMOTION = "neutral"
 
@@ -147,6 +151,10 @@ _EMOTION_SPEED_DELTA: dict[str, float] = {
     "authoritative": -0.04,
     "enthusiastic":   0.08,
     "dramatic":      -0.05,
+    "curious":       -0.04,
+    "tense":          0.04,
+    "scared":         0.08,
+    "somber":        -0.08,
 }
 
 # eleven_v3 only: maps channel_voice.v3_stability_preset → stability float.
@@ -155,6 +163,14 @@ _V3_STABILITY_PRESETS: dict[str, float] = {
     "creative": 0.30,
     "natural":  0.65,
     "robust":   0.85,
+}
+
+_ELEVENLABS_V3_DELIVERY_TAGS: dict[str, str] = {
+    "intro": "[whispers]",
+    "early_buildup": "[whispers]",
+    "late_buildup": "[dramatic pause]",
+    "climax_title": "[gasps]",
+    "outro": "[sighs]",
 }
 
 
@@ -439,7 +455,7 @@ def _split_script_into_section_units(text: str) -> list[dict]:
 
 
 def _select_section_delivery(section_context: dict, channel_emotion: str, channel_speed_profile: str, *, is_short_episode: bool) -> dict:
-    """Choose deterministic section-level Cartesia delivery, with safe channel fallback."""
+    """Choose deterministic section-level TTS delivery, with safe channel fallback."""
     fallback = {
         "emotion": channel_emotion,
         "speed_profile": channel_speed_profile,
@@ -605,6 +621,24 @@ def _resolve_cartesia_sonic3_emotion(emotion: str) -> str:
     return _CARTESIA_SONIC3_EMOTION_MAP.get(emotion_key, "neutral")
 
 
+def _with_elevenlabs_v3_delivery_tag(text: str, delivery: dict) -> str:
+    """Prefix one deterministic ElevenLabs v3 audio tag for section delivery.
+
+    ``prepare_script_for_tts()`` already inserts reveal-gated ``[dramatic pause]``
+    tags. This helper adds the per-section performance tag that used to be
+    Cartesia-only: intro/early buildup whisper, late buildup pause, climax gasp,
+    outro sigh. It never duplicates a tag when the prepared text already starts
+    with that tag.
+    """
+    prepared = text.strip()
+    if not prepared:
+        return prepared
+    tag = _ELEVENLABS_V3_DELIVERY_TAGS.get(str(delivery.get("reason") or ""))
+    if not tag or prepared.lower().startswith(tag.lower()):
+        return prepared
+    return f"{tag} {prepared}"
+
+
 def _resolve_cartesia_pronunciation_dict_id(channel_voice) -> str | None:
     """Return an optional configured Cartesia pronunciation dictionary id."""
     value = getattr(channel_voice, "cartesia_pronunciation_dict_id", None)
@@ -658,7 +692,11 @@ def _build_cartesia_tts_kwargs(
     return payload
 
 
-def _resolve_voice_settings(channel_voice) -> dict:
+def _resolve_voice_settings(
+    channel_voice,
+    emotion_override: str | None = None,
+    speed_profile_override: str | None = None,
+) -> dict:
     """Build ElevenLabs VoiceSettings kwargs from a ChannelVoice ORM object.
 
     Precedence (highest wins):
@@ -675,7 +713,7 @@ def _resolve_voice_settings(channel_voice) -> dict:
         Dict with keys stability, similarity_boost, style, use_speaker_boost, speed
         — suitable for ``VoiceSettings(**result)``.
     """
-    emotion = (getattr(channel_voice, "emotion", None) or _DEFAULT_EMOTION).lower()
+    emotion = (emotion_override or getattr(channel_voice, "emotion", None) or _DEFAULT_EMOTION).lower()
     if emotion not in _EMOTION_SETTINGS:
         emotion = _DEFAULT_EMOTION
 
@@ -707,7 +745,7 @@ def _resolve_voice_settings(channel_voice) -> dict:
     if getattr(channel_voice, "speed_override", None) is not None:
         settings["speed"] = max(0.7, min(1.2, float(channel_voice.speed_override)))
     else:
-        profile = getattr(channel_voice, "speed_profile", None) or "normal"
+        profile = speed_profile_override or getattr(channel_voice, "speed_profile", None) or "normal"
         base    = _SPEED_PROFILE_BASE.get(profile, 0.97)
         delta   = _EMOTION_SPEED_DELTA.get(emotion, 0.0)
         settings["speed"] = max(0.7, min(1.2, base + delta))
@@ -792,13 +830,25 @@ def _concat_mp3_chunks(chunk_bytes_list: list[bytes]) -> bytes:
     Uses ffmpeg's concat demuxer with re-encoding at 192 kbps to avoid click
     artifacts from raw byte concatenation. Inserts a tiny deterministic silence
     pad between chunks to avoid abrupt section-to-section joins.
-    Falls back to raw concat if ffmpeg is unavailable (no Remotion environment).
+
+    ffmpeg re-encoding is mandatory when there is more than one chunk (roadmap
+    2a / audit P0-1, code_report/forensic_output_audit_borrasca_run.md): a
+    prior raw-byte-concat fallback (used when ffmpeg was missing) produced an
+    mp3 with multiple concatenated headers, which a header-reading duration
+    measurement (mutagen) silently read as just the first chunk's length —
+    161.7s stored for a real 616.8s file, corrupting every downstream
+    timeline. A failed run is recoverable; a silently corrupting fallback is
+    not — so every ffmpeg failure point here raises instead of falling back
+    to raw concat.
 
     Args:
         chunk_bytes_list: One or more raw mp3 byte blobs (one per TTS chunk).
 
     Returns:
         Single mp3 blob at 192 kbps.
+
+    Raises:
+        RuntimeError: If ffmpeg is unavailable or any re-encode step fails.
     """
     if len(chunk_bytes_list) == 1:
         return chunk_bytes_list[0]
@@ -809,11 +859,13 @@ def _concat_mp3_chunks(chunk_bytes_list: list[bytes]) -> bytes:
 
     try:
         subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        logger.warning(
-            "ffmpeg not found — using raw byte concat (may have click artifacts)."
-        )
-        return b"".join(chunk_bytes_list)
+    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError(
+            "ffmpeg is not available — cannot re-encode "
+            f"{len(chunk_bytes_list)} audio chunks. A raw byte-concat "
+            "fallback is not used: it silently corrupts the resulting mp3's "
+            "duration (roadmap 2a / audit P0-1)."
+        ) from exc
 
     with tempfile.TemporaryDirectory() as tmp:
         # Write each chunk to a temp file
@@ -836,11 +888,10 @@ def _concat_mp3_chunks(chunk_bytes_list: list[bytes]) -> bytes:
         ]
         silence_proc = subprocess.run(silence_cmd, capture_output=True)
         if silence_proc.returncode != 0:
-            logger.warning(
-                "ffmpeg silence pad generation failed (rc=%d) — using raw byte concat. stderr: %s",
-                silence_proc.returncode, silence_proc.stderr[-200:].decode(errors="replace"),
+            raise RuntimeError(
+                f"ffmpeg silence pad generation failed (rc={silence_proc.returncode}): "
+                f"{silence_proc.stderr[-200:].decode(errors='replace')}"
             )
-            return b"".join(chunk_bytes_list)
 
         list_file = os.path.join(tmp, "concat.txt")
         with open(list_file, "w") as f:
@@ -859,13 +910,13 @@ def _concat_mp3_chunks(chunk_bytes_list: list[bytes]) -> bytes:
         ]
         proc = subprocess.run(cmd, capture_output=True)
         if proc.returncode != 0:
-            logger.warning(
-                "ffmpeg concat failed (rc=%d) — using raw byte concat. stderr: %s",
-                proc.returncode, proc.stderr[-200:].decode(errors="replace"),
+            raise RuntimeError(
+                f"ffmpeg concat failed (rc={proc.returncode}): "
+                f"{proc.stderr[-200:].decode(errors='replace')}"
             )
-            return b"".join(chunk_bytes_list)
 
-        result = open(out_file, "rb").read()
+        with open(out_file, "rb") as f:
+            result = f.read()
         logger.debug(
             "Concat: ffmpeg re-encode %d chunks with %.0f ms boundary silence → %d bytes (%.1f KB)",
             len(chunk_bytes_list), _CHUNK_BOUNDARY_SILENCE_SECONDS * 1000,
@@ -1028,16 +1079,19 @@ def generate_audio(voice_script: str, channel_voice, is_short_episode: bool = Fa
       between them to avoid abrupt section-boundary joins (Phase 11.6).
 
     ElevenLabs path (provider="elevenlabs"):
-      Model, VoiceSettings, and chunking (char-limit-based, not section-unit)
-      derived from ``channel_voice``. Each chunk still passes through
-      ``prepare_script_for_tts()``, so Phase 11.5's reveal-gated pacing applies
-      here too — Phase 11.3's Cartesia request-shape branching and Phase 11.4's section-aware delivery
-      selection do not, since this path has no Cartesia request to build and
-      uses ElevenLabs's own native text-conditioning (``previous_text`` /
-      ``next_text``) for cross-chunk continuity instead (skipped for
-      ``eleven_v3`` — not supported). Final concatenation still goes through
-      the same ffmpeg re-encode + silence-pad step as the Cartesia path
-      (Phase 11.6) when more than one chunk exists.
+      ``eleven_v3`` long-form scripts are split into one TTS request per marked
+      section, use the same deterministic section delivery selector as Cartesia,
+      resolve VoiceSettings per section, and prefix one v3 audio tag per section
+      (for example ``[whispers]`` on the intro/early buildup, ``[gasps]`` on a
+      climax-titled section, ``[sighs]`` on the outro). Non-v3 ElevenLabs models
+      keep the legacy char-limit chunking path and channel-level delivery.
+      Every chunk still passes through ``prepare_script_for_tts()``, so Phase
+      11.5's reveal-gated pacing applies here too. ElevenLabs text-conditioning
+      (``previous_text`` / ``next_text``) is still used only for non-v3 models
+      whose SDK supports it; ``eleven_v3`` stays standalone per section.
+      Final concatenation still goes through the same ffmpeg re-encode +
+      silence-pad step as the Cartesia path (Phase 11.6) when more than one
+      chunk exists.
 
     Args:
         voice_script:     Full narrator text (may include [INTRO]/[SECTION N]/[OUTRO]
@@ -1066,17 +1120,51 @@ def generate_audio(voice_script: str, channel_voice, is_short_episode: bool = Fa
     if emotion not in _EMOTION_SETTINGS:
         emotion = _DEFAULT_EMOTION
 
-    vs_dict        = _resolve_voice_settings(channel_voice)
-    voice_settings = VoiceSettings(**vs_dict)
-
     max_chars = _MODEL_CHAR_LIMITS.get(model_id, 9_500)
-    chunks    = _chunk_script_at_sections(voice_script, max_chars)
     client    = get_client()
+    channel_speed_profile = getattr(channel_voice, "speed_profile", None) or "normal"
 
-    prepared_chunks: list[str] = []
-    for chunk in chunks:
-        p = prepare_script_for_tts(chunk, language="", tone=emotion, tts_model=model_id, is_short_episode=is_short_episode)
-        prepared_chunks.append(p)
+    prepared_chunks: list[dict] = []
+    if model_id == "eleven_v3":
+        section_units = _split_script_into_section_units(voice_script)
+        for unit in section_units:
+            delivery = _select_section_delivery(
+                unit, emotion, channel_speed_profile, is_short_episode=is_short_episode
+            )
+            _log_section_delivery(unit, delivery, emotion, is_short_episode=is_short_episode)
+            prepared = prepare_script_for_tts(
+                unit["text"], language="", tone=delivery["emotion"],
+                tts_model=model_id, is_short_episode=is_short_episode,
+            )
+            prepared = _with_elevenlabs_v3_delivery_tag(prepared, delivery)
+            prepared_chunks.append({
+                **unit,
+                "prepared": prepared,
+                "delivery": delivery,
+                "voice_settings": VoiceSettings(**_resolve_voice_settings(
+                    channel_voice,
+                    emotion_override=delivery["emotion"],
+                    speed_profile_override=delivery["speed_profile"],
+                )),
+            })
+    else:
+        for chunk in _chunk_script_at_sections(voice_script, max_chars):
+            prepared = prepare_script_for_tts(
+                chunk, language="", tone=emotion, tts_model=model_id,
+                is_short_episode=is_short_episode,
+            )
+            prepared_chunks.append({
+                "text": chunk,
+                "prepared": prepared,
+                "delivery": {
+                    "emotion": emotion,
+                    "speed_profile": channel_speed_profile,
+                    "source": "fallback",
+                    "reason": "elevenlabs_non_v3_static_policy",
+                },
+                "voice_settings": VoiceSettings(**_resolve_voice_settings(channel_voice)),
+                **_parse_section_context(chunk),
+            })
 
     # Detect text-conditioning support (available since SDK >= 2.x).
     # eleven_v3 does not accept previous_text / next_text — standalone chunks only.
@@ -1094,13 +1182,16 @@ def generate_audio(voice_script: str, channel_voice, is_short_episode: bool = Fa
 
     all_bytes: list[bytes] = []
 
-    for i, prepared in enumerate(prepared_chunks):
+    for i, chunk in enumerate(prepared_chunks):
+        prepared = chunk["prepared"]
         if not prepared.strip():
             continue
 
+        delivery = chunk["delivery"]
         logger.debug(
-            "ElevenLabs TTS chunk %d/%d: voice_id=%s emotion=%s words=%d model=%s chars=%d",
-            i + 1, len(prepared_chunks), voice_id, emotion,
+            "ElevenLabs TTS chunk %d/%d: section=%s voice_id=%s emotion=%s speed_profile=%s words=%d model=%s chars=%d",
+            i + 1, len(prepared_chunks), chunk.get("section_label") or "unmarked",
+            voice_id, delivery["emotion"], delivery["speed_profile"],
             len(_WORD_TOKEN_RE.findall(prepared)), model_id, len(prepared),
         )
 
@@ -1109,14 +1200,16 @@ def generate_audio(voice_script: str, channel_voice, is_short_episode: bool = Fa
             voice_id=voice_id,
             model_id=model_id,
             output_format=_ELEVENLABS_OUTPUT_FORMAT,
-            voice_settings=voice_settings,
+            voice_settings=chunk["voice_settings"],
         )
 
         if _use_text_conditioning and len(prepared_chunks) > 1:
-            if i > 0 and prepared_chunks[i - 1].strip():
-                kwargs["previous_text"] = prepared_chunks[i - 1][-300:]
-            if i < len(prepared_chunks) - 1 and prepared_chunks[i + 1].strip():
-                kwargs["next_text"] = prepared_chunks[i + 1][:300]
+            previous_prepared = prepared_chunks[i - 1]["prepared"] if i > 0 else ""
+            next_prepared = prepared_chunks[i + 1]["prepared"] if i < len(prepared_chunks) - 1 else ""
+            if previous_prepared.strip():
+                kwargs["previous_text"] = previous_prepared[-300:]
+            if next_prepared.strip():
+                kwargs["next_text"] = next_prepared[:300]
 
         audio_iter = client.text_to_speech.convert(**kwargs)
         all_bytes.append(b"".join(audio_iter))

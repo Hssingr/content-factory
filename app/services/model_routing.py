@@ -3,7 +3,7 @@
 Resolution order (highest → lowest precedence):
   1. Explicit ``model_override`` argument on a call (rare, discouraged).
   2. Dev override: when ``CLAUDE_TIER=dev`` in the environment, all tasks route to the configured secondary model
-     EXCEPT ``story_research`` (web_search tool) and ``auto_correction`` (correction quality).
+     EXCEPT ``story_research`` (web_search tool).
   3. ``MODEL_ROUTING[task]`` — the production slot table.
 
 Unknown tasks raise ``ValueError`` immediately (fail-loud, no default fallback).
@@ -32,12 +32,11 @@ def _configured_model(slot: str) -> str:
 #         Includes channel_suggestion (Agent 1 UX — bad suggestions degrade onboarding).
 MODEL_ROUTING: dict[str, str] = {
     # ── Core generation (primary) ──────────────────────────────────────────
-    "script_generation":       PRIMARY_MODEL,
+    # Retired (post-roadmap deep audit): "script_generation" (zero call sites —
+    # section generation uses "section_generation") and "auto_correction" (the
+    # auto_correct_script prompt-repair layer was deleted with it).
     "native_adaptation":       PRIMARY_MODEL,
-    "quality_rewrite":         PRIMARY_MODEL,
-    "auto_correction":         PRIMARY_MODEL,  # dev-mode exception — correction quality matters
     "storyboard":              PRIMARY_MODEL,
-    "visual_bible_generation": PRIMARY_MODEL,  # Agent 4 story-level visual continuity bible
     "story_gate_scoring":      PRIMARY_MODEL,  # single-story gate: 18-dimension structured call
     "revision":                PRIMARY_MODEL,
     "story_research":          PRIMARY_MODEL,  # uses web_search tool — secondary model does not support it by default
@@ -47,10 +46,7 @@ MODEL_ROUTING: dict[str, str] = {
     "section_generation":      PRIMARY_MODEL,  # Creative writing per section
     "short_script":            PRIMARY_MODEL,  # Standalone short planning: TikTok-optimised episode script
     # ── Fast / cheap (secondary) ─────────────────────────────────────────────
-    "script_quality_check":    SECONDARY_MODEL,
-    "short_quality_check":     SECONDARY_MODEL,   # Phase 13.2: Short-form retention review, mirrors script_quality_check
     "content_reformat":        SECONDARY_MODEL,   # reformatting prose discovery output to JSON
-    "global_validation":       SECONDARY_MODEL,   # Narrative coherence check after assembly
     "shorts_planner":          SECONDARY_MODEL,   # Standalone short planning: structural planning for Short episodes
     "short_storyboard_remap":  SECONDARY_MODEL,   # Child short visual remap: remap parent beats to Short narration timing
 }
@@ -85,13 +81,12 @@ def resolve_model(task: str, model_override: str | None = None) -> str:
             f"Known tasks: {sorted(MODEL_ROUTING)}"
         )
     # Dev tier: cheap iterations on the configured secondary model.
-    # Exceptions that always use the configured primary model regardless of tier:
-    #   story_research  — web_search tool is not available on the secondary model by default.
-    #   auto_correction — correction quality is critical; secondary model can produce regressions.
+    # Exception that always uses the configured primary model regardless of tier:
+    #   story_research — web_search tool is not available on the secondary model by default.
     # Import settings here (not at module level) so pydantic-settings has already
     # loaded .env before this call.
     from app.config import settings
-    _DEV_PRIMARY_MODEL_EXCEPTIONS = {"story_research", "auto_correction"}
+    _DEV_PRIMARY_MODEL_EXCEPTIONS = {"story_research"}
     if settings.claude_tier.lower() == "dev" and task not in _DEV_PRIMARY_MODEL_EXCEPTIONS:
         return settings.secondary_model
     return _configured_model(MODEL_ROUTING[task])

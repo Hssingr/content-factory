@@ -194,24 +194,21 @@ class TestQualityGateWiresMaxLengthCheck(unittest.TestCase):
     """Proves check_maximum_length is really reachable through Agent 2's
     quality-gate issue collector, not just defined in isolation."""
 
-    def test_overlong_script_produces_high_severity_issue_in_all_issues(self):
+    def test_overlong_script_produces_major_issue_in_det_majors(self):
         overlong_script = " ".join(["word"] * 1799)
-        review = {"status": "PASSED", "issues": []}
         current = {"voice_script": overlong_script}
         issue_group = _collect_quality_gate_issues(
-            review=review, current=current, language="source", script_format="youtube_long",
+            current=current, language="source", script_format="youtube_long",
         )
         length_majors = [i for i in issue_group["length_det"] if i["severity"] == "MAJOR"]
         self.assertEqual(len(length_majors), 1)
-        high_issues = [i for i in issue_group["all_issues"] if i["severity"] == "HIGH"]
-        self.assertTrue(any(i["category"] == "maximum_length" for i in high_issues))
+        self.assertTrue(any(i["category"] == "maximum_length" for i in issue_group["det_majors"]))
 
     def test_normal_length_script_has_no_length_issue(self):
         normal_script = " ".join(["word"] * 1400)
-        review = {"status": "PASSED", "issues": []}
         current = {"voice_script": normal_script}
         issue_group = _collect_quality_gate_issues(
-            review=review, current=current, language="source", script_format="youtube_long",
+            current=current, language="source", script_format="youtube_long",
         )
         self.assertEqual(issue_group["length_det"], [])
 

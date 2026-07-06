@@ -156,10 +156,16 @@ def run_discovery(
 
     accepted, reason = decide_story_acceptance(story_score)
     logger.info(
-        "Discovery: title=%r overall_score=%.1f decision=%s reason=%s",
+        "Discovery: title=%r overall_score=%.1f rights_ip_risk=%d decision=%s reason=%s",
         story.title[:60], story_score["overall_score"],
+        story_score.get("dimension_scores", {}).get("rights_ip_risk", 0),
         "ACCEPTED" if accepted else "REJECTED", reason,
     )
+    for flag in story_score.get("operator_review_flags", []):
+        logger.warning(
+            "Discovery: operator review flag title=%r flag=%s",
+            story.title[:60], flag,
+        )
 
     if not accepted:
         logger.warning("Discovery: story rejected — exiting cleanly, no Content created")

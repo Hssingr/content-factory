@@ -51,6 +51,7 @@ _REQUIRED_TOP_LEVEL_FIELDS = (
     "output_mode",
     "visual_style",
     "image_style",
+    "narration_pov",
     "languages",
     "platforms",
     "videos_per_week",
@@ -155,8 +156,9 @@ def build_channel_config_snapshot(channel: Channel) -> dict:
         "content_mode": getattr(config, "content_mode", "single_story") if config else "single_story",
         "script_source": getattr(config, "script_source", "reddit") if config else "reddit",
         "output_mode": getattr(config, "output_mode", "youtube_and_shorts") if config else "youtube_and_shorts",
-        "visual_style": getattr(config, "visual_style", "documentary") if config else "documentary",
+        "visual_style": getattr(config, "visual_style", "story_driven") if config else "story_driven",
         "image_style": getattr(config, "image_style", "photorealistic") if config else "photorealistic",
+        "narration_pov": getattr(config, "narration_pov", "third_person") if config else "third_person",
         "languages": [
             {"language": l.language, "channel_name": l.channel_name} for l in channel.languages
         ],

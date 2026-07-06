@@ -205,7 +205,7 @@ class TestRunParentVisualsIntegration(unittest.TestCase):
     stubbed (the paid-API boundary)."""
 
     def _content_channel(self, content_id):
-        content = SimpleNamespace(id=content_id, source_language="en")
+        content = SimpleNamespace(id=content_id, source_language="en", story_blueprint=None)
         channel = SimpleNamespace(id=uuid.uuid4(), niche="mystery", tone="tense")
         return content, channel
 

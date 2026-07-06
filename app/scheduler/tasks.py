@@ -461,36 +461,7 @@ def dispatch_publishing() -> int:
     return count
 
 
-# ── Compatibility alias for removed child-audio parent gate ───────────────────
-
-@celery_app.task(name="app.scheduler.tasks.pickup_short_episodes_awaiting_parent")
-def pickup_short_episodes_awaiting_parent() -> int:
-    """Compatibility no-op for old queued Beat messages.
-
-    V2 standalone shorts are written as ``SCRIPTS_VALIDATED`` by Agent 2 and are
-    picked up by ``pickup_scripts_validated`` without waiting for parent audio.
-    """
-    logger.info(
-        "CHILD_SHORT_PARENT_AUDIO_GATE_REMOVED task=pickup_short_episodes_awaiting_parent"
-    )
-    return 0
-
-
 # ── Agent 3 — Audio Generation tasks ─────────────────────────────────────────
-
-
-def ensure_child_short_audio_enqueued(
-    parent_content_id: "uuid.UUID",
-    db: "Session",
-) -> int:
-    """Compatibility no-op for the removed parent-audio child release hook."""
-    logger.info(
-        "CHILD_SHORT_PARENT_AUDIO_GATE_REMOVED helper=ensure_child_short_audio_enqueued "
-        "parent_content_id=%s",
-        parent_content_id,
-    )
-    return 0
-
 
 @celery_app.task(name="app.scheduler.tasks.pickup_scripts_validated")
 def pickup_scripts_validated() -> int:
@@ -535,7 +506,7 @@ def run_agent3_audio_for_content(self, content_id: str) -> None:
 
     For each validated script language:
       1. ElevenLabs TTS → mp3 bytes
-      2. Save to disk + measure exact duration with mutagen
+      2. Save to disk + measure exact duration with ffprobe
       3. Whisper transcription → word-level timestamps
       4. Persist empty Shorts breakpoints for standalone-short architecture
       5. Persist AudioFile record; update Script with real values
@@ -576,17 +547,6 @@ def run_agent3_audio_for_content(self, content_id: str) -> None:
     finally:
         db.close()
 
-
-
-@celery_app.task(
-    name="app.scheduler.tasks.run_agent4_for_content",
-    bind=True,
-    max_retries=2,
-    default_retry_delay=120,
-)
-def run_agent4_for_content(self, content_id: str) -> None:
-    """Compatibility alias for the old Agent 3 audio Celery task name."""
-    return run_agent3_audio_for_content.run(content_id)
 
 
 # ── Agent 4 — Visual generation tasks ────────────────────────────────────────
@@ -854,14 +814,3 @@ def run_agent5_render_for_content(self, content_id: str) -> None:
             logger.error("Max retries reached for Agent 5 render of %s", content_id)
     finally:
         db.close()
-
-
-@celery_app.task(
-    name="app.scheduler.tasks.run_agent5_for_content",
-    bind=True,
-    max_retries=2,
-    default_retry_delay=300,
-)
-def run_agent5_for_content(self, content_id: str) -> None:
-    """Compatibility alias for the old Agent 5 video-generation Celery task name."""
-    return run_agent5_render_for_content.run(content_id)

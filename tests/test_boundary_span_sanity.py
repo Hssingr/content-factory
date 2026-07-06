@@ -113,9 +113,11 @@ class TestSpanSanityDemotion(unittest.TestCase):
             any("ANCHOR_SPAN_SANITY_DROPPED" in m for m in logs.output), logs.output
         )
 
-        # Beat 2 was demoted: its script_text degrades to visual_intent and it
+        # Beat 2 was demoted: its script_text is empty, flagged, and it
         # is NOT anchored at the 40 s duplicate.
-        self.assertEqual(sections[2]["script_text"], "intent 2")
+        self.assertEqual(sections[2]["script_text"], "")
+        self.assertEqual(sections[2]["script_text_source"], "empty_fallback_no_transcript_span")
+        self.assertTrue(sections[2]["script_text_missing"])
         self.assertLess(sections[2]["audio_start_ms"], 40_000)
 
         # Beat 10's anchor survived span sanity (9 covering beats) — kept exact.

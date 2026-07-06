@@ -50,7 +50,9 @@ class TestSpokenStylePromptRules(unittest.TestCase):
         self.assertIn("read-aloud test", prompt)
 
     def test_prompt_version_bumped(self):
-        self.assertEqual(system_prompt.PROMPT_VERSION, "4.4")
+        # 4.4 introduced these spoken-style rules; 4.5 (roadmap 4a / audit
+        # P1-9) added narration_pov threading on top — both must still hold.
+        self.assertGreaterEqual(tuple(map(int, system_prompt.PROMPT_VERSION.split("."))), (4, 4))
 
 
 class TestBlueprintSchemaRequiresMidpointTrap(unittest.TestCase):
@@ -183,7 +185,7 @@ class TestMidpointBodyIndexComputation(unittest.TestCase):
 
 class TestRunBodySectionLoopInjectsTrapOnlyAtMidpoint(unittest.TestCase):
     """Full-chain runtime proof: drives the real _run_body_section_loop()
-    (which calls the real _generate_section_with_retry() ->
+    (which calls the real _generate_section_once() ->
     _call_section_generation() -> generate_section()) with only
     call_claude_structured stubbed. Confirms the blueprint's
     midpoint_retention_trap reaches exactly the section at the computed

@@ -175,6 +175,12 @@ class TestCallFalRequestsPortraitPixels(unittest.TestCase):
         p1, p2 = _patched_flux_generator()
         p1.start()
         p2.start()
+        # Force the conservative-by-default routing contract regardless of
+        # this operator's local .env (which has image routing enabled for
+        # manual Dev/Pro canary testing) — this test asserts default
+        # (Schnell, no size cap) behavior specifically.
+        p3 = patch.object(flux_generator.settings, "image_routing_enabled", False)
+        p3.start()
         orig_fal_key = flux_generator.settings.fal_key
         orig_media_path = flux_generator.settings.media_path
         flux_generator.settings.fal_key = "stub-key"
@@ -199,6 +205,7 @@ class TestCallFalRequestsPortraitPixels(unittest.TestCase):
         finally:
             flux_generator.settings.fal_key = orig_fal_key
             flux_generator.settings.media_path = orig_media_path
+            p3.stop()
             p2.stop()
             p1.stop()
 
@@ -235,6 +242,14 @@ class TestGeneratePendingBeatImagesPortraitChain(unittest.TestCase):
         p1, p2 = _patched_flux_generator()
         p1.start()
         p2.start()
+        # Force the conservative-by-default routing contract regardless of
+        # this operator's local .env (which has image routing enabled for
+        # manual Dev/Pro canary testing) — beat_order=0 always qualifies as a
+        # "cover frame" under the Dev/Pro heuristic, which would otherwise
+        # route it to pro_1_1 (max_side=1440) and break this test's portrait
+        # size assertion for reasons unrelated to what it's actually proving.
+        p3 = patch.object(flux_generator.settings, "image_routing_enabled", False)
+        p3.start()
         orig_fal_key = flux_generator.settings.fal_key
         orig_media_path = flux_generator.settings.media_path
         flux_generator.settings.fal_key = "stub-key"
@@ -266,6 +281,7 @@ class TestGeneratePendingBeatImagesPortraitChain(unittest.TestCase):
         finally:
             flux_generator.settings.fal_key = orig_fal_key
             flux_generator.settings.media_path = orig_media_path
+            p3.stop()
             p2.stop()
             p1.stop()
 

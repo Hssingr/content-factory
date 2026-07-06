@@ -405,6 +405,50 @@ def check_minimum_length(voice_script: str, language: str, script_format: str = 
     return []
 
 
+# Roadmap 4b / audit P1-5: a real production run generated a 1,384-word
+# long-form script grounded on a 3,070-char (~560-word) source_excerpt — every
+# specific detail beyond that thin summary was necessarily model-invented
+# ("page fourteen", "nine hundred feet in", the K-initials device), and no
+# validator can check faithfulness against a source that isn't there. The
+# floor mirrors check_minimum_length()'s own per-format word targets just
+# above: a script cannot be responsibly grounded in a source with fewer words
+# than the shortest acceptable script itself.
+def check_source_material_floor(
+    source_excerpt: str, language: str, script_format: str = "youtube_long"
+) -> list[dict]:
+    """Check that source_excerpt carries enough material to ground a full script.
+
+    Args:
+        source_excerpt: Raw discovered source material (``Content.source_excerpt``).
+        language:       BCP-47 language code used to tag issues (the content's
+                        source language — this check runs before any Script row
+                        exists for any language).
+        script_format:  Format key — "youtube_long" requires 900 words (mirrors
+                        check_minimum_length's own floor); any other format
+                        requires 420.
+
+    Returns:
+        List with one MAJOR Issue dict if the source is too thin, else empty list.
+    """
+    min_words = 900 if script_format == "youtube_long" else 420
+    wc = _word_count(source_excerpt)
+    if wc < min_words:
+        return [{
+            "language": language, "severity": "MAJOR", "category": "source_material_floor",
+            "description": (
+                f"source_excerpt has {wc} words — below the {min_words}-word floor "
+                f"required to ground a {script_format} script without fabricating detail"
+            ),
+            "suggestion": (
+                "Discover a story with richer source material (full verbatim post "
+                "text plus top comments, not a summary), or configure a shorter "
+                "target script format that this source can actually support."
+            ),
+            "offending_text": None,
+        }]
+    return []
+
+
 # Roadmap 3.8 / audit G-7: the quality gate had no upper bound at all before
 # this — a real production script reached 1,799 words against the documented
 # 1,200-1,600 word spec (§9.3's _BASE_YOUTUBE_LONG_FORM_NATIVE), producing a

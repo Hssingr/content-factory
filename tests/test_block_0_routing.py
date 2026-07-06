@@ -32,8 +32,7 @@ class TestResolveModel(unittest.TestCase):
             mock_settings.secondary_model = "claude-custom-secondary"
             mock_settings.claude_tier = "prod"
             for task in (
-                "script_generation", "native_adaptation", "quality_rewrite",
-                "auto_correction", "storyboard", "visual_bible_generation",
+                "native_adaptation", "storyboard",
                 "story_gate_scoring", "revision", "story_research",
                 "channel_suggestion", "channel_research", "story_blueprint",
                 "section_generation", "short_script",
@@ -48,9 +47,8 @@ class TestResolveModel(unittest.TestCase):
             mock_settings.secondary_model = secondary
             mock_settings.claude_tier = "prod"
             for task in (
-                "script_quality_check", "short_quality_check",
                 "content_reformat",
-                "global_validation", "shorts_planner",
+                "shorts_planner",
                 "short_storyboard_remap",
             ):
                 with self.subTest(task=task):
@@ -87,6 +85,15 @@ class TestResolveModel(unittest.TestCase):
         self.assertIn("totally_unknown_task_xyz", str(ctx.exception))
         self.assertIn("MODEL_ROUTING", str(ctx.exception))
 
+    def test_short_quality_check_task_retired_by_elimination_mandate(self):
+        """The AI Short Quality Gate (assess_short_script_quality(), task=
+        short_quality_check) was deleted per the Elimination Mandate
+        (code_report/forensic_output_audit_borrasca_run.md, D1.3). This task
+        key must no longer resolve — a caller reintroducing it should fail
+        loudly, not silently route to a model."""
+        with self.assertRaises(ValueError):
+            self._resolve("short_quality_check")
+
     def test_model_override_bypasses_routing(self):
         self.assertEqual(
             self._resolve("storyboard", model_override="claude-opus-4-8"),
@@ -102,21 +109,23 @@ class TestResolveModel(unittest.TestCase):
             self.assertEqual(self._resolve("storyboard"), "claude-custom-secondary")
             self.assertEqual(self._resolve("content_reformat"), "claude-custom-secondary")
             self.assertEqual(self._resolve("story_research"), "claude-custom-primary")
-            self.assertEqual(self._resolve("auto_correction"), "claude-custom-primary")
+            # auto_correction retired (post-roadmap deep audit): the
+            # auto_correct_script prompt-repair layer was deleted entirely.
+            with self.assertRaises(ValueError):
+                self._resolve("auto_correction")
 
     def test_default_primary_and_secondary_model_ids(self):
         from app.services.model_routing import DEFAULT_PRIMARY_MODEL, DEFAULT_SECONDARY_MODEL
         self.assertEqual(DEFAULT_PRIMARY_MODEL, "claude-sonnet-5")
         self.assertEqual(DEFAULT_SECONDARY_MODEL, "claude-sonnet-4-6")
 
-    def test_config_defaults_upgrade_creative_tier_and_quality_gates_off_haiku(self):
+    def test_config_defaults_upgrade_creative_tier_off_haiku(self):
         """Roadmap 4.2 / audit S-2 (exec-6): with no env override, the creative
-        tier must resolve to the configured Sonnet 5-class primary model, and
-        the quality-gate tasks (previously pinned to Haiku) must resolve to a
-        Sonnet-class secondary model — never Haiku. Uses a real Settings()
-        instance (env_file=None so a local .env cannot mask the code default)
-        and the real resolve_model(), with only app.config.settings patched
-        to that instance — no internal routing logic is stubbed."""
+        tier must resolve to the configured Sonnet 5-class primary model. Uses
+        a real Settings() instance (env_file=None so a local .env cannot mask
+        the code default) and the real resolve_model(), with only
+        app.config.settings patched to that instance — no internal routing
+        logic is stubbed."""
         from app.config import Settings
         from app.services.model_routing import resolve_model
 
@@ -126,20 +135,38 @@ class TestResolveModel(unittest.TestCase):
 
         with patch("app.config.settings", default_settings):
             creative_tier_tasks = (
-                "script_generation", "native_adaptation", "quality_rewrite",
-                "storyboard", "visual_bible_generation", "story_blueprint",
+                "native_adaptation",
+                "storyboard", "story_blueprint",
                 "section_generation", "short_script",
             )
             for task in creative_tier_tasks:
                 with self.subTest(task=task):
                     self.assertEqual(resolve_model(task), "claude-sonnet-5")
 
-            quality_gate_tasks = ("script_quality_check", "short_quality_check")
-            for task in quality_gate_tasks:
-                with self.subTest(task=task):
-                    model = resolve_model(task)
-                    self.assertEqual(model, "claude-sonnet-4-6")
-                    self.assertNotIn("haiku", model.lower())
+    def test_parent_ai_quality_gate_tasks_retired_by_elimination_mandate(self):
+        """The entire parent AI quality gate (assess_script_quality(),
+        rewrite_script_for_quality()) and global narrative validation
+        (validate_script_globally()) were deleted per the Elimination Mandate
+        (code_report/forensic_output_audit_borrasca_run.md, D1.1/D1.2). Their
+        task keys must no longer resolve — a caller reintroducing one should
+        fail loudly, not silently route to a model."""
+        for task in ("script_quality_check", "quality_rewrite", "global_validation"):
+            with self.subTest(task=task):
+                with self.assertRaises(ValueError):
+                    self._resolve(task)
+
+    def test_visual_bible_generation_task_retired_by_elimination_mandate(self):
+        """The entire visual-bible layer (generate_visual_bible_for_content(),
+        task=visual_bible_generation) was deleted per the Elimination Mandate
+        (code_report/forensic_output_audit_borrasca_run.md, D2.1): a real
+        production run showed it generated 0 locations, 0 recurring motifs,
+        and 0 first-15 rules — a paid Claude call for a total no-op. It is
+        replaced by a deterministic, no-AI-call continuity line
+        (storyboard.build_continuity_line_from_blueprint()). This task key
+        must no longer resolve — a caller reintroducing it should fail
+        loudly, not silently route to a model."""
+        with self.assertRaises(ValueError):
+            self._resolve("visual_bible_generation")
 
 
 class TestCallClaudeStructured(unittest.TestCase):
@@ -277,10 +304,10 @@ class TestCallClaudeTaskRouting(unittest.TestCase):
                 "You are a validator.",
                 "Validate this.",
                 max_tokens=256,
-                task="global_validation",
+                task="shorts_planner",
             )
 
-        mock_resolve.assert_called_once_with("global_validation", None)
+        mock_resolve.assert_called_once_with("shorts_planner", None)
         self.assertEqual(
             mock_client.messages.create.call_args.kwargs["model"],
             "claude-haiku-4-5-20251001",

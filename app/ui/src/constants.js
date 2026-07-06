@@ -7,33 +7,25 @@ export const LANGUAGES = [
   { code: 'pt', label: 'Portuguese' },
 ]
 
+// Channel.tone flows verbatim into every script and storyboard prompt as
+// "Channel tone: <value>" — plain spoken-register words work best. The list
+// must cover tension/dread registers: the audited P1-9 incident (a horror
+// channel locked to tone=documentary, producing flat neutral narration) was
+// previously FORCED by this dropdown only offering neutral/informational
+// values. Keep in sync with the tone line in
+// app/agents/agent1_setup/system_prompt.py's suggest prompt.
 export const TONES = [
-  { value: 'documentary',    label: 'Documentary' },
+  { value: 'suspenseful',    label: 'Suspenseful' },
+  { value: 'ominous',        label: 'Ominous / Dark' },
+  { value: 'dramatic',       label: 'Dramatic' },
   { value: 'conversational', label: 'Conversational' },
+  { value: 'documentary',    label: 'Documentary' },
   { value: 'educational',    label: 'Educational' },
   { value: 'entertaining',   label: 'Entertaining' },
   { value: 'investigative',  label: 'Investigative' },
+  { value: 'humorous',       label: 'Humorous' },
+  { value: 'inspirational',  label: 'Inspirational' },
 ]
-
-export const EMOTIONS = [
-  { value: 'neutral',       label: 'Neutral' },
-  { value: 'enthusiastic',  label: 'Enthusiastic' },
-  { value: 'calm',          label: 'Calm' },
-  { value: 'authoritative', label: 'Authoritative' },
-  { value: 'dramatic',      label: 'Dramatic' },
-  { value: 'warm',          label: 'Warm' },
-]
-
-export const MUSIC_STYLES = [
-  { value: 'cinematic',   label: 'Cinematic' },
-  { value: 'upbeat',      label: 'Upbeat' },
-  { value: 'ambient',     label: 'Ambient' },
-  { value: 'dramatic',    label: 'Dramatic' },
-  { value: 'minimal',     label: 'Minimal' },
-  { value: 'electronic',  label: 'Electronic' },
-  { value: 'orchestral',  label: 'Orchestral' },
-]
-
 
 export const VOICE_PROVIDERS = [
   { value: 'cartesia', label: 'Cartesia' },
@@ -56,22 +48,6 @@ export const DEFAULT_VOICE_MODEL_BY_PROVIDER = {
   cartesia: 'sonic-3.5',
   elevenlabs: 'eleven_v3',
 }
-
-export const USE_CASES = [
-  { value: 'conversational',          label: 'Conversational' },
-  { value: 'narrative_story',         label: 'Narration' },
-  { value: 'characters_animation',    label: 'Characters' },
-  { value: 'social_media',            label: 'Social Media' },
-  { value: 'informative_educational', label: 'Educational' },
-  { value: 'advertisement',           label: 'Advertisement' },
-  { value: 'entertainment_tv',        label: 'Entertainment' },
-]
-
-export const SHORTS_RULES = [
-  { value: 'auto',   label: 'Auto (when content allows)' },
-  { value: 'always', label: 'Always create Shorts' },
-  { value: 'never',  label: 'Never create Shorts' },
-]
 
 export const SOURCE_TYPES = [
   { value: 'rss',     label: 'RSS Feed' },
@@ -110,9 +86,9 @@ export const SCRIPT_SOURCES = [
 ]
 
 export const OUTPUT_MODES = [
-  { value: 'youtube_and_shorts', label: 'YouTube long-form + Shorts',     executable: true },
-  { value: 'youtube_long_only',  label: 'YouTube long-form only (Coming soon)', executable: false },
-  { value: 'shorts_only',        label: 'Shorts only (Coming soon)',      executable: false },
+  { value: 'youtube_and_shorts', label: 'YouTube long-form + Shorts',  executable: true },
+  { value: 'youtube_long_only',  label: 'YouTube long-form only',      executable: true },
+  { value: 'shorts_only',        label: 'Shorts only (Coming soon)',   executable: false },
 ]
 
 // Structured preset options for visual/image style dropdowns (Item 17).
@@ -121,8 +97,10 @@ export const OUTPUT_MODES = [
 // short episodes) and Agent 4 storyboard prompts. Keep in sync with the storyboard
 // system prompt's recognized visual-direction vocabulary.
 export const VISUAL_STYLE_OPTIONS = [
+  { value: 'story_driven',      label: 'Story-Driven',
+    description: 'Grounded, narrative-first visuals that follow the story’s emotional beats rather than a fixed genre look — the default for most channels; matches whatever register the configured niche/tone imply.' },
   { value: 'documentary',       label: 'Documentary',
-    description: 'Neutral, factual, observational. Naturalistic lighting and real-world settings — the default for news, explainers, and investigative storytelling.' },
+    description: 'Neutral, factual, observational. Naturalistic lighting and real-world settings — best for news, explainers, and investigative storytelling.' },
   { value: 'true_crime',        label: 'True Crime',
     description: 'Dark suburban realism, evidence photography, police tape, and institutional interiors. Tightly framed, high-tension visual language.' },
   { value: 'investigative',     label: 'Investigative',
@@ -162,8 +140,19 @@ export const IMAGE_STYLE_OPTIONS = [
     description: 'Japanese animation style with bold outlines, expressive characters, and vibrant colour palettes.' },
 ]
 
+// Narration perspective/register (roadmap 4a / audit P1-9). Persisted to
+// ChannelConfig.narration_pov and threaded into Agent 2 script prompts
+// (blueprint, sections, native adaptation, short episodes) alongside
+// visual_style/image_style.
+export const NARRATION_POV_OPTIONS = [
+  { value: 'third_person',           label: 'Third Person (default)',
+    description: 'Standard narrator voice — refers to the people in the story by name and third-person pronouns (he/she/they).' },
+  { value: 'first_person_storytime', label: 'First Person / Storytime',
+    description: 'Narrated as if you are the protagonist retelling your own experience directly to the viewer, using "I"/"me"/"my" — the r/nosleep-style storytime format. Best when the source material has one clear protagonist.' },
+]
+
 export const OUTPUT_MODE_DESCRIPTIONS = {
   youtube_and_shorts: 'Generates a full-length YouTube video plus vertical Short episodes from the same story. Both are rendered and ready to publish.',
-  youtube_long_only:  'Generates only the long-form YouTube video — no Shorts. (Coming soon)',
+  youtube_long_only:  'Generates only the long-form YouTube video — the standalone Shorts planner is skipped entirely.',
   shorts_only:        'Generates only vertical Short episodes, with no long-form video. (Coming soon)',
 }

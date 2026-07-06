@@ -13,7 +13,7 @@ one real ceiling, `story.MAX_SOURCE_EXCERPT_CHARS` (60,000 chars).
 
 This proves the value actually survives from Story.body through to the real
 user_message sent to Claude in generate_story_blueprint()/generate_section()/
-auto_correct_script() — a multi-function data-flow chain — with only the
+generate_section() — a multi-function data-flow chain — with only the
 paid Claude call boundary stubbed (call_claude_with_tools / call_claude /
 call_claude_structured), never the internal truncation/assembly logic.
 """
@@ -160,11 +160,12 @@ def _json_escape(text: str) -> str:
 
 
 class TestBlueprintAndSectionReceiveFullSourceMaterial(unittest.TestCase):
-    """Runtime proof that generate_story_blueprint()/generate_section()/
-    auto_correct_script() actually forward the full (up to the shared
-    ceiling) source body to Claude — the multi-function propagation the
-    roadmap depends on. Only call_claude_structured/call_claude are
-    stubbed."""
+    """Runtime proof that generate_story_blueprint()/generate_section()
+    actually forward the full (up to the shared ceiling) source body to
+    Claude — the multi-function propagation the roadmap depends on. Only
+    call_claude_structured/call_claude are stubbed. (auto_correct_script
+    was deleted by the post-roadmap deep audit — its forwarding test went
+    with it.)"""
 
     def _story(self, body_chars: int) -> Story:
         return Story(
@@ -226,31 +227,6 @@ class TestBlueprintAndSectionReceiveFullSourceMaterial(unittest.TestCase):
 
         user_message = captured["user_message"]
         self.assertIn(story.body[-200:], user_message)
-
-    def test_auto_correct_script_forwards_body_beyond_old_8000_cap(self):
-        long_excerpt = _long_body(50_000)
-        channel = SimpleNamespace(niche="horror", tone="tense")
-        captured = {}
-
-        def fake_structured(**kwargs):
-            captured.update(kwargs)
-            return {"voice_script": "corrected script text."}
-
-        issues = [{
-            "severity": "MAJOR", "category": "minimum_length",
-            "description": "too short", "suggestion": "expand it",
-        }]
-
-        with patch.object(system_prompt, "call_claude_structured", side_effect=fake_structured):
-            system_prompt.auto_correct_script(
-                current_scripts={"voice_script": "short script."},
-                issues=issues,
-                language="en",
-                channel=channel,
-                source_excerpt=long_excerpt,
-            )
-
-        self.assertIn(long_excerpt[-200:], captured["user_message"])
 
 
 class TestContentModelPersistsFullyTruncatedExcerpt(unittest.TestCase):

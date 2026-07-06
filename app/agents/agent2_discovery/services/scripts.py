@@ -5,19 +5,13 @@ import uuid
 
 from sqlalchemy.orm import Session
 
-from app.models import Channel, ChannelConfig, ChannelLanguage, ChannelVoice, Content, ContentValidation, Script
+from app.models import Channel, ChannelConfig, ChannelLanguage, ChannelVoice, Content, Script
 from app.services.script_estimator import estimate_duration_sec
-from app.agents.agent2_discovery.services.story import MAX_SOURCE_EXCERPT_CHARS
 from app.agents.agent2_discovery.system_prompt import (
-    assess_script_quality,
-    assess_short_script_quality,
-    auto_correct_script,
     generate_native_script,
-    rewrite_script_for_quality,
     _extract_hook_context,
     generate_story_blueprint,
     generate_section,
-    validate_script_globally,
     generate_shorts_plan,
     generate_short_episode_script,
 )
@@ -39,10 +33,8 @@ from app.services.script_checks import (
 
 logger = logging.getLogger(__name__)
 
-_MAX_QUALITY_REWRITES = 2
 _MIN_BODY_SECTIONS    = 2
 _MAX_BODY_SECTIONS    = 7   # V2 hard cap — absolute maximum regardless of covered turns
-_MAX_SECTION_RETRIES  = 2
 
 
 def _script_trace(label: str, voice_script: str) -> None:
@@ -140,110 +132,54 @@ def diagnose_section_repetition(sections: list[dict]) -> list[dict]:
     return results
 
 
-def _emit_script_cost_estimate(scripts: dict, rewrite_calls: int) -> None:
+def _emit_script_cost_estimate(scripts: dict) -> None:
     """Log a rough cost estimate for the current script generation pass."""
     section_calls = scripts.get("_section_calls", 0)
-    retry_calls   = scripts.get("_retry_calls",   0)
-    est_in  = section_calls * 1800 + retry_calls * 2000 + rewrite_calls * 5500
-    est_out = section_calls *  600 + retry_calls *  600 + rewrite_calls * 3000
+    est_in  = section_calls * 1800
+    est_out = section_calls *  600
     logger.info(
-        "SCRIPT_COST_ESTIMATE section_calls=%d retry_calls=%d rewrite_calls=%d "
-        "estimated_input_tokens=%d estimated_output_tokens=%d",
-        section_calls, retry_calls, rewrite_calls, est_in, est_out,
+        "SCRIPT_COST_ESTIMATE section_calls=%d estimated_input_tokens=%d "
+        "estimated_output_tokens=%d",
+        section_calls, est_in, est_out,
     )
 
 
 def run_script_quality_gate(
     scripts: dict,
-    channel: Channel,
-    content: Content,
-    db: Session,
-    blueprint: dict,
     script_format: str = "youtube_long",
     language: str = "source",
-    tts_model: str = "sonic-2",
-    tts_provider: str = "cartesia",
 ) -> dict:
-    """Run the Script Quality Gate — assess retention quality, rewrite if needed.
+    """Apply deterministic TTS cleanup and log quality telemetry — no AI call.
 
-    Also runs global narrative-coherence validation once (attempt 1 only) and
-    folds its issues into the same rewrite mechanism (Phase 10A-0) — see
-    ``_run_global_script_validation``.
+    Per the Elimination Mandate (code_report/forensic_output_audit_borrasca_run.md,
+    D1.1/D1.2), the AI-judged assess/rewrite loop (``assess_script_quality()`` +
+    ``rewrite_script_for_quality()``, up to 2 rewrite attempts) and the global
+    narrative-coherence Claude call (``validate_script_globally()``) are
+    deleted: a real production run showed two paid rewrites still left the
+    script NEEDS_REWRITE, with the flagged repetitions shipped unfixed anyway,
+    and every global-validation finding also shipped unfixed regardless — pure
+    cost, zero effect. The mechanical TTS backstop and deterministic
+    structural checks (TTS compliance, hook quality, maximum length, retention
+    structure) still run; findings are logged as telemetry only and never
+    trigger a rewrite.
     """
     current = _apply_final_tts_backstop(scripts)
-    rewrite_calls = 0
-    global_issues = _run_global_script_validation(
-        current.get("voice_script", ""), blueprint, content, db
+    _log_quality_gate_input(current)
+
+    issue_group = _collect_quality_gate_issues(
+        current=current, language=language, script_format=script_format,
     )
-
-    for attempt in range(1, _MAX_QUALITY_REWRITES + 1):
-        _script_trace(f"quality_gate_input_{attempt}", current.get("voice_script", ""))
-        _log_quality_gate_input(current, attempt)
-
-        try:
-            review = assess_script_quality(current, channel, script_format=script_format)
-        except Exception as exc:
-            logger.error(
-                "Script Quality Gate assessment failed (attempt %d): %s — keeping script as-is",
-                attempt, exc,
-            )
-            _emit_script_cost_estimate(scripts, rewrite_calls)
-            return current
-
-        issue_group = _collect_quality_gate_issues(
-            review=review,
-            current=current,
-            language=language,
-            extra_issues=global_issues if attempt == 1 else [],
-            script_format=script_format,
+    _log_quality_gate_review(issue_group)
+    if issue_group["det_majors"]:
+        logger.warning(
+            "Script Quality Gate: %d deterministic MAJOR issue(s) found "
+            "(telemetry only, no rewrite): %s",
+            len(issue_group["det_majors"]),
+            [issue["category"] for issue in issue_group["det_majors"]],
         )
-        _log_quality_gate_review(issue_group, attempt)
 
-        if (
-            issue_group["status"] == "PASSED"
-            and not issue_group["converted_det"]
-            and not issue_group["global"]
-        ):
-            _script_trace(f"quality_gate_passed_attempt_{attempt}", current.get("voice_script", ""))
-            _emit_script_cost_estimate(scripts, rewrite_calls)
-            return current
-
-        if _has_tts_only_high_issues(issue_group["all_issues"]):
-            current = _apply_tts_only_quality_cleanup(
-                current=current,
-                issue_group=issue_group,
-                attempt=attempt,
-            )
-            continue
-
-        try:
-            current = rewrite_script_for_quality(
-                current, issue_group["all_issues"], channel,
-                script_format=script_format,
-                tts_model=tts_model,
-                tts_provider=tts_provider,
-            )
-            rewrite_calls += 1
-            logger.info("QUALITY_REWRITE_SCHEMA_OK attempt=%d", attempt)
-        except Exception as exc:
-            logger.error(
-                "QUALITY_REWRITE_JSON_FAIL attempt=%d error=%s — keeping prior script",
-                attempt, exc,
-            )
-            _script_trace(f"quality_gate_rewrite_failed_{attempt}", current.get("voice_script", ""))
-            _emit_script_cost_estimate(scripts, rewrite_calls)
-            return current
-
-        current = _apply_post_rewrite_cleanup(current, attempt)
-        _script_trace(f"quality_gate_after_rewrite_{attempt}", current.get("voice_script", ""))
-
-    logger.warning(
-        "Script Quality Gate: still NEEDS_REWRITE after %d attempt(s) — proceeding with latest version",
-        _MAX_QUALITY_REWRITES,
-    )
-    current = _apply_final_quality_cleanup(current)
-    _script_trace("quality_gate_max_retries_return", current.get("voice_script", ""))
-    _emit_script_cost_estimate(scripts, rewrite_calls)
+    _script_trace("quality_gate_return", current.get("voice_script", ""))
+    _emit_script_cost_estimate(scripts)
     return current
 
 
@@ -267,7 +203,7 @@ def _apply_final_tts_backstop(current: dict) -> dict:
     return current
 
 
-def _log_quality_gate_input(current: dict, attempt: int) -> None:
+def _log_quality_gate_input(current: dict) -> None:
     voice_script = current.get("voice_script", "")
     intro_match = re.search(
         r"\[INTRO\]\s*(.*?)(?=\n\s*\[|\Z)",
@@ -280,8 +216,8 @@ def _log_quality_gate_input(current: dict, attempt: int) -> None:
             if sentence.strip()
         ]
         logger.debug(
-            "QUALITY_GATE_INPUT attempt=%d intro_first=%r",
-            attempt, (intro_sents[0][:120] if intro_sents else ""),
+            "QUALITY_GATE_INPUT intro_first=%r",
+            (intro_sents[0][:120] if intro_sents else ""),
         )
     outro_match = re.search(r"\[OUTRO\]\s*(.*?)$", voice_script, re.DOTALL | re.IGNORECASE)
     if outro_match:
@@ -290,61 +226,40 @@ def _log_quality_gate_input(current: dict, attempt: int) -> None:
             if sentence.strip()
         ]
         logger.debug(
-            "QUALITY_GATE_INPUT attempt=%d outro_last=%r",
-            attempt, (outro_sents[-1][:120] if outro_sents else ""),
+            "QUALITY_GATE_INPUT outro_last=%r",
+            (outro_sents[-1][:120] if outro_sents else ""),
         )
 
 
 def _collect_quality_gate_issues(
-    review: dict,
     current: dict,
     language: str,
-    extra_issues: list[dict] | None = None,
     script_format: str = "youtube_long",
 ) -> dict:
-    status = review.get("status", "PASSED")
-    claude_issues: list[dict] = review.get("issues", [])
     voice_script = current.get("voice_script", "")
     tts_det = check_tts_compliance(voice_script, language)
     hook_det = check_hook_quality(voice_script, language)
     length_det = check_maximum_length(voice_script, language, script_format)
     # roadmap 6.3 / audit §6, §7: check_retention_structure() is always MINOR
-    # (curiosity-gap/dead-ending advisory, never a hard gate) — wired in as
-    # observability only, never converted to a rewrite-triggering HIGH issue
-    # and never counted toward det_majors below.
+    # (curiosity-gap/dead-ending advisory, never a hard gate) — observability
+    # only, never counted toward det_majors below.
     retention_det = check_retention_structure(voice_script, language, script_format)
     det_majors = [
         issue for issue in tts_det + hook_det + length_det if issue["severity"] == "MAJOR"
     ]
-    converted_det: list[dict] = [
-        {
-            "severity": "HIGH",
-            "category": issue["category"],
-            "description": issue["description"],
-            "fix": issue["suggestion"],
-        }
-        for issue in det_majors
-    ]
-    global_issues: list[dict] = list(extra_issues or [])
-    all_issues = claude_issues + converted_det + global_issues
     return {
-        "status": status,
         "tts_det": tts_det,
         "hook_det": hook_det,
         "length_det": length_det,
         "retention_det": retention_det,
-        "converted_det": converted_det,
-        "global": global_issues,
-        "all_issues": all_issues,
+        "det_majors": det_majors,
     }
 
 
-def _log_quality_gate_review(issue_group: dict, attempt: int) -> None:
-    all_issues = issue_group["all_issues"]
-    high = sum(1 for issue in all_issues if issue.get("severity") == "HIGH")
+def _log_quality_gate_review(issue_group: dict) -> None:
     logger.info(
-        "Script Quality Gate: claude=%s det_major=%d issues=%d (high=%d) attempt=%d",
-        issue_group["status"], len(issue_group["converted_det"]), len(all_issues), high, attempt,
+        "Script Quality Gate: det_major=%d",
+        len(issue_group["det_majors"]),
     )
     tts_major_count = len([
         issue for issue in issue_group["tts_det"] if issue["severity"] == "MAJOR"
@@ -356,68 +271,21 @@ def _log_quality_gate_review(issue_group: dict, attempt: int) -> None:
         issue for issue in issue_group.get("length_det", []) if issue["severity"] == "MAJOR"
     ])
     logger.debug(
-        "QUALITY_GATE_BREAKDOWN attempt=%d det_tts_maj=%d det_hook_maj=%d det_length_maj=%d",
-        attempt, tts_major_count, hook_major_count, length_major_count,
+        "QUALITY_GATE_BREAKDOWN det_tts_maj=%d det_hook_maj=%d det_length_maj=%d",
+        tts_major_count, hook_major_count, length_major_count,
     )
-    for issue in all_issues:
+    for issue in issue_group["det_majors"]:
         logger.debug(
             "Script quality issue [%s/%s]: %s -> %s",
             issue.get("severity", "?"), issue.get("category", "?"),
-            issue.get("description", ""), issue.get("fix", ""),
+            issue.get("description", ""), issue.get("suggestion", ""),
         )
-    # Telemetry only — never blocking, never fed into all_issues/the rewrite loop.
+    # Telemetry only — never blocking, never triggers a rewrite.
     for issue in issue_group.get("retention_det", []):
         logger.info(
-            "QUALITY_GATE_RETENTION_STRUCTURE attempt=%d [MINOR]: %s",
-            attempt, issue.get("description", ""),
+            "QUALITY_GATE_RETENTION_STRUCTURE [MINOR]: %s",
+            issue.get("description", ""),
         )
-
-
-def _has_tts_only_high_issues(all_issues: list[dict]) -> bool:
-    high_issues = [issue for issue in all_issues if issue.get("severity") == "HIGH"]
-    return bool(high_issues) and all(
-        issue.get("category") == "tts_compliance" for issue in high_issues
-    )
-
-
-def _apply_tts_only_quality_cleanup(
-    current: dict,
-    issue_group: dict,
-    attempt: int,
-) -> dict:
-    high_issues = [issue for issue in issue_group["all_issues"] if issue.get("severity") == "HIGH"]
-    logger.info(
-        "QUALITY_REWRITE_SKIPPED reason=TTS_ONLY high_count=%d attempt=%d",
-        len(high_issues), attempt,
-    )
-    voice_script = current.get("voice_script", "")
-    cleaned = split_long_sentences(normalize_tts_chars(voice_script))
-    if cleaned != voice_script:
-        current = {**current, "voice_script": cleaned}
-        logger.info("QUALITY_REWRITE_SKIPPED: deterministic cleanup applied")
-    _script_trace(f"quality_gate_tts_only_cleanup_{attempt}", current.get("voice_script", ""))
-    return current
-
-
-def _apply_post_rewrite_cleanup(current: dict, attempt: int) -> dict:
-    voice_script = current.get("voice_script", "")
-    cleaned = split_long_sentences(normalize_tts_chars(voice_script))
-    if cleaned != voice_script:
-        current = {**current, "voice_script": cleaned}
-        logger.info(
-            "Script Quality Gate: deterministic cleanup applied after rewrite (attempt %d)",
-            attempt,
-        )
-    return current
-
-
-def _apply_final_quality_cleanup(current: dict) -> dict:
-    voice_script = current.get("voice_script", "")
-    cleaned = split_long_sentences(normalize_tts_chars(voice_script))
-    if cleaned != voice_script:
-        current = {**current, "voice_script": cleaned}
-        logger.info("Script Quality Gate: final deterministic cleanup applied before returning")
-    return current
 
 
 def generate_multilingual_scripts(
@@ -478,6 +346,7 @@ def generate_multilingual_scripts(
         .first()
     )
     script_format = config.script_format if config else "youtube_long"
+    narration_pov = config.narration_pov if config else "third_person"
 
     # content_kind drives native-prompt selection (Phase 12.4) — child Standalone
     # Short episodes always use the dedicated flat-narration native prompt,
@@ -566,6 +435,7 @@ def generate_multilingual_scripts(
                     tts_provider=lang_provider,
                     hook_context=hook_context,
                     content_id=content.id,
+                    narration_pov=narration_pov,
                 )
                 if adapted is None:
                     raise ValueError("child Short translation failed after retries")
@@ -583,6 +453,7 @@ def generate_multilingual_scripts(
                     tts_provider=lang_provider,
                     hook_context=hook_context,
                     content_id=content.id,
+                    narration_pov=narration_pov,
                 )
                 if adapted is None:
                     raise ValueError("parent translation failed after retries")
@@ -678,8 +549,6 @@ def generate_multilingual_scripts(
 # added below, since those require the source script as a second input that
 # no existing per-language check function takes.
 
-_MAX_PARENT_TRANSLATION_CORRECTION_ROUNDS = 2
-
 # Reasonable word-count parity allowance vs. the source long-form script.
 # _BASE_YOUTUBE_LONG_FORM_NATIVE's own prompt text already asks for "the same
 # order of magnitude as source" — generous enough for normal cross-language
@@ -768,72 +637,60 @@ def _generate_validated_translated_parent_script(
     tts_provider: str,
     hook_context: str | None,
     content_id: uuid.UUID,
+    narration_pov: str = "third_person",
 ) -> dict | None:
-    """Generate and validate one translated/adapted parent long-form script (Phase 13.4).
+    """Generate one translated/adapted parent long-form script — single Claude call.
 
-    Mirrors ``_generate_validated_translated_short_script()``'s (Phase 12.4)
-    retry-on-MAJOR-issue loop — same structure, but its own separate retry
-    budget (``_MAX_PARENT_TRANSLATION_CORRECTION_ROUNDS``), so neither phase's
-    retry budget or behavior is shared with or changed by the other.
+    The former retry-on-MAJOR-issue loop (up to
+    ``_MAX_PARENT_TRANSLATION_CORRECTION_ROUNDS`` corrective re-generations
+    with an ``override_instruction``) is deleted per the Elimination Mandate's
+    extension to the translation paths (post-roadmap audit): it was the exact
+    full-regeneration + corrective-override pattern the audit (P1-6) proved
+    re-rolls quality from the same distribution instead of improving it, and
+    it always ended in FAIL_USING_LATEST (non-blocking) anyway — up to 2 extra
+    paid calls per language with no enforcement value. Deterministic findings
+    (``_collect_translated_parent_script_issues()``) are now telemetry only.
 
     Returns:
         Dict with key ``voice_script``, or ``None`` if ``generate_native_script()``
-        itself raised (as opposed to merely failing validation).
+        itself raised (a transport failure, not a quality judgment).
     """
-    override_instruction = ""
-    adapted: dict | None = None
-
-    for correction_round in range(1, _MAX_PARENT_TRANSLATION_CORRECTION_ROUNDS + 2):
-        try:
-            adapted = generate_native_script(
-                voice_script=source_voice_script,
-                target_language=target_language,
-                niche=channel.niche,
-                tone=channel.tone,
-                script_format=script_format,
-                audio_tags_enabled=audio_tags_enabled,
-                tts_model=tts_model,
-                tts_provider=tts_provider,
-                hook_context=hook_context,
-                content_kind="parent_long_form",
-                override_instruction=override_instruction,
-            )
-        except Exception as exc:
-            logger.error(
-                "PARENT_TRANSLATION_VALIDATION_FAIL content=%s lang=%s round=%d "
-                "reason=generation_error error=%s",
-                content_id, target_language, correction_round, exc,
-            )
-            return None
-
-        issues = _collect_translated_parent_script_issues(
-            adapted["voice_script"], target_language, source_voice_script,
+    try:
+        adapted = generate_native_script(
+            voice_script=source_voice_script,
+            target_language=target_language,
+            niche=channel.niche,
+            tone=channel.tone,
+            script_format=script_format,
+            audio_tags_enabled=audio_tags_enabled,
+            tts_model=tts_model,
+            tts_provider=tts_provider,
+            hook_context=hook_context,
+            content_kind="parent_long_form",
+            narration_pov=narration_pov,
         )
-        if not issues:
-            logger.info(
-                "PARENT_TRANSLATION_VALIDATION_PASS content=%s lang=%s round=%d",
-                content_id, target_language, correction_round,
-            )
-            return adapted
+    except Exception as exc:
+        logger.error(
+            "PARENT_TRANSLATION_VALIDATION_FAIL content=%s lang=%s "
+            "reason=generation_error error=%s",
+            content_id, target_language, exc,
+        )
+        return None
 
-        if correction_round > _MAX_PARENT_TRANSLATION_CORRECTION_ROUNDS:
-            logger.warning(
-                "PARENT_TRANSLATION_VALIDATION_FAIL content=%s lang=%s round=%d "
-                "status=FAIL_USING_LATEST remaining_issues=%s",
-                content_id, target_language, correction_round,
-                [i["category"] for i in issues],
-            )
-            return adapted
-
+    issues = _collect_translated_parent_script_issues(
+        adapted["voice_script"], target_language, source_voice_script,
+    )
+    if issues:
+        logger.warning(
+            "PARENT_TRANSLATION_VALIDATION_ISSUES content=%s lang=%s "
+            "(telemetry only, no retry): %s",
+            content_id, target_language, [i["category"] for i in issues],
+        )
+    else:
         logger.info(
-            "PARENT_TRANSLATION_VALIDATION_RETRY content=%s lang=%s round=%d issues=%s",
-            content_id, target_language, correction_round, [i["category"] for i in issues],
+            "PARENT_TRANSLATION_VALIDATION_PASS content=%s lang=%s",
+            content_id, target_language,
         )
-        override_instruction = (
-            "Fix these issues from the previous attempt: "
-            + "; ".join(i["description"] for i in issues[:3])
-        )
-
     return adapted
 
 
@@ -985,18 +842,15 @@ def _update_accumulator(
     })
 
 
-def _log_section_retry_input(
+def _log_section_input(
     label: str,
-    attempt: int,
     prior_sections_summary: list[dict],
     visual_intent_accumulator: dict,
-    override: str,
 ) -> None:
     logger.debug(
-        "SECTION_INPUT label=%s attempt=%d prior_count=%d avoid_count=%d override=%s",
-        label, attempt, len(prior_sections_summary),
+        "SECTION_INPUT label=%s prior_count=%d avoid_count=%d",
+        label, len(prior_sections_summary),
         len(visual_intent_accumulator.get("avoid_repeating", [])),
-        bool(override),
     )
     for prior_section in prior_sections_summary[-3:]:
         logger.debug(
@@ -1019,12 +873,12 @@ def _call_section_generation(
     tts_model: str,
     tts_provider: str,
     audio_tags_enabled: bool,
-    override: str,
     primary_required_turn: str | None,
     future_uncovered_turns: list[str] | None,
     attempt: int,
     visual_style: str = "",
     image_style: str = "",
+    narration_pov: str = "third_person",
     midpoint_retention_trap: str | None = None,
 ) -> dict | None:
     try:
@@ -1039,11 +893,11 @@ def _call_section_generation(
             tts_model=tts_model,
             tts_provider=tts_provider,
             audio_tags_enabled=audio_tags_enabled,
-            override_instruction=override,
             primary_required_turn=primary_required_turn,
             future_uncovered_turns=future_uncovered_turns,
             visual_style=visual_style,
             image_style=image_style,
+            narration_pov=narration_pov,
             midpoint_retention_trap=midpoint_retention_trap,
         )
     except Exception as exc:
@@ -1086,7 +940,7 @@ def _clean_generated_section(result: dict) -> tuple[dict, str, bool]:
     return result, cleaned, backstop_changed
 
 
-def _collect_section_retry_issues(
+def _collect_section_issues(
     script_text: str,
     check_hook: bool,
     prior_summary_text: str,
@@ -1147,54 +1001,36 @@ def _log_section_rhythm_issues(label: str, rhythm_issues: list[dict]) -> None:
         )
 
 
-def _finalize_section_after_retry_limit(
-    label: str,
-    result: dict,
-    script_text: str,
-    check_hook: bool,
-) -> dict:
-    cleaned = normalize_tts_chars(script_text)
-    cleaned = split_long_sentences(cleaned)
-    if cleaned != script_text:
-        script_text = cleaned
-        result = {**result, "script_text": script_text}
+def _apply_hook_by_construction(result: dict, hook: str) -> dict:
+    """Force the blueprint's hook to be the INTRO's literal opening line.
 
-    final_majors = [
-        issue for issue in
-        check_tts_compliance(script_text, "source")
-        + (check_hook_quality(script_text, "source") if check_hook else [])
-        if issue["severity"] == "MAJOR"
-    ]
-    if final_majors:
-        logger.warning(
-            "Section %s: proceeding with %d known TTS MAJOR issue(s) after "
-            "final deterministic cleanup — %s",
-            label, len(final_majors),
-            [f"{issue['category']}: {(issue.get('offending_text') or '')[:50]}"
-             for issue in final_majors],
-        )
-    else:
-        logger.info(
-            "Section %s: final deterministic cleanup resolved all MAJOR issues",
-            label,
-        )
-    return result
+    Roadmap 4c / audit P1-4: check_hook_quality() can only ever validate
+    whichever sentence Claude happened to open with — it has no way to
+    require that sentence be the blueprint's own carefully-crafted hook. A
+    real production run showed the blueprint's hook generated (it was even
+    designed to pass the hook-quality shape rules — <=15 words, concrete,
+    withheld mechanism) but buried at sentence 6, with the INTRO opening on
+    a "character roster" sentence instead; check_hook_quality() passed that
+    roster sentence anyway, since it was also concrete and <=15 words — a
+    false negative by design (it validates shape, not which sentence is
+    actually first). Constructing the opening line deterministically removes
+    the validator's discretion: the hook is prepended here, not hoped for.
+
+    A no-op when the blueprint carries no hook, or when the generated INTRO
+    already opens with it verbatim (avoids a literal double hook).
+    """
+    hook = (hook or "").strip()
+    script_text = result.get("script_text", "")
+    if not hook or script_text.strip().casefold().startswith(hook.casefold()):
+        return result
+    if hook[-1] not in ".!?":
+        hook = f"{hook}."
+    new_text = f"{hook} {script_text}".strip() if script_text else hook
+    logger.info("HOOK_BY_CONSTRUCTION_APPLIED hook=%r", hook[:120])
+    return {**result, "script_text": new_text}
 
 
-def _build_section_retry_instruction(
-    majors: list[dict],
-    transition_issues: list[dict],
-    rhythm_issues: list[dict],
-) -> str:
-    feedback_parts = [issue["description"] for issue in majors[:3]]
-    if transition_issues:
-        feedback_parts.append(transition_issues[0]["description"])
-    if rhythm_issues:
-        feedback_parts.append(rhythm_issues[0]["description"])
-    return f"Fix these issues from the previous attempt: {'; '.join(feedback_parts)}"
-
-
-def _generate_section_with_retry(
+def _generate_section_once(
     label: str,
     story,
     blueprint: dict,
@@ -1211,65 +1047,69 @@ def _generate_section_with_retry(
     future_uncovered_turns: list[str] | None = None,
     visual_style: str = "",
     image_style: str = "",
+    narration_pov: str = "third_person",
     midpoint_retention_trap: str | None = None,
 ) -> dict | None:
-    """Generate a single section, retrying up to _MAX_SECTION_RETRIES on MAJOR violations."""
-    override = ""
-    for attempt in range(1, _MAX_SECTION_RETRIES + 2):
-        _log_section_retry_input(
-            label, attempt, prior_sections_summary, visual_intent_accumulator, override
-        )
-        result = _call_section_generation(
-            label=label,
-            story=story,
-            blueprint=blueprint,
-            prior_sections_summary=prior_sections_summary,
-            visual_intent_accumulator=visual_intent_accumulator,
-            channel=channel,
-            script_format=script_format,
-            tts_model=tts_model,
-            tts_provider=tts_provider,
-            audio_tags_enabled=audio_tags_enabled,
-            override=override,
-            primary_required_turn=primary_required_turn,
-            future_uncovered_turns=future_uncovered_turns,
-            attempt=attempt,
-            visual_style=visual_style,
-            image_style=image_style,
-            midpoint_retention_trap=midpoint_retention_trap,
-        )
-        if result is None:
-            if attempt > _MAX_SECTION_RETRIES:
-                return None
-            continue
+    """Generate a single section with exactly one Claude call — no quality-judging retry.
 
-        raw_metrics = _log_section_generation_output(label, attempt, result)
-        result, script_text, backstop_changed = _clean_generated_section(result)
-        issue_group = _collect_section_retry_issues(
-            script_text=script_text,
-            check_hook=check_hook,
-            prior_summary_text=prior_summary_text,
+    Per the Elimination Mandate (code_report/forensic_output_audit_borrasca_run.md,
+    D1.4), section-level regeneration retries are deleted: a real production run
+    showed the retry loop's corrective override_instruction (built from TTS/hook/
+    rhythm/transition findings) pushed the model toward shorter, choppier sentences
+    on every pass, producing the machine-gun monotone the audit identified — the
+    retry mechanism was actively hurting narration quality, not improving it.
+
+    The deterministic TTS backstop (normalize_tts_chars/split_long_sentences) still
+    runs — it is a mechanical text fix, not a regeneration. TTS/hook/rhythm/
+    transition findings are logged as telemetry only and never trigger a re-roll.
+    """
+    _log_section_input(label, prior_sections_summary, visual_intent_accumulator)
+    result = _call_section_generation(
+        label=label,
+        story=story,
+        blueprint=blueprint,
+        prior_sections_summary=prior_sections_summary,
+        visual_intent_accumulator=visual_intent_accumulator,
+        channel=channel,
+        script_format=script_format,
+        tts_model=tts_model,
+        tts_provider=tts_provider,
+        audio_tags_enabled=audio_tags_enabled,
+        primary_required_turn=primary_required_turn,
+        future_uncovered_turns=future_uncovered_turns,
+        attempt=1,
+        visual_style=visual_style,
+        image_style=image_style,
+        narration_pov=narration_pov,
+        midpoint_retention_trap=midpoint_retention_trap,
+    )
+    if result is None:
+        return None
+
+    raw_metrics = _log_section_generation_output(label, 1, result)
+    if check_hook:
+        result = _apply_hook_by_construction(result, blueprint.get("hook", ""))
+    result, script_text, backstop_changed = _clean_generated_section(result)
+    issue_group = _collect_section_issues(
+        script_text=script_text,
+        check_hook=check_hook,
+        prior_summary_text=prior_summary_text,
+    )
+    _log_section_cleanup(label, 1, backstop_changed, raw_metrics, script_text, issue_group)
+    _log_section_transition_issues(label, issue_group["transition_issues"])
+    _log_section_rhythm_issues(label, issue_group["rhythm_issues"])
+
+    if issue_group["majors"]:
+        logger.warning(
+            "Section %s: %d MAJOR issue(s) after deterministic cleanup "
+            "(telemetry only, no retry): %s",
+            label, len(issue_group["majors"]),
+            [f"{issue['category']}: {(issue.get('offending_text') or '')[:50]}"
+             for issue in issue_group["majors"]],
         )
-        _log_section_cleanup(
-            label, attempt, backstop_changed, raw_metrics, script_text, issue_group
-        )
-        _log_section_transition_issues(label, issue_group["transition_issues"])
-        _log_section_rhythm_issues(label, issue_group["rhythm_issues"])
-
-        if not issue_group["majors"]:
-            return result
-
-        if attempt > _MAX_SECTION_RETRIES:
-            return _finalize_section_after_retry_limit(
-                label, result, script_text, check_hook
-            )
-
-        override = _build_section_retry_instruction(
-            issue_group["majors"], issue_group["transition_issues"], issue_group["rhythm_issues"]
-        )
-        logger.info("Section %s retry %d — issues: %s", label, attempt, override)
-
-    return None
+    else:
+        logger.info("Section %s: no MAJOR issues after deterministic cleanup", label)
+    return result
 
 
 _SECTION_TITLE_WORD_RE = re.compile(r"[A-Za-z0-9À-ɏ'’.-]+")
@@ -1399,6 +1239,7 @@ def _build_section_generation_context(
     blueprint: dict,
     visual_style: str = "",
     image_style: str = "",
+    narration_pov: str = "third_person",
 ) -> dict:
     major_turns = blueprint.get("major_turns") or []
     max_body = max(
@@ -1425,6 +1266,7 @@ def _build_section_generation_context(
         "midpoint_body_index": (max_body + 1) // 2,
         "visual_style": visual_style,
         "image_style": image_style,
+        "narration_pov": narration_pov,
     }
 
 
@@ -1436,7 +1278,6 @@ def _create_section_loop_state() -> dict:
         "visual_intent_history": [],
         "covered_turns": set(),
         "section_calls": 0,
-        "narrative_retry_calls": 0,
     }
 
 
@@ -1513,7 +1354,7 @@ def _generate_intro_section(
     major_turns = context["major_turns"]
     _uncov = list(range(len(major_turns)))
     logger.debug("SECTION_INPUT label=INTRO sections_so_far=0 covered=[] uncovered=%s", _uncov)
-    intro = _generate_section_with_retry(
+    intro = _generate_section_once(
         label="INTRO",
         story=story,
         blueprint=blueprint,
@@ -1530,6 +1371,7 @@ def _generate_intro_section(
         future_uncovered_turns=None,
         visual_style=context.get("visual_style", ""),
         image_style=context.get("image_style", ""),
+        narration_pov=context.get("narration_pov", "third_person"),
     )
     if intro is None:
         raise RuntimeError("generate_script_sections: INTRO generation failed after retries")
@@ -1656,7 +1498,7 @@ def _run_body_section_loop(
             primary_idx, uncovered,
         )
         is_midpoint_section = body_index == context.get("midpoint_body_index")
-        section = _generate_section_with_retry(
+        section = _generate_section_once(
             label=label,
             story=story,
             blueprint=blueprint,
@@ -1673,6 +1515,7 @@ def _run_body_section_loop(
             future_uncovered_turns=future_turns if future_turns else None,
             visual_style=context.get("visual_style", ""),
             image_style=context.get("image_style", ""),
+            narration_pov=context.get("narration_pov", "third_person"),
             midpoint_retention_trap=(
                 blueprint.get("midpoint_retention_trap") if is_midpoint_section else None
             ),
@@ -1720,7 +1563,7 @@ def _generate_outro_section(
         ",".join(str(i) for i in sorted(state["covered_turns"])),
         _uncov_outro,
     )
-    outro = _generate_section_with_retry(
+    outro = _generate_section_once(
         label="OUTRO",
         story=story,
         blueprint=blueprint,
@@ -1737,6 +1580,7 @@ def _generate_outro_section(
         future_uncovered_turns=None,
         visual_style=context.get("visual_style", ""),
         image_style=context.get("image_style", ""),
+        narration_pov=context.get("narration_pov", "third_person"),
     )
     if outro is None:
         raise RuntimeError("generate_script_sections: OUTRO generation failed after retries")
@@ -1799,120 +1643,22 @@ def _assemble_sections_with_diagnostics(
 
     length_majors = [i for i in length_issues if i.get("severity") == "MAJOR"]
     if length_majors:
-        voice_script = _apply_length_correction(
-            voice_script=voice_script,
-            length_majors=length_majors,
-            story=story,
-            channel=channel,
-            script_format=script_format,
-            context=context,
-        )
-
-    return voice_script
-
-
-def _apply_length_correction(
-    voice_script: str,
-    length_majors: list[dict],
-    story,
-    channel: Channel,
-    script_format: str,
-    context: dict,
-) -> str:
-    wc_before = len(voice_script.split())
-    logger.warning(
-        "generate_script_sections: voice_script under minimum length (%d words) — "
-        "calling auto_correct_script once with source_excerpt",
-        wc_before,
-    )
-    try:
-        corrected = auto_correct_script(
-            current_scripts={"voice_script": voice_script},
-            issues=length_majors,
-            language=story.language,
-            channel=channel,
-            script_format=script_format,
-            source_excerpt=(story.body or "")[:MAX_SOURCE_EXCERPT_CHARS],
-            tts_model=context["tts_model"],
-            tts_provider=context["tts_provider"],
-        )
-        voice_script = corrected.get("voice_script", voice_script)
-        wc_after = len(voice_script.split())
-        logger.info(
-            "generate_script_sections: length correction applied — %d → %d words",
-            wc_before, wc_after,
-        )
-    except Exception as exc:
-        logger.debug(
-            "generate_script_sections: length correction failed (non-blocking): %s", exc
-        )
-    return voice_script
-
-
-def _run_global_script_validation(
-    voice_script: str,
-    blueprint: dict,
-    content: Content,
-    db: Session,
-) -> list[dict]:
-    """Run global narrative-coherence validation once and persist the result.
-
-    Called once per quality-gate pass (attempt 1 only — see ``run_script_quality_gate``).
-    Persists status + raw issues to ``ContentValidation`` (Phase 10A-0) so the
-    finding survives past a log line, and returns the issues converted into the
-    rewrite-issue shape (``severity``/``category``/``description``/``fix``) so they
-    can be merged into the same ``rewrite_script_for_quality()`` call the quality
-    gate already runs for Claude-judged and deterministic issues — no second,
-    parallel rewrite mechanism.
-
-    Non-blocking: a failed Claude call persists ``NEEDS_REVIEW`` and returns no
-    issues rather than raising, matching this validator's pre-existing behavior.
-    """
-    validation = (
-        db.query(ContentValidation)
-        .filter(ContentValidation.content_id == content.id)
-        .first()
-    )
-    try:
-        gv = validate_script_globally(voice_script, blueprint)
-    except Exception as exc:
-        logger.debug("Global validation failed (non-blocking): %s", exc)
-        if validation:
-            validation.script_validation_status = "NEEDS_REVIEW"
-            db.commit()
-        return []
-
-    raw_issues: list[dict] = gv.get("issues", [])
-    if gv.get("status") == "NEEDS_FIX":
-        for issue in raw_issues:
-            logger.info(
-                "Global validation [%s]: %s — %s",
-                issue.get("section"), issue.get("description"), issue.get("suggestion"),
-            )
-        status = "AUTO_CORRECTED"
-    else:
-        status = "PASSED"
-
-    if validation:
-        validation.script_validation_status = status
-        validation.script_issues_log = raw_issues
-        db.commit()
-    else:
+        # Elimination Mandate extension (post-roadmap audit): the former
+        # auto_correct_script() expansion call — a paid full-script rewrite —
+        # is deleted. It re-rolled the entire script from scratch (the exact
+        # P1-6 failure mechanism), could bury the deterministically-constructed
+        # hook (roadmap 4c) and midpoint-trap placement, and with the
+        # source-material floor (roadmap 4b) guaranteeing >=900 source words,
+        # a materially under-length script is a generation defect to surface,
+        # not silently paper over. Telemetry only, no rewrite.
         logger.warning(
-            "_run_global_script_validation: no ContentValidation row for content %s — "
-            "result not persisted",
-            content.id,
+            "generate_script_sections: voice_script under minimum length "
+            "(%d words) — telemetry only, no rewrite: %s",
+            len(voice_script.split()),
+            [i.get("description") for i in length_majors],
         )
 
-    return [
-        {
-            "severity": "HIGH",
-            "category": "global_narrative",
-            "description": issue.get("description", ""),
-            "fix": issue.get("suggestion", ""),
-        }
-        for issue in raw_issues
-    ]
+    return voice_script
 
 
 def _log_turn_coverage_alignment(
@@ -1946,188 +1692,23 @@ def _log_turn_coverage_alignment(
     )
 
 
-def _group_narrative_retry_instructions(
-    nc_issues: list[str],
-    sections: list[dict],
-) -> dict[str, list[str]]:
-    issue_to_section: list[tuple[str, str | None]] = [
-        ("Hook:", "INTRO"),
-        ("Major turns", None),
-        ("final_payoff", "OUTRO"),
-        ("comment_trigger", "OUTRO"),
-    ]
-    body_labels = [s["label"] for s in sections if s["label"] not in ("INTRO", "OUTRO")]
-    section_instructions: dict[str, list[str]] = {}
-    for issue in nc_issues:
-        target_label: str | None = None
-        for prefix, lbl in issue_to_section:
-            if issue.startswith(prefix):
-                target_label = lbl
-                break
-        if target_label is None:
-            target_label = body_labels[-1] if body_labels else "OUTRO"
-        section_instructions.setdefault(target_label, []).append(issue)
-    return section_instructions
-
-
-def _run_single_narrative_retry(
-    target_label: str,
-    instructions: list[str],
-    state: dict,
-    story,
-    blueprint: dict,
-    channel: Channel,
-    script_format: str,
-    audio_tags_enabled: bool,
-    context: dict,
-) -> None:
-    sections = state["sections"]
-    major_turns = context["major_turns"]
-    covered_turns = state["covered_turns"]
-    label_to_idx: dict[str, int] = {s["label"]: i for i, s in enumerate(sections)}
-    idx = label_to_idx.get(target_label)
-    if idx is None:
-        logger.warning(
-            "generate_script_sections: narrative retry — section %r not found, skipping",
-            target_label,
-        )
-        return
-
-    combined = "; ".join(instructions)
-    override = (
-        f"The assembled script has these narrative completeness issues: {combined}. "
-        f"Fix all of them in this section."
-    )
-    logger.info(
-        "generate_script_sections: narrative retry for section %r — %s",
-        target_label, combined,
-    )
-    logger.info(
-        "NARRATIVE_COMPLETENESS target=%r issues=%s covered_before=%d/%d",
-        target_label, instructions, len(covered_turns), len(major_turns),
-    )
-    state["narrative_retry_calls"] += 1
-    _old_sha = hashlib.sha256(
-        sections[idx]["script_text"].encode("utf-8", errors="replace")
-    ).hexdigest()[:8]
-    _covered_before_retry = len(covered_turns)
-    try:
-        prior_for_retry = [
-            {"label": s["label"], "summary": "", "reveals": [], "open_questions": []}
-            for s in sections[:idx]
-        ]
-        result = generate_section(
-            label=target_label,
-            story=story,
-            blueprint=blueprint,
-            prior_sections_summary=prior_for_retry,
-            visual_intent_accumulator=state["visual_intent_accumulator"],
-            channel=channel,
-            script_format=script_format,
-            tts_model=context["tts_model"],
-            tts_provider=context["tts_provider"],
-            audio_tags_enabled=audio_tags_enabled,
-            override_instruction=override,
-        )
-        retry_text = _clean_narrative_retry_text(result.get("script_text", ""), target_label)
-        replacement = {"label": target_label, "script_text": retry_text}
-        if sections[idx].get("title"):
-            replacement["title"] = sections[idx]["title"]
-        sections[idx] = replacement
-        _new_sha = hashlib.sha256(
-            retry_text.encode("utf-8", errors="replace")
-        ).hexdigest()[:8]
-        _new_first = (re.split(r"(?<=[.!?])\s+", retry_text.strip()) or [""])[0][:80]
-        _retry_coverage = _match_turns(
-            result.get("reveals", []), major_turns, retry_text,
-            label=f"{target_label}_retry_check",
-        )
-        _covered_after_retry = len(covered_turns | _retry_coverage)
-        logger.debug(
-            "NARRATIVE_RETRY target=%r sha=%s→%s first_sent=%r",
-            target_label, _old_sha, _new_sha, _new_first,
-        )
-        logger.debug(
-            "NARRATIVE_RETRY target=%r new_reveals=%s turns_covered=%d→%d/%d",
-            target_label,
-            [(r or "")[:60] for r in (result.get("reveals") or [])[:3]],
-            _covered_before_retry, _covered_after_retry, len(major_turns),
-        )
-        logger.info(
-            "generate_script_sections: narrative retry replaced section %r", target_label
-        )
-    except Exception as exc:
-        logger.warning(
-            "generate_script_sections: narrative retry call failed for %r: %s — "
-            "proceeding with original section",
-            target_label, exc,
-        )
-
-
-def _clean_narrative_retry_text(retry_text: str, target_label: str) -> str:
-    cleaned = split_long_sentences(normalize_tts_chars(retry_text))
-    if cleaned != retry_text:
-        retry_text = cleaned
-        logger.info(
-            "generate_script_sections: narrative retry backstop modified %r",
-            target_label,
-        )
-
-    if target_label == "INTRO":
-        _hook_after = [
-            i for i in check_hook_quality(retry_text, "source")
-            if i["severity"] == "MAJOR"
-        ]
-        if _hook_after:
-            logger.warning(
-                "generate_script_sections: INTRO narrative retry still has "
-                "MAJOR hook issue(s) after backstop — %s",
-                [i["description"] for i in _hook_after],
-            )
-    return retry_text
-
-
-def _log_post_retry_narrative_result(
-    voice_script: str,
-    blueprint: dict,
-    major_turns: list[str],
-    covered_turns: set[int],
-) -> None:
-    nc_issues_after = check_narrative_completeness(
-        voice_script, blueprint, already_covered=covered_turns
-    )
-    if nc_issues_after:
-        logger.warning(
-            "generate_script_sections: narrative completeness still failing after retry: %s",
-            nc_issues_after,
-        )
-        _post_nc_body = _get_content_tokens(voice_script)
-        for _i_post, _t_post in enumerate(major_turns):
-            if _i_post in covered_turns:
-                _tp = _get_content_tokens(_t_post)
-                _ov_post = len(_tp & _post_nc_body) / len(_tp) if _tp else 0.0
-                if _ov_post < 0.6:
-                    logger.warning(
-                        "TURN_COVERAGE_DISAGREEMENT_POST_RETRY turn[%d] overlap=%.2f "
-                        "— section_progression is authoritative, ignoring",
-                        _i_post, _ov_post,
-                    )
-    else:
-        logger.info(
-            "generate_script_sections: narrative completeness PASSED after retry"
-        )
-
-
-def _run_narrative_completeness_retry(
+def _log_narrative_completeness_telemetry(
     voice_script: str,
     state: dict,
-    story,
     blueprint: dict,
-    channel: Channel,
-    script_format: str,
-    audio_tags_enabled: bool,
     context: dict,
-) -> str:
+) -> None:
+    """Log narrative-completeness findings — telemetry only, never a regeneration.
+
+    Per the Elimination Mandate (code_report/forensic_output_audit_borrasca_run.md,
+    D1.4), the narrative-completeness retry pass (which used to regenerate INTRO/
+    OUTRO/body sections targeted at whichever completeness check failed) is
+    deleted: it was one more paid regeneration loop on top of the ones already
+    proven to degrade quality, with no evidence it produced a better script than
+    the original section. ``check_narrative_completeness()`` itself (pure Python,
+    no API call) still runs and is logged so the finding remains visible for
+    manual review — it just never triggers a Claude call anymore.
+    """
     major_turns = context["major_turns"]
     covered_turns = state["covered_turns"]
     _log_turn_coverage_alignment(voice_script, major_turns, covered_turns)
@@ -2135,30 +1716,14 @@ def _run_narrative_completeness_retry(
     nc_issues = check_narrative_completeness(
         voice_script, blueprint, already_covered=covered_turns
     )
-    if not nc_issues:
-        return voice_script
-
-    logger.info(
-        "generate_script_sections: narrative completeness issues before retry: %s", nc_issues
-    )
-    section_instructions = _group_narrative_retry_instructions(nc_issues, state["sections"])
-    for target_label, instructions in section_instructions.items():
-        _run_single_narrative_retry(
-            target_label=target_label,
-            instructions=instructions,
-            state=state,
-            story=story,
-            blueprint=blueprint,
-            channel=channel,
-            script_format=script_format,
-            audio_tags_enabled=audio_tags_enabled,
-            context=context,
+    if nc_issues:
+        logger.warning(
+            "generate_script_sections: narrative completeness issue(s) "
+            "(telemetry only, no retry): %s",
+            nc_issues,
         )
-
-    voice_script = assemble_script(state["sections"])
-    _script_trace("after_narrative_retry", voice_script)
-    _log_post_retry_narrative_result(voice_script, blueprint, major_turns, covered_turns)
-    return voice_script
+    else:
+        logger.info("generate_script_sections: narrative completeness PASSED")
 
 
 def generate_script_sections(
@@ -2170,28 +1735,32 @@ def generate_script_sections(
     audio_tags_enabled: bool = False,
     visual_style: str = "",
     image_style: str = "",
+    narration_pov: str = "third_person",
 ) -> dict:
     """Generate INTRO → body sections → OUTRO guided by the story blueprint.
 
-    Each section is generated individually with per-section TTS and hook checks.
-    Python controls the section count via _MIN_BODY_SECTIONS, _MAX_BODY_SECTIONS,
-    and coverage of blueprint.major_turns. Claude's ``suggests_outro`` is advisory.
+    Each section is generated individually with a single Claude call each — see
+    ``_generate_section_once()``. Python controls the section count via
+    _MIN_BODY_SECTIONS, _MAX_BODY_SECTIONS, and coverage of blueprint.major_turns.
+    Claude's ``suggests_outro`` is advisory.
 
     Post-assembly:
     - check_completeness + check_minimum_length are run; issues logged as WARNING
       (non-blocking — per-section TTS enforcement makes assembly-level issues rare).
-    - check_narrative_completeness (pure Python) is blocking: failing sections are
-      regenerated once with targeted override instructions before proceeding.
+    - check_narrative_completeness (pure Python) is telemetry only — per the
+      Elimination Mandate (code_report/forensic_output_audit_borrasca_run.md,
+      D1.4), it no longer regenerates any section. See
+      ``_log_narrative_completeness_telemetry()``.
 
-    Global narrative-coherence validation (Haiku, ``validate_script_globally``) is
-    no longer run here — it now runs once inside ``run_script_quality_gate()``,
-    where its result is persisted to ``ContentValidation`` and its issues feed the
-    same rewrite mechanism the quality gate already uses (Phase 10A-0). Running it
-    here was redundant: this function returns before the quality gate ever sees the
-    script, so the result had nowhere to go but a log line.
+    Global narrative-coherence validation (``validate_script_globally()``) and
+    the AI quality gate (``run_script_quality_gate()``'s former assess/rewrite
+    loop) were both deleted entirely per the Elimination Mandate
+    (code_report/forensic_output_audit_borrasca_run.md, D1.1/D1.2) — neither
+    exists anywhere in the pipeline anymore, not just skipped here.
     """
     context = _build_section_generation_context(
-        channel_voice, blueprint, visual_style=visual_style, image_style=image_style
+        channel_voice, blueprint, visual_style=visual_style, image_style=image_style,
+        narration_pov=narration_pov,
     )
     state = _create_section_loop_state()
     _log_blueprint_summary(blueprint, context["major_turns"], context["max_body"])
@@ -2208,15 +1777,8 @@ def generate_script_sections(
     voice_script = _assemble_sections_with_diagnostics(
         state, story, blueprint, channel, script_format, context
     )
-    voice_script = _run_narrative_completeness_retry(
-        voice_script=voice_script,
-        state=state,
-        story=story,
-        blueprint=blueprint,
-        channel=channel,
-        script_format=script_format,
-        audio_tags_enabled=audio_tags_enabled,
-        context=context,
+    _log_narrative_completeness_telemetry(
+        voice_script=voice_script, state=state, blueprint=blueprint, context=context,
     )
 
     _script_trace("generate_script_sections_returning", voice_script)
@@ -2225,13 +1787,11 @@ def generate_script_sections(
         "voice_script": voice_script,
         "visual_intent_history": state["visual_intent_history"],
         "_section_calls": state["section_calls"],
-        "_retry_calls": state["narrative_retry_calls"],
     }
 
 
 # ── Standalone short planning: Shorts Planner ──────────────────────────────────────────────────
 
-_MAX_SHORT_CORRECTION_ROUNDS = 2
 # Calibrated for a 61-90 s Short at the measured ~120 wpm child-Short rate
 # (roadmap 3.6/3.8, audit G-7 — real Shorts run at ~120 wpm, not the
 # previously-assumed 180 wpm / "3 words per second"; the old 250-word cap
@@ -2267,9 +1827,8 @@ _OVERLAP_NGRAM_LENGTH = 6
 # a full 6-word verbatim run, and would not register as a span at all).
 _OVERLAP_MAX_RATIO = 0.15
 
-# How many concrete overlapping excerpts to surface in logs and correction
-# instructions — enough to be actionable, short enough to keep the
-# override_instruction concise (mirrors the existing `issues_for_retry[:3]` cap).
+# How many concrete overlapping excerpts to surface in telemetry logs — enough
+# to be actionable for manual review, short enough to keep log lines readable.
 _OVERLAP_MAX_EXCERPTS = 3
 
 _OVERLAP_WORD_TOKEN_RE = re.compile(r"[^\W_]+(?:['’][^\W_]+)?", re.UNICODE)
@@ -2413,6 +1972,7 @@ def run_shorts_planner(
     channel_voice = _load_short_source_voice(long_content, channel, db)
     visual_style: str = config.visual_style if config else ""
     image_style: str = config.image_style if config else ""
+    narration_pov: str = config.narration_pov if config else "third_person"
 
     # Roadmap 6.1 / audit S-8, C-2: check for existing children BEFORE the
     # paid Claude plan call — a re-run against a parent whose Shorts already
@@ -2444,7 +2004,7 @@ def run_shorts_planner(
             db=db,
         )
 
-        generated = _generate_validated_short_script(
+        generated = _generate_short_script(
             part_plan=part_plan_with_total,
             part_n=part_n,
             voice_script=voice_script,
@@ -2454,6 +2014,7 @@ def run_shorts_planner(
             source_language=long_content.source_language,
             visual_style=visual_style,
             image_style=image_style,
+            narration_pov=narration_pov,
         )
         if generated is None:
             _remove_failed_short_content(short_content, part_n, db)
@@ -2607,7 +2168,7 @@ def _create_child_short_content(
     return short_content
 
 
-def _generate_validated_short_script(
+def _generate_short_script(
     part_plan: dict,
     part_n: int,
     voice_script: str,
@@ -2617,187 +2178,124 @@ def _generate_validated_short_script(
     source_language: str,
     visual_style: str = "",
     image_style: str = "",
+    narration_pov: str = "third_person",
 ) -> dict | None:
-    """Generate one child Short script, structurally and AI-quality validated.
+    """Generate one child Short script with a single Claude call — no quality-judging retry.
 
-    Three gates run in order, within the same ``_MAX_SHORT_CORRECTION_ROUNDS``
-    retry budget (Phase 13.2/13.3 — no new/expanded retry counter):
-
-    1. Deterministic structural checks (``_collect_short_script_major_issues``)
-       — word cap, TTS compliance, hook opener, no section markers.
-    2. Deterministic parent/child overlap check (``detect_parent_child_overlap``,
-       Phase 13.3) — exact word-sequence reuse from the parent long-form script.
-    3. The AI Short Quality Gate (``_run_short_quality_gate``, Phase 13.2) —
-       holistic retention review.
-
-    Each gate only runs once every earlier gate has passed for that attempt —
-    the AI quality gate in particular is never charged a Claude call for a
-    draft that's already going to be regenerated for a structural or overlap
-    reason. Whichever gate produced issues most recently feeds the same
-    override_instruction mechanism for the next attempt.
-    """
-    generated: dict | None = None
-    issues_for_retry: list[dict] = []
-    total_parts = part_plan.get("_total_parts")
-    is_final_part = total_parts is not None and part_n == total_parts
-
-    for correction_round in range(1, _MAX_SHORT_CORRECTION_ROUNDS + 2):
-        try:
-            result = generate_short_episode_script(
-                part_plan=part_plan,
-                long_voice_script=voice_script,
-                blueprint=blueprint,
-                channel=channel,
-                channel_voice=channel_voice,
-                override_instruction="" if correction_round == 1 else (
-                    f"Fix these issues from the previous attempt: "
-                    f"{'; '.join(i['description'] for i in issues_for_retry[:3])}"
-                ),
-                visual_style=visual_style,
-                image_style=image_style,
-            )
-        except Exception as exc:
-            logger.error(
-                "run_shorts_planner: script error for part %d attempt %d: %s",
-                part_n,
-                correction_round,
-                exc,
-            )
-            break
-
-        ep_voice_script = result.get("voice_script", "")
-        tts_majors = _collect_short_script_major_issues(
-            ep_voice_script=ep_voice_script,
-            source_language=source_language,
-            part_n=part_n,
-            correction_round=correction_round,
-        )
-        if tts_majors:
-            issues_for_retry = tts_majors
-            if correction_round > _MAX_SHORT_CORRECTION_ROUNDS:
-                logger.warning(
-                    "run_shorts_planner: part %d still has structural MAJOR issues "
-                    "after %d round(s) — using latest version",
-                    part_n,
-                    _MAX_SHORT_CORRECTION_ROUNDS,
-                )
-                generated = result
-                break
-            logger.info(
-                "run_shorts_planner: part %d retry %d — %d structural MAJOR issue(s): %s",
-                part_n,
-                correction_round,
-                len(tts_majors),
-                [i["category"] for i in tts_majors],
-            )
-            continue
-
-        # Structural checks passed — run the parent/child overlap detector (Phase 13.3)
-        # before the AI Short Quality Gate, so an overlap-rejected draft never spends
-        # an AI quality call.
-        overlap_result = detect_parent_child_overlap(
-            child_voice_script=ep_voice_script,
-            parent_voice_script=voice_script,
-            part_n=part_n,
-            correction_round=correction_round,
-        )
-        overlap_issues = overlap_result["issues"] if overlap_result is not None else []
-        if overlap_issues:
-            issues_for_retry = overlap_issues
-            if correction_round > _MAX_SHORT_CORRECTION_ROUNDS:
-                logger.warning(
-                    "run_shorts_planner: part %d still has parent/child overlap "
-                    "(ratio=%.1f%%) after %d round(s) — using latest version",
-                    part_n,
-                    overlap_result["overlap_ratio"] * 100,
-                    _MAX_SHORT_CORRECTION_ROUNDS,
-                )
-                generated = result
-                break
-            logger.info(
-                "run_shorts_planner: part %d retry %d — parent/child overlap ratio=%.1f%%",
-                part_n,
-                correction_round,
-                overlap_result["overlap_ratio"] * 100,
-            )
-            continue
-
-        # Structural + overlap checks passed — run the AI Short Quality Gate (Phase 13.2).
-        quality_issues = _run_short_quality_gate(
-            ep_voice_script=ep_voice_script,
-            channel=channel,
-            part_n=part_n,
-            correction_round=correction_round,
-            is_final_part=is_final_part,
-        )
-        if not quality_issues:
-            generated = result
-            break
-
-        issues_for_retry = quality_issues
-        if correction_round > _MAX_SHORT_CORRECTION_ROUNDS:
-            logger.warning(
-                "run_shorts_planner: part %d still has AI quality issues after %d "
-                "round(s) — using latest version",
-                part_n,
-                _MAX_SHORT_CORRECTION_ROUNDS,
-            )
-            generated = result
-            break
-
-        logger.info(
-            "run_shorts_planner: part %d retry %d — %d AI quality issue(s): %s",
-            part_n,
-            correction_round,
-            len(quality_issues),
-            [i["category"] for i in quality_issues],
-        )
-    return generated
-
-
-def _run_short_quality_gate(
-    ep_voice_script: str,
-    channel: Channel,
-    part_n: int,
-    correction_round: int,
-    is_final_part: bool,
-) -> list[dict]:
-    """Run the AI Short Quality Gate on one structurally-valid Short draft (Phase 13.2).
-
-    Mirrors ``run_script_quality_gate()``'s fail-safe convention: if the assessment
-    call itself fails (bad JSON, API error, unexpected status), log it clearly and
-    treat the draft as accepted — rewriting based on a failed assessment would be
-    meaningless, and a flaky assessor must never block or loop the pipeline.
-
-    Returns:
-        List of issue dicts if the gate returned NEEDS_REWRITE (non-empty means
-        "retry needed"). Empty list means PASSED, or the assessment call failed
-        and the draft is accepted as-is.
+    Per the Elimination Mandate (code_report/forensic_output_audit_borrasca_run.md,
+    D1.3), the correction-round loop and the AI Short Quality Gate are deleted:
+    a real production run showed word counts got WORSE across retry rounds
+    (205 -> 196 -> 218 words, still over the 180-word cap) and shipped anyway,
+    and the AI gate's ``status=="PASSED"`` + non-empty ``issues`` contract
+    mismatch burned a retry into a worse draft. Deterministic structural checks
+    (word floor/cap, TTS compliance, hook opener, section markers) and the
+    parent/child overlap detector still run and are logged — they no longer
+    trigger regeneration.
     """
     try:
-        review = assess_short_script_quality(ep_voice_script, channel, is_final_part=is_final_part)
+        result = generate_short_episode_script(
+            part_plan=part_plan,
+            long_voice_script=voice_script,
+            blueprint=blueprint,
+            channel=channel,
+            channel_voice=channel_voice,
+            visual_style=visual_style,
+            image_style=image_style,
+            narration_pov=narration_pov,
+        )
     except Exception as exc:
-        logger.error(
-            "SHORT_AI_QUALITY_VALIDATION_FAIL part=%d round=%d reason=assessment_error error=%s "
-            "— accepting structurally-valid draft as-is",
-            part_n, correction_round, exc,
-        )
-        return []
+        logger.error("run_shorts_planner: script error for part %d: %s", part_n, exc)
+        return None
 
-    issues: list[dict] = review.get("issues", [])
-    if review.get("status") == "PASSED" and not issues:
-        logger.info(
-            "SHORT_AI_QUALITY_VALIDATION_PASS part=%d round=%d",
-            part_n, correction_round,
-        )
-        return []
-
-    logger.info(
-        "SHORT_AI_QUALITY_VALIDATION_FAIL part=%d round=%d status=%s issues=%d categories=%s",
-        part_n, correction_round, review.get("status"), len(issues),
-        [i.get("category") for i in issues],
+    _collect_short_title_spoiler_issue(
+        title=str(result.get("title", "")),
+        part_plan=part_plan,
+        blueprint=blueprint,
+        part_n=part_n,
     )
-    return issues
+
+    ep_voice_script = result.get("voice_script", "")
+    tts_majors = _collect_short_script_major_issues(
+        ep_voice_script=ep_voice_script,
+        source_language=source_language,
+        part_n=part_n,
+        correction_round=1,
+    )
+    if tts_majors:
+        logger.warning(
+            "run_shorts_planner: part %d has %d structural MAJOR issue(s) "
+            "(telemetry only, no retry): %s",
+            part_n, len(tts_majors), [i["category"] for i in tts_majors],
+        )
+
+    overlap_result = detect_parent_child_overlap(
+        child_voice_script=ep_voice_script,
+        parent_voice_script=voice_script,
+        part_n=part_n,
+        correction_round=1,
+    )
+    if overlap_result is not None and overlap_result["issues"]:
+        logger.warning(
+            "run_shorts_planner: part %d has parent/child overlap ratio=%.1f%% "
+            "(telemetry only, no retry)",
+            part_n, overlap_result["overlap_ratio"] * 100,
+        )
+
+    return result
+
+
+def _collect_short_title_spoiler_issue(
+    title: str,
+    part_plan: dict,
+    blueprint: dict,
+    part_n: int,
+) -> dict | None:
+    """Telemetry-only check for Short titles that disclose their own payoff.
+
+    The Short title can sit on a thumbnail/title card before the viewer hears the
+    setup. If it substantially overlaps the planned reveal or final payoff, log
+    the evidence for operators, but do not rewrite or regenerate anything.
+    """
+    title_tokens = _get_content_tokens(title)
+    if len(title_tokens) < 2:
+        return None
+
+    candidates = [
+        ("part_main_reveal", part_plan.get("main_reveal", "")),
+        ("part_cliffhanger", part_plan.get("cliffhanger", "")),
+        ("blueprint_final_payoff", blueprint.get("final_payoff", "")),
+    ]
+    best: dict | None = None
+    for source, text in candidates:
+        candidate_tokens = _get_content_tokens(str(text or ""))
+        if not candidate_tokens:
+            continue
+        matched = sorted(title_tokens & candidate_tokens)
+        overlap_ratio = len(matched) / max(len(title_tokens), 1)
+        if len(matched) < 2 or overlap_ratio < 0.6:
+            continue
+        issue = {
+            "severity": "TELEMETRY",
+            "category": "short_title_spoiler",
+            "source": source,
+            "title": title,
+            "overlap_ratio": overlap_ratio,
+            "matched_terms": matched,
+        }
+        if best is None or issue["overlap_ratio"] > best["overlap_ratio"]:
+            best = issue
+
+    if best is not None:
+        logger.warning(
+            "SHORT_TITLE_SPOILER_TELEMETRY part=%d source=%s title=%r "
+            "overlap_ratio=%.2f matched_terms=%s action=log_only",
+            part_n,
+            best["source"],
+            title,
+            best["overlap_ratio"],
+            best["matched_terms"],
+        )
+    return best
 
 
 def _collect_short_script_major_issues(
@@ -2821,11 +2319,10 @@ def _collect_short_script_major_issues(
     # flat narration only (CLAUDE.md §5.2). Reuses the same generic bracket-marker
     # regex the Phase 12.4 translation path already validates against
     # (_SHORT_TRANSLATION_MARKER_RE, defined above) — this is a new call site, not
-    # a change to that function or constant. Phase 13.2: this structural check did
-    # not previously exist for freshly-generated source-language Short scripts
-    # (only for translated/adapted ones), so a stray marker was never caught before
-    # reaching the AI quality gate. Checked deterministically, before any AI call,
-    # consistent with §15 "business rules live in Python."
+    # a change to that function or constant. Checked deterministically (telemetry
+    # only, no retry — see the Elimination Mandate in
+    # code_report/forensic_output_audit_borrasca_run.md D1.3), consistent with
+    # §15 "business rules live in Python."
     marker_match = _SHORT_TRANSLATION_MARKER_RE.search(ep_voice_script)
     if marker_match:
         tts_majors.append({
@@ -2965,73 +2462,59 @@ def _generate_validated_translated_short_script(
     tts_provider: str,
     hook_context: str | None,
     content_id: uuid.UUID,
+    narration_pov: str = "third_person",
 ) -> dict | None:
-    """Generate and validate one translated/adapted child Short script (Phase 12.4).
+    """Generate one translated/adapted child Short script — single Claude call.
 
-    Mirrors ``_generate_validated_short_script()``'s retry-on-MAJOR-issue loop:
-    up to ``_MAX_SHORT_CORRECTION_ROUNDS`` retries with a corrective instruction
-    appended, then the latest attempt is used non-blocking (logged), matching this
-    codebase's existing short-script correction convention — never silently, always
-    logged either PASS or FAIL_USING_LATEST.
+    The former retry loop (up to ``_MAX_SHORT_CORRECTION_ROUNDS`` corrective
+    re-generations with an ``override_instruction``, Phase 12.4) is deleted per
+    the Elimination Mandate's extension to the translation paths (post-roadmap
+    audit): the identical mechanism on the source-language Short path was
+    measured making drafts WORSE across rounds (word count 205 → 196 → 218,
+    audit P1-6), and this loop too always ended in FAIL_USING_LATEST
+    (non-blocking). Deterministic findings
+    (``_collect_translated_short_script_issues()``) are now telemetry only.
 
     Returns:
         Dict with key ``voice_script``, or ``None`` if generation itself raised
-        (as opposed to merely failing validation).
+        (a transport failure, not a quality judgment).
     """
     source_word_count = len(source_voice_script.split())
-    override_instruction = ""
-    adapted: dict | None = None
-
-    for correction_round in range(1, _MAX_SHORT_CORRECTION_ROUNDS + 2):
-        try:
-            adapted = generate_native_script(
-                voice_script=source_voice_script,
-                target_language=target_language,
-                niche=channel.niche,
-                tone=channel.tone,
-                script_format=script_format,
-                audio_tags_enabled=audio_tags_enabled,
-                tts_model=tts_model,
-                tts_provider=tts_provider,
-                hook_context=hook_context,
-                content_kind="child_short",
-                override_instruction=override_instruction,
-            )
-        except Exception as exc:
-            logger.error(
-                "CHILD_SHORT_TRANSLATION_FAILED content=%s lang=%s round=%d: %s",
-                content_id, target_language, correction_round, exc,
-            )
-            return None
-
-        issues = _collect_translated_short_script_issues(
-            adapted["voice_script"], target_language, source_word_count,
+    try:
+        adapted = generate_native_script(
+            voice_script=source_voice_script,
+            target_language=target_language,
+            niche=channel.niche,
+            tone=channel.tone,
+            script_format=script_format,
+            audio_tags_enabled=audio_tags_enabled,
+            tts_model=tts_model,
+            tts_provider=tts_provider,
+            hook_context=hook_context,
+            content_kind="child_short",
+            narration_pov=narration_pov,
         )
-        if not issues:
-            logger.info(
-                "CHILD_SHORT_TRANSLATION_VALIDATED content=%s lang=%s round=%d status=PASS",
-                content_id, target_language, correction_round,
-            )
-            return adapted
+    except Exception as exc:
+        logger.error(
+            "CHILD_SHORT_TRANSLATION_FAILED content=%s lang=%s: %s",
+            content_id, target_language, exc,
+        )
+        return None
 
-        if correction_round > _MAX_SHORT_CORRECTION_ROUNDS:
-            logger.warning(
-                "CHILD_SHORT_TRANSLATION_VALIDATED content=%s lang=%s round=%d "
-                "status=FAIL_USING_LATEST remaining_issues=%s",
-                content_id, target_language, correction_round,
-                [i["category"] for i in issues],
-            )
-            return adapted
-
+    issues = _collect_translated_short_script_issues(
+        adapted["voice_script"], target_language, source_word_count,
+    )
+    if issues:
+        logger.warning(
+            "CHILD_SHORT_TRANSLATION_ISSUES content=%s lang=%s "
+            "(telemetry only, no retry): %s",
+            content_id, target_language, [i["category"] for i in issues],
+        )
+    else:
         logger.info(
-            "CHILD_SHORT_TRANSLATION_RETRY content=%s lang=%s round=%d issues=%s",
-            content_id, target_language, correction_round, [i["category"] for i in issues],
+            "CHILD_SHORT_TRANSLATION_VALIDATED content=%s lang=%s status=PASS",
+            content_id, target_language,
         )
-        override_instruction = (
-            "Fix these issues from the previous attempt: "
-            + "; ".join(i["description"] for i in issues[:3])
-        )
-
     return adapted
 
 

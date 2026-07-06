@@ -8,13 +8,14 @@ from app.models import (
     Content, Script,
 )
 from app.agents.agent3_audio.services.tts import generate_audio
-from app.agents.agent3_audio.services.storage import audio_path, save_audio
+from app.agents.agent3_audio.services.storage import audio_path, save_audio, measure_audio_duration_ms
 from app.agents.agent3_audio.services.whisper import transcribe
 from app.services.local_run_paths import ensure_run_dirs
 
 logger = logging.getLogger(__name__)
 
 _MIN_SHORT_AUDIO_DURATION_MS = 61_000
+_DURATION_TRANSCRIPT_DRIFT_TOLERANCE = 0.02  # 2%
 
 
 def _assert_short_audio_min_duration(
@@ -68,6 +69,49 @@ def _assert_short_audio_has_transcript(
     return False
 
 
+def _assert_duration_transcript_alignment(
+    *,
+    content_id: uuid.UUID,
+    language: str,
+    duration_ms: int,
+    transcript: list[dict],
+) -> bool:
+    """Return False when ``duration_ms`` and the Whisper transcript's last
+    word end disagree by more than ``_DURATION_TRANSCRIPT_DRIFT_TOLERANCE``.
+
+    Roadmap 2b / audit P0-2 (`code_report/forensic_output_audit_borrasca_run.md`):
+    a real production run persisted ``duration_ms=161724`` for a real
+    616,835 ms audio file, with the SAME ``AudioFile`` row's
+    ``whisper_transcript`` already showing a last word ending at ~616,580 ms
+    — nothing anywhere compared the two, so the corrupted duration silently
+    poisoned every downstream timeline (Agent 4's beat budget, timestamp
+    mapping, the hold cap, Remotion's composition length, WPM calibration).
+    This is the cross-timeline invariant that would have caught it at Agent
+    3, before any Claude, Flux, or render spend.
+
+    Applies to both parent and child content — the corruption this guards
+    against hit parent audio, not just Shorts. Skipped only when there is no
+    transcript to compare against, which is already a separately-tolerated
+    case for parent content (see ``_assert_short_audio_has_transcript``,
+    which hard-fails only Shorts on a missing transcript).
+    """
+    if not transcript:
+        return True
+    last_word_end_ms = float(transcript[-1].get("end") or 0.0) * 1000
+    if last_word_end_ms <= 0:
+        return True
+    drift_ratio = abs(duration_ms - last_word_end_ms) / max(duration_ms, 1)
+    if drift_ratio <= _DURATION_TRANSCRIPT_DRIFT_TOLERANCE:
+        return True
+    logger.error(
+        "AUDIO_DURATION_TRANSCRIPT_MISMATCH content_id=%s lang=%s "
+        "duration_ms=%d whisper_last_word_end_ms=%.0f drift=%.1f%% tolerance=%.0f%%",
+        content_id, language, duration_ms, last_word_end_ms,
+        drift_ratio * 100, _DURATION_TRANSCRIPT_DRIFT_TOLERANCE * 100,
+    )
+    return False
+
+
 def run_audio_generation(content_id: uuid.UUID, db: Session) -> bool:
     """Run the full Agent 3 audio pipeline for one piece of content.
 
@@ -75,7 +119,7 @@ def run_audio_generation(content_id: uuid.UUID, db: Session) -> bool:
       1. Look up the voice_id + emotion from channel_voices
       2. Generate TTS audio via the configured provider (channel_voice.provider;
          model from channel_voice.tts_model; chunked at [SECTION N] boundaries)
-      3. Save the mp3 to disk and measure exact duration with mutagen
+      3. Save the mp3 to disk and measure exact duration with ffprobe
       4. Transcribe with OpenAI Whisper → word-level timestamps
       5. Persist AudioFile record and update Script.estimated_duration_sec
 
@@ -148,12 +192,32 @@ def run_audio_generation(content_id: uuid.UUID, db: Session) -> bool:
 
         # ── Step 1: TTS (skip if file already on disk) ───────────────────────
         existing = audio_path(content_id, lang)
+        reuse_existing_transcript = False
+        transcript: list[dict] = []
         try:
             if existing.exists():
                 logger.info("Audio already on disk — skipping TTS for lang=%s", lang)
-                file_path   = str(existing)
-                from mutagen.mp3 import MP3
-                duration_ms = int(MP3(file_path).info.length * 1000)
+                file_path = str(existing)
+                existing_audio_file: AudioFile | None = (
+                    db.query(AudioFile)
+                    .filter(AudioFile.content_id == content_id, AudioFile.language == lang)
+                    .first()
+                )
+                if existing_audio_file and existing_audio_file.duration_ms and existing_audio_file.whisper_transcript:
+                    # D1.6 (Elimination Mandate, code_report/forensic_output_audit_borrasca_run.md):
+                    # the audio file on disk hasn't changed, so trust the already-persisted
+                    # duration + transcript instead of re-measuring the header and
+                    # re-transcribing it — a resumed run was re-transcribing the same
+                    # audio on every retry for zero new information.
+                    duration_ms = existing_audio_file.duration_ms
+                    transcript  = existing_audio_file.whisper_transcript
+                    reuse_existing_transcript = True
+                    logger.info(
+                        "RESUME_TRANSCRIPT_REUSED content_id=%s lang=%s duration_ms=%d words=%d",
+                        content_id, lang, duration_ms, len(transcript),
+                    )
+                else:
+                    duration_ms = measure_audio_duration_ms(existing)
             else:
                 audio_bytes             = generate_audio(script.voice_script, voice, is_short_episode=is_short_episode)
                 file_path, duration_ms  = save_audio(content_id, lang, audio_bytes)
@@ -176,21 +240,31 @@ def run_audio_generation(content_id: uuid.UUID, db: Session) -> bool:
         # Soft for parent long-form content — missing transcript is tolerated,
         # falling back to proportional timing downstream. Hard for child
         # Shorts (roadmap 3.9 / audit A-3, exec-10) — see
-        # _assert_short_audio_has_transcript() below.
-        transcript: list[dict] = []
-        try:
-            transcript = transcribe(file_path, language=lang)
-        except Exception as exc:
-            logger.warning(
-                "Whisper failed lang=%s (%s) — continuing without word timestamps",
-                lang, exc,
-            )
+        # _assert_short_audio_has_transcript() below. Skipped entirely when a
+        # transcript was already reused above (D1.6) — the file didn't change.
+        if not reuse_existing_transcript:
+            try:
+                transcript = transcribe(file_path, language=lang)
+            except Exception as exc:
+                logger.warning(
+                    "Whisper failed lang=%s (%s) — continuing without word timestamps",
+                    lang, exc,
+                )
 
         if not _assert_short_audio_has_transcript(
             content_id=content_id,
             language=lang,
             transcript=transcript,
             is_short_episode=is_short_episode,
+        ):
+            db.rollback()
+            continue
+
+        if not _assert_duration_transcript_alignment(
+            content_id=content_id,
+            language=lang,
+            duration_ms=duration_ms,
+            transcript=transcript,
         ):
             db.rollback()
             continue

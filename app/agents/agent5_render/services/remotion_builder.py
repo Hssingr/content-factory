@@ -11,7 +11,7 @@ Layout of the main props file (build_main_props):
     "duration_ms": 479300,
     "sections": [...],
     "subtitles": {"style": "standard", "captions": [...]},
-    "config": {"style": "documentary", "color_grade": "desaturated"}
+    "config": {"style": "story_driven", "color_grade": "desaturated"}
   }
 
 Layout of a Short props file (build_short_props — used by Standalone short architecture child short episodes
@@ -28,7 +28,7 @@ when they eventually render with the Short.tsx 9:16 composition):
     "subtitles": {"style": "karaoke", "captions": [...]},
     "part_label": "Partie 1/3",
     "total_parts": 3,
-    "config": {"style": "documentary", "color_grade": "desaturated"}
+    "config": {"style": "story_driven", "color_grade": "desaturated"}
   }
 """
 
@@ -40,6 +40,67 @@ from pathlib import Path
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+# Roadmap 2b / audit P0-2 (code_report/forensic_output_audit_borrasca_run.md):
+# mirrors Agent 3's cross-timeline invariant at the props-building layer.
+_TIMELINE_DRIFT_TOLERANCE = 0.02  # 2%
+
+
+def _assert_timeline_alignment(
+    *,
+    duration_ms: int,
+    sections: list[dict],
+    captions: list[dict],
+    context: str,
+) -> None:
+    """Raise ValueError if the last caption end or last section end drifts
+    from ``duration_ms`` by more than ``_TIMELINE_DRIFT_TOLERANCE``.
+
+    Roadmap 2b / audit P0-2: three independent timelines flow into a render
+    (``AudioFile.duration_ms``, Whisper-derived captions, ``VideoSection``-
+    derived section spans) and a real production run shipped with captions
+    ending at 616,580 ms while sections and the DB's own ``duration_ms``
+    ended at 161,724 ms — nothing anywhere compared the three, so the props
+    file silently carried both numbers into the same render. This mirrors
+    ``agent3_audio.services.audio._assert_duration_transcript_alignment()``
+    at the last checkpoint before a corrupted timeline reaches Remotion.
+
+    Args:
+        duration_ms: Expected audio duration in milliseconds.
+        sections:    Raw section/beat dicts (before `_section_for_remotion()`
+                     field trimming — `audio_end_ms` is unaffected either way).
+        captions:    Caption chunks as they will be embedded in the props file.
+        context:     Human-readable identifier for the error message.
+
+    Raises:
+        ValueError: If either comparison exceeds the tolerance.
+    """
+    if duration_ms <= 0:
+        return
+
+    last_section_end_ms = max((s.get("audio_end_ms") or 0 for s in sections), default=0)
+    last_caption_end_ms = max((c.get("end_ms") or 0 for c in captions), default=0)
+
+    mismatches: list[str] = []
+    if last_section_end_ms > 0:
+        drift = abs(last_section_end_ms - duration_ms) / duration_ms
+        if drift > _TIMELINE_DRIFT_TOLERANCE:
+            mismatches.append(
+                f"last_section_end_ms={last_section_end_ms} vs duration_ms={duration_ms} "
+                f"(drift={drift:.1%})"
+            )
+    if last_caption_end_ms > 0:
+        drift = abs(last_caption_end_ms - duration_ms) / duration_ms
+        if drift > _TIMELINE_DRIFT_TOLERANCE:
+            mismatches.append(
+                f"last_caption_end_ms={last_caption_end_ms} vs duration_ms={duration_ms} "
+                f"(drift={drift:.1%})"
+            )
+
+    if mismatches:
+        raise ValueError(
+            f"Timeline alignment invariant violated in {context}: " + "; ".join(mismatches)
+        )
 
 
 def _audio_rel(audio_file_path: str) -> str:
@@ -60,7 +121,7 @@ def build_main_props(
     sections: list[dict],
     standard_subtitles: list[dict],
     karaoke_subtitles: list[dict],
-    channel_style: str = "documentary",
+    channel_style: str = "story_driven",
     channel_color_grade: str = "desaturated",
 ) -> str:
     """Write the main video props JSON and return the file path.
@@ -79,6 +140,13 @@ def build_main_props(
     Returns:
         Absolute path to the written props JSON file.
     """
+    _assert_timeline_alignment(
+        duration_ms=duration_ms,
+        sections=sections,
+        captions=standard_subtitles,
+        context=f"main props content={content_id} language={language}",
+    )
+
     props_dir = _ensure_props_dir()
     file_name = f"{content_id}_{language}_main.json"
     file_path = props_dir / file_name
@@ -107,7 +175,7 @@ def build_short_props(
     audio_file_path: str,
     short: dict,
     karaoke_subtitles: list[dict],
-    channel_style: str = "documentary",
+    channel_style: str = "story_driven",
     channel_color_grade: str = "desaturated",
 ) -> str:
     """Write a props JSON file for a single Short and return the file path.
@@ -135,6 +203,13 @@ def build_short_props(
         c for c in karaoke_subtitles
         if c.get("start_ms", 0) >= short_start and c.get("end_ms", 0) <= short_end
     ]
+
+    _assert_timeline_alignment(
+        duration_ms=short_end - short_start,
+        sections=short.get("sections", []),
+        captions=short_captions,
+        context=f"short props content={content_id} language={language} short_index={short_index}",
+    )
 
     props = {
         "content_id":  content_id,

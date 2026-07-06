@@ -26,6 +26,11 @@ export default function AISuggestionField({
 
   const renderInput = () => {
     if (options) {
+      // An AI suggestion or research recommendation can set a value outside
+      // the preset list (the backend column is free-form) — render it as an
+      // extra option so the select displays it instead of silently showing
+      // the first/blank option while a different value is actually saved.
+      const hasValue = !value || options.some(o => o.value === value)
       return (
         <select
           className="field-select"
@@ -33,6 +38,7 @@ export default function AISuggestionField({
           onChange={e => onChange(e.target.value)}
           disabled={disabled}
         >
+          {!hasValue && <option value={value}>{value} (custom)</option>}
           {options.map(o => (
             <option key={o.value} value={o.value}>{o.label}</option>
           ))}

@@ -136,8 +136,11 @@ class TestMediaValidatorMergeRuntimeChain(unittest.TestCase):
 
     @staticmethod
     def _write_image(path: Path):
+        # 160x90 = 16:9 — matches the media validator's parent aspect-ratio
+        # check (roadmap 3a / audit P1-3); this fixture's content is always
+        # is_short_episode=False (see _fixtures()).
         path.parent.mkdir(parents=True, exist_ok=True)
-        Image.new("RGB", (8, 8), color="blue").save(path)
+        Image.new("RGB", (160, 90), color="blue").save(path)
 
     def test_beats_by_lang_flows_into_round_trip_check_without_blocking(self):
         db, content_id = self._fixtures()
@@ -163,7 +166,6 @@ class TestMediaValidatorMergeRuntimeChain(unittest.TestCase):
 
             with (
                 patch.object(vo, "run_visual_generation", return_value=fake_result),
-                patch.object(vo, "generate_visual_bible_for_content", return_value={}),
                 patch.object(vo, "generate_visual_review_html", return_value="review.html"),
                 patch.object(vo, "ensure_run_dirs", return_value={}),
                 patch.object(vo, "validate_visual_media_assets", side_effect=spying_validate),
@@ -196,7 +198,6 @@ class TestMediaValidatorMergeRuntimeChain(unittest.TestCase):
 
             with (
                 patch.object(vo, "run_visual_generation", return_value=fake_result),
-                patch.object(vo, "generate_visual_bible_for_content", return_value={}),
                 patch.object(vo, "generate_visual_review_html", return_value="review.html"),
                 patch.object(vo, "ensure_run_dirs", return_value={}),
                 patch("app.agents.agent4_visuals.services.media_validation.settings.media_path", tmp),
