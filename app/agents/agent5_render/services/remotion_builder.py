@@ -10,8 +10,7 @@ Layout of the main props file (build_main_props):
     "audio_file": "/media/audio/.../fr.mp3",
     "duration_ms": 479300,
     "sections": [...],
-    "subtitles": {"style": "standard", "captions": [...]},
-    "config": {"style": "story_driven", "color_grade": "desaturated"}
+    "subtitles": {"style": "standard", "captions": [...]}
   }
 
 Layout of a Short props file (build_short_props — used by Standalone short architecture child short episodes
@@ -27,8 +26,7 @@ when they eventually render with the Short.tsx 9:16 composition):
     "sections": [...],
     "subtitles": {"style": "karaoke", "captions": [...]},
     "part_label": "Partie 1/3",
-    "total_parts": 3,
-    "config": {"style": "story_driven", "color_grade": "desaturated"}
+    "total_parts": 3
   }
 """
 
@@ -121,8 +119,6 @@ def build_main_props(
     sections: list[dict],
     standard_subtitles: list[dict],
     karaoke_subtitles: list[dict],
-    channel_style: str = "story_driven",
-    channel_color_grade: str = "desaturated",
 ) -> str:
     """Write the main video props JSON and return the file path.
 
@@ -134,8 +130,6 @@ def build_main_props(
         sections:            All validated + media-enriched sections.
         standard_subtitles:  Caption chunks for the 16:9 video.
         karaoke_subtitles:   Karaoke chunks (kept for future use; not embedded here).
-        channel_style:       ``video_style_type`` from channel_config.
-        channel_color_grade: ``video_color_grade`` from channel_config.
 
     Returns:
         Absolute path to the written props JSON file.
@@ -158,10 +152,6 @@ def build_main_props(
         "duration_ms": duration_ms,
         "sections": [_section_for_remotion(s) for s in sections],
         "subtitles": {"style": "standard", "captions": standard_subtitles},
-        "config": {
-            "style":       channel_style,
-            "color_grade": channel_color_grade,
-        },
     }
 
     _write_json(file_path, props)
@@ -175,8 +165,6 @@ def build_short_props(
     audio_file_path: str,
     short: dict,
     karaoke_subtitles: list[dict],
-    channel_style: str = "story_driven",
-    channel_color_grade: str = "desaturated",
 ) -> str:
     """Write a props JSON file for a single Short and return the file path.
 
@@ -186,8 +174,6 @@ def build_short_props(
         audio_file_path:     Absolute path to the language audio file.
         short:               Short segment dict with short_index, start_ms, end_ms, sections, etc.
         karaoke_subtitles:   All karaoke captions (filtered to this Short's window).
-        channel_style:       ``video_style_type`` from channel_config.
-        channel_color_grade: ``video_color_grade`` from channel_config.
 
     Returns:
         Absolute path to the written props JSON file.
@@ -223,10 +209,6 @@ def build_short_props(
         "subtitles":   {"style": "karaoke", "captions": short_captions},
         "part_label":  short.get("part_label", ""),
         "total_parts": short.get("total_parts", 1),
-        "config": {
-            "style":       channel_style,
-            "color_grade": channel_color_grade,
-        },
     }
 
     _write_json(file_path, props)

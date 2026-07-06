@@ -29,17 +29,10 @@ class ChannelUpdate(BaseModel):
 
 class ChannelConfigUpsert(BaseModel):
     videos_per_week: int = 3
-    shorts_rule: str = "auto"
     validation_timeout_hours: int = 24
     validation_max_revisions: int = 3
     validation_on_limit_reached: str = "auto_approve"
-    subtitle_style_main: str = "standard"
-    subtitle_style_shorts: str = "karaoke"
     subtitle_karaoke_active_color: str = "#FFD700"
-    shorts_part_label_style: str = "default"
-    video_style_type: str = "story_driven"
-    video_color_grade: str | None = None
-    runway_enabled: bool = False
     # V3 groundwork fields — additive, not yet consumed downstream (see CLAUDE.md §8.1).
     content_mode: ContentMode = "single_story"
     script_source: ScriptSource = "reddit"
@@ -98,17 +91,10 @@ class VerifyCredential(BaseModel):
 class ChannelConfigResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     videos_per_week: int
-    shorts_rule: str
     validation_timeout_hours: int
     validation_max_revisions: int
     validation_on_limit_reached: str
-    subtitle_style_main: str
-    subtitle_style_shorts: str
     subtitle_karaoke_active_color: str
-    shorts_part_label_style: str
-    video_style_type: str
-    video_color_grade: str | None
-    runway_enabled: bool
     content_mode: ContentMode
     script_source: ScriptSource
     output_mode: OutputMode

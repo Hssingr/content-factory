@@ -14,32 +14,26 @@ class ChannelConfig(Base):
         UUID(as_uuid=True), ForeignKey("channels.id", ondelete="CASCADE"), primary_key=True
     )
     videos_per_week: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
-    # 'always' | 'never' | 'auto'
-    shorts_rule: Mapped[str] = mapped_column(String(16), nullable=False, default="auto")
     validation_timeout_hours: Mapped[int] = mapped_column(Integer, nullable=False, default=24)
     validation_max_revisions: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
     # 'auto_approve' | 'needs_review'
     validation_on_limit_reached: Mapped[str] = mapped_column(String(16), nullable=False, default="auto_approve")
-    subtitle_style_main: Mapped[str] = mapped_column(String(32), nullable=False, default="standard")
-    subtitle_style_shorts: Mapped[str] = mapped_column(String(32), nullable=False, default="karaoke")
+    # Karaoke active-word color for Shorts subtitles (main video uses standard
+    # subtitles, Shorts use karaoke — hardcoded by format in agent5 video.py).
     subtitle_karaoke_active_color: Mapped[str] = mapped_column(String(16), nullable=False, default="#FFD700")
-    shorts_part_label_style: Mapped[str] = mapped_column(String(32), nullable=False, default="default")
-    video_style_type: Mapped[str] = mapped_column(String(64), nullable=False, default="story_driven", server_default="story_driven")
-    video_color_grade: Mapped[str] = mapped_column(String(64), nullable=True)
-    # Runway is the absolute last resort; disabled by default
-    runway_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     # 'youtube_long' | 'youtube_short' | 'tiktok' | 'reels'
     script_format: Mapped[str] = mapped_column(String(32), nullable=False, server_default="youtube_long")
-    # Storyboard failure policy. False (default): stop language generation with an
-    # explicit error when the Storyboard Agent fails — never silently fall back to
-    # the legacy section splitter (silent fallback was masking a 100% storyboard
-    # failure rate). True: restore the previous silent-fallback behavior.
+    # Timestamp-mapping tolerance policy (repurposed name — the legacy section
+    # splitter it originally gated was removed by roadmap 6.3). False (default):
+    # treat >50% proportional-fallback beat timing as a mapping failure for that
+    # language. True: accept the mapping regardless.
     allow_legacy_fallback: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
-    # Quality gate policy. False (default): block render only on HIGH-severity viewer
-    # experience issues (visuals category) that remain after the repair pass — non-blocking
-    # categories (intro, audio, captions, pacing) never block rendering.
-    # True: block on any NEEDS_FIXES verdict that survives the repair pass.
-    strict_quality_gate: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+
+    # Dead columns dropped by migration 009 (post-roadmap deep audit):
+    # shorts_rule, subtitle_style_main, subtitle_style_shorts,
+    # shorts_part_label_style, runway_enabled, strict_quality_gate,
+    # video_style_type, video_color_grade — none had a live runtime reader.
+    # visual_style (below) is the single channel-level style column.
 
     # ElevenLabs v3 audio tags (e.g. [dramatic pause], [whispers]).
     # Only meaningful when provider="elevenlabs" AND tts_model="eleven_v3".
@@ -63,9 +57,9 @@ class ChannelConfig(Base):
     # parent+standalone-shorts architecture) | 'youtube_long_only' | 'shorts_only'
     # (reserved).
     output_mode: Mapped[str] = mapped_column(String(32), nullable=False, server_default="youtube_and_shorts")
-    # Free-form descriptor, same looseness as video_style_type above (no DB-level
-    # enum). Distinct column from video_style_type intentionally — see CLAUDE.md
-    # §8.1 for why both exist and which one a future phase should reconcile/deprecate.
+    # Free-form descriptor (no DB-level enum). The single channel-level visual
+    # style column — the former duplicate video_style_type was reconciled away
+    # by migration 009 (its consumer chain ended in an unread Remotion prop).
     visual_style: Mapped[str] = mapped_column(Text, nullable=False, server_default="story_driven")
     # Free-form descriptor for the Flux image-generation look.
     image_style: Mapped[str] = mapped_column(Text, nullable=False, server_default="photorealistic")

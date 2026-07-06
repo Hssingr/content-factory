@@ -374,5 +374,100 @@ class TestEliminatedSurfacesStayEliminated(unittest.TestCase):
                 self.assertNotIn("override_instruction", inspect.signature(fn).parameters)
 
 
+_DROPPED_CONFIG_COLUMNS = (
+    "shorts_rule", "subtitle_style_main", "subtitle_style_shorts",
+    "shorts_part_label_style", "runway_enabled", "strict_quality_gate",
+    "video_style_type", "video_color_grade",
+)
+
+
+class TestChannelConfigDeadColumnsDropped(unittest.TestCase):
+    """channel_config cleanup: eight columns with no live runtime reader are
+    dropped by migration 009, removed from the ORM model and Pydantic
+    schemas, and their dead Agent 5 consumer chain (channel_style /
+    channel_color_grade → props "config" key that no Remotion component ever
+    read) is removed end to end."""
+
+    def test_model_no_longer_maps_dropped_columns(self):
+        for col in _DROPPED_CONFIG_COLUMNS:
+            with self.subTest(col=col):
+                self.assertFalse(hasattr(ChannelConfig, col))
+
+    def test_model_keeps_live_columns(self):
+        for col in (
+            "videos_per_week", "validation_timeout_hours",
+            "validation_max_revisions", "validation_on_limit_reached",
+            "subtitle_karaoke_active_color", "script_format",
+            "allow_legacy_fallback", "audio_tags_enabled", "content_mode",
+            "script_source", "output_mode", "visual_style", "image_style",
+            "narration_pov",
+        ):
+            with self.subTest(col=col):
+                self.assertTrue(hasattr(ChannelConfig, col))
+
+    def test_schemas_no_longer_carry_dropped_columns(self):
+        from app.schemas.channel import ChannelConfigUpsert, ChannelConfigResponse
+        for schema in (ChannelConfigUpsert, ChannelConfigResponse):
+            for col in _DROPPED_CONFIG_COLUMNS:
+                with self.subTest(schema=schema.__name__, col=col):
+                    self.assertNotIn(col, schema.model_fields)
+
+    def test_props_builders_emit_no_config_key(self):
+        """Runtime proof: the real build_main_props()/build_short_props()
+        write props JSON without the dead "config" key (no Remotion
+        component ever read it)."""
+        import json
+        import tempfile
+        from unittest.mock import patch as mock_patch
+        from app.agents.agent5_render.services import remotion_builder
+
+        section = {"audio_start_ms": 0, "audio_end_ms": 9000, "media_url": "cache/x/a.jpg"}
+        caption = {"start_ms": 0, "end_ms": 9000, "text": "hello"}
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock_patch.object(remotion_builder.settings, "media_path", tmp):
+                main_path = remotion_builder.build_main_props(
+                    content_id="c1", language="en", audio_file_path=f"{tmp}/a.mp3",
+                    duration_ms=9000, sections=[section],
+                    standard_subtitles=[caption], karaoke_subtitles=[caption],
+                )
+                short_path = remotion_builder.build_short_props(
+                    content_id="c1", language="en", audio_file_path=f"{tmp}/a.mp3",
+                    short={"short_index": 0, "start_ms": 0, "end_ms": 9000,
+                           "sections": [section]},
+                    karaoke_subtitles=[caption],
+                )
+            for path in (main_path, short_path):
+                with self.subTest(path=path):
+                    props = json.loads(open(path).read())
+                    self.assertNotIn("config", props)
+                    self.assertIn("sections", props)
+
+    def test_migration_009_drops_exactly_the_dead_columns(self):
+        import importlib.util
+        from pathlib import Path as _P
+        path = _P("alembic/versions/009_drop_dead_channel_config_columns.py")
+        spec = importlib.util.spec_from_file_location("migration_009", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        self.assertEqual(mod.revision, "009")
+        self.assertEqual(mod.down_revision, "008")
+        self.assertEqual(set(mod._DROPPED), set(_DROPPED_CONFIG_COLUMNS))
+
+        dropped = []
+
+        class _FakeOp:
+            @staticmethod
+            def drop_column(table, column):
+                dropped.append((table, column))
+
+        with patch.object(mod, "op", _FakeOp):
+            mod.upgrade()
+        self.assertEqual(
+            {c for _, c in dropped}, set(_DROPPED_CONFIG_COLUMNS),
+        )
+        self.assertTrue(all(t == "channel_config" for t, _ in dropped))
+
+
 if __name__ == "__main__":
     unittest.main()

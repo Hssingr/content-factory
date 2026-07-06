@@ -386,7 +386,6 @@ class TestProcessLanguageRebuildsWhenPropsAreStale(unittest.TestCase):
                 result = video_module._process_language(
                     content_id=content_id, language="en", script=SimpleNamespace(),
                     audio=audio, beats=[], channel=channel,
-                    channel_style="documentary", channel_color_grade="desaturated",
                     karaoke_color="#fff", db=db,
                 )
 
@@ -404,7 +403,6 @@ class TestProcessLanguageRebuildsWhenPropsAreStale(unittest.TestCase):
                 result = video_module._process_language(
                     content_id=content_id, language="en", script=SimpleNamespace(),
                     audio=audio, beats=[{"audio_end_ms": 9000}], channel=channel,
-                    channel_style="documentary", channel_color_grade="desaturated",
                     karaoke_color="#fff", db=db,
                 )
 

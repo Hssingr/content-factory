@@ -780,7 +780,7 @@ acts on it.
 | `content_mode` | `str` (Pydantic `Literal`) | `"single_story"` | `"single_story"` — matches today's only real behavior (one discovery → one parent + standalone shorts per cycle) | `"limited_series"`, `"ongoing_series"` — reserved; no Agent 2 execution logic exists for either |
 | `script_source` | `str` (Pydantic `Literal`) | `"reddit"` | `"reddit"` — matches Agent 2's current discovery default | `"ai_generated"`, `"user_provided"`, `"hybrid"` — reserved; Agent 2 always runs the same discovery→blueprint→script flow regardless of this value today |
 | `output_mode` | `str` (Pydantic `Literal`) | `"youtube_and_shorts"` | `"youtube_and_shorts"` (parent render + standalone shorts via `run_shorts_planner`, per §9.4) and `"youtube_long_only"` (same parent pipeline; `run_script_workflow()` skips the shorts planner, logged `SHORTS_PLANNER_SKIPPED` — post-roadmap deep audit, the first runtime consumer of this column) | `"shorts_only"` — reserved; Agent 5 always renders the parent main video, no switch exists to skip the long-form half |
-| `visual_style` | `str` (free-form, no DB enum) | `"story_driven"` (roadmap 4a / audit P1-9 — was `"documentary"`) | **Read by Agent 2 and Agent 4** — Agent 2 injects it into `generate_story_blueprint()`, `generate_section()`, and `generate_short_episode_script()` user messages as "Visual style:" so narration and hook framing align with the channel's visual aesthetic; Agent 4 injects it into every `generate_storyboard_batch()` call as "Global visual direction:" applying a consistent mood/color/lighting constraint across all beats. See §11 (Agent 4) for the Agent 4 injection contract. | Intentionally a **separate column from `video_style_type`** (§19's existing field, same default); a future phase should decide whether to reconcile/deprecate one of them — do not silently merge them without updating this section |
+| `visual_style` | `str` (free-form, no DB enum) | `"story_driven"` (roadmap 4a / audit P1-9 — was `"documentary"`) | **Read by Agent 2 and Agent 4** — Agent 2 injects it into `generate_story_blueprint()`, `generate_section()`, and `generate_short_episode_script()` user messages as "Visual style:" so narration and hook framing align with the channel's visual aesthetic; Agent 4 injects it into every `generate_storyboard_batch()` call as "Global visual direction:" applying a consistent mood/color/lighting constraint across all beats. See §11 (Agent 4) for the Agent 4 injection contract. | **Reconciled (migration 009):** the former duplicate `video_style_type` column is dropped — its only consumer chain (Agent 5 `channel_style` → props `config.style`) ended in a Remotion prop no component ever read. `visual_style` is the single channel-level style column |
 | `image_style` | `str` (free-form, no DB enum) | `"photorealistic"` | **Read by Agent 2 and Agent 4** — Agent 2 injects it into the same three prompt functions as `visual_style` as "Image style:"; Agent 4 injects it into every `generate_storyboard_batch()` call as "Global image style:" applying a consistent Flux rendering approach across all beats. See §11 (Agent 4) for the Agent 4 injection contract. | No per-beat `image_style` override exists; the channel-level setting applies uniformly to every `flux_generated` beat |
 | `narration_pov` | `str` (Pydantic `Literal`, roadmap 4a / audit P1-9) | `"third_person"` | **Read by Agent 2 only** — `"third_person"` (standard narrator voice) or `"first_person_storytime"` (narrate as the protagonist, "I"/"me"/"my" — the r/nosleep storytime format). Threaded via `ScriptWorkflowContext` into `generate_story_blueprint()`, `generate_section()`, `generate_short_episode_script()`, and `generate_native_script()` (native adaptation is instructed to preserve the source's POV, never convert it) as "Narration POV:". Real behavioral rules exist in `_STORY_BLUEPRINT_SYSTEM_PROMPT`, `_SECTION_GENERATION_SYSTEM_PROMPT`, and `_SHORT_EPISODE_SYSTEM_PROMPT` — this is not a passthrough label. | Not read by Agent 4 — visual storyboard direction does not depend on narration person |
 
@@ -802,7 +802,7 @@ Rules:
   `Literal` types in `app/schemas/channel.py` (`ContentMode`/`ScriptSource`/
   `OutputMode`/`NarrationPov`) — the API rejects any value outside the table
   above. `visual_style`/`image_style` are plain strings (no enum), matching
-  the existing looseness of `video_style_type`/`video_color_grade`.
+  the existing looseness those descriptors have always had (no DB enum).
 - All six columns are `NOT NULL` with a `server_default` (migrations
   `alembic/versions/004_add_v3_channel_config_fields.py` for the first five,
   `008_add_narration_pov_and_story_driven_default.py` for `narration_pov`
@@ -1151,6 +1151,20 @@ Post-roadmap deep audit changes to this wizard (all implemented):
 - **Dead constants removed** from `constants.js`: `EMOTIONS`, `MUSIC_STYLES`
   (no music layer exists — §11A.7 is design-only), `SHORTS_RULES`, and
   `USE_CASES` — none had a JSX consumer.
+- **`channel_config` dead columns dropped (migration 009)**: `shorts_rule`,
+  `subtitle_style_main`, `subtitle_style_shorts` (styles are hardcoded by
+  format — main=standard, Shorts=karaoke), `shorts_part_label_style` (the
+  part label is env-flag controlled), `runway_enabled` (no Runway
+  integration exists), `strict_quality_gate` (its gate was deleted by the
+  Elimination Mandate), and `video_style_type`/`video_color_grade` (dead-end
+  consumer chain — the props `config` key they fed was never read by any
+  Remotion component; the per-beat `VideoSection.color_grade` is the real
+  render mechanism, §11A.6). The props `config` key, `VideoConfig` TS type,
+  and `channel_style`/`channel_color_grade` builder parameters were removed
+  with them. Kept live: `videos_per_week`, `validation_*` (3),
+  `subtitle_karaoke_active_color`, `script_format`, `allow_legacy_fallback`
+  (repurposed: proportional-fallback tolerance), `audio_tags_enabled`, and
+  the six V3 fields. Operator must run `alembic upgrade head`.
 - **The ElevenLabs voice-browser chain is removed**: `VoicePicker.jsx` had
   zero importers, so the whole dead chain went with it —
   `api.getVoices`, the `GET /api/agent1/voices` router

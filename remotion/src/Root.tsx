@@ -28,7 +28,6 @@ export const RemotionRoot: React.FC = () => {
             duration_ms: 0,
             sections:    [],
             subtitles:   { style: "standard", captions: [] },
-            config:      { style: "documentary", color_grade: "desaturated" },
           } satisfies MainVideoProps
         }
       />
@@ -58,7 +57,6 @@ export const RemotionRoot: React.FC = () => {
             subtitles:     { style: "karaoke", captions: [] },
             part_label:    "",
             total_parts:   1,
-            config:        { style: "documentary", color_grade: "desaturated" },
           } satisfies ShortProps
         }
       />

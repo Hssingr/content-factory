@@ -78,15 +78,17 @@ class TestAgent4NoLongerAssumesDocumentary(unittest.TestCase):
 # ── Agent 5: props builder / render fallback defaults ─────────────────────────
 
 class TestAgent5NoLongerDefaultsToDocumentary(unittest.TestCase):
-    def test_build_main_props_channel_style_default_is_story_driven(self):
+    def test_props_builders_no_longer_carry_channel_style_at_all(self):
+        # Migration 009 (channel_config cleanup) removed video_style_type/
+        # video_color_grade entirely — their consumer chain ended in a props
+        # "config" key no Remotion component ever read. The de-hardcoding this
+        # class originally proved is now moot: the parameters must not exist.
         import inspect
-        sig = inspect.signature(remotion_builder.build_main_props)
-        self.assertEqual(sig.parameters["channel_style"].default, "story_driven")
-
-    def test_build_short_props_channel_style_default_is_story_driven(self):
-        import inspect
-        sig = inspect.signature(remotion_builder.build_short_props)
-        self.assertEqual(sig.parameters["channel_style"].default, "story_driven")
+        for fn in (remotion_builder.build_main_props, remotion_builder.build_short_props):
+            with self.subTest(fn=fn.__name__):
+                params = inspect.signature(fn).parameters
+                self.assertNotIn("channel_style", params)
+                self.assertNotIn("channel_color_grade", params)
 
     def test_video_module_source_has_no_documentary_fallback(self):
         import inspect

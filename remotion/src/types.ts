@@ -70,11 +70,6 @@ export interface KaraokeSubtitles {
 
 // ── Composition props ─────────────────────────────────────────────────────────
 
-export interface VideoConfig {
-  style:       string;
-  color_grade: string;
-}
-
 // Index signature required by Remotion's CalculateMetadataFunction constraint
 interface RemotionProps { [key: string]: unknown }
 
@@ -85,7 +80,6 @@ export interface MainVideoProps extends RemotionProps {
   duration_ms: number;
   sections:    SectionData[];
   subtitles:   StandardSubtitles;
-  config:      VideoConfig;
 }
 
 export interface ShortProps extends RemotionProps {
@@ -100,5 +94,4 @@ export interface ShortProps extends RemotionProps {
   subtitles:    KaraokeSubtitles;
   part_label:   string;
   total_parts:  number;
-  config:       VideoConfig;
 }

@@ -124,9 +124,7 @@ def run_video_generation(content_id: uuid.UUID, db: Session) -> bool:
         logger.info("RENDER_START content_id=%s", content_id)
 
     config: ChannelConfig | None = db.get(ChannelConfig, channel.id)
-    channel_style         = config.video_style_type              if config else "story_driven"
-    channel_color_grade   = config.video_color_grade             if config else "desaturated"
-    karaoke_color         = config.subtitle_karaoke_active_color if config else "#FFD700"
+    karaoke_color = config.subtitle_karaoke_active_color if config else "#FFD700"
 
     scripts_by_lang: dict[str, Script] = {
         s.language: s
@@ -213,8 +211,6 @@ def run_video_generation(content_id: uuid.UUID, db: Session) -> bool:
                 audio=audio,
                 beats=beats_for_lang,
                 channel=channel,
-                channel_style=channel_style,
-                channel_color_grade=channel_color_grade,
                 karaoke_color=karaoke_color,
                 db=db,
                 is_short_episode=is_short_episode,
@@ -283,8 +279,6 @@ def _process_language(
     audio: AudioFile,
     beats: list[dict],
     channel: Channel,
-    channel_style: str,
-    channel_color_grade: str,
     karaoke_color: str,
     db: Session,
     is_short_episode: bool = False,
@@ -411,8 +405,6 @@ def _process_language(
             audio_file_path=audio.file_path,
             short=short_dict,
             karaoke_subtitles=karaoke_subs,
-            channel_style=channel_style,
-            channel_color_grade=channel_color_grade,
         )
     else:
         # Parent content — MainVideo.tsx (16:9, 1920×1080)
@@ -431,8 +423,6 @@ def _process_language(
             sections=beats,
             standard_subtitles=standard_subs,
             karaoke_subtitles=karaoke_subs,
-            channel_style=channel_style,
-            channel_color_grade=channel_color_grade,
         )
 
     # ── PRE_RENDER_ASSET_AUDIT — local images only ────────────────────────────
