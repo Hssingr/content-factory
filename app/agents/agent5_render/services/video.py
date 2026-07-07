@@ -233,6 +233,20 @@ def run_video_generation(content_id: uuid.UUID, db: Session) -> bool:
             )
             db.rollback()
 
+    if content.status == "NEEDS_REVIEW":
+        # A language failed post-render verification and flagged operator
+        # review (fresh full-system audit §3.7). That flag must survive —
+        # previously the final status write below overwrote it with RENDERED
+        # (another language succeeded) or FAILED (all failed), losing the
+        # operator-attention signal.
+        logger.warning(
+            "RENDER_NEEDS_REVIEW content_id=%s successful_languages=%d — "
+            "post-render verification flagged this content; keeping NEEDS_REVIEW",
+            content_id, successful,
+        )
+        db.commit()
+        return successful > 0
+
     if successful > 0:
         content.status = "RENDERED"
         logger.info(

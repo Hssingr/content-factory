@@ -25,6 +25,40 @@ from app.scheduler import celery_app
 logger = logging.getLogger(__name__)
 
 
+# ── Stuck-state recovery thresholds (fresh full-system audit §1.2) ───────────
+# Content whose worker died mid-stage keeps its in-progress status forever —
+# the pickups below re-dispatch it once its `updated_at` is older than the
+# stage's threshold. Thresholds are deliberately generous (this is a safety
+# net for process death, not a scheduler): they must exceed the stage's
+# worst-case legitimate runtime so a live worker is never raced by a
+# duplicate dispatch (e.g. a chunked long-form render can genuinely take
+# over an hour on a small VPS).
+_STALE_RECOVERY_MINUTES: dict[str, int] = {
+    "GENERATING_SCRIPTS": 60,
+    "GENERATING_AUDIO":   60,
+    "GENERATING_VISUALS": 120,
+    "RENDERING":          180,
+}
+
+
+def _stale_in_progress(db, in_progress_status: str) -> list:
+    """Return content rows stuck in ``in_progress_status`` past its recovery threshold."""
+    from app.models import Content
+
+    threshold = _STALE_RECOVERY_MINUTES[in_progress_status]
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=threshold)
+    rows = (
+        db.query(Content)
+        .filter(Content.status == in_progress_status, Content.updated_at < cutoff)
+        .all()
+    )
+    for row in rows:
+        logger.warning(
+            "STUCK_STATE_RECOVERY content_id=%s status=%s stale_minutes>=%d — re-dispatching",
+            row.id, in_progress_status, threshold,
+        )
+    return rows
+
 
 # ── Periodic: dispatch discovery ─────────────────────────────────────────────
 
@@ -122,7 +156,7 @@ def pickup_approved_content() -> int:
             .filter(Content.status == "APPROVED")
             .all()
         )
-        for content in approved:
+        for content in approved + _stale_in_progress(db, "GENERATING_SCRIPTS"):
             run_agent2_scripts_for_content.delay(str(content.id))
             dispatched += 1
     finally:
@@ -229,7 +263,13 @@ def run_agent2_scripts_for_content(self, content_id: str) -> None:
         if not content:
             logger.warning("Content %s not found — skipping", content_id)
             return
-        if content.status != "APPROVED":
+        # GENERATING_SCRIPTS is accepted so (a) Celery's own retry works after a
+        # mid-run exception (the first status transition used to make the retried
+        # task skip itself — audit §1.2) and (b) the stuck-state sweep can
+        # re-dispatch a row whose worker died. run_script_workflow is re-entrant:
+        # source-script persistence versions up, multilingual generation reuses
+        # validated rows, and the shorts planner skips existing children.
+        if content.status not in ("APPROVED", "GENERATING_SCRIPTS"):
             logger.debug(
                 "Content %s status=%s — skipping script generation",
                 content_id, content.status,
@@ -480,7 +520,7 @@ def pickup_scripts_validated() -> int:
     dispatched = 0
     try:
         validated = db.query(Content).filter(Content.status == "SCRIPTS_VALIDATED").all()
-        for content in validated:
+        for content in validated + _stale_in_progress(db, "GENERATING_AUDIO"):
             run_agent3_audio_for_content.delay(str(content.id))
             dispatched += 1
             logger.info(
@@ -505,11 +545,10 @@ def run_agent3_audio_for_content(self, content_id: str) -> None:
     """Run the full Agent 3 audio generation pipeline for one content item.
 
     For each validated script language:
-      1. ElevenLabs TTS → mp3 bytes
+      1. TTS (configured provider) → mp3 bytes
       2. Save to disk + measure exact duration with ffprobe
       3. Whisper transcription → word-level timestamps
-      4. Persist empty Shorts breakpoints for standalone-short architecture
-      5. Persist AudioFile record; update Script with real values
+      4. Persist AudioFile record; update Script with real values
 
     Sets ``content.status = "AUDIO_DONE"`` on full success,
     ``"FAILED"`` if all languages fail.
@@ -528,7 +567,12 @@ def run_agent3_audio_for_content(self, content_id: str) -> None:
         if not content:
             logger.warning("Content %s not found — skipping", content_id)
             return
-        if content.status not in ("SCRIPTS_VALIDATED", "AUDIO_DONE"):
+        # GENERATING_AUDIO is accepted so Celery retries work after a mid-run
+        # exception and the stuck-state sweep can recover a dead worker's row
+        # (audit §1.2). run_audio_generation is re-entrant: on-disk audio is
+        # reused (TTS skip), persisted transcripts are reused (D1.6), and
+        # AudioFile rows are upserted.
+        if content.status not in ("SCRIPTS_VALIDATED", "AUDIO_DONE", "GENERATING_AUDIO"):
             logger.debug(
                 "Content %s status=%s — skipping audio generation",
                 content_id, content.status,
@@ -572,7 +616,7 @@ def pickup_audio_done() -> int:
     dispatched = 0
     try:
         ready = db.query(Content).filter(Content.status == "AUDIO_DONE").all()
-        for content in ready:
+        for content in ready + _stale_in_progress(db, "GENERATING_VISUALS"):
             has_audio = (
                 db.query(AudioFile)
                 .filter(AudioFile.content_id == content.id)
@@ -697,6 +741,15 @@ def pickup_visual_ready() -> int:
     db = _get_session_factory()()
     dispatched = 0
     try:
+        # Stale RENDERING rows already passed every readiness gate once; dispatch
+        # them directly — the has_render skip below would otherwise strand a row
+        # whose worker died after rendering only some of its languages
+        # (run_video_generation is re-entrant for RENDERING and skips per-language
+        # outputs that already exist).
+        for content in _stale_in_progress(db, "RENDERING"):
+            run_agent5_render_for_content.delay(str(content.id))
+            dispatched += 1
+
         candidates = (
             db.query(Content)
             .filter(Content.status.in_(("PARENT_VISUALS_DONE", "CHILD_SHORT_VISUALS_DONE")))

@@ -90,7 +90,10 @@ def run_visual_generation(
     is_short_episode = bool(getattr(content, "is_short_episode", False))
 
     if is_short_episode:
-        return _run_child_short_visuals(content, scripts_by_lang, audio_by_lang, db)
+        return _run_child_short_visuals(
+            content, scripts_by_lang, audio_by_lang, db,
+            visual_style=visual_style, image_style=image_style,
+        )
 
     return _run_parent_visuals(
         content_id=content_id,
@@ -454,7 +457,15 @@ def _run_visual_pass(
         )
         return None, 0
 
-    beats = _cleanup_micro_beats(beats, script_format)
+    # The second, flat-2000ms micro-beat cleanup that used to run here is
+    # deleted (fresh full-system audit §3.2): it systematically merged away
+    # every 1.0-2.0s high-intensity reveal beat the storyboard prompt
+    # explicitly designs (high tier = 1.0-2.5s), and — because it ran AFTER
+    # split_into_beats() applied the parent hold cap — merging could silently
+    # re-create holds above the 9s ceiling. The mapping-level intensity floors
+    # (INTENSITY_FLOOR_MS), micro-merge discard guard, and density invariant
+    # inside split_into_beats() already guarantee no zero-width or absurd
+    # beats, with the intensity awareness the flat floor lacked.
     logger.info(
         "Agent4 [STORYBOARD] content=%s beats=%d source_lang=%s",
         content_id, len(beats), source_lang,
@@ -462,17 +473,20 @@ def _run_visual_pass(
 
     # ── 1b. Storyboard validation gate ────────────────────────────────────────
     # Runs after storyboard is complete and before any fal.ai calls. The sole
-    # remaining deterministic validator (Elimination Mandate D2.4 — the bible
-    # enrichment/first15 mutation passes that used to run after this, plus
-    # their re-validation checks, are deleted; there is nothing left to mutate
-    # flux_prompt between this gate and Flux, so nothing left to re-validate).
-    # Telemetry only (D1.5) — MAJOR findings are logged, never trigger a
-    # segment-level retry; the storyboard is always returned unchanged.
-    beats = _run_storyboard_validation(beats)
+    # remaining deterministic validator (Elimination Mandate D2.4). Telemetry
+    # only (D1.5) — MAJOR findings are logged, never trigger a retry. The
+    # issues list is passed straight into the duplicate-prompt repair so the
+    # full validator (and its always-on diagnostics) runs exactly once per
+    # path (fresh full-system audit §3.3 — it used to run twice, double-
+    # logging every diagnostic).
+    issues = _collect_storyboard_issues(beats)
+    _log_storyboard_major_issues(issues)
 
     # ── 1c. Duplicate-prompt repair (audit G-5.3) — last mutation of
     # flux_prompt before Flux. ──
-    beats = _repair_duplicate_prompts(beats, content_id=content_id, language=source_lang)
+    beats = _repair_duplicate_prompts(
+        beats, content_id=content_id, language=source_lang, issues=issues,
+    )
 
     # Stale-visuals guard (audit V-6b / roadmap 2d, P0-3): stamp both
     # staleness fingerprints onto every beat before the FIRST save, so they
@@ -511,17 +525,24 @@ def _repair_duplicate_prompts(
     content_id: uuid.UUID,
     language: str = "",
     include_resolved: bool = False,
+    issues: list[dict] | None = None,
 ) -> list[dict]:
     """Deterministically vary surviving duplicate-prompt beats (audit G-5.3).
 
     The single call site for `repair_duplicate_flux_prompts()` — shared by
     the parent path (both fresh generation and flux-incomplete recovery) and
-    the child remap path. Must run AFTER every prompt-shaping step (visual
-    bible enrichment, first15 enhancement) and BEFORE any Flux call, so the
-    repaired text is what actually reaches fal.ai — this is the last mutation
-    of `flux_prompt` before generation.
+    the child remap path. Must run BEFORE any Flux call, so the repaired text
+    is what actually reaches fal.ai — this is the last mutation of
+    `flux_prompt` before generation.
+
+    ``issues``: the already-computed ``validate_storyboard()`` findings from
+    this path's validation gate — passing them avoids a second full validator
+    run (audit §3.3). The flux-incomplete recovery path omits it (no prior
+    validation ran there), so the repair validates once itself.
     """
-    repaired, repairs = repair_duplicate_flux_prompts(beats, include_resolved=include_resolved)
+    repaired, repairs = repair_duplicate_flux_prompts(
+        beats, include_resolved=include_resolved, issues=issues,
+    )
     if not repairs:
         logger.info(
             "DUPLICATE_PROMPT_REPAIR_OK content=%s language=%s beats=%d include_resolved=%s",
@@ -570,26 +591,29 @@ def _check_storyboard_issues(beats: list[dict]) -> list[dict]:
     return [i for i in _collect_storyboard_issues(beats) if i["severity"] == "MAJOR"]
 
 
-def _run_storyboard_validation(beats: list[dict]) -> list[dict]:
-    """Run the storyboard validation gate as telemetry only.
-
-    Elimination Mandate D1.5 (code_report/forensic_output_audit_borrasca_run.md):
-    the segment-level storyboard retry this function used to trigger on MAJOR
-    findings (``retry_segment_constraints`` path in ``split_into_beats()``) is
-    deleted — MAJOR findings never actually blocked the pipeline (a failed
-    retry just logged and proceeded with the original storyboard), so the
-    retry was paid/surgical regeneration driven by advisory findings that
-    never gated anything. MAJOR issues are now logged and the storyboard is
-    returned unchanged; MINOR issues are logged at WARNING only (via
-    ``_collect_storyboard_issues()``).
-    """
-    major_issues = _check_storyboard_issues(beats)
+def _log_storyboard_major_issues(issues: list[dict]) -> None:
+    """Log MAJOR validator findings — telemetry only, never a retry (D1.5)."""
+    major_issues = [i for i in issues if i["severity"] == "MAJOR"]
     if major_issues:
         logger.warning(
             "Storyboard MAJOR issue(s) found — telemetry only, no retry. "
             "MAJOR_count=%d checks=%s",
             len(major_issues), [i["check"] for i in major_issues],
         )
+
+
+def _run_storyboard_validation(beats: list[dict]) -> list[dict]:
+    """Run the storyboard validation gate as telemetry only.
+
+    Elimination Mandate D1.5: MAJOR findings are logged and the storyboard is
+    returned unchanged; MINOR issues are logged at WARNING only. Kept as a
+    self-contained unit entrypoint (tests exercise it directly); the
+    production path in ``_run_visual_pass()`` calls
+    ``_collect_storyboard_issues()`` + ``_log_storyboard_major_issues()``
+    itself so the same issues list can feed the duplicate-prompt repair
+    without a second full validation run (fresh full-system audit §3.3).
+    """
+    _log_storyboard_major_issues(_collect_storyboard_issues(beats))
     return beats
 
 
@@ -777,72 +801,11 @@ def _remap_beats_timing(
     return result
 
 
-# ── Micro-beat cleanup ─────────────────────────────────────────────────────────
-
-_MIN_BEAT_MS_NORMAL       = 2000
-_MIN_BEAT_MS_TEXT_OVERLAY = 1500
-_MIN_BEAT_MS_CUT_ACTION   = 500
-
-
-def _cleanup_micro_beats(sections: list[dict], script_format: str) -> list[dict]:
-    """Merge beats shorter than the minimum duration into their neighbour.
-
-    Args:
-        sections:     Beat-section dicts with timing fields.
-        script_format: Format key — reserved for future format-aware floors.
-
-    Returns:
-        Possibly-shorter section list with no micro-beats (except cut+action).
-    """
-    if not sections:
-        return sections
-
-    result = list(sections)
-    exception_budget = 1
-
-    changed = True
-    while changed and len(result) > 1:
-        changed = False
-        for i in range(len(result)):
-            s      = result[i]
-            dur_ms = s.get("audio_end_ms", 0) - s.get("audio_start_ms", 0)
-            vtype  = s.get("visual_type", "b-roll")
-            effect = s.get("effect", "slow_zoom")
-
-            min_ms = _MIN_BEAT_MS_TEXT_OVERLAY if vtype == "text_overlay" else _MIN_BEAT_MS_NORMAL
-            if dur_ms >= min_ms:
-                continue
-
-            if effect == "cut" and vtype == "action" and exception_budget > 0:
-                exception_budget -= 1
-                continue
-
-            absorber_idx = (i - 1) if i > 0 else (i + 1)
-            if absorber_idx >= len(result):
-                continue
-
-            absorber = result[absorber_idx]
-            if absorber_idx < i:
-                absorber["audio_end_ms"] = s["audio_end_ms"]
-            else:
-                absorber["audio_start_ms"] = s["audio_start_ms"]
-            absorber["duration_sec"] = (
-                (absorber["audio_end_ms"] - absorber["audio_start_ms"]) / 1000
-            )
-            result.pop(i)
-            changed = True
-            break
-
-    for new_order, s in enumerate(result):
-        s["section_order"] = new_order
-        if "beat_order" in s:
-            s["beat_order"] = new_order
-
-    logger.info(
-        "Micro-beat cleanup: beats_before=%d beats_after=%d merged=%d",
-        len(sections), len(result), len(sections) - len(result),
-    )
-    return result
+# The orchestrator-level flat-2000ms micro-beat cleanup that lived here was
+# deleted (fresh full-system audit §3.2) — see the note at its former call
+# site in _run_visual_pass(). storyboard.py's intensity-aware
+# _cleanup_micro_beats (INTENSITY_FLOOR_MS) is the single remaining
+# micro-beat mechanism.
 
 
 # ── Child short visual readiness ───────────────────────────────────────────────
@@ -852,6 +815,8 @@ def _run_child_short_visuals(
     scripts_by_lang: dict[str, Script],
     audio_by_lang: dict[str, AudioFile],
     db: Session,
+    visual_style: str = "",
+    image_style: str = "",
 ) -> dict:
     content_id = content.id
     parent_content_id = getattr(content, "parent_content_id", None)
@@ -900,6 +865,27 @@ def _run_child_short_visuals(
         if not audio:
             continue
 
+        # Idempotency guard (fresh full-system audit §3.6): a re-dispatched
+        # child (defer loop, crash retry) used to re-run the remap Claude call
+        # and regenerate every portrait image even when this language's rows
+        # were already complete — remap output is nondeterministic, so each
+        # re-run produced different prompts and a full fresh generation. If
+        # complete persisted rows exist (every beat has a local image), reuse
+        # them — mirroring the parent path's persisted-beat reuse. (Child
+        # scripts are never regenerated in place — run_shorts_planner skips
+        # existing children — so no script-hash staleness check is needed here.)
+        existing_sections = load_video_sections(content_id, language, db)
+        if existing_sections and all(
+            (b.get("media_url") or "").startswith("cache/") for b in existing_sections
+        ):
+            logger.info(
+                "CHILD_SHORT_VISUALS_REUSED content_id=%s language=%s beats=%d "
+                "— persisted rows already complete; skipping remap and generation",
+                content_id, language, len(existing_sections),
+            )
+            beats_by_lang[language] = existing_sections
+            continue
+
         logger.info(
             "CHILD_SHORT_VISUALS_START content_id=%s parent_content_id=%s language=%s",
             content_id, parent_content_id, language,
@@ -910,6 +896,8 @@ def _run_child_short_visuals(
             short_audio_file=audio,
             parent_content_id=parent_content_id,
             db=db,
+            visual_style=visual_style,
+            image_style=image_style,
         )
         if not beats:
             logger.error(
@@ -921,13 +909,11 @@ def _run_child_short_visuals(
 
         # Same storyboard validation gate the parent path runs (§ "Parent visual
         # readiness" above), applied to the remapped child beats. Telemetry only
-        # (Elimination Mandate D1.5, code_report/forensic_output_audit_borrasca_run.md):
-        # the deterministic beat-level prompt remediation this used to attempt
-        # on MAJOR findings is deleted — MAJOR issues never blocked the pipeline
-        # either way, so a repair pass gated on them added complexity without a
-        # provable quality gain. MAJOR findings are logged and the child proceeds
-        # unchanged.
-        major_issues = _check_storyboard_issues(beats)
+        # (Elimination Mandate D1.5): MAJOR findings are logged and the child
+        # proceeds unchanged. The issues list feeds the duplicate-prompt repair
+        # directly so the validator runs exactly once (audit §3.3).
+        issues = _collect_storyboard_issues(beats)
+        major_issues = [i for i in issues if i["severity"] == "MAJOR"]
         if major_issues:
             logger.error(
                 "Storyboard MAJOR issue(s) found in child short remap — telemetry only, "
@@ -938,15 +924,11 @@ def _run_child_short_visuals(
             )
 
         # Duplicate-prompt repair — last mutation of flux_prompt before Flux.
-        # Child Short generation clears every media_url and regenerates portrait
-        # images below, so include already-resolved parent-reuse beats in the
-        # append-only variation pass for this same run. Bible
-        # enrichment and first15 enhancement/validation used to run here —
-        # both deleted per the Elimination Mandate (D2.1): a real production
-        # run showed the bible they depended on returned 0 locations, 0
-        # motifs, 0 first-15 rules, a total no-op paid call.
+        # Every child beat leaves remap_beats_for_short() pending
+        # (media_url="", audit §3.1), so the default pending-only repair scope
+        # covers the whole list.
         beats = _repair_duplicate_prompts(
-            beats, content_id=content_id, language=language, include_resolved=True,
+            beats, content_id=content_id, language=language, issues=issues,
         )
 
         # Generation happens AFTER validation, not before (Phase 4E-E ordering

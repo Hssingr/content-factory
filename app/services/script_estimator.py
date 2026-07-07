@@ -47,7 +47,9 @@ _ROLLING_WINDOW_SIZE = 20
 _MIN_SAMPLES_FOR_CALIBRATION = 3
 
 
-def compute_measured_wpm(db: "Session", language: str) -> float | None:
+def compute_measured_wpm(
+    db: "Session", language: str, is_short_episode: bool | None = None,
+) -> float | None:
     """Compute the rolling average measured wpm for a language from real audio.
 
     Queries the most recent ``_ROLLING_WINDOW_SIZE`` ``AudioFile`` rows for
@@ -57,6 +59,15 @@ def compute_measured_wpm(db: "Session", language: str) -> float | None:
     script text) since it reflects what the TTS engine actually spoke,
     including any words it dropped or added.
 
+    Args:
+        is_short_episode: When set, restrict the calibration window to parent
+            long-form rows (``False``) or child Short rows (``True``) via a
+            join on ``Content`` — the two run at measurably different rates
+            (~135 vs ~120 wpm; fresh full-system audit §3.4), and a blended
+            average drifts with whichever kind dominates the recent window.
+            ``None`` preserves the original blended behavior for callers that
+            do not know the content kind.
+
     Returns:
         The rolling average wpm, or ``None`` if fewer than
         ``_MIN_SAMPLES_FOR_CALIBRATION`` usable rows exist yet (fail-open —
@@ -64,11 +75,17 @@ def compute_measured_wpm(db: "Session", language: str) -> float | None:
     """
     from sqlalchemy import desc
 
-    from app.models import AudioFile
+    from app.models import AudioFile, Content
 
+    query = db.query(AudioFile).filter(
+        AudioFile.language == language, AudioFile.duration_ms > 0,
+    )
+    if is_short_episode is not None:
+        query = query.join(Content, Content.id == AudioFile.content_id).filter(
+            Content.is_short_episode.is_(is_short_episode)
+        )
     rows: list[AudioFile] = (
-        db.query(AudioFile)
-        .filter(AudioFile.language == language, AudioFile.duration_ms > 0)
+        query
         .order_by(desc(AudioFile.id))
         .limit(_ROLLING_WINDOW_SIZE)
         .all()
@@ -89,7 +106,9 @@ def compute_measured_wpm(db: "Session", language: str) -> float | None:
     return sum(samples) / len(samples)
 
 
-def get_calibrated_wpm(db: "Session | None", language: str) -> float:
+def get_calibrated_wpm(
+    db: "Session | None", language: str, is_short_episode: bool | None = None,
+) -> float:
     """Return the best-known narration speed (wpm) for a language.
 
     Uses the rolling measured average (``compute_measured_wpm()``) when a
@@ -99,15 +118,24 @@ def get_calibrated_wpm(db: "Session | None", language: str) -> float:
     storyboard beat-pacing diagnostics) should read from, rather than
     reading ``SPEECH_RATES`` directly, so a future caller with a db session
     automatically benefits from real calibration data as it accumulates.
+
+    ``is_short_episode`` scopes the calibration window to one content kind
+    (see ``compute_measured_wpm()``) — pass it wherever the caller knows
+    whether it is estimating for a parent long-form or a child Short.
     """
     if db is not None:
-        measured = compute_measured_wpm(db, language)
+        measured = compute_measured_wpm(db, language, is_short_episode=is_short_episode)
         if measured is not None:
             return measured
     return SPEECH_RATES.get(language, _DEFAULT_RATE)
 
 
-def estimate_duration_sec(voice_script: str, language: str, db: "Session | None" = None) -> float:
+def estimate_duration_sec(
+    voice_script: str,
+    language: str,
+    db: "Session | None" = None,
+    is_short_episode: bool | None = None,
+) -> float:
     """Estimate narration duration from a voice script's word count.
 
     Uses ``get_calibrated_wpm()`` — the rolling measured rate when ``db`` is
@@ -121,11 +149,14 @@ def estimate_duration_sec(voice_script: str, language: str, db: "Session | None"
         language:     BCP-47 language code (e.g. "fr", "en").
         db:           Optional session; when provided, calibrates against
                       real measured audio for this language (roadmap 3.8).
+        is_short_episode: Optional content-kind filter for the calibration
+                      window (fresh full-system audit §3.4) — parents and
+                      Shorts run at measurably different rates.
 
     Returns:
         Estimated duration in seconds, rounded to 1 decimal place.
     """
-    rate = get_calibrated_wpm(db, language)
+    rate = get_calibrated_wpm(db, language, is_short_episode=is_short_episode)
     word_count = len(voice_script.split())
     result = round((word_count / rate) * 60.0, 1)
     return result

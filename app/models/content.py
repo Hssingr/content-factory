@@ -35,6 +35,13 @@ class Content(Base):
     # one. Not read by Agent 2/3/4/5 today — see CLAUDE.md §8.5.
     channel_config_snapshot: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    # Touched by every ORM UPDATE (status transitions included) — the staleness
+    # signal for the stuck-state recovery sweep in app/scheduler/tasks.py: an
+    # in-progress status (GENERATING_*/RENDERING) whose updated_at is older
+    # than its stage's recovery threshold is re-dispatched by the pickups.
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False,
+    )
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # Short episode fields — null on long-form content rows
     is_short_episode: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")

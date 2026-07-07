@@ -12,9 +12,10 @@ Agent 3's Claude validation output, so they can be merged and processed together
         "offending_text": str | None,  # optional
     }
 
-These checks run first (no I/O, no Claude calls). Claude validation is then scoped
-only to subjective checks (tone, linguistic_naturalness, content_policy) and only
-for languages that have no deterministic MAJOR issue.
+These checks run deterministically (no I/O, no Claude calls). Since the
+Elimination Mandate there is no AI validation stage behind them — findings are
+telemetry only; mechanical fixes (normalize_tts_chars/split_long_sentences) are
+the only enforcement.
 """
 
 import logging
@@ -40,7 +41,7 @@ _ANY_SECTION_LINE_RE = re.compile(
 
 _FORBIDDEN_OPENERS: tuple[str, ...] = (
     "In this video", "In this story",  # check longer forms first
-    "In ",     "Today,", "Today ",
+    "Today,", "Today ",
     "Have you ", "Have you,",
     "Welcome,", "Welcome ",
     "What if",
@@ -157,6 +158,19 @@ def _split_sentences(text: str) -> list[str]:
     return [p.replace(sentinel, ".").strip() for p in parts if p.strip()]
 
 
+def split_sentences(text: str) -> list[str]:
+    """Public sentence splitter — the single tokenizer for sentence-level rules.
+
+    Fresh full-system audit §3.5/D-1: the ≤18-word rule used to be counted with
+    four different ad-hoc splitters across scripts.py / script_checks.py, so a
+    borderline sentence could be "fixed" by one function and still "flagged" by
+    another. Every sentence-splitting call site should use this (it guards
+    common abbreviations and closing-quote punctuation, unlike a plain
+    ``re.split`` on sentence-ending characters).
+    """
+    return _split_sentences(text)
+
+
 def _section_bodies(voice_script: str) -> list[tuple[str, str, bool]]:
     """Return (marker_text, body_text, is_last) for every [SECTION N] in voice_script."""
     positions = list(_SECTION_MARKER_RE.finditer(voice_script))
@@ -183,9 +197,9 @@ def _section_bodies(voice_script: str) -> list[tuple[str, str, bool]]:
 def split_long_sentences(text: str, max_words: int = 18) -> str:
     """Deterministically split sentences that exceed max_words at a natural break point.
 
-    Applied as a pre-check backstop inside ``_generate_section_with_retry()`` before
-    ``check_tts_compliance`` runs. Eliminates the most common long-sentence TTS
-    violations without spending a Sonnet retry on them.
+    Applied as a mechanical backstop (``_clean_generated_section()`` /
+    ``_apply_final_tts_backstop()``) before ``check_tts_compliance`` runs —
+    eliminates the most common long-sentence TTS violations deterministically.
 
     Break points tried in order (first match wins):
     1. ``[;—]`` followed by whitespace
@@ -193,8 +207,8 @@ def split_long_sentences(text: str, max_words: int = 18) -> str:
        (``and``, ``but``, ``so``, ``because``, ``although``, ``while``, ``when``,
        ``which``, ``who``, ``that``)
 
-    Sentences with no break point are left unchanged — ``check_tts_compliance`` will
-    still flag them and Claude's retry override will handle them.
+    Sentences with no break point are left unchanged — ``check_tts_compliance``
+    still flags them (telemetry only; no regeneration exists).
 
     Processes the text line-by-line to preserve paragraph structure (newlines).
     Each line is split into sentences using the same ``_split_sentences()`` tokeniser
@@ -786,8 +800,8 @@ def check_section_transition(
     signals the section is opening with a summary of what was just said rather than
     advancing the story.
 
-    Always MINOR — logged and folded into the next retry override if one is triggered
-    by MAJOR issues. Does not hard-block section acceptance on its own.
+    Always MINOR — telemetry only (no retry mechanism exists). Never blocks
+    section acceptance.
 
     Args:
         current_section_text:  Narration text of the section being validated (no markers).
@@ -868,11 +882,9 @@ def check_sentence_rhythm_variance(section_text: str, language: str = "source") 
 
     Bands: short (<=7 words), medium (8-11 words), long (>=12 words).
 
-    Always MINOR — advisory only, same as check_retention_structure() and
-    check_section_transition(). Never hard-blocks section acceptance on its
-    own; the caller folds a finding into the next retry's
-    override_instruction only when a MAJOR from another check has already
-    triggered that retry (see _build_section_retry_instruction()).
+    Always MINOR — advisory telemetry only, same as check_retention_structure()
+    and check_section_transition(). No retry mechanism exists; findings are
+    logged and never block section acceptance.
 
     Args:
         section_text: Narration text for one section (markers, if present,

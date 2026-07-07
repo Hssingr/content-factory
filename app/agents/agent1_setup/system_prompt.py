@@ -433,7 +433,7 @@ def research_channel_ideas(
         "pipeline_constraints": {
             "currently_executable_content_mode": "single_story",
             "currently_executable_script_source": "reddit",
-            "currently_executable_output_mode": "youtube_and_shorts",
+            "currently_executable_output_modes": ["youtube_and_shorts", "youtube_long_only"],
             "no_platform_api_access": True,
             "no_verified_analytics": True,
             "operator_review_required": True,

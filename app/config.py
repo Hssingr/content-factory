@@ -87,10 +87,8 @@ class Settings(BaseSettings):
     whisper_local_primary: bool = False
 
     # Agent 4 image model routing (Phase 14.6 foundation) — conservative by
-    # default. With routing disabled (the default), every generated beat and
-    # every text-card background uses Flux Schnell exactly as before this
-    # phase. Text-card backgrounds always use Schnell regardless of these
-    # flags (enforced in image_router.select_route(), not configurable).
+    # default. With routing disabled (the default), every generated beat uses
+    # Flux Schnell exactly as before that phase.
     image_routing_enabled: bool = False
     image_routing_allow_dev: bool = False
     image_routing_allow_pro: bool = False

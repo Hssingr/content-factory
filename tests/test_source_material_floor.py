@@ -28,6 +28,9 @@ class _FakeQuery:
     def __init__(self, rows):
         self.rows = rows
 
+    def join(self, *a, **k):
+        return self
+
     def filter(self, *a, **k):
         return self
 

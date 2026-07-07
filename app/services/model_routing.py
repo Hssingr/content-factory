@@ -35,10 +35,12 @@ MODEL_ROUTING: dict[str, str] = {
     # Retired (post-roadmap deep audit): "script_generation" (zero call sites —
     # section generation uses "section_generation") and "auto_correction" (the
     # auto_correct_script prompt-repair layer was deleted with it).
+    # Retired (fresh full-system audit §1.3): "revision" — the script-revision
+    # chain was unreachable dead code (no script exists while a validation is
+    # PENDING); Telegram CHANGE is now story-level feedback with no Claude call.
     "native_adaptation":       PRIMARY_MODEL,
     "storyboard":              PRIMARY_MODEL,
-    "story_gate_scoring":      PRIMARY_MODEL,  # single-story gate: 18-dimension structured call
-    "revision":                PRIMARY_MODEL,
+    "story_gate_scoring":      PRIMARY_MODEL,  # single-story gate structured call
     "story_research":          PRIMARY_MODEL,  # uses web_search tool — secondary model does not support it by default
     "channel_suggestion":      PRIMARY_MODEL,  # Agent 1 UX — poor suggestions harm onboarding quality
     "channel_research":        PRIMARY_MODEL,  # Agent 1 market-research estimate; nuanced strategy output

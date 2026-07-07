@@ -75,28 +75,22 @@ class TestNativeAdaptationUsesStructuredCall(unittest.TestCase):
         self.assertEqual(call_kwargs["tool_choice"], {"type": "tool", "name": "native_adaptation_output"})
 
 
-class TestRevisionUsesStructuredCall(unittest.TestCase):
-    def test_returns_parsed_dict_with_changes_array(self):
-        payload = {
-            "title": "Revised Title",
-            "voice_script": "[INTRO] Revised text. [OUTRO] Done.",
-            "changes": [{"section": "INTRO", "before_summary": "old", "after_summary": "new"}],
-        }
-        response = SimpleNamespace(
-            content=[_tool_use_block("revision_output", payload)],
-            usage=_usage(), stop_reason="tool_use",
-        )
-        fake_client = MagicMock()
-        fake_client.messages.create.return_value = response
+class TestRevisionChainRetired(unittest.TestCase):
+    """Fresh full-system audit §1.3: the script-revision chain was unreachable
+    dead code (scripts exist only after approval; validations stop matching
+    once approved) — generate_revised_scripts/_REVISION_SCHEMA and the
+    "revision" routing key are deleted. Telegram CHANGE is now story-level
+    feedback with no Claude call."""
 
-        with patch("app.services.claude_client._get_client", return_value=fake_client):
-            result = system_prompt.generate_revised_scripts(
-                current_scripts={"title": "Old Title", "voice_script": "[INTRO] Old text."},
-                feedback="Make the intro punchier.",
-                channel=_Channel(),
-            )
+    def test_generate_revised_scripts_no_longer_exists(self):
+        self.assertFalse(hasattr(system_prompt, "generate_revised_scripts"))
+        self.assertFalse(hasattr(system_prompt, "_REVISION_SCHEMA"))
+        self.assertFalse(hasattr(system_prompt, "_REVISION_SYSTEM_PROMPT"))
 
-        self.assertEqual(result, payload)
+    def test_revision_routing_key_removed(self):
+        from app.services.model_routing import resolve_model
+        with self.assertRaises(ValueError):
+            resolve_model("revision")
 
 
 class TestShortEpisodeScriptUsesStructuredCall(unittest.TestCase):

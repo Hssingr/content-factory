@@ -308,7 +308,9 @@ def _next_source_script_version(content: Content, db: Session) -> int:
 def _persist_source_script(content: Content, scripts: dict, db: Session) -> str:
     content.title = scripts.get("title", content.title)
     src_voice_script = scripts.get("voice_script", "")
-    src_dur_sec = estimate_duration_sec(src_voice_script, content.source_language, db=db)
+    src_dur_sec = estimate_duration_sec(
+        src_voice_script, content.source_language, db=db, is_short_episode=False,
+    )
     version = _next_source_script_version(content, db)
 
     script_record = Script(
@@ -349,7 +351,9 @@ def _set_multilingual_durations(content: Content, db: Session) -> None:
     for script in all_scripts:
         if script.language == content.source_language:
             continue
-        dur = estimate_duration_sec(script.voice_script, script.language, db=db)
+        dur = estimate_duration_sec(
+            script.voice_script, script.language, db=db, is_short_episode=False,
+        )
         script.estimated_duration_sec = dur
         script.validated = True
         logger.info(

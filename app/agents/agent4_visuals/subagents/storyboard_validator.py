@@ -1,16 +1,14 @@
 """Storyboard validation gate — deterministic, no Claude/fal.ai calls.
 
-``validate_storyboard(beats)`` — text/structure checks (storyboard quality,
-  flux_prompt text quality, reuse-pattern checks). Runs BEFORE any fal.ai
-  call, via `visual_orchestrator._check_storyboard_issues()`. For the parent
-  path, MAJOR issues trigger one full-storyboard retry in
-  `split_into_beats()`; the child path has no equivalent regeneration
-  primitive and logs/proceeds immediately. Shared by the parent storyboard
-  path and the child remap path through their respective single call
-  sites — there is exactly one implementation, not a parent variant and a
-  child variant.
-
-MINOR issues are always logged at WARNING and never block the pipeline.
+``validate_storyboard(beats)`` — deterministic text/structure checks
+(storyboard quality, flux_prompt text quality). Runs BEFORE any fal.ai call,
+via `visual_orchestrator._collect_storyboard_issues()`, exactly once per path
+(the issues list is forwarded to the duplicate-prompt repair — fresh
+full-system audit §3.3). Telemetry only (Elimination Mandate D1.5): MAJOR
+findings are logged and never trigger a retry on either path; MINOR findings
+are logged at WARNING. Shared by the parent storyboard path and the child
+remap path — there is exactly one implementation, not a parent variant and a
+child variant.
 
 Media existence/integrity checks (post-generation, since a file's existence
 cannot be checked before it exists) live in
@@ -219,19 +217,12 @@ _FLUX_DUPLICATE_CHECK_NAMES: frozenset[str] = frozenset({
     "flux_prompt_exact_duplicate", "flux_prompt_near_duplicate",
 })
 
-# ── Child remap reuse thresholds (Phase 4E-E) ──────────────────────────────────
-# A run of this many or more consecutive beats sharing the same non-empty
-# media_url is flagged as reuse clustering. Only ever observable on the child
-# remap path: by the time validate_storyboard() runs, parent beats always
-# have media_url="" (Flux hasn't run yet — see _run_visual_pass ordering),
-# while reused child beats already carry the parent's real cache/ path. No
-# child-specific code is needed to scope this check; the data makes it so.
-_REUSE_CLUSTER_RUN_LENGTH = 3
-
-# If more than this fraction of flux_generated beats already have a non-empty
-# media_url at validation time (i.e. reused from the parent rather than
-# pending a new image), the short is over budget and must be remediated.
-_REUSE_RATIO_THRESHOLD = 0.60
+# Checks 17 (reuse_clustering) and 18 (excessive_reuse_ratio) are retired
+# (fresh full-system audit §3.1): they observed the child remap's
+# reuse-vs-pending media_url split, but portrait regeneration (roadmap 3.1)
+# made every child beat a fresh generation — every beat now arrives here with
+# media_url="" and the "reuse" the checks measured no longer physically
+# exists. The match_score is a prompt-inheritance decision only.
 
 
 class StoryboardIssue(TypedDict):
@@ -437,12 +428,8 @@ def validate_storyboard(beats: list[dict]) -> list[StoryboardIssue]:
     # ── MINOR checks 15-16: flux_prompt duplication (exact + near) ──────────
     issues.extend(_find_flux_prompt_duplicate_issues(beats))
 
-    # ── MINOR check 17: reuse clustering (same reused image, consecutive) ───
-    # Only ever fires on the child remap path — see threshold comment above.
-    issues.extend(_find_reuse_clustering_issues(beats))
-
-    # ── MINOR check 18: excessive reuse ratio (too little new visual content) ─
-    issues.extend(_find_excessive_reuse_issues(beats))
+    # Checks 17/18 (reuse_clustering / excessive_reuse_ratio) retired — see
+    # the note above StoryboardIssue (audit §3.1: no physical reuse exists).
 
     if issues:
         majors = [iss for iss in issues if iss["severity"] == "MAJOR"]
@@ -502,37 +489,16 @@ def validate_storyboard(beats: list[dict]) -> list[StoryboardIssue]:
         flux_generated_total, len(duplicate_flagged), duplicate_rate,
     )
 
-    # ── Diagnostics: CHILD_SHORT_REUSE_RATE / CHILD_SHORT_REUSE_CLUSTERING ───
-    # Always logged. Named CHILD_SHORT_* because reuse-from-parent is a child
-    # remap concept; the underlying computation runs for every
-    # validate_storyboard() call (parent included) but is naturally always
-    # zero/LOW for parents (see threshold comment above) — no child-specific
-    # branch was needed to produce these correctly.
-    reused_now = sum(
-        1 for b in beats
-        if b.get("media_strategy", "flux_generated") == "flux_generated"
-        and (b.get("media_url") or "").startswith("cache/")
-    )
-    reuse_rate_now = (reused_now / flux_generated_total * 100) if flux_generated_total else 0.0
-    logger.info(
-        "CHILD_SHORT_REUSE_RATE flux_beats=%d reused=%d rate=%.1f%%",
-        flux_generated_total, reused_now, reuse_rate_now,
-    )
-
-    clustering_issues = [iss for iss in issues if iss["check"] == "reuse_clustering"]
-    if clustering_issues:
-        logger.warning(
-            "CHILD_SHORT_REUSE_CLUSTERING risk=HIGH runs=%d beat_orders=%s",
-            len(clustering_issues), [iss["beat_order"] for iss in clustering_issues],
-        )
-    else:
-        logger.info("CHILD_SHORT_REUSE_CLUSTERING risk=LOW runs=0")
+    # The CHILD_SHORT_REUSE_RATE / CHILD_SHORT_REUSE_CLUSTERING diagnostics
+    # were retired with checks 17/18 (audit §3.1) — the prompt-inheritance
+    # stat that replaced the reuse concept is logged by
+    # remap_beats_for_short() as CHILD_SHORT_PROMPT_INHERITANCE_STATS.
 
     return issues
 
 
 def _find_visual_monotony_issues(issues: list[StoryboardIssue]) -> list[StoryboardIssue]:
-    """Escalate aggregate repetition signals into one MAJOR retry reason."""
+    """Aggregate repetition signals into one MAJOR summary finding (telemetry)."""
     consecutive_env_count = sum(
         1 for issue in issues if issue["check"] == "consecutive_same_environment"
     )
@@ -567,9 +533,9 @@ def _find_visual_monotony_issues(issues: list[StoryboardIssue]) -> list[Storyboa
         beat_order=-1,
         check="visual_monotony",
         description=(
-            "Aggregate visual repetition exceeds retry threshold: "
+            "Aggregate visual repetition exceeds threshold (telemetry only): "
             + "; ".join(reasons)
-            + ". Regenerate with stronger environment, motif, and composition variety."
+            + ". Storyboard shows strong environment/motif/composition repetition."
         ),
     )]
 
@@ -954,85 +920,14 @@ def _find_flux_prompt_duplicate_issues(beats: list[dict]) -> list[StoryboardIssu
     return issues
 
 
-def _find_reuse_clustering_issues(beats: list[dict]) -> list[StoryboardIssue]:
-    """Flag runs of `_REUSE_CLUSTER_RUN_LENGTH`+ consecutive beats sharing the
-    same non-empty `media_url` — e.g. four child-short beats in a row all
-    reusing the identical parent image. One issue per run, not per beat.
-    """
-    issues: list[StoryboardIssue] = []
-    n = len(beats)
-    i = 0
-    while i < n:
-        url = beats[i].get("media_url")
-        if not url:
-            i += 1
-            continue
-        j = i
-        while j + 1 < n and beats[j + 1].get("media_url") == url:
-            j += 1
-        run_length = j - i + 1
-        if run_length >= _REUSE_CLUSTER_RUN_LENGTH:
-            issues.append(StoryboardIssue(
-                severity="MINOR",
-                beat_order=beats[i].get("beat_order", i),
-                check="reuse_clustering",
-                description=(
-                    f"{run_length} consecutive beats (beat_order="
-                    f"{beats[i].get('beat_order', i)}–{beats[j].get('beat_order', j)}) "
-                    "all reuse the identical image — the same visual repeated "
-                    "back-to-back. Vary which parent beats are reused, or "
-                    "generate a new image for some of this run."
-                ),
-            ))
-        i = j + 1
-
-    return issues
-
-
-def _find_excessive_reuse_issues(beats: list[dict]) -> list[StoryboardIssue]:
-    """Flag a storyboard where more than `_REUSE_RATIO_THRESHOLD` of its
-    flux_generated beats already have a non-empty media_url at validation
-    time (i.e. reused rather than pending a new image) — too little of the
-    short's own visual identity, mostly recycled parent footage.
-
-    One aggregate issue for the whole storyboard (beat_order=-1), matching
-    the existing convention for storyboard-wide ratio checks (e.g.
-    environment_over_saturation).
-    """
-    flux_generated = [
-        b for b in beats if b.get("media_strategy", "flux_generated") == "flux_generated"
-    ]
-    if not flux_generated:
-        return []
-
-    reused = sum(1 for b in flux_generated if (b.get("media_url") or "").startswith("cache/"))
-    ratio = reused / len(flux_generated)
-    if ratio <= _REUSE_RATIO_THRESHOLD:
-        return []
-
-    return [StoryboardIssue(
-        severity="MAJOR",
-        beat_order=-1,
-        check="excessive_reuse_ratio",
-        description=(
-            f"{reused}/{len(flux_generated)} beats ({100*ratio:.0f}% > "
-            f"{100*_REUSE_RATIO_THRESHOLD:.0f}% budget) already reuse a parent "
-            "image at validation time — this short may be mostly recycled "
-            "parent footage with too little of its own visual identity."
-        ),
-    )]
-
-
-
 # ── Duplicate-prompt repair (audit G-5.3) ──────────────────────────────────────
 # Two beats with byte-identical `flux_prompt` text hash to the SAME Flux cache
 # file (image_router/flux_generator's cache key is sha256(prompt) within one
 # content_id's cache directory) — a surviving `flux_prompt_exact_duplicate`/
 # `flux_prompt_near_duplicate`/`near_duplicate_beat` finding is not just a
-# validator note, it is a guaranteed duplicate or near-duplicate image. MAJOR
-# findings already trigger a storyboard retry; these three checks are MINOR by
-# design (a handful of similar beats is not worth a Sonnet re-generation), so
-# nothing today fixes them once the retry pass is exhausted. This
+# validator note, it is a guaranteed duplicate or near-duplicate image. No
+# retry/regeneration mechanism exists (Elimination Mandate D1.5), so without
+# this repair nothing would ever fix them. This
 # deterministic, zero-cost repair runs immediately before Flux generation: it
 # appends a composition-slot variation (camera distance + angle, drawn from a
 # fixed rotation — never random, never an AI call) to exactly the beat_order
@@ -1074,14 +969,26 @@ def composition_slot_variation(occurrence: int) -> str:
     return _COMPOSITION_ROTATION[occurrence % len(_COMPOSITION_ROTATION)]
 
 
-def find_duplicate_prompt_beat_orders(beats: list[dict]) -> dict[int, str]:
+def find_duplicate_prompt_beat_orders(
+    beats: list[dict],
+    issues: list[StoryboardIssue] | None = None,
+) -> dict[int, str]:
     """Return ``{beat_order: check}`` for beats validate_storyboard() flags as
     a visual duplicate — the exact set of beats ``repair_duplicate_flux_prompts()``
-    would act on. Reuses ``validate_storyboard()`` itself so the repair target
-    list can never drift from what the validator actually detects.
+    would act on. Derives from ``validate_storyboard()``'s own findings so the
+    repair target list can never drift from what the validator actually detects.
+
+    Args:
+        issues: Optional pre-computed ``validate_storyboard()`` result. Passing
+            it avoids running the entire validator (and emitting every one of
+            its always-on diagnostics) a second time per content — the double
+            execution the fresh full-system audit flagged (§3.3). ``None``
+            keeps the self-contained behavior for direct callers.
     """
+    if issues is None:
+        issues = validate_storyboard(beats)
     targets: dict[int, str] = {}
-    for issue in validate_storyboard(beats):
+    for issue in issues:
         if issue["check"] in _DUPLICATE_REPAIR_CHECKS and issue["beat_order"] not in targets:
             targets[issue["beat_order"]] = issue["check"]
     return targets
@@ -1091,6 +998,7 @@ def repair_duplicate_flux_prompts(
     beats: list[dict],
     *,
     include_resolved: bool = False,
+    issues: list[StoryboardIssue] | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """Deterministically vary the flux_prompt of beats flagged as visual duplicates.
 
@@ -1105,6 +1013,10 @@ def repair_duplicate_flux_prompts(
             Flux generation.
         include_resolved: When True, repair duplicate prompts even if the beat
             currently has ``media_url`` because the caller will regenerate it.
+        issues: Optional pre-computed ``validate_storyboard()`` result —
+            forwarded to ``find_duplicate_prompt_beat_orders()`` so callers
+            that already validated do not pay for (and double-log) a second
+            full validation pass.
 
     Returns:
         ``(repaired_beats, repairs)`` — a new list (beats are shallow-copied,
@@ -1113,7 +1025,7 @@ def repair_duplicate_flux_prompts(
         repairs list means no beat needed repair (including the common case
         of zero duplicate findings).
     """
-    targets = find_duplicate_prompt_beat_orders(beats)
+    targets = find_duplicate_prompt_beat_orders(beats, issues=issues)
     if not targets:
         return beats, []
 

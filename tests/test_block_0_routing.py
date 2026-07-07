@@ -33,7 +33,7 @@ class TestResolveModel(unittest.TestCase):
             mock_settings.claude_tier = "prod"
             for task in (
                 "native_adaptation", "storyboard",
-                "story_gate_scoring", "revision", "story_research",
+                "story_gate_scoring", "story_research",
                 "channel_suggestion", "channel_research", "story_blueprint",
                 "section_generation", "short_script",
             ):

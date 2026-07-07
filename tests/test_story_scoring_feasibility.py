@@ -42,16 +42,21 @@ class StoryScoringFeasibilityTest(unittest.TestCase):
         self.assertFalse(accepted)
         self.assertIn("image_generation_feasibility 39 < 40", reason)
 
-    def test_legacy_stock_media_key_aliases_to_image_generation_feasibility(self) -> None:
+    def test_legacy_stock_media_alias_removed(self) -> None:
+        """Fresh full-system audit §4: the legacy key aliases are deleted — no
+        producer of stock_media_feasibility exists (every assessment comes from
+        score_story_for_gate's forced tool-use schema, which requires the
+        canonical names). A legacy key is now simply ignored and the canonical
+        dimension scores 0, failing its floor loudly instead of silently
+        aliasing."""
         scores = strong_scores()
-        image_score = scores.pop("image_generation_feasibility")
-        self.assertEqual(image_score, 80)
-        scores["stock_media_feasibility"] = 39
+        scores.pop("image_generation_feasibility")
+        scores["stock_media_feasibility"] = 80
 
         result = scoring.score_story_assessment({"scores": scores})
 
-        self.assertEqual(result["dimension_scores"]["image_generation_feasibility"], 39)
-        self.assertIn("image_generation_feasibility 39 < 40", result["failed_gates"])
+        self.assertEqual(result["dimension_scores"]["image_generation_feasibility"], 0)
+        self.assertIn("image_generation_feasibility 0 < 40", result["failed_gates"])
 
 
 if __name__ == "__main__":

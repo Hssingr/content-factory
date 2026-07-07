@@ -16,6 +16,7 @@ from app.agents.agent2_discovery.system_prompt import (
     generate_short_episode_script,
 )
 from app.services.script_checks import (
+    split_sentences,
     check_hook_quality,
     check_tts_compliance,
     check_completeness,
@@ -40,8 +41,8 @@ _MAX_BODY_SECTIONS    = 7   # V2 hard cap — absolute maximum regardless of cov
 def _script_trace(label: str, voice_script: str) -> None:
     """Log word count, section count, and SHA-256 fingerprint for script version tracing.
 
-    Temporary diagnostic — call at every major stage where the script is passed between
-    functions to verify that the latest version (not a stale copy) is in use.
+    Permanent tracing diagnostic — called at every major stage where the script is
+    passed between functions so a stale-copy bug is diagnosable from logs alone.
     """
     wc  = len(voice_script.split())
     sec = len(re.findall(
@@ -55,13 +56,13 @@ def _script_trace(label: str, voice_script: str) -> None:
 
 def _max_sentence_len(text: str) -> int:
     """Return the word count of the longest sentence in text."""
-    sentences = [s for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+    sentences = split_sentences(text)
     return max((len(s.split()) for s in sentences), default=0)
 
 
 def _count_sentences(text: str) -> int:
     """Return the number of sentences in text."""
-    return len([s for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()])
+    return len(split_sentences(text))
 
 
 def diagnose_section_repetition(sections: list[dict]) -> list[dict]:
@@ -186,12 +187,12 @@ def run_script_quality_gate(
 def _apply_final_tts_backstop(current: dict) -> dict:
     voice_script = current.get("voice_script", "")
     over_before = sum(
-        1 for sentence in re.split(r"(?<=[.!?])\s+", voice_script)
+        1 for sentence in split_sentences(voice_script)
         if len(sentence.split()) > 18
     )
     cleaned = split_long_sentences(normalize_tts_chars(voice_script))
     over_after = sum(
-        1 for sentence in re.split(r"(?<=[.!?])\s+", cleaned)
+        1 for sentence in split_sentences(cleaned)
         if len(sentence.split()) > 18
     )
     logger.debug(
@@ -211,20 +212,14 @@ def _log_quality_gate_input(current: dict) -> None:
         re.DOTALL | re.IGNORECASE,
     )
     if intro_match:
-        intro_sents = [
-            sentence for sentence in re.split(r"(?<=[.!?])\s+", intro_match.group(1).strip())
-            if sentence.strip()
-        ]
+        intro_sents = split_sentences(intro_match.group(1).strip())
         logger.debug(
             "QUALITY_GATE_INPUT intro_first=%r",
             (intro_sents[0][:120] if intro_sents else ""),
         )
     outro_match = re.search(r"\[OUTRO\]\s*(.*?)$", voice_script, re.DOTALL | re.IGNORECASE)
     if outro_match:
-        outro_sents = [
-            sentence for sentence in re.split(r"(?<=[.!?])\s+", outro_match.group(1).strip())
-            if sentence.strip()
-        ]
+        outro_sents = split_sentences(outro_match.group(1).strip())
         logger.debug(
             "QUALITY_GATE_INPUT outro_last=%r",
             (outro_sents[-1][:120] if outro_sents else ""),
@@ -467,7 +462,10 @@ def generate_multilingual_scripts(
         if existing is not None:
             existing.voice_script = adapted["voice_script"]
             existing.validated = True
-            existing.estimated_duration_sec = estimate_duration_sec(adapted["voice_script"], lang, db=db)
+            existing.estimated_duration_sec = estimate_duration_sec(
+                adapted["voice_script"], lang, db=db,
+                is_short_episode=content.is_short_episode,
+            )
             db.flush()
             result.append(existing)
             logger.debug("Script re-validated in place: lang=%s id=%s", lang, existing.id)
@@ -478,7 +476,10 @@ def generate_multilingual_scripts(
                 voice_script=adapted["voice_script"],
                 version=1,
                 validated=True,
-                estimated_duration_sec=estimate_duration_sec(adapted["voice_script"], lang, db=db),
+                estimated_duration_sec=estimate_duration_sec(
+                    adapted["voice_script"], lang, db=db,
+                    is_short_episode=content.is_short_episode,
+                ),
             )
             db.add(script)
             db.flush()
@@ -912,7 +913,7 @@ def _log_section_generation_output(label: str, attempt: int, result: dict) -> di
         "sentence_count": _count_sentences(script_text),
         "max_sentence_len": _max_sentence_len(script_text),
     }
-    first_sentence = (re.split(r"(?<=[.!?])\s+", script_text.strip()) or [""])[0][:120]
+    first_sentence = (split_sentences(script_text.strip()) or [""])[0][:120]
     logger.debug(
         "SECTION_OUTPUT label=%s attempt=%d words=%d sents=%d max_sent=%d suggests_outro=%s",
         label, attempt, metrics["word_count"], metrics["sentence_count"],
@@ -1221,7 +1222,7 @@ def check_narrative_completeness(
     # ── 4. Comment trigger as last OUTRO sentence ─────────────────────────────
     comment_trigger = blueprint.get("comment_trigger", "")
     if comment_trigger and outro_text:
-        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", outro_text) if s.strip()]
+        sentences = split_sentences(outro_text)
         if sentences:
             last_sent     = sentences[-1]
             trigger_tokens = _get_content_tokens(comment_trigger)
@@ -1374,7 +1375,7 @@ def _generate_intro_section(
         narration_pov=context.get("narration_pov", "third_person"),
     )
     if intro is None:
-        raise RuntimeError("generate_script_sections: INTRO generation failed after retries")
+        raise RuntimeError("generate_script_sections: INTRO generation failed (single-call, no retry)")
     state["covered_turns"] |= _append_generated_section(state, "INTRO", intro, major_turns)
 
 
@@ -1522,7 +1523,7 @@ def _run_body_section_loop(
         )
         if section is None:
             logger.warning(
-                "generate_script_sections: %s failed after retries — stopping body loop", label
+                "generate_script_sections: %s failed (single-call, no retry) — stopping body loop", label
             )
             break
 
@@ -1583,7 +1584,7 @@ def _generate_outro_section(
         narration_pov=context.get("narration_pov", "third_person"),
     )
     if outro is None:
-        raise RuntimeError("generate_script_sections: OUTRO generation failed after retries")
+        raise RuntimeError("generate_script_sections: OUTRO generation failed (single-call, no retry)")
     _append_generated_section(
         state, "OUTRO", outro, major_turns, add_prior_summary=False, track_turns=False
     )
@@ -1796,7 +1797,12 @@ def generate_script_sections(
 # (roadmap 3.6/3.8, audit G-7 — real Shorts run at ~120 wpm, not the
 # previously-assumed 180 wpm / "3 words per second"; the old 250-word cap
 # produced measured 110 s Shorts, overshooting the 60-90 s plan band).
-_MIN_SHORT_WORDS = 125  # ~61 s at 120 wpm
+# Floor raised 125 → 135 (fresh full-system audit §2.4): 125 words at 120 wpm
+# is 62.5 s — only 1.5 s of margin over Agent 3's hard 61 s monetization floor
+# (_MIN_SHORT_AUDIO_DURATION_MS); a marginally fast read failed the language
+# after paying for script + translation + TTS. 135 words ≈ 67.5 s keeps real
+# margin.
+_MIN_SHORT_WORDS = 135  # ~67 s at 120 wpm
 _MAX_SHORT_WORDS = 180  # ~90 s at 120 wpm
 
 # Section markers must never appear in a child Short's narration — flat narration only
@@ -2306,7 +2312,7 @@ def _collect_short_script_major_issues(
 ) -> list[dict]:
     tts_issues = check_tts_compliance(ep_voice_script, source_language)
     first_sent = (
-        re.split(r"(?<=[.!?])\s+", ep_voice_script.strip())[0]
+        (split_sentences(ep_voice_script.strip()) or [""])[0]
         if ep_voice_script.strip() else ""
     )
     hook_issues = check_hook_quality(f"[INTRO]\n{first_sent}", source_language)
@@ -2335,7 +2341,7 @@ def _collect_short_script_major_issues(
             ),
         })
         logger.warning(
-            "run_shorts_planner: part %d attempt %d contains section marker %r — will retry",
+            "run_shorts_planner: part %d attempt %d contains section marker %r (telemetry only)",
             part_n, correction_round, marker_match.group(0),
         )
 
@@ -2351,7 +2357,7 @@ def _collect_short_script_major_issues(
             ),
         })
         logger.warning(
-            "run_shorts_planner: part %d attempt %d word count %d < floor %d — will retry",
+            "run_shorts_planner: part %d attempt %d word count %d < floor %d (telemetry only)",
             part_n,
             correction_round,
             ep_wc,
@@ -2369,7 +2375,7 @@ def _collect_short_script_major_issues(
             ),
         })
         logger.warning(
-            "run_shorts_planner: part %d attempt %d word count %d > cap %d — will retry",
+            "run_shorts_planner: part %d attempt %d word count %d > cap %d (telemetry only)",
             part_n,
             correction_round,
             ep_wc,

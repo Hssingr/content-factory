@@ -61,6 +61,9 @@ class _FakeQuery:
         self._rows = rows
         self._conditions = conditions
 
+    def join(self, *a, **k):
+        return self
+
     def filter(self, *conditions):
         return _FakeQuery(self._rows, self._conditions + conditions)
 

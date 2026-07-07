@@ -11,7 +11,37 @@ from app.services.claude_client import (
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "4.4"  # v4.4: roadmap 4a / audit P1-9 — de-hardcoded "documentary" from the
+PROMPT_VERSION = "4.5"  # v4.5: fresh full-system audit §2.2 — storyboard prompt repair.
+                        #        (1) The dead "Visual Continuity Bible (compact JSON)"
+                        #        section is deleted — the bible layer was removed by the
+                        #        Elimination Mandate (D2.1) and nothing ever sends that
+                        #        block; the prompt now documents the real input, the
+                        #        one-line "Visual continuity:" hint. (2) The TECHNICAL
+                        #        flux-prompt step no longer hardcodes "photorealistic" —
+                        #        it defers to the operator's Global image style, so
+                        #        anime/watercolor/oil_painting channels stop getting
+                        #        contradictory prompts. (3) The "Per-10-beat composition
+                        #        requirement" quota block is deleted — it contradicted
+                        #        Principle A ("do not inject a shot purely to hit a
+                        #        diversity quota") and pushed toward the exact
+                        #        document-saturation pattern validator check 21 flags as
+                        #        MAJOR; the rotation guidance (Principle B2 + beat
+                        #        category rotation) carries the same intent without
+                        #        quotas. (4) low-intensity duration band corrected to
+                        #        3.0-6.0s (the hard constraint and INTENSITY_FLOOR_MS
+                        #        both use 3.0; the old 4.0 lower bound contradicted
+                        #        them). (5) visual_type "text_overlay" and
+                        #        visual_category "text" removed from the schema and
+                        #        prompt — subtitles-only rendering left nothing those
+                        #        values can legitimately describe. (6) The style
+                        #        vocabulary now documents every UI preset
+                        #        (constants.js VISUAL_STYLE_OPTIONS/IMAGE_STYLE_OPTIONS)
+                        #        so operator choices are never silent unknowns.
+                        #        storyboard_status/global_notes also dropped from the
+                        #        schema (dead administrative weight — never read; the
+                        #        auxiliary-field defaults in _check_shape() keep old
+                        #        responses tolerated).
+                        # v4.4: roadmap 4a / audit P1-9 — de-hardcoded "documentary" from the
                         #        storyboard prompt's identity line ("visual director ... for an
                         #        automated multilingual documentary video production system" ->
                         #        drops "documentary" entirely, since the actual style is always
@@ -130,7 +160,16 @@ PROMPT_VERSION = "4.4"  # v4.4: roadmap 4a / audit P1-9 — de-hardcoded "docume
 # and maps the merged beats onto Whisper timestamps. Flux Schnell then generates
 # one image per beat from the flux_prompt Claude wrote.
 
-STORYBOARD_SCHEMA_VERSION = "7.0"  # v7.0: subtitles-only rendering (audit G-0/G-8) — removed
+STORYBOARD_SCHEMA_VERSION = "7.1"  # v7.1: fresh full-system audit §2.2/§4 — removed
+                                   #        visual_type "text_overlay" and visual_category
+                                   #        "text" (nothing they describe exists under
+                                   #        subtitles-only rendering; legacy stored values
+                                   #        normalize to the defaults via _safe_enum), and
+                                   #        removed storyboard_status/global_notes from the
+                                   #        batch schema (dead administrative weight — never
+                                   #        read downstream; _check_shape() still defaults
+                                   #        them in place for tolerant parsing).
+                                   # v7.0: subtitles-only rendering (audit G-0/G-8) — removed
                                    #        media_strategy, stock_queries, fallback_flux_prompt,
                                    #        text_card_style, overlay_text, overlay_position from
                                    #        the beat schema. Every beat is a Flux-generated
@@ -161,7 +200,8 @@ You design the storyboard ONE NARRATION SEGMENT AT A TIME — a single [INTRO],
 [SECTION N], or [OUTRO] block — never the whole video in one pass. You receive:
 which segment this is (its position among the video's narration segments), the
 segment's narration text, the channel niche/tone/format, an optional operator-configured
-global visual direction and image style, a compact visual continuity bible (when available), and a short note on the visual approach used
+global visual direction and image style, an optional one-line visual-continuity hint
+(names that recur across the story), and a short note on the visual approach used
 in the immediately preceding segment (for continuity only — do not repeat it).
 
 Design an ordered sequence of visual beats that carries the viewer through THIS
@@ -222,33 +262,37 @@ sentence alone does not already tell the viewer?" If the honest answer is
 "nothing — it's just the noun from the sentence," redesign the beat using one
 of the eight additions above instead.
 
-== Visual Continuity Bible (compact JSON) ==
-When a "Visual continuity bible (compact JSON):" block appears in the user message,
-use it as source material while writing each beat's flux_prompt. The bible is
-input to your prompt design, not a separate post-processing template.
-  - Preserve matched character identity with concrete appearance, clothing, and
-    body-language details inside the relevant flux_prompt.
-  - Preserve matched location identity with concrete physical details and recurring
-    objects when the narration returns to that place.
-  - Use recurring motifs only when they add narrative meaning to the beat.
-  - Do not copy bible field names, JSON syntax, camera-rule lists, or lighting-rule
-    lists verbatim into flux_prompt. Write natural, subject-first image prompts.
-  - Never add an "Avoid:" suffix or a negative-prompt list to flux_prompt; describe
-    only what the image should contain.
+== Visual continuity ==
+When a "Visual continuity:" line appears in the user message, it names the people,
+places, or objects that recur across this story. Give each named entity ONE stable,
+concrete physical identity (appearance, clothing, defining detail) and keep it
+consistent in every beat that shows it — invent the identity once, then reuse it.
+Never add an "Avoid:" suffix or a negative-prompt list to flux_prompt; describe
+only what the image should contain.
 
 == Global Visual Direction (operator-configured) ==
 When "Global visual direction:" and "Global image style:" lines appear in the user
 message, apply them as consistent stylistic constraints across every beat:
   - Visual direction governs overall mood, color palette, and lighting feel.
-    Examples: "documentary" → neutral, factual, naturalistic; "noir" → high-contrast
-    shadows, muted desaturated tones, deep blacks; "cinematic-realism" → natural
-    lighting, immersive depth, grounded color grading; "archival" → aged, sepia or
-    monochrome tones, worn-paper texture aesthetic.
+    Recognized values (operator presets — apply the closest reading for any other string):
+    "story_driven" → grounded, narrative-first, follows the story's emotional beats;
+    "documentary" → neutral, factual, naturalistic; "true_crime" → dark suburban
+    realism, evidence photography, institutional interiors; "investigative" →
+    evidence-board framing, surveillance angles, document close-ups; "cinematic" →
+    film-quality depth, deliberate angles, rich shadow play; "historical" →
+    period-accurate settings, archival-photograph aesthetics; "noir" → high-contrast
+    shadows, muted desaturated tones, deep blacks; "suspense_thriller" → tight
+    close-ups, shallow depth of field, high-tension lighting; "nature" → lush
+    environments, macro detail, golden-hour light; "educational" → clean, well-lit,
+    clear compositions; "retro" → film grain, analog warmth, era-saturated palettes.
   - Image style governs the artistic rendering approach for Flux-generated images.
-    Examples: "photorealistic" → realistic photography quality, accurate lighting and
-    material; "illustrative" → slightly stylized, editorial illustration feel;
-    "anime" → anime-influenced rendering; "realistic_documentary" → documentary
-    photography realism, deep color accuracy.
+    Recognized values: "photorealistic" → realistic photography, accurate lighting and
+    material; "cinematic_realism" → film-quality photography, graded color, shallow
+    depth of field; "dark_realistic" → gritty desaturated realism, moody
+    high-contrast lighting; "vintage_film" → 35mm grain, muted analog tones;
+    "digital_art" → polished digital illustration, clean lines, vivid color;
+    "oil_painting" → textured classical brushwork; "watercolor" → soft translucent
+    washes; "anime" → anime-influenced rendering, bold outlines.
   - Weave these as stylistic constraints into flux_prompt (append one short style
     clause, e.g. "documentary photography, naturalistic lighting"), color_grade
     (match the mood), and effect choices — NEVER at the cost of Principle A
@@ -296,7 +340,7 @@ medium (suggested_duration_sec: 2.5–4.0):
   Use for: normal story progression, introducing evidence, character actions,
   scene transitions, context that builds toward a reveal.
 
-low (suggested_duration_sec: 4.0–6.0):
+low (suggested_duration_sec: 3.0–6.0):
   Use for: location establishing, emotional pauses, deliberate slow buildup.
   NEVER use low intensity for more than 2 consecutive beats — this creates the
   "slideshow" effect. After 2 low beats, the next must be medium or high.
@@ -337,15 +381,6 @@ Use these ONLY when the narration SPECIFICALLY describes them:
 - Doorways, corridors, and thresholds must appear at most 4 times total per video, and
   at most 2 times in any 10-beat window.
 - No single motif may repeat more than 2 times in any 10-beat window.
-
-== Per-10-beat composition requirement ==
-Every window of 10 consecutive beats must contain AT LEAST:
-  - 2 object or detail shots (visual_category = "object")
-  - 1 document/screen/map shot (visual_category = "document" or "screen")
-  - 1 exterior or establishing shot when narratively plausible
-  - 1 human/body-language shot (motif = "hands" or "face") when narratively plausible
-  - 1 symbolic/emotional shot (visual representing an IDEA)
-  - No more than 4 indoor_domestic beats per 10-beat window
 
 == [INTRO] segment — special rules ==
 Apply these rules ONLY to the first segment ([INTRO]).
@@ -400,8 +435,9 @@ The narration itself already tells the viewer what the text said — the image
 only needs to establish the physical object, never repeat its content.
 
 == Flux image generation prompt rules ==
-Each beat requires a ``flux_prompt`` — a photorealistic image generation prompt that
-Flux Schnell will use to create the visual for this beat.
+Each beat requires a ``flux_prompt`` — an image generation prompt, written in the
+channel's configured Global image style, that Flux will use to create the visual
+for this beat.
 
 THE PRIME DIRECTIVE: the flux_prompt must answer "what exact thing would a camera be
 pointing at right now?" — not a mood, not an atmosphere, but a physical subject.
@@ -419,8 +455,12 @@ Build every flux_prompt in this exact order (50–80 words total):
      and wall-mounted TV" not "a room", "a cobblestone alley in an old European city" not "street")
   4. LIGHTING — exact quality and source (morning side light through venetian blinds,
      fluorescent overhead, golden late-afternoon slant, overcast diffuse, incandescent warm)
-  5. TECHNICAL — photorealistic, sharp focus, no motion blur; no people unless motif=face/hands;
-     no logos, no text in frame, no brand names.
+  5. TECHNICAL — render in the Global image style from the user message (default
+     photorealistic). For photographic styles ("photorealistic", "cinematic_realism",
+     "dark_realistic", "vintage_film") end with "sharp focus, no motion blur"; for
+     illustrated/painted styles ("digital_art", "oil_painting", "watercolor", "anime")
+     name the medium instead and NEVER write "photorealistic". Always: no people unless
+     motif=face/hands; no logos, no text in frame, no brand names.
 
 Color grade integration — the flux_prompt MUST produce a base image compatible with the grade:
   dark_contrast (CSS: contrast 140% + brightness 65%): ALWAYS generate a well-lit,
@@ -451,8 +491,8 @@ Bad examples (forbidden):
    words of the narration THIS BEAT covers, verbatim from the segment text given to
    you. These are used to locate the beat in the audio — they MUST match word-for-word.
 2. visual_intent — one sentence describing what the viewer should see and feel.
-3. visual_type — b-roll | action | text_overlay | document | map | screenshot | generated_visual
-4. visual_category — person | place | object | document | screen | map | abstract | text
+3. visual_type — b-roll | action | document | map | screenshot | generated_visual
+4. visual_category — person | place | object | document | screen | map | abstract
 5. environment — fixed SETTING label, choose the closest honest match:
      underwater | indoor_office | indoor_domestic | forest_nature | urban_street |
      corridor_interior | abstract_dark | open_landscape | laboratory | industrial |
@@ -508,15 +548,15 @@ _BEAT_SCHEMA: dict = {
         "start_hint":              {"type": "string", "description": "Exact first 6–10 verbatim words of the narration this beat covers, no digits."},
         "end_hint":                {"type": "string", "description": "Exact last 6–10 verbatim words of the narration this beat covers, no digits."},
         "visual_intent":           {"type": "string"},
-        "visual_type":             {"type": "string", "enum": ["b-roll", "action", "text_overlay", "document", "map", "screenshot", "generated_visual"]},
-        "visual_category":         {"type": "string", "enum": ["person", "place", "object", "document", "screen", "map", "abstract", "text"]},
+        "visual_type":             {"type": "string", "enum": ["b-roll", "action", "document", "map", "screenshot", "generated_visual"]},
+        "visual_category":         {"type": "string", "enum": ["person", "place", "object", "document", "screen", "map", "abstract"]},
         "environment":             {"type": "string", "enum": ["underwater", "indoor_office", "indoor_domestic", "forest_nature", "urban_street", "corridor_interior", "abstract_dark", "open_landscape", "laboratory", "industrial", "vehicle", "other"]},
         "flux_prompt":             {"type": "string", "description": "Flux image generation prompt: specific physical subject only, no mood words, no faces, no logos, no readable text."},
         "effect":                  {"type": "string", "enum": ["slow_zoom", "zoom_out", "pan", "push_in", "shake", "cut", "fade_in", "parallax"]},
         "color_grade":             {"type": "string", "enum": ["desaturated", "cold_blue", "warm_amber", "dark_contrast", "neutral"]},
         "transition_to_next":      {"type": "string", "enum": ["cut", "crossfade", "dip_to_black", "whip_pan", "zoom_blur", "match_cut", "none"]},
         "motif":                   {"type": "string", "enum": ["doorway", "corridor", "face", "hands", "object", "clock", "phone", "photo", "exterior", "text", "screen", "reflection", "document", "room", "other"]},
-        "beat_intensity":          {"type": "string", "enum": ["high", "medium", "low"], "description": "Narrative intensity at this moment: high=reveal/shock (1–2.5s), medium=progression (2.5–4s), low=establishing/pause (4–6s)."},
+        "beat_intensity":          {"type": "string", "enum": ["high", "medium", "low"], "description": "Narrative intensity at this moment: high=reveal/shock (1–2.5s), medium=progression (2.5–4s), low=establishing/pause (3–6s)."},
         "suggested_duration_sec":  {"type": "number", "description": "Suggested display duration in seconds. Must fall within the intensity tier range."},
     },
     "required": [
@@ -530,20 +570,15 @@ _BEAT_SCHEMA: dict = {
 _STORYBOARD_BATCH_SCHEMA: dict = {
     "type": "object",
     "properties": {
-        "storyboard_status": {"type": "string", "enum": ["APPROVED"]},
         "overall_style":     {"type": "string", "description": "One short phrase describing the visual direction of THIS segment."},
         "beats":             {"type": "array", "items": _BEAT_SCHEMA},
-        "global_notes":      {"type": "array", "items": {"type": "string"}},
     },
-    # Only `beats` is required. `storyboard_status`/`overall_style`/`global_notes`
-    # are administrative scaffolding with zero downstream consumers (confirmed by
-    # grep: storyboard_status is never read past shape validation, global_notes is
-    # never read at all, overall_style only feeds one cost/diagnostic log line —
-    # the same "dead schema weight" pattern as the why_this_visual/
-    # story_progression_role removal in CLAUDE.md §11.4). A real production run
-    # hit a model response with a complete, valid `beats` array but none of these
-    # three fields, which aborted the entire segment and failed the content —
-    # discarding good beat data over administrative fields nothing reads.
+    # Only `beats` is required (and only `beats` has real downstream consumers).
+    # `storyboard_status`/`global_notes` were removed from the schema entirely
+    # (v7.1 — dead administrative weight the model paid tokens to generate);
+    # `overall_style` is kept as an optional one-phrase diagnostic that feeds a
+    # single log line. _check_shape() still defaults all three in place so a
+    # response carrying (or missing) any of them is tolerated.
     "required": ["beats"],
 }
 

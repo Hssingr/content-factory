@@ -6,7 +6,26 @@ from app.agents.agent2_discovery.services.story import MAX_SOURCE_EXCERPT_CHARS
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "4.6"  # v4.6: Elimination Mandate extension (post-roadmap deep audit) —
+PROMPT_VERSION = "4.7"  # v4.7: fresh full-system audit §2.1 — section-prompt subtraction.
+                        # Three changes, all removals/reconciliations, no new rules:
+                        # (1) "EXACTLY ONE narrative function" vs "a new revelation every
+                        # 110-150 words" contradiction resolved — a section serves ONE
+                        # PRIMARY function and the 110-150-word cadence now explicitly
+                        # develops that SAME function (details/escalation/consequence),
+                        # never a second function. (2) The unactionable 25%/60% mini-hook
+                        # placement rule is deleted — per-section generation cannot know
+                        # total word count or which section lands at those marks (the
+                        # midpoint trap already handles targeted placement correctly, in
+                        # Python). (3) The <=18-word rule was stated three times (TTS core,
+                        # FINAL CHECK paragraph, section strict rule 3) — the FINAL CHECK
+                        # re-count paragraph and strict rule 3 are deleted; the core
+                        # statement plus the deterministic split_long_sentences() backstop
+                        # remain. "One idea per sentence" softened from an absolute ban on
+                        # and/but joins (it contradicted the sonic-2 block's own
+                        # comma-cluster pacing guidance and pushed machine-gun monotone —
+                        # the same failure the Elimination Mandate deleted the retry loop
+                        # for).
+                        # v4.6: Elimination Mandate extension (post-roadmap deep audit) —
                         # auto_correct_script(), _CORRECTION_SYSTEM_PROMPT_BASE, and the
                         # _corr*/_split_long_sentences_agent2 helper family (used only by
                         # auto-correction) are deleted: the last remaining AI prompt-repair
@@ -101,16 +120,11 @@ TTS WRITING CONSTRAINTS — apply to every sentence in voice_script:
 - No abbreviations: Dr. → Doctor, vs. → versus, etc. → and so on, \
 e.g. → for example, Mr. → Mister, St. → Saint.
 - No ALL-CAPS words of three or more letters — use mixed case or spell the word out.
-- One idea per sentence — do not join two distinct thoughts with "and" or "but".
+- Prefer one main idea per sentence — avoid chaining several distinct thoughts into one
+  long compound sentence. (Short connected clauses used deliberately for pacing are fine.)
 - One blank line between narrative beats (breathing room for the voice).
 - No stage directions, no parenthetical notes, no editorial asides in brackets.
-- Square brackets are allowed ONLY for section markers: [INTRO], [SECTION N], [OUTRO].
-
-FINAL CHECK — before returning your JSON:
-  Re-read every sentence in voice_script one by one and count its words.
-  If any sentence contains 19 or more words, STOP and split it into two shorter
-  sentences before returning. Do not return until every sentence is ≤18 words.
-  No exceptions — a 19-word sentence is a hard failure.\
+- Square brackets are allowed ONLY for section markers: [INTRO], [SECTION N], [OUTRO].\
 """
 
 TTS_BLOCK: dict[str, str] = {
@@ -416,7 +430,7 @@ def _extract_hook_context(voice_script: str, script_format: str) -> str:
     if script_format == "youtube_long":
         return (
             f'Opening hook: "{first}"\n'
-            f"This was selected by a retention optimizer as the strongest hook for this story. "
+            f"This opening line is deliberately constructed for retention. "
             f"Preserve its concrete specificity, named facts, and sense of arriving mid-story "
             f"in your translation."
         )
@@ -430,7 +444,7 @@ def _extract_hook_context(voice_script: str, script_format: str) -> str:
 
 _STORY_BLUEPRINT_SYSTEM_PROMPT = """\
 You are a story architect for YouTube long-form retention. Your task: read
-a news story and design both its narrative skeleton AND its emotional arc — how
+a source story and design both its narrative skeleton AND its emotional arc — how
 dread, tension, and curiosity should build across the video, not just which facts
 must appear.
 
@@ -461,7 +475,7 @@ Rules:
   Between 2 and 5. Python may override.
 - suggested_title: YouTube title derived from hook. 60–70 chars. SEO-optimized.
 - Write the hook, major_turns, and final_payoff in a register matching the Channel
-  niche and Channel tone values provided below (provided below). Horror/thriller/mystery: favor dread,
+  niche and Channel tone values provided below. Horror/thriller/mystery: favor dread,
   withheld information, and escalating unease. Documentary/educational: favor
   clarity and context. Match the configured niche — do not default to a neutral
   documentary register regardless of niche.
@@ -595,7 +609,7 @@ Narration POV — driven by the "Narration POV" value in the user message, not h
 Blueprint constraint: every section must advance the story toward the final_payoff and
 comment_trigger provided in the blueprint. Do not veer off-story.
 
-Each BODY section must do EXACTLY ONE of these narrative functions:
+Each BODY section serves ONE PRIMARY narrative function — pick it from this list:
   - Introduce new information the viewer has not seen yet
   - Reveal a contradiction between two things stated as true
   - Escalate the stakes (make things worse or more urgent)
@@ -649,12 +663,10 @@ Narrative progression rules — apply to every section:
   - Future turns listed in the user message as "do not resolve yet" may be foreshadowed
     but must not be answered or fully explained. Leave them for later sections.
   - End body sections with a bridge or an open question toward the next uncovered turn.
-  - The two strongest mini-hooks across the whole script must land at the body sections
-    nearest the 25% and 60% marks of total word count — these are the highest
-    audience drop-off risk points.
-  - Every 110–150 words of narration, introduce a new revelation, complication, or
-    emotional beat. Tension must never plateau — if two consecutive sentences add no
-    new fact or escalation, the section is failing this rule.
+  - Keep momentum WITHIN the section's primary function: every 110–150 words, add a new
+    concrete development of that SAME function — a detail, an escalation, a consequence —
+    never a second narrative function. Tension must never plateau — if two consecutive
+    sentences add no new fact or escalation, the section is failing this rule.
 
 [INTRO] specific rules — apply ONLY when label = INTRO:
   - The first sentence must be the blueprint's hook verbatim or a direct derivation
@@ -701,8 +713,7 @@ Output format — return ONLY the tool schema. No prose, no code fence, no extra
 Rules:
 1. Never fabricate facts not in the story body or blueprint.
 2. script_text must NOT contain [INTRO], [SECTION N], or [OUTRO] markers inside it.
-3. Every sentence in script_text must be ≤18 words. Count them.
-4. suggests_outro: true ONLY when all major_turns from the blueprint have been covered in
+3. suggests_outro: true ONLY when all major_turns from the blueprint have been covered in
    prior sections. This is a recommendation only — Python decides whether to end generation.\
 """
 
@@ -901,25 +912,15 @@ _TELEGRAM_TEMPLATES: dict[str, dict[str, str]] = {
 }
 
 
-# ── Revision prompt ────────────────────────────────────────────────────────────
-
-_REVISION_SYSTEM_PROMPT = """\
-You revise an existing video script based on user feedback.
-
-Rules:
-1. Return ONLY valid JSON. No markdown. No code fence. No extra keys.
-2. Preserve the source language, tone, and factual content unless the feedback explicitly
-   asks to change them.
-3. Apply changes accurately and minimally — do not rewrite what the feedback does not address.
-4. Never invent facts, URLs, statistics, or events not present in the script you received.
-5. Never send a partial script — always return the full voice_script.
-6. Preserve [INTRO], [SECTION N], [OUTRO] markers in voice_script.
-7. Output schema:
-   {"title": "...", "voice_script": "...",
-    "changes": [{"section": "INTRO|SECTION 1|...|OUTRO", "before_summary": "...", "after_summary": "..."}]}
-   Include an entry in "changes" for every section that was meaningfully modified.
-   "before_summary" and "after_summary": one sentence each describing the substance of the change.\
-"""
+# ── Script revision — REMOVED (fresh full-system audit §1.3) ─────────────────
+# generate_revised_scripts(), _REVISION_SYSTEM_PROMPT, and _REVISION_SCHEMA
+# were deleted: scripts are generated only AFTER Telegram approval, so no
+# reachable state ever had a script to revise while its validation was still
+# PENDING — the whole chain was dead code, and the operator's CHANGE reply
+# was silently swallowed. A CHANGE reply is now story-level feedback
+# (validation.py _handle_change): reject the story and re-dispatch discovery
+# with the feedback threaded into the exclusion context. The "revision" task
+# key was removed from MODEL_ROUTING with it.
 
 
 # ── Public functions ───────────────────────────────────────────────────────────
@@ -1077,74 +1078,6 @@ def generate_native_script(
     )
 
 
-_REVISION_SCHEMA: dict = {
-    "type": "object",
-    "properties": {
-        "title":        {"type": "string"},
-        "voice_script": {"type": "string"},
-        "changes": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "section":         {"type": "string"},
-                    "before_summary":  {"type": "string"},
-                    "after_summary":   {"type": "string"},
-                },
-                "required": ["section", "before_summary", "after_summary"],
-            },
-        },
-    },
-    "required": ["title", "voice_script", "changes"],
-    "additionalProperties": False,
-}
-
-
-def generate_revised_scripts(
-    current_scripts: dict,
-    feedback: str,
-    channel,
-    tts_model: str = "sonic-2",
-    tts_provider: str = "cartesia",
-) -> dict:
-    """Revise an existing script based on user feedback (called on CHANGE replies).
-
-    Applies TTS_BLOCK to the revision system prompt so corrections cannot
-    reintroduce TTS violations. Returns a ``changes`` array alongside the
-    revised script — callers should persist this to script_issues_log.
-
-    Args:
-        current_scripts: Dict with ``title``, ``voice_script``.
-        feedback:        The raw user feedback text from Telegram.
-        channel:         Channel ORM object (provides niche and tone as context).
-        tts_model:       TTS model ID for writing constraints.
-        tts_provider:    TTS provider ("cartesia" | "elevenlabs").
-
-    Returns:
-        Dict with ``title``, ``voice_script``, and ``changes``
-        (list of per-section change summaries).
-
-    Raises:
-        ValueError: If Claude returns malformed JSON or a required key is missing.
-    """
-    prompt = with_tts_block(_REVISION_SYSTEM_PROMPT, tts_provider, tts_model)
-    user_message = (
-        f"Channel niche: {channel.niche}\n"
-        f"Channel tone: {channel.tone}\n\n"
-        f"Current title: {current_scripts.get('title', '')}\n\n"
-        f"Current voice script:\n{current_scripts.get('voice_script', '')}\n\n"
-        f"User feedback:\n{feedback}"
-    )
-    return call_claude_structured(
-        task="revision",
-        system_prompt=prompt,
-        user_message=user_message,
-        schema_name="revision_output",
-        input_schema=_REVISION_SCHEMA,
-        max_tokens=8192,
-    )
-
-
 # ── Script Quality Gate assess/rewrite — REMOVED (Elimination Mandate, D1.1) ─
 # assess_script_quality() and rewrite_script_for_quality() (plus their schemas
 # and the _SCRIPT_QUALITY_SYSTEM_PROMPT/_SCRIPT_QUALITY_REWRITE_BASE prompts
@@ -1161,25 +1094,21 @@ def generate_revised_scripts(
 
 # ── Story Scoring Gate (single story) ─────────────────────────────────────────
 
+# Slimmed 19 → 8 dimensions (fresh full-system audit §2.5): four pairs were
+# near-duplicates (clickability/thumbnail/title_thumbnail/scroll_stopper;
+# central_mystery/curiosity_gap; viral_clip_count/short_form_clip_potential;
+# series/episode_two), five carried weights of 0.01-0.02 (≤7 combined points),
+# and 12 independent floors gave a noisy LLM score 12 chances to reject a
+# usable story. Each surviving dimension's prompt description absorbs what its
+# merged siblings measured.
 _SCORING_DIMENSIONS: list[str] = [
     "visual_storytelling_potential",
-    "social_media_clickability",
-    "opening_scene_strength",
-    "thumbnail_strength",
     "scroll_stopper_potential",
     "emotional_stakes",
-    "viral_clip_count",
     "central_mystery",
-    "curiosity_gap",
     "conflict_or_contradiction",
-    "emotional_specificity",
-    "title_thumbnail_potential",
-    "visual_range",
+    "social_media_clickability",
     "image_generation_feasibility",
-    "short_form_clip_potential",
-    "comment_section_potential",
-    "series_potential",
-    "episode_two_potential",
     "rights_ip_risk",
 ]
 
@@ -1218,24 +1147,20 @@ Special inverted operator-review dimension:
   is not a performance score and does not decide acceptance; it flags operator review.
 
 Dimensions:
-  visual_storytelling_potential  Can be SHOWN on screen with 5+ distinct visual categories?
-  social_media_clickability      User clicks based on realistic thumbnail + title alone?
-  opening_scene_strength         First moment drops viewer into action/danger/contradiction?
-  thumbnail_strength             Produces one powerful, nameable thumbnail image?
-  scroll_stopper_potential       Opening sentence stops mid-scroll? Concrete + high-stakes?
-  emotional_stakes               Named person in real human drama with personal consequence?
-  viral_clip_count               Self-contained 30–90 second moments (need 3+)?
-  central_mystery                Clear factual mystery or unexplained phenomenon?
-  curiosity_gap                  Opening creates factual open question story credibly answers?
+  visual_storytelling_potential  Can be SHOWN on screen with several distinct visual
+                                 categories AND genuinely different contexts/environments?
+  scroll_stopper_potential       Does the opening moment stop a mid-scroll viewer —
+                                 concrete, high-stakes, dropping them into
+                                 action/danger/contradiction?
+  emotional_stakes               Named person in real human drama with personal
+                                 consequence — emotion tied to a specific person in a
+                                 specific moment?
+  central_mystery                Clear factual mystery or unexplained phenomenon whose
+                                 opening creates an open question the story credibly answers?
   conflict_or_contradiction      Real conflict or factual contradiction (not bland)?
-  emotional_specificity          Emotion tied to a specific named person in a specific moment?
-  title_thumbnail_potential      Compelling title AND strong nameable visual together?
-  visual_range                   Multiple genuinely different visual contexts/environments?
+  social_media_clickability      Compelling title AND one powerful, nameable thumbnail
+                                 image together — would a user click on those alone?
   image_generation_feasibility   Key moments can be depicted as distinct concrete generated images?
-  short_form_clip_potential      At least one self-contained punchy 30–90 second moment?
-  comment_section_potential      Viewers feel compelled to share strong opinions?
-  series_potential               Could generate multiple follow-up videos?
-  episode_two_potential          Clear factual "part two" question left unanswered?
   rights_ip_risk                 Operator-review risk for monetized adaptation rights/IP claims?
 
 Rules: score strictly; do NOT invent facts; judge only what is in the story body provided.\
@@ -1306,7 +1231,7 @@ Rules:
 - total_parts must be between 3 and 5 (inclusive). Never fewer than 3 or more than 5.
 - Split at narrative boundaries: reveals, discoveries, reversals, or escalations.
   Never split primarily by time — narrative logic is paramount.
-- Each part covers 60–90 seconds of spoken narration (≈125–180 words at the measured
+- Each part covers 65–90 seconds of spoken narration (≈135–180 words at the measured
   ~120 wpm real Short narration rate).
 - Every part must be independently watchable: a viewer who starts on Part 3 must
   understand the situation from the first 5 seconds without having seen prior parts.
@@ -1417,7 +1342,7 @@ You are writing a TikTok episode script — one standalone part of a multi-part 
 This is NOT a cut of a longer video. It is purpose-built for TikTok.
 
 Rules:
-- Hard limit: 125–180 words. Count every word in voice_script before returning.
+- Hard limit: 135–180 words. Count every word in voice_script before returning.
   If voice_script exceeds 180 words, cut it — remove the least essential sentences
   until the count is at or below 180. Do not return until the word count is ≤180.
   (180 words ≈ 90 seconds at the measured ~120 wpm real Short narration rate —
@@ -1473,7 +1398,7 @@ _SHORT_EPISODE_SCHEMA: dict = {
     "type": "object",
     "properties": {
         "title":        {"type": "string", "description": "Part N title (≤60 chars, TikTok-optimized)."},
-        "voice_script": {"type": "string", "description": "Full flat narration text, 125-180 words."},
+        "voice_script": {"type": "string", "description": "Full flat narration text, 135-180 words."},
     },
     "required": ["title", "voice_script"],
     "additionalProperties": False,
@@ -1531,9 +1456,16 @@ def generate_short_episode_script(
         f"Blueprint:\n{bp_json}\n\n"
         f"CTA guardrail: do not copy blueprint.comment_trigger verbatim or near-verbatim; "
         f"write a story-specific final question for this part only.\n\n"
+        # Full script, deliberately untruncated (fresh full-system audit §2.4):
+        # a 1,600-word long script is ~10k chars, so the old [:6000] slice cut
+        # off the story's ending — parts 4-5 of a 5-part plan were grounded on
+        # one-sentence plan summaries alone, reintroducing the thin-grounding
+        # fabrication risk the source-material floor exists to prevent. The
+        # long script is capped at ~1,750 words by check_maximum_length, so the
+        # full text always fits comfortably in context.
         f"Long-form voice script (for FACT GROUNDING ONLY — see ORIGINALITY rule above. "
         f"Do not reuse its exact phrasing):\n"
-        f"{long_voice_script[:6000]}"
+        f"{long_voice_script}"
         )
 
     return call_claude_structured(

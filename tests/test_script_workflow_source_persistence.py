@@ -20,6 +20,9 @@ class FakeQuery:
         self.rows = list(rows)
         self._limit = None
 
+    def join(self, *args, **kwargs):
+        return self
+
     def filter(self, *args, **kwargs):
         return self
 

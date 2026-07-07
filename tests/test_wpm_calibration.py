@@ -60,17 +60,23 @@ class _FakeAudioFile:
 
 
 class _FakeQuery:
-    def __init__(self, rows: list):
+    def __init__(self, rows: list, tracker: dict | None = None):
         self._rows = rows
+        self._tracker = tracker if tracker is not None else {}
 
     def filter(self, *args, **kwargs):
+        self._tracker.setdefault("filters", []).extend(args)
+        return self
+
+    def join(self, *args, **kwargs):
+        self._tracker["joined"] = True
         return self
 
     def order_by(self, *args, **kwargs):
         return self
 
     def limit(self, n):
-        return _FakeQuery(self._rows[:n])
+        return _FakeQuery(self._rows[:n], self._tracker)
 
     def all(self):
         return list(self._rows)
@@ -79,13 +85,48 @@ class _FakeQuery:
 class _FakeDb:
     def __init__(self, rows: list[_FakeAudioFile]):
         self._rows = rows
+        self.tracker: dict = {}
 
     def query(self, model):
-        return _FakeQuery(self._rows)
+        return _FakeQuery(self._rows, self.tracker)
 
 
 def _transcript(word_count: int) -> list[dict]:
     return [{"word": f"w{i}", "start": i * 0.4, "end": (i + 1) * 0.4} for i in range(word_count)]
+
+
+class TestContentKindScopedCalibration(unittest.TestCase):
+    """Fresh full-system audit §3.4: parents (~135 wpm) and Shorts (~120 wpm)
+    are different distributions — the calibration window must be scopeable to
+    one content kind via a Content join, and unscoped calls must keep the
+    original blended (no-join) behavior."""
+
+    def _rows(self):
+        return [_FakeAudioFile("en", 60_000, _transcript(130)) for _ in range(5)]
+
+    def test_default_call_does_not_join_content(self):
+        db = _FakeDb(self._rows())
+        script_estimator.compute_measured_wpm(db, "en")
+        self.assertNotIn("joined", db.tracker)
+
+    def test_kind_scoped_call_joins_and_filters_is_short_episode(self):
+        for kind in (True, False):
+            db = _FakeDb(self._rows())
+            result = script_estimator.compute_measured_wpm(db, "en", is_short_episode=kind)
+            self.assertTrue(db.tracker.get("joined"), f"kind={kind} must join Content")
+            filter_strs = [str(f) for f in db.tracker.get("filters", [])]
+            self.assertTrue(
+                any("is_short_episode" in s for s in filter_strs),
+                f"kind={kind} must filter on Content.is_short_episode: {filter_strs}",
+            )
+            self.assertIsNotNone(result)
+
+    def test_estimate_duration_sec_threads_kind_to_query(self):
+        db = _FakeDb(self._rows())
+        script_estimator.estimate_duration_sec(
+            "word " * 100, "en", db=db, is_short_episode=True,
+        )
+        self.assertTrue(db.tracker.get("joined"))
 
 
 class TestComputeMeasuredWpm(unittest.TestCase):
@@ -214,8 +255,10 @@ class TestQualityGateWiresMaxLengthCheck(unittest.TestCase):
 
 
 class TestShortWordBandRecalibrated(unittest.TestCase):
-    def test_min_and_max_match_120_wpm_61_to_90_second_band(self):
-        self.assertEqual(_MIN_SHORT_WORDS, 125)
+    def test_min_and_max_match_120_wpm_67_to_90_second_band(self):
+        # Floor raised 125 → 135 (fresh full-system audit §2.4): 125 words at
+        # 120 wpm left only 1.5 s of margin over the hard 61 s audio floor.
+        self.assertEqual(_MIN_SHORT_WORDS, 135)
         self.assertEqual(_MAX_SHORT_WORDS, 180)
 
 

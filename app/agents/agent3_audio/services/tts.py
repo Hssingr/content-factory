@@ -39,6 +39,13 @@ _LONG_SENTENCE_RE  = re.compile(r"(?<=[.!?])\s+")
 _MAX_SENTENCE_WORDS = 18
 _WORD_TOKEN_RE = re.compile(r"[^\W_]+(?:['’][^\W_]+)?", re.UNICODE)
 _PAUSE_TAG_RE = re.compile(r"\[\s*dramatic\s+pause\s*\]", re.IGNORECASE)
+# Any ElevenLabs v3 audio tag ([whispers], [dramatic pause], [gasps], …).
+# Used to keep the three independent tag sources from stacking on one
+# sentence (fresh full-system audit §2.6 P-6): script-embedded tags
+# (AUDIO_TAGS_INSTRUCTION, Agent 2), the per-section delivery prefix, and
+# the deterministic pacing inserter each check for an existing tag before
+# adding their own — the v3 contract is max one tag per sentence.
+_ANY_V3_TAG_RE = re.compile(r"\[[a-z][a-z ]{2,24}\]", re.IGNORECASE)
 
 # Natural split points inside a long sentence — tried in order of preference.
 _SPLIT_CANDIDATES = re.compile(
@@ -338,7 +345,13 @@ def _apply_pacing_markers(
         nonlocal insertion_count
         if insertion_count >= max_pause:
             return match.group(0)
-        if not _is_reveal_beat_sentence(_candidate_sentence_from_reveal_match(match)):
+        candidate_sentence = _candidate_sentence_from_reveal_match(match)
+        if not _is_reveal_beat_sentence(candidate_sentence):
+            return match.group(0)
+        # Never stack a second v3 tag onto a sentence that already carries one
+        # (a script-embedded AUDIO_TAGS_INSTRUCTION tag, or the per-section
+        # delivery prefix) — v3's own contract is max one tag per sentence.
+        if use_v3 and _ANY_V3_TAG_RE.search(candidate_sentence):
             return match.group(0)
         insertion_count += 1
         if use_v3:
@@ -354,8 +367,11 @@ def _apply_pacing_markers(
         and insertion_count < max_pause
     ):
         if use_v3:
-            text = "[dramatic pause] " + text.lstrip()
-            insertion_count += 1
+            # Skip the slow-open tag when the text already opens on a v3 tag
+            # (script-embedded or section-delivery) — never two tags together.
+            if not _ANY_V3_TAG_RE.match(text.lstrip()):
+                text = "[dramatic pause] " + text.lstrip()
+                insertion_count += 1
         else:
             first_end = re.search(r"(?<=[^\W_])\.\s", text, re.UNICODE)
             if first_end and len(_WORD_TOKEN_RE.findall(text[: first_end.start()])) <= 12:
@@ -634,7 +650,17 @@ def _with_elevenlabs_v3_delivery_tag(text: str, delivery: dict) -> str:
     if not prepared:
         return prepared
     tag = _ELEVENLABS_V3_DELIVERY_TAGS.get(str(delivery.get("reason") or ""))
-    if not tag or prepared.lower().startswith(tag.lower()):
+    if not tag:
+        return prepared
+    # Never stack two tags on the opening sentence (v3 is max one tag per
+    # sentence). A leading [dramatic pause] is the generic pacing slow-open —
+    # the section delivery tag is the more intentional choice, so it replaces
+    # it. Any OTHER leading tag (a script-embedded AUDIO_TAGS_INSTRUCTION tag)
+    # wins and the delivery tag is skipped.
+    leading_pause = _PAUSE_TAG_RE.match(prepared)
+    if leading_pause:
+        prepared = prepared[leading_pause.end():].lstrip()
+    elif _ANY_V3_TAG_RE.match(prepared):
         return prepared
     return f"{tag} {prepared}"
 

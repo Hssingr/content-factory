@@ -226,6 +226,22 @@ No agent writes a status outside its own row in this table. Agent 4 never
 writes `RENDERING`/`RENDERED`; Agent 5 never writes
 `GENERATING_VISUALS`/`PARENT_VISUALS_DONE`/`CHILD_SHORT_VISUALS_DONE`.
 
+Stuck-state recovery (fresh full-system audit §1.2): `Content.updated_at`
+(migration `010_add_content_updated_at.py`, touched by every ORM UPDATE) is
+the staleness signal for in-progress statuses. Each Beat pickup also
+re-dispatches rows stuck in its stage's in-progress status past a
+per-stage threshold (`_STALE_RECOVERY_MINUTES` in `app/scheduler/tasks.py`:
+GENERATING_SCRIPTS/GENERATING_AUDIO 60 min, GENERATING_VISUALS 120 min,
+RENDERING 180 min — deliberately above worst-case legitimate runtimes so a
+live worker is never raced; logged `STUCK_STATE_RECOVERY`). Stale RENDERING
+rows dispatch directly, bypassing the has-render skip (a partial render must
+not strand the row). To make both this sweep and Celery's own task retries
+actually re-enter the service, the Agent 2/3 task guards accept their own
+in-progress status (`GENERATING_SCRIPTS` / `GENERATING_AUDIO`) in addition
+to their entry statuses — both services are re-entrant (source scripts
+version up, validated rows are reused, on-disk audio/transcripts are
+reused).
+
 `VIDEO_DONE` and `GENERATING_VIDEO` are retired — no runtime code path reads
 or writes them. They previously conflated Agent 4's visual-generation window
 and Agent 5's render window into one ambiguous status with crossover
@@ -620,6 +636,11 @@ Responsibilities:
 - Source-material floor check (roadmap 4b / audit P1-5 —
   `check_source_material_floor()`; see §9.3's `fetch_batch` entry).
 - Deterministic cleanup utilities.
+- `split_sentences()` — the single public sentence splitter (fresh
+  full-system audit §3.5): every sentence-level rule in Agent 2/script-checks
+  counts sentences with this one tokenizer (abbreviation- and
+  closing-quote-aware); do not add another ad-hoc `re.split` on
+  sentence-ending punctuation.
 
 This file has no per-function check inventory table (unlike Agent 4's
 `validate_storyboard()` table in §11.4) — its checks are documented only as
@@ -669,10 +690,17 @@ is a live query over existing `AudioFile` rows.
 
 Responsibilities:
 
-- `compute_measured_wpm(db, language)` — rolling average of
-  `len(whisper_transcript) / (duration_ms / 60_000)` over the most recent
-  real `AudioFile` rows for a language; `None` if fewer than
+- `compute_measured_wpm(db, language, is_short_episode=None)` — rolling
+  average of `len(whisper_transcript) / (duration_ms / 60_000)` over the most
+  recent real `AudioFile` rows for a language; `None` if fewer than
   `_MIN_SAMPLES_FOR_CALIBRATION` usable rows exist (fail-open).
+  `is_short_episode` (fresh full-system audit §3.4) scopes the window to
+  parent long-form (`False`) or child Short (`True`) rows via a `Content`
+  join — the two run at measurably different rates (~135 vs ~120 wpm), and a
+  blended average drifts with whichever kind dominates the recent window.
+  Callers that know the content kind pass it (script_workflow: parent;
+  generate_multilingual_scripts: `content.is_short_episode`;
+  split_into_beats diagnostics: parent).
 - `get_calibrated_wpm(db, language)` — the single call site wpm-dependent
   callers should use: the measured rolling average when `db` is provided and
   enough samples exist, otherwise the static `SPEECH_RATES` table (now only
@@ -1604,12 +1632,23 @@ Full source-material fetch (roadmap 4.1 / audit S-1, exec-2):
 - Story gate feasibility dimension (roadmap 4.5 / audit S-7): the old
   `stock_media_feasibility` score/floor is retired because this pipeline no
   longer searches Pexels/Unsplash/Pixabay stock media; visuals are generated.
-  Agent 2 now asks for and gates on `image_generation_feasibility`: whether
+  Agent 2 asks for and gates on `image_generation_feasibility`: whether
   the story's key moments can be depicted as distinct concrete generated
-  images. `score_story_assessment()` still aliases legacy cached
-  `stock_media_feasibility` payloads into the new dimension for backward
-  compatibility, but new Claude scoring schemas must require
-  `image_generation_feasibility`.
+  images. The legacy key aliases (`stock_media_feasibility`,
+  `emotional_tension`, `controversy_or_debate_potential`) are removed — no
+  producer exists; every assessment comes fresh from `score_story_for_gate()`'s
+  forced tool-use schema.
+- Story gate slimmed 19 → 8 dimensions, 12 → 5 pass conditions (fresh
+  full-system audit §2.5): four near-duplicate pairs merged into their
+  strongest member, the five ≤0.02-weight dimensions dropped. Weighted
+  dimensions (sum 1.0): visual_storytelling_potential .20,
+  scroll_stopper_potential/emotional_stakes/central_mystery/
+  social_media_clickability .15 each, conflict_or_contradiction/
+  image_generation_feasibility .10 each; `rights_ip_risk` stays unweighted.
+  Floors: overall ≥65; visual_storytelling ≥55; emotional_stakes ≥55;
+  scroll_stopper ≥55; image_generation_feasibility ≥40 — every floor is a
+  chance for one noisy LLM dimension to reject a usable story, so only the
+  non-negotiables kept one.
 - Story gate rights/IP dimension (roadmap Phase 5 P3-5): new scoring
   payloads must include `rights_ip_risk` (0 = low apparent rights risk,
   100 = high apparent monetized-adaptation/takedown risk such as famous
@@ -1692,7 +1731,17 @@ Rules:
 - Telegram failures must log clearly.
 - Markdown formatting failures may retry as plain text.
 - Approval marks content `APPROVED`.
-- Change flow before script generation must be handled explicitly; do not pretend script revision exists when no script exists.
+- A non-APPROVE reply (CHANGE) is **story-level feedback** (fresh full-system
+  audit §1.3): `_handle_change()` rejects the story (validation REJECTED,
+  content FAILED), re-dispatches `run_agent2_for_channel` with the rejected
+  story *and the operator's feedback text* in `rejected_stories` (fetch_batch
+  renders it as an "Operator feedback:" line in the exclusion block), and
+  replies honestly (`STORY_FEEDBACK_REDISCOVERY`). After
+  `validation_max_revisions` consecutive rejections the configured limit
+  policy applies. The old revise-the-script flow (generate_revised_scripts,
+  `revision` task key) was unreachable dead code — no script exists while a
+  validation is PENDING — and is deleted; do not pretend script revision
+  exists when no script exists.
 
 #### `run_agent2_scripts_for_content`
 
@@ -1777,7 +1826,10 @@ Rules:
 `midpoint_retention_trap` (roadmap 4.3 / audit S-3, §6): one concrete reveal
 or counterintuitive fact, distinct from `final_payoff`, placed at roughly the
 story's halfway point — the highest-leverage completion-rate lever current
-research identifies, missing from the existing 25%/60% mini-hook cadence.
+research identifies. (The former 25%/60% mini-hook placement rule was deleted
+from the section prompt — per-section generation cannot know total word count
+or which section lands at those marks; this Python-targeted midpoint trap is
+the correct mechanism for placed retention beats.)
 `generate_story_blueprint()` does not post-process or validate its content
 (unlike `major_turns`'s ≥2-entry check) — an empty value is tolerated
 fail-open by `generate_script_sections()` below (no constraint is injected).
@@ -2261,7 +2313,10 @@ telemetry only (Elimination Mandate, roadmap
 13.2's AI Short Quality Gate and the correction-round retry loop):
 
 - `_generate_short_script()` (`scripts.py`) calls `generate_short_episode_script()`
-  exactly **once** per part. A real production run showed the deleted
+  exactly **once** per part, passing the **full** long-form voice script for
+  fact grounding (the former `[:6000]` slice cut off the story's ending, so
+  late parts were grounded on one-sentence plan summaries — fresh full-system
+  audit §2.4). A real production run showed the deleted
   correction loop made drafts *worse* across rounds (word count went
   205 → 196 → **218**, still over the 180-word cap, and shipped anyway), and
   the deleted AI Short Quality Gate's `status=="PASSED"` + non-empty `issues`
@@ -2272,7 +2327,7 @@ telemetry only (Elimination Mandate, roadmap
   `task="short_quality_check"` were deleted from `system_prompt.py` and
   `model_routing.py` entirely — not disabled, not capped, removed.
 - **Structural checks** (`_collect_short_script_major_issues()`): calibrated
-  `_MIN_SHORT_WORDS` floor (125 words, roadmap 3.6 / audit S-5), word cap
+  `_MIN_SHORT_WORDS` floor (135 words — see the calibrated band note below), word cap
   (`_MAX_SHORT_WORDS` = 180), TTS compliance, hook opener, and section-marker
   presence (`_SHORT_TRANSLATION_MARKER_RE`, shared with the translated-Short
   check below) still run on the single generated draft. Any MAJOR is logged
@@ -2291,7 +2346,9 @@ telemetry only (Elimination Mandate, roadmap
   parent long-form script — not to parent long-form generation itself, and
   not to Phase 12.4's multilingual child-Short translation/adaptation path.
 - Deterministic code still owns the hard duration band: `_MIN_SHORT_WORDS`
-  (125) through `_MAX_SHORT_WORDS` (180 — recalibrated from 250 by roadmap
+  (135 — raised from 125 by the fresh full-system audit §2.4: 125 words at
+  120 wpm left only 1.5 s of margin over Agent 3's hard 61 s floor) through
+  `_MAX_SHORT_WORDS` (180 — recalibrated from 250 by roadmap
   3.8 / audit G-7, since real Shorts measured ~120 wpm, not the
   previously-assumed 180 wpm / "3 words per second") — both the
   source-language and translated/adapted Short validators still emit MAJOR
@@ -2789,7 +2846,13 @@ horror/reveal/somber delivery from being silently discarded when an operator
 chooses ElevenLabs v3. Non-v3 ElevenLabs models keep the legacy character-limit
 chunking path (`_chunk_script_at_sections()`) and channel-level delivery.
 Every ElevenLabs chunk still runs through `prepare_script_for_tts()` (so Phase
-11.5's reveal-gated deterministic pacing applies identically). Text-conditioning
+11.5's reveal-gated deterministic pacing applies identically). The three
+independent v3 tag sources never stack on one sentence (fresh full-system
+audit §2.6 P-6): the pacing inserter skips a sentence already carrying any
+tag, and the per-section delivery prefix replaces a generic leading
+`[dramatic pause]` slow-open (the more intentional tag wins) but yields to
+any other script-embedded leading tag — v3's contract is max one tag per
+sentence. Text-conditioning
 (`previous_text`/`next_text`) remains non-v3 only when the SDK supports it, and
 all multi-chunk/multi-section output still passes through `_concat_mp3_chunks()`
 (Phase 11.6) for final concatenation.
@@ -2949,7 +3012,20 @@ Responsibilities:
 - Ask Claude for structured visual beats.
 - Return schema-validated storyboard batch.
 
-**Storyboard prompt inputs (`PROMPT_VERSION` 4.4):**
+**Storyboard prompt inputs (`PROMPT_VERSION` 4.5, `STORYBOARD_SCHEMA_VERSION`
+7.1 — fresh full-system audit §2.2):** the dead "Visual Continuity Bible"
+prompt section is replaced by documentation of the real one-line
+"Visual continuity:" hint; the TECHNICAL flux-prompt step is image-style-aware
+(never appends "photorealistic" to an illustrated/painted style); the
+per-10-beat composition quota block is deleted (it contradicted Principle A
+and pushed toward the document-saturation pattern check 21 flags); the
+low-intensity band is 3.0–6.0 s (matching the hard constraint and
+INTENSITY_FLOOR_MS); `visual_type="text_overlay"`/`visual_category="text"`
+and the never-read `storyboard_status`/`global_notes` fields are removed from
+the schema; and the style vocabulary documents every UI preset
+(constants.js). Details below reflect the surviving structure.
+
+**Storyboard prompt inputs:**
 `generate_storyboard_batch()` accepts optional `visual_style`, `image_style`,
 and `continuity_line` arguments. `split_into_beats()` threads those from the
 parent visual path and from the validation retry path, so both the first
@@ -3399,8 +3475,8 @@ Checks (current full inventory):
 | 14 | `low_information_prompt` — `flux_prompt` is under 4 words, or ≥50% generic filler words | MINOR |
 | 15 | `flux_prompt_exact_duplicate` — `flux_prompt` is character-identical to an earlier beat's in the same storyboard | MINOR |
 | 16 | `flux_prompt_near_duplicate` — `flux_prompt`'s word-token set overlaps ≥80% (Jaccard) with an earlier beat's | MINOR |
-| 17 | `reuse_clustering` — 3+ consecutive beats reuse the identical `media_url` | MINOR |
-| 18 | `excessive_reuse_ratio` — >60% of `flux_generated` child Short beats already have a non-empty `media_url` at validation time, exceeding the parent-reuse budget | MAJOR |
+| 17 | *(retired — fresh full-system audit §3.1: no physical child image reuse exists; the reuse split the check observed is gone)* | — |
+| 18 | *(retired — same; the match_score is a prompt-inheritance decision only)* | — |
 | 19 | `ai_text_rendering_requested` — `flux_generated` `flux_prompt` contains a quoted phrase or a "the text reads"/"sign that says"-style instruction asking the image model to render readable text (Phase 14.7) | MAJOR |
 | 20 | `dark_contrast_unlit_prompt` — a beat uses `color_grade="dark_contrast"` while its `flux_prompt` names no bright light source (`has_bright_lighting_evidence()`); defense-in-depth only — `_build_beat_section()` already downgrades such beats to `desaturated` in place (`DARK_CONTRAST_GRADE_DOWNGRADED`), so this fires only on beats that bypassed beat building (audit G-6) | MINOR |
 | 21 | `document_saturation` — document-ish beats (`motif="document"` or `visual_type="document"`) exceed 15% globally or more than 2 in any 10-beat window (roadmap 2.3 / audit G-2) | MAJOR |
@@ -3408,12 +3484,12 @@ Checks (current full inventory):
 
 Checks 12–16 validate `flux_prompt` *text quality* (subject/environment/
 information clarity, exact/near duplication) — distinct from check 4, which
-only catches an explicit forbidden mood word. Checks 17–18 validate *image
-reuse patterns* (Phase 4E-E / roadmap 3.3) — only ever observable on the child remap path:
-parent beats never have a `media_url` set at the point `validate_storyboard()`
-runs (Flux hasn't generated yet — see the Ordering rule under
-`remap_beats_for_short` above), so these two checks are naturally always
-zero/LOW for parents with no child-specific branch required. Check 19
+only catches an explicit forbidden mood word. Checks 17–18 are retired (no
+beat of either path carries a `media_url` when `validate_storyboard()` runs).
+`validate_storyboard()` runs exactly ONCE per path (audit §3.3): the issues
+list from the validation gate is forwarded into
+`repair_duplicate_flux_prompts(issues=...)`, which no longer re-runs the full
+validator to find its targets. Check 19
 (Phase 14.7, §11.6) is a defense-in-depth complement to Phase 14.7's
 Python-side prompt sanitization — it fires only on a beat the sanitization's
 keyword detector missed, not on the normal sanitized happy path. Check 21
@@ -3460,9 +3536,8 @@ Rules:
   `generate_pending_beat_images()`, and only compares local pixels already on
   disk. Runtime proof: `tests/test_pixel_duplicate_reroll.py`.
 - Every `validate_storyboard()` call logs `VISUAL_REPEAT_RATE`,
-  `AI_SLIDESHOW_RISK`, `FLUX_PROMPT_QUALITY`, `FLUX_DUPLICATE_RATE`,
-  `CHILD_SHORT_REUSE_RATE`, and `CHILD_SHORT_REUSE_CLUSTERING` (all always,
-  even when zero) as summary diagnostics — see §29.
+  `AI_SLIDESHOW_RISK`, `FLUX_PROMPT_QUALITY`, and `FLUX_DUPLICATE_RATE`
+  (always, even when zero) as summary diagnostics — see §29.
 - Do not add a second validator module for child-only, parent-only, or
   Flux-prompt-only checks — extend this function and its check list instead.
 - Checks 12–18 are deterministic keyword/length/overlap/run-length
@@ -3659,11 +3734,24 @@ Rules:
 
 - Use child short voice script.
 - Use child short audio and Whisper.
-- Use parent visual beats only as a visual source pool.
-- Reuse parent images only when match score threshold passes.
+- Use parent visual beats only as a PROMPT source pool (fresh full-system
+  audit §3.1): `match_score >= 70` inherits the matched parent beat's
+  `flux_prompt` for visual continuity; below 70 uses the remap model's
+  `new_image_prompt`. Every beat leaves the remap with `media_url=""` —
+  the child path has no physical image reuse (portrait regeneration made it
+  impossible), so the former 60% reuse budget, demotion pass, and
+  `CHILD_SHORT_REUSE_BUDGET_APPLIED` log are deleted. Stats log:
+  `CHILD_SHORT_PROMPT_INHERITANCE_STATS`.
 - Threshold is enforced in Python, not prompt.
-- Child Shorts have a hard parent-reuse budget of 60% (roadmap 3.3 / audit G-4.2): after thresholding, `remap_beats_for_short()` demotes the lowest-scoring reused beats to `media_url=""` until reuse is at or below 60%, forcing those beats into new portrait generation via `generate_pending_beat_images()`. Log marker: `CHILD_SHORT_REUSE_BUDGET_APPLIED`.
-- The `short_storyboard_remap` schema includes `new_image_prompt` (roadmap 3.4 / audit V-3). For assignments with `match_score < 70`, it must be a complete portrait-safe Flux prompt for a new child Short image. `remap_beats_for_short()` uses that prompt for child-new beats and fails the remap with `CHILD_REMAP_NEW_PROMPT_MISSING` if it is empty, rather than inheriting a rejected parent prompt or falling back to raw narration. Reused beats may keep the parent prompt; high-score candidates forced into new generation by non-reusable parent media or the 60% reuse budget use `new_image_prompt` when supplied, otherwise a deterministic physical fallback prompt.
+- `visual_style`/`image_style` are threaded into the remap call (orchestrator →
+  `remap_beats_for_short()`) as "Global visual direction/Global image style"
+  lines so newly written child prompts match the channel look.
+- Child visual idempotency (audit §3.6): before remapping a language,
+  `_run_child_short_visuals()` reuses complete persisted `VideoSection` rows
+  (every beat has a local `cache/` image) instead of re-running the remap
+  call and regenerating every portrait — logged
+  `CHILD_SHORT_VISUALS_REUSED`.
+- The `short_storyboard_remap` schema includes `new_image_prompt` (roadmap 3.4 / audit V-3). For assignments with `match_score < 70`, it must be a complete portrait-safe Flux prompt for a new child Short image. `remap_beats_for_short()` uses that prompt for below-threshold beats and fails the remap with `CHILD_REMAP_NEW_PROMPT_MISSING` if it is empty, rather than inheriting a rejected parent prompt or falling back to raw narration. At-or-above-threshold beats inherit the matched parent beat's prompt; a high-score assignment whose parent beat was excluded from the candidate pool (legacy text-card / missing media) uses `new_image_prompt` when supplied, otherwise a deterministic physical fallback prompt.
 - Child remap MAJOR handling is telemetry only (Elimination Mandate D1.5, `code_report/forensic_output_audit_borrasca_run.md` — supersedes the former roadmap 3.5 / audit G-4.3 deterministic remediation primitive): after `validate_storyboard()` finds child MAJORs, `_run_child_short_visuals()` logs them and proceeds with the beats unchanged. The deleted primitive (`remediate_child_major_storyboard_issues()`) used to strip forbidden/readable-text language and regenerate `flux_prompt` from `visual_intent`/environment/motif for `forbidden_flux_word`/`ai_text_rendering_requested` MAJORs — removed because MAJOR findings never blocked the pipeline either way, so the repair pass added complexity without a provable quality gain. No Claude, Flux, or internal remap retry is invoked (unchanged).
 - Log reuse stats.
 - Child Short visual sections use `settings.short_visual_max_hold_ms` (default
@@ -3796,12 +3884,10 @@ Shorts):
 
 Rules:
 
-- Must run **after** `_check_storyboard_issues()`, never before — this is
-  the entire point of the Phase 4E-E ordering alignment. `validate_storyboard()`
-  still observes the pre-generation reuse-vs-pending split (checks 17/18 —
-  `reuse_clustering`/`excessive_reuse_ratio`) exactly as before; this
-  function's subsequent portrait regeneration of "reused" beats does not
-  change what the validator saw.
+- Must run **after** the storyboard validation gate, never before — the
+  Phase 4E-E validate-then-generate ordering. Every beat arrives pending
+  (`media_url=""` — audit §3.1); the retired reuse checks 17/18 no longer
+  exist to observe a split.
 - Every beat goes through the same `generate_beat_image_with_routing()`
   model-tier decision as the parent path (see §11.5) — conservative/Schnell
   by default — passing `width=1080, height=1920`.
@@ -4336,6 +4422,10 @@ Rules:
 - Parent renders only `format="main"`.
 - Child renders only `format="short"`.
 - Parent must not create short props or short renders.
+- A `NEEDS_REVIEW` set by per-language render verification survives the final
+  status write (fresh full-system audit §3.7) — `run_video_generation()`
+  never overwrites it with `RENDERED`/`FAILED` (logged
+  `RENDER_NEEDS_REVIEW`).
 
 #### `_props_are_stale`
 
@@ -4861,6 +4951,11 @@ Important tasks:
 Rules:
 
 - Beat tasks are safety nets, not the only orchestration mechanism for critical handoffs.
+- Every pickup also re-dispatches rows stuck in its stage's in-progress
+  status past the per-stage `_STALE_RECOVERY_MINUTES` threshold (stuck-state
+  recovery — see §4.3); the Agent 2/3 task guards accept their own
+  in-progress status so Celery retries and the sweep actually re-enter the
+  service.
 - Child short audio pickup must not depend on parent audio completion.
 - Idempotency must be enforced at the worker/service layer.
 - Duplicate task dispatch is tolerable only if worker-level guards prevent duplicate side effects.
@@ -5534,10 +5629,13 @@ D1.1/D1.2/D1.3/D2.1, extended by the post-roadmap deep audit) — do not
 reintroduce without a new operator decision superseding the mandate:
 `quality_rewrite`, `global_validation`, `script_quality_check`,
 `short_quality_check`, `visual_bible_generation`, `auto_correction` (the
-auto_correct_script prompt-repair layer, deleted with its caller), and
+auto_correct_script prompt-repair layer, deleted with its caller),
 `script_generation` (never had a call site — section generation uses
-`section_generation`). None of these exist in `MODEL_ROUTING` anymore;
-`resolve_model()` raises `ValueError` for all seven.
+`section_generation`), and `revision` (fresh full-system audit §1.3 — the
+script-revision chain was unreachable dead code; Telegram CHANGE is now
+story-level feedback with no Claude call). None of these exist in
+`MODEL_ROUTING` anymore; `resolve_model()` raises `ValueError` for all
+eight.
 
 Rules:
 
@@ -5581,8 +5679,7 @@ PARENT_VISUALS_START
 PARENT_VISUALS_DONE
 CHILD_SHORT_VISUALS_DEFERRED
 CHILD_SHORT_VISUALS_START
-CHILD_SHORT_REUSE_STATS
-STANDALONE_SHORT_REUSE_STATS
+CHILD_SHORT_PROMPT_INHERITANCE_STATS
 STANDALONE_SHORT_RENDER
 STANDALONE_SHORT_RENDER_DONE
 PRE_RENDER_ASSET_AUDIT
@@ -5787,18 +5884,13 @@ FLUX_PROMPT_QUALITY    — always logged; % of flux_generated beats flagged by
 FLUX_DUPLICATE_RATE    — always logged; % of flux_generated beats flagged by
                           flux_prompt_exact_duplicate or
                           flux_prompt_near_duplicate
-CHILD_SHORT_REUSE_RATE — always logged; % of flux_generated beats that already
-                          have a real (non-empty) media_url at validation time
-                          — naturally always 0% for parents (see §11.4
-                          remap_beats_for_short Ordering rule)
-CHILD_SHORT_REUSE_CLUSTERING — always logged; risk=HIGH if any reuse_clustering
-                          issue fired, else risk=LOW
-CHILD_SHORT_REUSE_STATS — child remap reuse/generate stats (storyboard.py,
-                          remap_beats_for_short); not a storyboard-validator
-                          output, listed here only to correct prior drift —
-                          this was previously mis-documented in this section
-                          as STANDALONE_SHORT_REUSE_STATS, a name that was
-                          never implemented under that spelling
+CHILD_SHORT_PROMPT_INHERITANCE_STATS — child remap prompt-inheritance stats
+                          (storyboard.py, remap_beats_for_short): inherited
+                          parent prompts vs. new prompts per Short. Replaces
+                          the retired CHILD_SHORT_REUSE_RATE /
+                          CHILD_SHORT_REUSE_CLUSTERING / CHILD_SHORT_REUSE_STATS
+                          reuse diagnostics (no physical reuse exists —
+                          audit §3.1)
 ```
 
 Diagnostics not yet implemented (future work — do not assume these exist):

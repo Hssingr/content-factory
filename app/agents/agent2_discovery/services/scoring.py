@@ -30,46 +30,34 @@ _RIGHTS_IP_RISK_DIMENSION = "rights_ip_risk"
 _RIGHTS_IP_REVIEW_THRESHOLD = 70
 
 # Weighted dimensions — must sum to 1.0.
-# opening_scene_strength, social_media_clickability, thumbnail_strength,
-# visual_storytelling_potential, and viral_clip_count are the highest-priority
-# dimensions: they gate YouTube retention and platform performance directly.
-# central_mystery and conflict_or_contradiction are the primary narrative-quality
-# gates: a story with no mystery, conflict, or contradiction cannot hold a viewer.
+# Slimmed 19 → 7 weighted dimensions + unweighted rights_ip_risk (fresh
+# full-system audit §2.5): four near-duplicate pairs were merged into their
+# strongest member, and the five ≤0.02-weight dimensions (which contributed at
+# most 7 combined points while forcing the model to score them every call)
+# were dropped. Each surviving dimension's prompt description absorbs its
+# merged siblings' meaning (see system_prompt._SCORING_DIMENSIONS).
 _DIMENSION_WEIGHTS: dict[str, float] = {
-    "visual_storytelling_potential":   0.14,
-    "social_media_clickability":       0.12,
-    "opening_scene_strength":          0.10,
-    "thumbnail_strength":              0.09,
-    "scroll_stopper_potential":        0.08,
-    "emotional_stakes":                0.08,
-    "viral_clip_count":                0.07,
-    "central_mystery":                 0.06,
-    "curiosity_gap":                   0.05,
-    "conflict_or_contradiction":       0.05,
-    "emotional_specificity":           0.04,
-    "title_thumbnail_potential":       0.03,
-    "visual_range":                    0.03,
-    "image_generation_feasibility":    0.02,
-    "short_form_clip_potential":       0.01,
-    "comment_section_potential":       0.01,
-    "series_potential":                0.01,
-    "episode_two_potential":           0.01,
+    "visual_storytelling_potential":   0.20,
+    "scroll_stopper_potential":        0.15,
+    "emotional_stakes":                0.15,
+    "central_mystery":                 0.15,
+    "social_media_clickability":       0.15,
+    "conflict_or_contradiction":       0.10,
+    "image_generation_feasibility":    0.10,
 }
 
 # Hard floors — a story can have a high weighted average and still be rejected
 # if any of these named dimensions falls below its individual floor.
-# Dimension floors:
+# Slimmed 12 → 5 pass conditions (audit §2.5): every floor is a chance for one
+# noisy LLM dimension score to reject a usable story (a story scoring 80
+# overall used to die on opening_scene_strength=49). The four kept floors are
+# the non-negotiables: a story that cannot be shown, has no human stakes,
+# cannot hook a scroller, or cannot be depicted as generated images is
+# unusable regardless of its average.
 _MIN_OVERALL_SCORE           = 65
 _MIN_VISUAL_STORYTELLING     = 55
 _MIN_EMOTIONAL_STAKES        = 55
 _MIN_SCROLL_STOPPER          = 55
-_MIN_CENTRAL_MYSTERY         = 45
-_MIN_CONFLICT_CONTRADICTION  = 45
-_MIN_SOCIAL_CLICKABILITY     = 50
-_MIN_TITLE_THUMBNAIL         = 50
-_MIN_OPENING_SCENE           = 50
-_MIN_THUMBNAIL_STRENGTH      = 50
-_MIN_VISUAL_RANGE            = 35
 _MIN_IMAGE_GENERATION_FEASIBILITY = 40
 
 
@@ -105,13 +93,11 @@ def score_story_assessment(assessment: dict) -> dict:
                                 including high rights/IP risk.
     """
     raw_scores = assessment.get("scores") or {}
-    # Support legacy key aliases from older single-candidate Claude responses
-    if "emotional_tension" in raw_scores and "emotional_stakes" not in raw_scores:
-        raw_scores["emotional_stakes"] = raw_scores["emotional_tension"]
-    if "controversy_or_debate_potential" in raw_scores and "conflict_or_contradiction" not in raw_scores:
-        raw_scores["conflict_or_contradiction"] = raw_scores["controversy_or_debate_potential"]
-    if "stock_media_feasibility" in raw_scores and "image_generation_feasibility" not in raw_scores:
-        raw_scores["image_generation_feasibility"] = raw_scores["stock_media_feasibility"]
+    # Legacy key aliases (emotional_tension, controversy_or_debate_potential,
+    # stock_media_feasibility) removed (fresh full-system audit §4): no
+    # producer of those keys exists — every assessment comes fresh from
+    # score_story_for_gate(), whose forced tool-use schema requires the
+    # canonical dimension names.
 
     def _extract(val) -> int:
         """Accept either plain int (new batch schema) or {"score": int} (legacy)."""
@@ -146,14 +132,7 @@ def score_story_assessment(assessment: dict) -> dict:
     _check("visual_storytelling_potential", _MIN_VISUAL_STORYTELLING)
     _check("emotional_stakes",              _MIN_EMOTIONAL_STAKES)
     _check("scroll_stopper_potential",      _MIN_SCROLL_STOPPER)
-    _check("central_mystery",              _MIN_CENTRAL_MYSTERY)
-    _check("conflict_or_contradiction",    _MIN_CONFLICT_CONTRADICTION)
-    _check("social_media_clickability",    _MIN_SOCIAL_CLICKABILITY)
-    _check("title_thumbnail_potential",    _MIN_TITLE_THUMBNAIL)
-    _check("opening_scene_strength",       _MIN_OPENING_SCENE)
-    _check("thumbnail_strength",           _MIN_THUMBNAIL_STRENGTH)
-    _check("visual_range",                 _MIN_VISUAL_RANGE)
-    _check("image_generation_feasibility", _MIN_IMAGE_GENERATION_FEASIBILITY)
+    _check("image_generation_feasibility",  _MIN_IMAGE_GENERATION_FEASIBILITY)
 
     operator_review_flags: list[str] = []
     rights_ip_risk = dimension_scores.get(_RIGHTS_IP_RISK_DIMENSION, 0)
@@ -174,9 +153,10 @@ def decide_story_acceptance(story_score: dict) -> tuple[bool, str]:
     """Apply the fixed accept/reject gates to a computed story score.
 
     This is the ONLY place the accept/reject decision is made — Claude never
-    returns a verdict directly. A story is accepted only if its weighted overall
-    score clears the bar AND all three named hard floors (narrative_tension,
-    visual_potential, youtube_retention) are individually satisfied.
+    returns a verdict directly. A story is accepted only if its weighted
+    overall score clears ``_MIN_OVERALL_SCORE`` AND every per-dimension hard
+    floor (visual storytelling, emotional stakes, scroll-stopper, image
+    generation feasibility) is individually satisfied.
 
     Args:
         story_score: Output of ``score_story_assessment()``.

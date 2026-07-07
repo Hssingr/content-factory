@@ -105,7 +105,6 @@ def _chunk_transcript(
 
 def build_standard_subtitles(
     whisper_transcript: list[dict],
-    max_words_override: int | None = None,
 ) -> list[dict]:
     """Generate standard subtitle captions from Whisper word timestamps.
 
@@ -117,9 +116,6 @@ def build_standard_subtitles(
     Args:
         whisper_transcript: Word-level Whisper output.
                             Each word: {"word": str, "start": float, "end": float}
-        max_words_override: Override the hard word-count ceiling. Used by the Viewer
-                            Experience repair pass to rebuild with a stricter cap (e.g. 8)
-                            without changing the module-level constant.
 
     Returns:
         List of caption dicts: [{text, start_ms, end_ms}, ...]
@@ -128,7 +124,7 @@ def build_standard_subtitles(
     if not whisper_transcript:
         return []
 
-    max_words = max_words_override if max_words_override is not None else _MAX_WORDS_STANDARD
+    max_words = _MAX_WORDS_STANDARD
     chunks = _chunk_transcript(
         whisper_transcript,
         min_words=_MIN_WORDS_STANDARD,

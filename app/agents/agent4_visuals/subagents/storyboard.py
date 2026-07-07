@@ -4,7 +4,7 @@ The legacy ``section_splitter -> enrich_sections_with_visuals -> validate_sectio
 flow this replaced is fully removed (roadmap 6.3 / audit §7) — it was reachable
 only behind ``ChannelConfig.allow_legacy_fallback``, which defaults False and the
 UI never sets. Claude makes every creative decision (visual intent, visual type,
-search queries, effects, color grades, transitions, overlays); Python only does
+flux prompts, effects, color grades, transitions); Python only does
 the deterministic work — splitting the narration into segments, batching the
 Claude calls, merging the results, locating each beat's narration span in the
 real Whisper transcript, and converting it into millisecond timestamps.
@@ -91,9 +91,11 @@ _FALLBACK_FAIL_RATIO  = 0.50
 _VALID_EFFECTS           = {"slow_zoom", "zoom_out", "pan", "push_in", "shake", "cut", "fade_in", "parallax"}
 _VALID_GRADES            = {"desaturated", "cold_blue", "warm_amber", "dark_contrast", "neutral"}
 _VALID_TRANSITIONS       = {"cut", "crossfade", "dip_to_black", "whip_pan", "zoom_blur", "match_cut", "none"}
-_VALID_OVERLAY_POSITIONS = {"center", "lower_third", "top_left", "top_right", "none"}
-_VALID_VISUAL_TYPES      = {"b-roll", "action", "text_overlay", "document", "map", "screenshot", "generated_visual"}
-_VALID_VISUAL_CATEGORIES = {"person", "place", "object", "document", "screen", "map", "abstract", "text"}
+# "text_overlay"/"text" removed (schema v7.1) — nothing they describe exists under
+# subtitles-only rendering. A legacy stored beat carrying either value normalizes
+# to the default via _safe_enum on load/build.
+_VALID_VISUAL_TYPES      = {"b-roll", "action", "document", "map", "screenshot", "generated_visual"}
+_VALID_VISUAL_CATEGORIES = {"person", "place", "object", "document", "screen", "map", "abstract"}
 _VALID_ENVIRONMENTS      = {
     "underwater", "indoor_office", "indoor_domestic", "forest_nature", "urban_street",
     "corridor_interior", "abstract_dark", "open_landscape", "laboratory", "industrial",
@@ -169,10 +171,11 @@ _VISUAL_LANGUAGE = "__visual__"
 # text_card fallback sentinel — written to media_url when Flux generation fails.
 _TEXT_CARD_SENTINEL = "__text_card__"
 
-# match_score threshold: assignments at or above this reuse the parent Flux image;
-# below this threshold a new image is generated.
+# match_score threshold: assignments at or above this inherit the parent beat's
+# image PROMPT (visual continuity); below it the remap model's new_image_prompt
+# is used. Every child image is generated fresh at portrait size either way —
+# there is no physical image reuse on the child path (audit §3.1).
 _MATCH_SCORE_THRESHOLD = 70
-_SHORT_REUSE_RATIO_MAX = 0.60
 
 # Default child Short visual-hold ceiling. Read through settings so operators can
 # tune the target without touching code; parent long-form mapping never uses it.
@@ -205,7 +208,7 @@ _CHILD_HINT_MIN_WORDS = 6
 _CHILD_HINT_MAX_WORDS = 10
 
 # If more than this fraction of assignments in one remap response lack a usable
-# narration_phrase, treat it as a systemic Haiku response defect (fail loud)
+# narration_phrase, treat it as a systemic remap response defect (fail loud)
 # rather than silently letting every affected beat fall back to proportional
 # timing one by one.
 _CHILD_REMAP_HINT_MISSING_FAIL_RATIO = 0.3
@@ -217,38 +220,49 @@ _CHILD_REMAP_HINT_MISSING_FAIL_RATIO = 0.3
 _SHORT_IMAGE_WIDTH = 1080
 _SHORT_IMAGE_HEIGHT = 1920
 
-# ── Short episode storyboard remap (Haiku) ─────────────────────────────────────
+# ── Short episode storyboard remap (secondary model) ───────────────────────────
 
+# Every child Short beat's image is regenerated fresh at portrait size — the
+# match_score decides PROMPT INHERITANCE only (parent beat's image prompt vs. a
+# new prompt written here), never physical image reuse (fresh full-system audit
+# §3.1 — the former reuse-budget machinery measured a "reuse" that portrait
+# regeneration had already made impossible).
 _SHORT_REMAP_SYSTEM_PROMPT = (
-    "You map a parent documentary video's visual beats to a Short episode narration.\n\n"
+    "You map a parent video's visual beats to a Short episode narration.\n\n"
     "You receive:\n"
     "- A Short narration text (60-90 seconds of standalone content)\n"
-    "- A compact index of parent video beats: beat_order, visual_intent, environment, motif\n\n"
+    "- A compact index of parent video beats: beat_order, visual_intent, environment, motif\n"
+    "- Optional global visual direction / image style lines (the channel's configured look)\n\n"
+    "Every Short beat's image is generated fresh in vertical/portrait format. Your\n"
+    "match_score decides which IMAGE PROMPT that generation uses: a high score inherits\n"
+    "the parent beat's existing prompt (visual continuity with the parent video); a low\n"
+    "score means you write a new portrait prompt for this phrase.\n\n"
     "Divide the narration into phrases of roughly 3-5 seconds each. "
     "For each phrase, assign the most thematically relevant parent beat.\n\n"
     "For each assignment:\n"
     "- narration_phrase: the exact narration text this beat covers (verbatim excerpt)\n"
     "- long_beat_order: integer index from the parent beat index that best matches this phrase\n"
     "- match_score: 0-100 integer\n"
-    "  90-100: Same subject and setting — direct visual match\n"
-    "  70-89:  Compatible environment and mood — reuse is appropriate\n"
-    "  50-69:  Loosely related, different context — new image is better\n"
-    "  0-49:   Unrelated — new image required\n"
+    "  90-100: Same subject and setting — inherit the parent prompt\n"
+    "  70-89:  Compatible subject and mood — inheriting the parent prompt is appropriate\n"
+    "  50-69:  Loosely related, different context — a new prompt is better\n"
+    "  0-49:   Unrelated — a new prompt is required\n"
     "- new_image_prompt: for match_score below 70, a complete portrait-safe Flux image prompt "
-    "for a NEW child Short image; for 70+ reuse candidates, return an empty string unless "
+    "for this phrase; for 70+ inheritance candidates, return an empty string unless "
     "the phrase would still benefit from a custom image\n"
     "- beat_intensity: pacing intent for this phrase\n"
     "  'high':   revelation, shock, key fact\n"
     "  'medium': story progression, context\n"
     "  'low':    setup, establishing, pause\n\n"
     "Rules:\n"
-    "- Multiple phrases may share the same long_beat_order (parent beats can be reused)\n"
+    "- Multiple phrases may share the same long_beat_order\n"
     "- Prefer variety: if two phrases have similar scores, pick different parent beats\n"
     "- new_image_prompt must describe a concrete vertical/portrait physical scene: subject, "
     "place, composition, lighting; no mood-only words, no readable text, no raw narration "
-    "copied as a sentence\n"
+    "copied as a sentence. When global visual direction / image style lines are present, "
+    "write the prompt in that style (matching the parent prompts' look)\n"
     "- Return ONLY valid JSON. No markdown. No code fence. No extra keys.\n"
-    "PROMPT_VERSION = \"1.1\""
+    "PROMPT_VERSION = \"2.0\""
 )
 
 _SHORT_REMAP_MAX_TOKENS = 4096
@@ -443,7 +457,12 @@ def split_into_beats(
     # per-language calibrated rate when db is available and enough samples
     # exist, falling back to the static _WORDS_PER_MINUTE otherwise
     # (roadmap 3.8 / audit G-7).
-    diagnostic_wpm = get_calibrated_wpm(db, language) if db is not None else _WORDS_PER_MINUTE
+    # split_into_beats() only ever runs on the parent path (child Shorts use
+    # remap_beats_for_short), so scope the calibration window to parent rows.
+    diagnostic_wpm = (
+        get_calibrated_wpm(db, language, is_short_episode=False)
+        if db is not None else _WORDS_PER_MINUTE
+    )
     estimated_beats = _estimate_beat_count(voice_script, script_format, wpm=diagnostic_wpm)
     logger.info(
         "Storyboard generation start: schema_version=%s language=%s segments=%d "
@@ -1851,21 +1870,22 @@ def remap_beats_for_short(
     short_audio_file,
     parent_content_id: uuid.UUID,
     db: Session,
+    visual_style: str = "",
+    image_style: str = "",
 ) -> list[dict]:
     """Remap parent long-video beats to a standalone Short episode narration.
 
-    Loads the parent video's shared visual beats (language="__visual__"), asks Haiku
-    to assign the most thematically relevant parent beat to each narration phrase, then
-    applies a match_score threshold: scores >= ``_MATCH_SCORE_THRESHOLD`` reuse the
-    parent's Flux image; lower scores require a new Flux image. Missing or text_card
-    ``media_url`` values also require a new image regardless of score.
-
-    Does NOT call Flux/fal.ai itself for beats that need a new image — those are
-    left with ``media_url=""`` (pending) so the caller can run
-    ``validate_storyboard()`` against the beat list before any generation
-    happens (Phase 4E-E ordering alignment, mirroring the parent path's
-    validate-then-generate order). Call ``generate_pending_beat_images()``
-    afterward to fill in the pending beats' ``media_url``.
+    Loads the parent video's shared visual beats (language="__visual__") and asks
+    the secondary-model remap call to assign the most thematically relevant
+    parent beat to each narration phrase. The match_score decides PROMPT
+    INHERITANCE only (fresh full-system audit §3.1): scores >=
+    ``_MATCH_SCORE_THRESHOLD`` inherit the parent beat's ``flux_prompt`` for
+    visual continuity; lower scores use the remap model's ``new_image_prompt``.
+    Every beat leaves this function with ``media_url=""`` — the child path has
+    no physical image reuse; ``generate_pending_beat_images()`` generates every
+    beat fresh at portrait size afterward, which also preserves the Phase 4E-E
+    ordering (``validate_storyboard()`` runs on the beat list before any
+    fal.ai call).
 
     Timestamps are resolved via ``map_storyboard_beats_to_timestamps()`` on the Short's
     own Whisper transcript with ``allow_legacy_fallback=True`` — short episodes always
@@ -1877,11 +1897,14 @@ def remap_beats_for_short(
         short_audio_file:   AudioFile ORM row (provides duration_ms + whisper_transcript + language).
         parent_content_id:  content_id of the long-form parent video.
         db:                 SQLAlchemy session.
+        visual_style:       Channel-level visual direction (ChannelConfig.visual_style) —
+                            forwarded into the remap user message so new child prompts
+                            match the channel look, not an unstyled default.
+        image_style:        Channel-level image rendering style (ChannelConfig.image_style).
 
     Returns:
-        List of renderable beat-section dicts. Reused beats have ``media_url``
-        set; beats needing a new image have ``media_url=""`` until
-        ``generate_pending_beat_images()`` runs. Empty list on failure.
+        List of renderable beat-section dicts, every one with ``media_url=""``
+        (pending portrait generation). Empty list on failure.
     """
     content_id_str = str(short_content.id)
 
@@ -1940,9 +1963,16 @@ def remap_beats_for_short(
         for r, extras in reusable_parent_pairs
     ]
 
-    # 3. Haiku remap call
+    # 3. Secondary-model remap call
+    direction_lines = ""
+    if visual_style or image_style:
+        direction_lines = (
+            f"Global visual direction: {visual_style or 'story_driven'}\n"
+            f"Global image style: {image_style or 'photorealistic'}\n\n"
+        )
     user_message = (
-        f"Short narration ({short_audio_file.duration_ms}ms):\n"
+        direction_lines
+        + f"Short narration ({short_audio_file.duration_ms}ms):\n"
         f"{short_voice_script}\n\n"
         f"Parent beat index ({len(beat_index)} beats):\n"
         + json.dumps(beat_index, ensure_ascii=False)
@@ -2008,15 +2038,18 @@ def remap_beats_for_short(
         )
         return []
 
-    # 4. Apply threshold: reuse parent image or generate new
+    # 4. Apply threshold: inherit the parent beat's prompt or use the new one.
+    # Every beat leaves with media_url="" — generation happens strictly after
+    # validate_storyboard() (Phase 4E-E ordering), in
+    # generate_pending_beat_images(), fresh at portrait size for every beat.
     parent_by_order: dict[int, tuple] = {
         r.section_order: (r, extras)
         for r, extras in reusable_parent_pairs
     }
 
     beats: list[dict] = []
-    reuse_count = 0
-    generate_count = 0
+    inherited_count = 0
+    new_prompt_count = 0
     missing_hint_count = 0
 
     for i, assignment in enumerate(assignments):
@@ -2037,33 +2070,19 @@ def remap_beats_for_short(
         start_hint, end_hint = _derive_child_alignment_hints(narration_phrase)
 
         parent_row, extras = parent_by_order.get(long_order, (None, {}))
-        parent_media: str = extras.get("media_url", "") if extras else ""
 
-        # Phase 4E-E ordering alignment: decide reuse-vs-new here, but do NOT
-        # call generate_beat_image() yet — image generation for beats that
-        # need a new image is deferred to generate_pending_beat_images(),
-        # which the caller (_run_child_short_visuals) runs AFTER
-        # validate_storyboard() has had a chance to fire, mirroring the
-        # parent path's validate-then-generate ordering
-        # (_run_visual_pass: _run_storyboard_validation() before
-        # generate_all_beat_images()). A beat needing a new image is left
-        # with media_url="" (pending) here; generate_pending_beat_images()
-        # fills it in afterward using this same beat dict's flux_prompt.
-        if (
-            match_score >= _MATCH_SCORE_THRESHOLD
-            and _parent_media_reusable(parent_media, extras or {})
-        ):
-            media_url = parent_media
-        else:
-            # Below threshold OR missing/sentinel media OR a legacy parent
-            # text-card beat (excluded from the reuse pool — audit G-4.1) →
-            # needs a new Flux image via generate_pending_beat_images().
-            media_url = ""
-
-        if media_url:
-            flux_prompt = (parent_row.flux_prompt if parent_row else "") or new_image_prompt
+        # Prompt inheritance decision (audit §3.1): high score + a pool-eligible
+        # parent beat → inherit the parent's flux_prompt for visual continuity;
+        # otherwise use the remap model's new_image_prompt. media_url is never
+        # set here — every child image is generated fresh at portrait size by
+        # generate_pending_beat_images(), after validate_storyboard() runs.
+        parent_prompt = (parent_row.flux_prompt if parent_row is not None else "") or ""
+        if match_score >= _MATCH_SCORE_THRESHOLD and parent_prompt:
+            flux_prompt = parent_prompt
+            inherited_count += 1
         else:
             flux_prompt = new_image_prompt
+            new_prompt_count += 1
             if not flux_prompt and match_score < _MATCH_SCORE_THRESHOLD:
                 logger.error(
                     "CHILD_REMAP_NEW_PROMPT_MISSING content_id=%s assignment_index=%d "
@@ -2073,12 +2092,13 @@ def remap_beats_for_short(
                 )
                 return []
             if not flux_prompt:
-                # High-score candidates can still be forced into new portrait
-                # generation by non-reusable media or the reuse budget. Use a
-                # deterministic physical prompt, never the rejected parent prompt
-                # and never the raw narration sentence by itself.
+                # High-score assignment whose parent beat was excluded from the
+                # candidate pool (legacy text-card / missing media — audit
+                # G-4.1) and no new_image_prompt supplied. Use a deterministic
+                # physical prompt, never the excluded parent prompt and never
+                # the raw narration sentence by itself.
                 flux_prompt = (
-                    "Vertical documentary photograph of a concrete physical clue "
+                    "Vertical photograph of a concrete physical clue "
                     f"from this Short moment: {narration_phrase[:180]}, practical light, "
                     "subject in foreground, no readable text"
                 )
@@ -2104,7 +2124,10 @@ def remap_beats_for_short(
             "motif":                  _safe_enum(extras.get("motif") if extras else None, _VALID_MOTIFS, _DEFAULT_MOTIF),
             "beat_intensity":         beat_intensity,
             "suggested_duration_sec": 3.0,
-            "media_url":              media_url,
+            # Always pending — the child path has no physical image reuse;
+            # generate_pending_beat_images() generates every beat fresh at
+            # portrait size (audit §3.1).
+            "media_url":              "",
             "media_type":             "image",
             "parent_reuse_match_score": match_score,
             "start_hint":             start_hint,
@@ -2113,33 +2136,6 @@ def remap_beats_for_short(
         beats.append(beat)
 
     total_beats = len(beats)
-    max_reuse_count = int(total_beats * _SHORT_REUSE_RATIO_MAX)
-    reused_indices = [
-        idx for idx, beat in enumerate(beats)
-        if (beat.get("media_url") or "").startswith("cache/")
-    ]
-    if len(reused_indices) > max_reuse_count:
-        demote_count = len(reused_indices) - max_reuse_count
-        demoted_indices = sorted(
-            reused_indices,
-            key=lambda idx: (
-                int(beats[idx].get("parent_reuse_match_score", 0)),
-                int(beats[idx].get("beat_order", idx)),
-            ),
-        )[:demote_count]
-        for idx in demoted_indices:
-            beats[idx]["media_url"] = ""
-        logger.info(
-            "CHILD_SHORT_REUSE_BUDGET_APPLIED content_id=%s beats=%d "
-            "max_reuse=%d demoted=%d demoted_orders=%s",
-            content_id_str, total_beats, max_reuse_count, demote_count,
-            [beats[idx].get("beat_order", idx) for idx in demoted_indices],
-        )
-
-    reuse_count = sum(
-        1 for beat in beats if (beat.get("media_url") or "").startswith("cache/")
-    )
-    generate_count = total_beats - reuse_count
     missing_hint_ratio = (missing_hint_count / total_beats) if total_beats > 0 else 0.0
     if missing_hint_ratio > _CHILD_REMAP_HINT_MISSING_FAIL_RATIO:
         logger.error(
@@ -2150,15 +2146,11 @@ def remap_beats_for_short(
             100 * missing_hint_ratio, 100 * _CHILD_REMAP_HINT_MISSING_FAIL_RATIO,
         )
         return []
-    reuse_rate = (reuse_count / total_beats * 100) if total_beats > 0 else 0.0
+    inherited_rate = (inherited_count / total_beats * 100) if total_beats > 0 else 0.0
     logger.info(
-        "remap_beats_for_short: content=%s beats=%d reuse=%d pending_generation=%d",
-        content_id_str, total_beats, reuse_count, generate_count,
-    )
-    logger.info(
-        "CHILD_SHORT_REUSE_STATS content_id=%s beats=%d reused_parent_images=%d "
-        "new_flux_images=%d reuse_rate=%.1f%%",
-        content_id_str, total_beats, reuse_count, generate_count, reuse_rate,
+        "CHILD_SHORT_PROMPT_INHERITANCE_STATS content_id=%s beats=%d "
+        "inherited_parent_prompts=%d new_prompts=%d inherited_rate=%.1f%%",
+        content_id_str, total_beats, inherited_count, new_prompt_count, inherited_rate,
     )
 
     # 5. Map to real timestamps via Short's own Whisper transcript
@@ -2193,31 +2185,16 @@ def remap_beats_for_short(
 def generate_pending_beat_images(beats: list[dict], content_id: str) -> list[dict]:
     """Generate portrait (1080x1920) Flux images for every child Short beat.
 
-    Child Shorts render vertically (Short.tsx), but every beat coming out of
-    `remap_beats_for_short()` was written/framed against the parent's
-    landscape (1920x1080) storyboard. Two beat groups exist there:
-      - "pending" beats (`media_url == ""`) — below the reuse match-score
-        threshold, or the parent media was missing/unreusable; these always
-        needed a fresh Flux call.
-      - "reused" beats — at/above the threshold, `media_url` still points
-        directly at the *parent's* landscape cache file.
+    Child Shorts render vertically (Short.tsx). Every beat arrives from
+    `remap_beats_for_short()` with ``media_url=""`` and a ``flux_prompt``
+    (either inherited from the matched parent beat or freshly written by the
+    remap call — audit §3.1: the child path has no physical image reuse).
+    Each beat is generated fresh at `_SHORT_IMAGE_WIDTH` x
+    `_SHORT_IMAGE_HEIGHT` and cached under this child's own cache dir —
+    never the parent's landscape cache (roadmap 3.1 / audit V-2, G-4.2).
 
-    Before roadmap 3.1, only the pending group was generated, and always at
-    the landscape default — "reused" beats forced a horizontal image into a
-    vertical frame, and pending beats were generated at the wrong aspect
-    ratio too. Both groups now generate fresh at `_SHORT_IMAGE_WIDTH` x
-    `_SHORT_IMAGE_HEIGHT`, using each beat's own `flux_prompt` (already the
-    parent's prompt for a reused beat, via `remap_beats_for_short()`), and
-    always cached under this child's own cache dir — never the parent's,
-    since a portrait render is a new artifact, not the reused parent file
-    (audit V-2/G-4.2: "regenerate a portrait version of the same prompt
-    (cache-keyed) — costs one Schnell call per reused beat but transforms
-    Short quality").
-
-    `validate_storyboard()` already ran against the pre-generation beat list
-    (Phase 4E-E ordering — this function runs strictly after it), so the
-    reuse-vs-pending split it observed (checks 17/18) is unaffected by this
-    function subsequently regenerating "reused" beats as portrait images.
+    Runs strictly AFTER `validate_storyboard()` (Phase 4E-E ordering —
+    validate-then-generate, mirroring the parent path).
 
     Mutates every beat in-place (mirrors `generate_all_beat_images()`'s
     contract):
@@ -2238,14 +2215,10 @@ def generate_pending_beat_images(beats: list[dict], content_id: str) -> list[dic
     if not beats:
         return beats
 
-    was_reused_count = sum(1 for b in beats if b.get("media_url"))
-    was_pending_count = len(beats) - was_reused_count
-
     logger.info(
         "generate_pending_beat_images: content=%s beats=%d requesting portrait "
-        "%dx%d images (was_pending=%d was_reused_now_regenerated=%d)",
+        "%dx%d images",
         content_id, len(beats), _SHORT_IMAGE_WIDTH, _SHORT_IMAGE_HEIGHT,
-        was_pending_count, was_reused_count,
     )
 
     # Caller-scoped only (this child language's generation pass), never
@@ -2255,8 +2228,8 @@ def generate_pending_beat_images(beats: list[dict], content_id: str) -> list[dic
     pixel_ledger: list[dict] = []
 
     for beat in beats:
-        # Clear any parent-reused landscape media_url before routing/generation
-        # so image_router.select_route() never short-circuits to "reuse" —
+        # Defensive clear (beats normally arrive pending already) so
+        # image_router.select_route() never short-circuits to "reuse" —
         # every beat gets a fresh portrait call using its own flux_prompt.
         beat["media_url"] = ""
         new_url = generate_beat_image_with_routing(

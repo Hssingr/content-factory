@@ -128,7 +128,11 @@ class ShortRemapReusePoolTest(unittest.TestCase):
         self.assertNotEqual(beats[0].get("media_url"), "cache/parent/text-card-background.jpg")
         self.assertNotEqual(beats[0].get("visual_type"), "text_card")
 
-    def test_reuse_budget_demotes_lowest_scoring_reuses_to_pending_generation(self) -> None:
+    def test_prompt_inheritance_by_score_all_beats_pending(self) -> None:
+        """Fresh full-system audit §3.1: match_score decides PROMPT inheritance
+        only — every beat leaves remap pending (media_url="") because portrait
+        generation regenerates every child image fresh; there is no physical
+        reuse and no reuse budget anymore."""
         rows = [
             parent_row(
                 i,
@@ -143,7 +147,7 @@ class ShortRemapReusePoolTest(unittest.TestCase):
             )
             for i in range(5)
         ]
-        scores = [100, 99, 98, 70, 71]
+        scores = [100, 99, 98, 70, 42]
 
         def fake_remap_call(**kwargs):
             return (
@@ -154,7 +158,10 @@ class ShortRemapReusePoolTest(unittest.TestCase):
                             "long_beat_order": i,
                             "match_score": score,
                             "narration_phrase": f"Mara checks hallway clue number {i} near the quiet porch",
-                            "new_image_prompt": "",
+                            "new_image_prompt": (
+                                "" if score >= 70
+                                else f"Vertical hallway clue close-up number {i}, practical lamp, no readable text"
+                            ),
                             "beat_intensity": "medium",
                         }
                         for i, score in enumerate(scores)
@@ -188,10 +195,17 @@ class ShortRemapReusePoolTest(unittest.TestCase):
             )
 
         self.assertEqual(len(beats), 5)
-        reused_orders = [beat["beat_order"] for beat in beats if beat["media_url"]]
-        pending_orders = [beat["beat_order"] for beat in beats if not beat["media_url"]]
-        self.assertEqual(reused_orders, [0, 1, 2])
-        self.assertEqual(pending_orders, [3, 4])
+        # Every beat is pending generation — no physical parent image reuse.
+        self.assertEqual([beat["media_url"] for beat in beats], [""] * 5)
+        # Scores >= 70 inherit the parent beat's prompt; below 70 use the new prompt.
+        for i, score in enumerate(scores):
+            if score >= 70:
+                self.assertEqual(
+                    beats[i]["flux_prompt"],
+                    f"Parent image prompt {i}, practical lamp, no readable text",
+                )
+            else:
+                self.assertIn("Vertical hallway clue close-up", beats[i]["flux_prompt"])
 
 
     def test_low_score_child_new_image_uses_real_new_prompt(self) -> None:

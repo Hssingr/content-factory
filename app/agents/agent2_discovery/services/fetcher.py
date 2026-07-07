@@ -108,8 +108,13 @@ def fetch_batch(
     )
 
     if rejected_stories:
+        # Entries may carry an optional "feedback" key — the operator's own
+        # words on why a story was rejected (Telegram CHANGE flow). Threading
+        # it into the exclusion block turns a bare "not this one" into
+        # actionable guidance for the next pick.
         rejected_block = "\n".join(
             f"  {i + 1}. Title: {r['title']}\n     URL: {r['url']}"
+            + (f"\n     Operator feedback: {r['feedback']}" if r.get("feedback") else "")
             for i, r in enumerate(rejected_stories)
         )
         user_message += (

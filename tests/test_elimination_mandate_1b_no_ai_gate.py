@@ -149,6 +149,7 @@ class TestGenerateParentSourceScriptChainMakesNoGateClaudeCalls(unittest.TestCas
             def __init__(self, rows):
                 self.rows = rows
             def filter(self, *a, **k): return self
+            def join(self, *a, **k): return self
             def order_by(self, *a, **k): return self
             def limit(self, n): return _FakeQuery(self.rows[:n])
             def first(self): return self.rows[0] if self.rows else None
