@@ -50,6 +50,24 @@ class TestFetcherPromptAsksForFullTextNotSummary(unittest.TestCase):
     def test_reformat_prompt_also_preserves_full_text(self):
         self.assertIn("full verbatim", fetcher._SINGLE_STORY_REFORMAT_PROMPT.lower())
 
+    def test_system_prompt_instructs_combining_multi_part_series(self):
+        """Prompt engineering follow-up: a real run picked "Part 1" of an
+        8-part r/nosleep series and relayed only that part (428 words) — the
+        discovery-time floor gate rejected it and burned a retry, when the
+        better fix is teaching Claude to find and combine every part up
+        front."""
+        prompt = fetcher._SINGLE_STORY_SYSTEM_PROMPT.lower()
+        self.assertIn("multi-part", prompt)
+        self.assertIn("part 1", prompt)
+        self.assertIn("combined verbatim text of every part", prompt)
+
+    def test_max_tokens_raised_to_accommodate_combined_multi_part_bodies(self):
+        """The multi-part rule means one response can legitimately carry
+        several parts' worth of body text — must exceed the old 8192 ceiling
+        that was sized for a single post."""
+        self.assertGreater(fetcher._STORY_FETCH_MAX_TOKENS, 8192)
+        self.assertEqual(fetcher._STORY_FETCH_MAX_TOKENS, fetcher._STORY_REFORMAT_MAX_TOKENS)
+
 
 class TestStoryFromDictTruncatesAtSharedCeiling(unittest.TestCase):
     def test_body_under_ceiling_is_untouched(self):
@@ -92,7 +110,7 @@ class TestFetchBatchUsesRaisedTokenBudgetAndPreservesFullBody(unittest.TestCase)
         self.assertEqual(len(stories), 1)
         self.assertEqual(stories[0].body, long_body)
         self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["max_tokens"], 8192)
+        self.assertEqual(calls[0]["max_tokens"], fetcher._STORY_FETCH_MAX_TOKENS)
         self.assertIn("verbatim", calls[0]["system_prompt"].lower())
 
     def test_fetch_batch_caps_max_rounds_at_8(self):
@@ -147,7 +165,7 @@ class TestFetchBatchUsesRaisedTokenBudgetAndPreservesFullBody(unittest.TestCase)
         self.assertEqual(len(stories), 1)
         self.assertEqual(stories[0].body, long_body)
         self.assertEqual(len(reformat_calls), 1)
-        self.assertEqual(reformat_calls[0]["max_tokens"], 8192)
+        self.assertEqual(reformat_calls[0]["max_tokens"], fetcher._STORY_REFORMAT_MAX_TOKENS)
         # The raw prose (well under MAX_SOURCE_EXCERPT_CHARS here) must have
         # been passed through whole, not clipped at the old 6000-char cap.
         self.assertIn(long_body[:100], reformat_calls[0]["user_message"])

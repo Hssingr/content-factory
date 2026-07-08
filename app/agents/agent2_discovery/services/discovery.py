@@ -13,6 +13,7 @@ from app.agents.agent2_discovery.services.scoring import (
     decide_story_acceptance,
 )
 from app.agents.agent2_discovery.system_prompt import score_story_for_gate
+from app.services.script_checks import check_source_material_floor
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +31,11 @@ def run_discovery(
 ) -> tuple[Content, Story, dict] | None:
     """Main entry point for Agent 2 — discover the best story for a channel.
 
-    Retry escalation on duplicate detection:
+    Retry escalation on duplicate detection OR source-material floor failure
+    (prompt engineering follow-up — a candidate whose ``source_excerpt`` cannot
+    ground a full script, e.g. a wiki/fandom summary page relayed instead of
+    the primary post, is rejected and retried exactly like a duplicate, so a
+    too-thin story never reaches Telegram approval in the first place):
       1. Initial fetch (clean or with caller-supplied ``rejected_stories``)
       2. Retry 1 — accumulated rejected list injected into fetch prompt
       3. Retry 2 — accumulated rejected list
@@ -109,6 +114,24 @@ def run_discovery(
             accumulated_rejected.append({"title": candidate.title, "url": candidate.url})
             continue
 
+        floor_reason = _fails_source_material_floor(candidate, script_format)
+        if floor_reason:
+            logger.warning(
+                "Discovery: candidate too thin on attempt %d (title=%r) — %s — "
+                "adding to rejected list and retrying",
+                attempt + 1, candidate.title[:60], floor_reason,
+            )
+            accumulated_rejected.append({
+                "title": candidate.title,
+                "url": candidate.url,
+                "feedback": (
+                    "Source material was too thin (e.g. a wiki/fandom page or other summary "
+                    "ABOUT the post, not the full post itself) — find a different story and "
+                    "relay the actual primary source text, not a page that describes it."
+                ),
+            })
+            continue
+
         story = candidate
         break
 
@@ -120,7 +143,7 @@ def run_discovery(
             _MAX_DEDUP_RETRIES + 1, channel_id,
         )
         story = _nuclear_retry(
-            channel, sources_list, accumulated_rejected, db
+            channel, sources_list, accumulated_rejected, db, script_format
         )
 
     # ── All retries exhausted — send manual Telegram fallback ─────────────────
@@ -227,11 +250,26 @@ def _is_duplicate(story: Story, db: Session) -> bool:
     return False
 
 
+def _fails_source_material_floor(story: Story, script_format: str) -> str | None:
+    """Deterministic source-material floor check, run at discovery time.
+
+    Reuses ``check_source_material_floor()`` (the same check
+    ``generate_parent_source_script()`` runs post-approval, roadmap 4b /
+    audit P1-5) so a too-thin candidate is caught before a Telegram approval
+    is ever sent for it, instead of only failing after the operator has
+    already approved it. Returns the human-readable rejection description on
+    failure, or ``None`` when the candidate has enough material.
+    """
+    issues = check_source_material_floor(story.body or "", story.language, script_format)
+    return issues[0]["description"] if issues else None
+
+
 def _nuclear_retry(
     channel: Channel,
     sources_list: list[tuple[str, str, float]],
     accumulated_rejected: list[dict],
     db: Session,
+    script_format: str,
 ) -> Story | None:
     """One final fetch with the full channel content history as the exclusion list.
 
@@ -287,6 +325,14 @@ def _nuclear_retry(
         logger.warning(
             "Discovery: nuclear retry candidate is still a duplicate (title=%r)",
             candidate.title[:60],
+        )
+        return None
+
+    floor_reason = _fails_source_material_floor(candidate, script_format)
+    if floor_reason:
+        logger.warning(
+            "Discovery: nuclear retry candidate too thin (title=%r) — %s",
+            candidate.title[:60], floor_reason,
         )
         return None
 

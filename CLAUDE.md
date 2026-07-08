@@ -1498,7 +1498,8 @@ Agent 2 must not:
 flowchart TD
     A[run_discovery] --> B[fetch_batch]
     B --> C[dedup check]
-    C --> D[story gate scoring]
+    C --> C2[source-material floor check]
+    C2 --> D[story gate scoring]
     D --> E[Content PENDING_APPROVAL]
     E --> F[send_for_validation]
     F --> G[Telegram APPROVE]
@@ -1574,6 +1575,11 @@ Rules:
 - Must not block the whole pipeline on one duplicate candidate.
 - Must not invent URLs.
 - Must not validate business decisions by prompt alone.
+- Must prefer the primary source post/thread over a wiki/fandom/aggregator
+  page that describes or summarizes it, even when the secondary page ranks
+  highly in search or is itself long — see the "Discovery-time floor gate"
+  entry under `run_discovery` below for the deterministic backstop when this
+  prompt rule alone isn't followed.
 
 Full source-material fetch (roadmap 4.1 / audit S-1, exec-2):
 
@@ -1616,21 +1622,46 @@ Full source-material fetch (roadmap 4.1 / audit S-1, exec-2):
   audit). `score_story_for_gate()`'s
   own `[:6000]` cap is deliberately untouched — gate scoring judges fit/
   quality, not narrative grounding, and does not need the full body.
-- `call_claude_with_tools()`'s `max_tokens` for `story_research` raised from
-  4096 to `8192` (this codebase's own established, already-proven output
-  ceiling — matches `STORYBOARD_BATCH_MAX_TOKENS` in agent4 — chosen over an
-  unverified higher value since a live API call to confirm one is not
-  permitted). The reformat fallback's `max_tokens` and input-truncation cap
-  were raised to match (`8192` / `MAX_SOURCE_EXCERPT_CHARS`, up from `2048`
-  / `6000` chars) so a long real body surviving only in prose form is not
-  lost before reformatting.
+- `call_claude_with_tools()`'s `max_tokens` for `story_research` was raised
+  from 4096 to `8192` (this codebase's own established, already-proven output
+  ceiling at the time — matched `STORYBOARD_BATCH_MAX_TOKENS` in agent4),
+  then to **`16384`** (prompt engineering follow-up — see the multi-part
+  stories entry below). Unlike the original 4096→8192 bump, 16384 is not an
+  unverified guess: Claude Sonnet 5 supports up to 128K output tokens, and
+  since `claude_client.py` never streams (every call goes through the SDK's
+  non-streaming path, `_get_client()`'s `timeout=httpx.Timeout(600.0, ...)`),
+  the real ceiling to respect is the Anthropic SDK's own non-streaming guard
+  (raises before sending if it estimates the request would run past ~10
+  minutes wall-clock) — 16384 tokens sits comfortably inside that budget at
+  any realistic generation rate. `_STORY_REFORMAT_MAX_TOKENS` was raised to
+  match, staying equal to `_STORY_FETCH_MAX_TOKENS` by convention.
+- **Multi-part stories (prompt engineering follow-up):** a real operator run
+  picked "We Used to Live Here (Part 1)" — a genuine multi-part r/nosleep
+  series — and relayed only 428 words (that one part's own length), correctly
+  rejected by the discovery-time floor gate (`_fails_source_material_floor()`,
+  see `run_discovery` below) but at the cost of discarding a high-engagement
+  candidate and paying for a whole new discovery search. `_SINGLE_STORY_SYSTEM_PROMPT`
+  now has an explicit "Multi-part stories" rule: detect a serialized title
+  ("Part N", "Chapter N", etc.), search for and retrieve every part before
+  answering, and return the **combined verbatim text of every part** as
+  `body` (canonical `url` = the earliest part's URL; `title` describes the
+  whole series, not just the part first found). This is why `max_tokens` was
+  raised — one response can now legitimately carry several parts' worth of
+  body text. The discovery-time floor gate remains the safety net for
+  standalone stories that are genuinely too thin, or for a series whose later
+  parts don't exist yet/can't be found — the prompt explicitly forbids
+  inventing missing parts to fill the gap.
 - `max_rounds` for the same `story_research` call is capped at `8`, down from
   `20` (roadmap 6.2 / audit C-4). Once this call only has to find and relay a
   story via `web_search` — no longer condense it into a summary — it does
   not need 20 tool-use round-trips to converge; `max_rounds` is a hard safety
   cap (`call_claude_with_tools()` raises `ValueError` if exceeded, caught by
   `fetch_batch()`'s own `except Exception: return []`), so this is a
-  deliberate cost reduction, not a quality change.
+  deliberate cost reduction, not a quality change. Unchanged by the
+  multi-part rule — the model can issue multiple searches within a single
+  tool-use round (a real run's first round alone made 22 server-side tool
+  calls), so finding additional parts of a series does not obviously need
+  more rounds; only the per-round output-token ceiling needed raising.
 - `models/content.py` required **no schema change/migration** —
   `Content.source_excerpt` was already an unbounded `Text` column; the fix is
   entirely prompt + truncation-constant changes.
@@ -1712,6 +1743,48 @@ check faithfulness against a source that isn't there.
   `run_script_quality_gate()` are ever called (each poisoned to raise if
   touched), while a well-grounded source proceeds to `GENERATING_SCRIPTS`
   exactly as before this change.
+
+**Discovery-time floor gate (prompt engineering follow-up) — the same check
+now also runs before Telegram approval, not only after it.** A real operator
+run showed the post-approval check above catching a genuinely bad pick only
+after the operator had already spent their attention approving it: `run_discovery()`
+accepted a candidate whose `source_excerpt` turned out to be a fandom-wiki page
+*describing* an 8-part r/nosleep series (527 words), not the series itself —
+Claude's `web_search` cited a secondary summary page instead of the primary
+Reddit thread, so even the "relay full verbatim text, do not condense"
+instruction in `_SINGLE_STORY_SYSTEM_PROMPT` had nothing substantial to relay.
+
+- `_SINGLE_STORY_SYSTEM_PROMPT` (`fetcher.py`) gained an explicit rule: prefer
+  the primary source itself over a wiki/fandom/"best of"/news page that
+  describes or reviews it, even when that secondary page ranks highly in
+  search results or is itself long enough to look substantial.
+- `run_discovery()`'s targeted-retry loop and `_nuclear_retry()` both now call
+  `_fails_source_material_floor()` (a thin wrapper around
+  `check_source_material_floor()`, same 900/420-word floors) on every
+  candidate immediately after the existing duplicate check, before it can
+  become `story` and reach `Content`/Telegram creation. A failing candidate is
+  rejected exactly like a duplicate — appended to `accumulated_rejected` with
+  a `feedback` string ("source material was too thin... find a different
+  story and relay the actual primary source text") threaded into the next
+  `fetch_batch()` call's exclusion block — and retried through the same
+  ladder (2 targeted retries → nuclear retry → manual Telegram fallback) the
+  duplicate-detection path already used.
+- This does **not** replace the post-approval check in
+  `generate_parent_source_script()` above — that one remains the backstop for
+  the manually-submitted-story path (`_handle_manual_story_input()` in
+  `validation.py`), which never goes through `run_discovery()`'s retry loop
+  and so never passes through this gate. The two checks are the same
+  deterministic function at two different points in the pipeline, not
+  duplicated logic with drift risk.
+- Runtime proof: `tests/test_discovery_source_material_floor_gate.py` — real
+  `run_discovery()` against a fake DB, with only `fetch_batch()` (paid
+  `story_research`) and `score_story_for_gate()` (paid `story_gate_scoring`)
+  stubbed; proves a thin candidate's title/url/feedback reach the next
+  `fetch_batch()` call's `rejected_stories` and that the persisted `Content`
+  row's `source_excerpt` is always the eventually-accepted rich candidate's
+  body, never the rejected thin one's; and that an all-candidates-thin run
+  (including the nuclear retry) falls through to the manual fallback with no
+  `Content` row ever created.
 
 #### `send_for_validation`
 

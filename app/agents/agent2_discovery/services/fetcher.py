@@ -12,12 +12,35 @@ _WEB_SEARCH_TOOL: dict = {"type": "web_search_20250305", "name": "web_search"}
 
 # Roadmap 4.1 / audit S-1 (exec-2): raised from 4096 so Claude has headroom to
 # return the full verbatim post + top comments instead of a short summary.
-# 8192 is this codebase's own established, proven-working output-token
-# ceiling (matches STORYBOARD_BATCH_MAX_TOKENS in agent4's system_prompt.py)
-# — kept here rather than a larger unverified value since a live API call to
-# confirm a higher ceiling is not permitted.
-_STORY_FETCH_MAX_TOKENS = 8192
-_STORY_REFORMAT_MAX_TOKENS = 8192
+# 8192 was this codebase's own established, proven-working output-token
+# ceiling at the time (matches STORYBOARD_BATCH_MAX_TOKENS in agent4's
+# system_prompt.py).
+#
+# Raised to 16384 (multi-part story fetching, prompt engineering follow-up):
+# a real run picked "We Used to Live Here (Part 1)" — a genuine multi-part
+# r/nosleep series — and only relayed 428 words, correctly rejected by the
+# discovery-time floor gate (see discovery.py) but at the cost of discarding
+# a high-engagement candidate outright. The fix is the "Multi-part stories"
+# prompt rule below (fetch and combine every part before returning), which
+# means one response can now legitimately carry several parts' worth of body
+# text — comfortably able to exceed the old 8192-token ceiling on the exact
+# same failure shape this codebase already fixed once (truncated JSON /
+# "Unterminated string" errors, see storyboard.py's module docstring for the
+# prior incident this class of bug caused).
+#
+# 16384 is a justified, not-guessed increase, not a re-run of the same
+# unverified-ceiling risk the original 8192 comment flagged: Claude Sonnet 5
+# supports up to 128K output tokens (per the Anthropic API model reference),
+# and this codebase's Claude client (claude_client.py) never streams — every
+# call goes through the SDK's non-streaming path under a 600s client
+# timeout. The Anthropic SDK's own non-streaming guard estimates whether a
+# request will exceed roughly 10 minutes wall-clock and raises before
+# sending if so; 16384 tokens sits comfortably inside that budget at any
+# realistic generation rate, while a jump straight to something near the
+# 128K ceiling would not. Do not raise this further without the same kind
+# of check — verify against current SDK/model documentation, not a guess.
+_STORY_FETCH_MAX_TOKENS = 16384
+_STORY_REFORMAT_MAX_TOKENS = 16384
 
 # Roadmap 6.2 / audit C-4: capped from 20 — since roadmap 4.1, this call only
 # has to FIND and relay a story via web_search, not additionally condense it
@@ -41,6 +64,29 @@ Rules:
 - Compare multiple stories across sources before picking the highest-engagement one
 - Skip: promotional content, ads, stickied posts, meta announcements
 - Never invent facts, URLs, titles, or statistics — only include what you actually found
+- Prefer the primary source itself (the actual subreddit post/thread) over a secondary
+  page that describes, summarizes, or reviews it. Wiki pages (e.g. fandom.com), "best of"
+  compilation articles, and news write-ups ABOUT a post are not acceptable substitutes for
+  the post — even when they rank highly in search results and even when they mention real
+  engagement numbers. If the source is a subreddit, browse the subreddit/post directly.
+
+Multi-part stories — many posts are serialized ("Part 1", "Part 2",
+"Chapter 3", "(Final Part)", or an explicit "continued in the comments"/"part 2 here" link):
+- Before deciding on a candidate, check whether it is part of a series. A title containing
+  "Part N", "Chapter N", or similar is a strong signal — do not treat it as a complete,
+  standalone story.
+- If it is part of a series, use web_search to find and retrieve EVERY part you can locate,
+  in order, before returning your answer. A single early part is usually far too short on
+  its own to ground a full video script, even when it is otherwise the best candidate by
+  engagement.
+- "body" must be the combined verbatim text of every part you found, concatenated in story
+  order — never just the one part your search happened to surface first.
+- "url" should be the first/earliest part's URL — the natural entry point for a reader
+  following the series from the start.
+- "title" should describe the whole series, not just the single part you started from (e.g.
+  drop a trailing "(Part 1)" once you have merged multiple parts into one combined story).
+- If later parts are not published yet, or you genuinely cannot find them after searching,
+  relay only what actually exists — never invent a missing part's content to fill the gap.
 
 Source material — this is the single most important rule in this prompt:
 - "body" must be the FULL text you actually retrieved via web_search, not a summary.
@@ -49,6 +95,10 @@ Source material — this is the single most important rule in this prompt:
   comments. Preserve concrete names, dates, numbers, and quotes exactly as written.
 - Do NOT condense, paraphrase, or write "a factual summary" — every fact downstream is
   generated from this field alone, so compressing it starves the rest of the pipeline.
+- A page that talks ABOUT a post (a wiki summary, a retrospective, a "this went viral"
+  write-up) is a symptom of the same problem even when it is long enough to pass a word
+  count — it is not the original text, so it must never be used as "body" regardless of
+  its own length. Go back to the actual post instead.
 - If the real post/comments are long, include as much of the real text as you can up to
   your own output limit — never pad or invent text to reach any target length.
 
