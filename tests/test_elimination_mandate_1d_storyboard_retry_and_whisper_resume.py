@@ -215,6 +215,7 @@ class TestChildShortVisualsSkipsRemediation(unittest.TestCase):
         ))
 
         content = SimpleNamespace(id=content_id, parent_content_id=parent_content_id)
+        channel = SimpleNamespace(niche="true crime", tone="suspenseful")
         script = SimpleNamespace(voice_script="Sam finds a sign in the hallway.")
         scripts_by_lang = {"en": script}
         audio = SimpleNamespace(duration_ms=6000, whisper_transcript=[])
@@ -230,7 +231,7 @@ class TestChildShortVisualsSkipsRemediation(unittest.TestCase):
             with self.assertLogs(
                 "app.agents.agent4_visuals.services.visual_orchestrator", level="ERROR"
             ) as logs:
-                result = vo._run_child_short_visuals(content, scripts_by_lang, audio_by_lang, db)
+                result = vo._run_child_short_visuals(content, channel, scripts_by_lang, audio_by_lang, db)
 
         self.assertEqual(result["status"], "CHILD_SHORT_VISUALS_DONE")
         self.assertTrue(

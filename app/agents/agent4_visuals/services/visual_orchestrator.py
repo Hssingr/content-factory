@@ -91,7 +91,7 @@ def run_visual_generation(
 
     if is_short_episode:
         return _run_child_short_visuals(
-            content, scripts_by_lang, audio_by_lang, db,
+            content, channel, scripts_by_lang, audio_by_lang, db,
             visual_style=visual_style, image_style=image_style,
         )
 
@@ -641,16 +641,23 @@ def _save_shared_beats(content_id: uuid.UUID, beats: list[dict], db: Session) ->
 # the next run can detect the mismatch before reusing anything.
 
 
-def _source_script_hash(content: Content, scripts_by_lang: dict[str, Script]) -> str | None:
-    """SHA-256 hex digest of the source-language voice_script — the staleness
-    fingerprint for the shared `__visual__` beats. Returns ``None`` when the
-    source-language script is unavailable (never treated as a mismatch;
-    the caller must fail open, not force an unwarranted regeneration)."""
-    source_script = scripts_by_lang.get(content.source_language)
-    if not source_script or not source_script.voice_script:
-        return None
-    return hashlib.sha256(source_script.voice_script.encode("utf-8")).hexdigest()
+def _source_script_hash(
+    content: Content,
+    scripts_by_lang: dict[str, Script],
+) -> str | None:
+    """Source-language script fingerprint for parent shared visuals."""
+    return _script_hash(
+        scripts_by_lang.get(content.source_language)
+    )
 
+def _script_hash(script: Script | None) -> str | None:
+    """SHA-256 fingerprint of one persisted script's narration."""
+    if not script or not script.voice_script:
+        return None
+
+    return hashlib.sha256(
+        script.voice_script.encode("utf-8")
+    ).hexdigest()
 
 def _tag_beats_with_script_hash(beats: list[dict], script_hash: str) -> None:
     """Stamp `script_hash` onto every beat in place — called once, before the
@@ -812,6 +819,7 @@ def _remap_beats_timing(
 
 def _run_child_short_visuals(
     content: Content,
+    channel: Channel,
     scripts_by_lang: dict[str, Script],
     audio_by_lang: dict[str, AudioFile],
     db: Session,
@@ -874,17 +882,118 @@ def _run_child_short_visuals(
         # them — mirroring the parent path's persisted-beat reuse. (Child
         # scripts are never regenerated in place — run_shorts_planner skips
         # existing children — so no script-hash staleness check is needed here.)
-        existing_sections = load_video_sections(content_id, language, db)
-        if existing_sections and all(
-            (b.get("media_url") or "").startswith("cache/") for b in existing_sections
-        ):
-            logger.info(
-                "CHILD_SHORT_VISUALS_REUSED content_id=%s language=%s beats=%d "
-                "— persisted rows already complete; skipping remap and generation",
-                content_id, language, len(existing_sections),
+        current_script_hash = _script_hash(script)
+        current_audio_duration_ms = (
+            int(audio.duration_ms)
+            if audio.duration_ms
+            else None
+        )
+
+        existing_sections = load_video_sections(
+            content_id,
+            language,
+            db,
+        )
+
+        existing_complete = bool(existing_sections) and all(
+            (beat.get("media_url") or "").startswith("cache/")
+            for beat in existing_sections
+        )
+
+        if existing_complete:
+            stored_script_hash = (
+                existing_sections[0].get("source_script_sha256")
+                or ""
             )
-            beats_by_lang[language] = existing_sections
-            continue
+            stored_audio_duration_ms = (
+                existing_sections[0].get("source_audio_duration_ms")
+                or 0
+            )
+
+            script_stale = (
+                current_script_hash is not None
+                and bool(stored_script_hash)
+                and stored_script_hash != current_script_hash
+            )
+            audio_stale = (
+                current_audio_duration_ms is not None
+                and bool(stored_audio_duration_ms)
+                and stored_audio_duration_ms
+                != current_audio_duration_ms
+            )
+
+            if script_stale or audio_stale:
+                logger.warning(
+                    "CHILD_SHORT_VISUALS_STALE "
+                    "content_id=%s language=%s "
+                    "script_stale=%s audio_stale=%s "
+                    "stored_script=%s current_script=%s "
+                    "stored_audio_ms=%s current_audio_ms=%s "
+                    "— discarding persisted child visuals and regenerating",
+                    content_id,
+                    language,
+                    script_stale,
+                    audio_stale,
+                    stored_script_hash[:12],
+                    (
+                        current_script_hash[:12]
+                        if current_script_hash
+                        else ""
+                    ),
+                    stored_audio_duration_ms,
+                    current_audio_duration_ms,
+                )
+            else:
+                needs_backfill = False
+
+                if (
+                    current_script_hash is not None
+                    and not stored_script_hash
+                ):
+                    _tag_beats_with_script_hash(
+                        existing_sections,
+                        current_script_hash,
+                    )
+                    needs_backfill = True
+
+                if (
+                    current_audio_duration_ms is not None
+                    and not stored_audio_duration_ms
+                ):
+                    _tag_beats_with_audio_duration(
+                        existing_sections,
+                        current_audio_duration_ms,
+                    )
+                    needs_backfill = True
+
+                if needs_backfill:
+                    _save_video_sections(
+                        content_id,
+                        language,
+                        existing_sections,
+                        db,
+                    )
+                    db.commit()
+
+                    logger.info(
+                        "CHILD_SHORT_VISUALS_FINGERPRINT_BACKFILLED "
+                        "content_id=%s language=%s beats=%d",
+                        content_id,
+                        language,
+                        len(existing_sections),
+                    )
+
+                logger.info(
+                    "CHILD_SHORT_VISUALS_REUSED "
+                    "content_id=%s language=%s beats=%d "
+                    "— persisted rows complete and fingerprints fresh",
+                    content_id,
+                    language,
+                    len(existing_sections),
+                )
+
+                beats_by_lang[language] = existing_sections
+                continue
 
         logger.info(
             "CHILD_SHORT_VISUALS_START content_id=%s parent_content_id=%s language=%s",
@@ -898,6 +1007,8 @@ def _run_child_short_visuals(
             db=db,
             visual_style=visual_style,
             image_style=image_style,
+            channel_niche=channel.niche or "",
+            channel_tone=channel.tone or "",
         )
         if not beats:
             logger.error(
@@ -940,9 +1051,29 @@ def _run_child_short_visuals(
         # were "reused" from the parent's landscape cache — since a Short
         # must never render a landscape image; see
         # generate_pending_beat_images()'s docstring.
-        beats = generate_pending_beat_images(beats, str(content_id))
+        beats = generate_pending_beat_images(
+            beats,
+            str(content_id),
+        )
 
-        _save_video_sections(content_id, language, beats, db)
+        if current_script_hash is not None:
+            _tag_beats_with_script_hash(
+                beats,
+                current_script_hash,
+            )
+
+        if current_audio_duration_ms is not None:
+            _tag_beats_with_audio_duration(
+                beats,
+                current_audio_duration_ms,
+            )
+
+        _save_video_sections(
+            content_id,
+            language,
+            beats,
+            db,
+        )
         db.commit()
         save_beat_review_metadata(content_id, language, beats)
         logger.info(

@@ -220,6 +220,24 @@ _CHILD_REMAP_HINT_MISSING_FAIL_RATIO = 0.3
 _SHORT_IMAGE_WIDTH = 1080
 _SHORT_IMAGE_HEIGHT = 1920
 
+# Sanity range for the RAW suggested_duration_sec value Claude returns per
+# beat_intensity tier — mirrors _STORYBOARD_SYSTEM_PROMPT's own "Dynamic beat
+# duration" tiers (high 1.0-2.5, medium 2.5-4.0, low 3.0-6.0) verbatim.
+# Deliberately separate from INTENSITY_FLOOR_MS just below, which floors the
+# ACTUAL post-timestamp-mapping beat span (a different concern — that floor
+# exists to prevent zero-width spans after Whisper alignment, not to bound
+# what Claude is allowed to suggest before mapping ever runs).
+_INTENSITY_MIN_DURATION_SEC: dict[str, float] = {
+    "high": 1.0,
+    "medium": 2.5,
+    "low": 3.0,
+}
+_INTENSITY_MAX_DURATION_SEC: dict[str, float] = {
+    "high": 2.5,
+    "medium": 4.0,
+    "low": 6.0,
+}
+
 # ── Short episode storyboard remap (secondary model) ───────────────────────────
 
 # Every child Short beat's image is regenerated fresh at portrait size — the
@@ -1571,8 +1589,29 @@ def _build_beat_section(beat: dict, index: int, start_ms: int, end_ms: int, scri
 
     intensity = _safe_enum(beat.get("beat_intensity"), {"high", "medium", "low"}, "medium")
     raw_suggested = beat.get("suggested_duration_sec")
-    suggested_sec: float = float(raw_suggested) if raw_suggested is not None else 3.0
+    suggested_sec = _normalize_suggested_duration_sec(
+        raw_suggested,
+        intensity,
+    )
 
+    try:
+        raw_suggested_sec = float(raw_suggested)
+    except (TypeError, ValueError):
+        raw_suggested_sec = None
+
+    if (
+        raw_suggested_sec is not None
+        and math.isfinite(raw_suggested_sec)
+        and raw_suggested_sec != suggested_sec
+    ):
+        logger.warning(
+            "STORYBOARD_DURATION_OUT_OF_TIER "
+            "beat_order=%s intensity=%s raw=%.2f normalized=%.2f",
+            beat_order,
+            intensity,
+            raw_suggested_sec,
+            suggested_sec,
+        )
     actual_sec = max(end_ms - start_ms, 0) / 1000
     if intensity == "high" and actual_sec > 3.0:
         logger.debug(
@@ -1663,6 +1702,39 @@ def _build_beat_section(beat: dict, index: int, start_ms: int, end_ms: int, scri
         "start_hint":           str(beat.get("start_hint", "")),
         "end_hint":             str(beat.get("end_hint", "")),
     }
+
+
+def _normalize_suggested_duration_sec(
+    value: object,
+    beat_intensity: str,
+) -> float:
+    """Clamp a beat's raw ``suggested_duration_sec`` into its intensity
+    tier's sanity range (see ``_INTENSITY_MIN_DURATION_SEC``/
+    ``_INTENSITY_MAX_DURATION_SEC``).
+
+    The storyboard prompt states this range as a "hard constraint," but nothing
+    upstream enforces it — a raw value from Claude that violates its own
+    stated tier is not just a cosmetic prompt miss: this value directly feeds
+    the expected-position accumulator (hint-search proximity window) and the
+    anchor-span-sanity gap threshold, both load-bearing for the frozen-frame
+    guards. Missing/non-numeric/non-finite input falls back to the tier's
+    midpoint, matching the same "Python enforces, never trusts Claude's
+    values blindly" convention already applied to every enum field in
+    ``_build_beat_section()``.
+    """
+    minimum = _INTENSITY_MIN_DURATION_SEC.get(beat_intensity, 2.5)
+    maximum = _INTENSITY_MAX_DURATION_SEC.get(beat_intensity, 4.0)
+    default = (minimum + maximum) / 2.0
+
+    try:
+        duration = float(value)
+    except (TypeError, ValueError):
+        return default
+
+    if not math.isfinite(duration):
+        return default
+
+    return max(minimum, min(duration, maximum))
 
 
 def _apply_short_visual_hold_cap(
@@ -1872,6 +1944,8 @@ def remap_beats_for_short(
     db: Session,
     visual_style: str = "",
     image_style: str = "",
+    channel_niche: str = "",
+    channel_tone: str = "",
 ) -> list[dict]:
     """Remap parent long-video beats to a standalone Short episode narration.
 
@@ -1964,14 +2038,15 @@ def remap_beats_for_short(
     ]
 
     # 3. Secondary-model remap call
-    direction_lines = ""
-    if visual_style or image_style:
-        direction_lines = (
-            f"Global visual direction: {visual_style or 'story_driven'}\n"
-            f"Global image style: {image_style or 'photorealistic'}\n\n"
-        )
+    context_lines = (
+        f"Channel niche: {channel_niche or 'general'}\n"
+        f"Channel tone: {channel_tone or 'neutral'}\n"
+        f"Global visual direction: {visual_style or 'story_driven'}\n"
+        f"Global image style: {image_style or 'photorealistic'}\n\n"
+    )
+
     user_message = (
-        direction_lines
+        context_lines
         + f"Short narration ({short_audio_file.duration_ms}ms):\n"
         f"{short_voice_script}\n\n"
         f"Parent beat index ({len(beat_index)} beats):\n"

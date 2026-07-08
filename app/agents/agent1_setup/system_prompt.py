@@ -189,7 +189,7 @@ def suggest_publish_timing(
         "Return the optimal publish schedule JSON."
     )
     data = call_claude_structured(
-        task="channel_suggestion",
+        task="publish_timing_suggestion",
         system_prompt=_TIMING_SYSTEM_PROMPT,
         user_message=user_message,
         schema_name="publish_timing_suggestion",
@@ -231,6 +231,15 @@ _VISUAL_STYLE_VALUES = [
 _IMAGE_STYLE_VALUES = [
     "photorealistic", "cinematic_realism", "dark_realistic", "vintage_film",
     "digital_art", "oil_painting", "watercolor", "anime",
+]
+# Mirrors app/ui/src/constants.js TONES exactly, same reason as the two style
+# lists above: recommended_tone/editable_config.tone were previously free
+# strings, the one field in this schema NOT enum-constrained to its UI
+# dropdown's preset list despite carrying the identical mismatch risk
+# visual_style/image_style were already fixed for.
+_TONE_VALUES = [
+    "suspenseful", "ominous", "dramatic", "conversational", "documentary",
+    "educational", "entertaining", "investigative", "humorous", "inspirational",
 ]
 
 _RESEARCH_IDEAS_SYSTEM_PROMPT = """\
@@ -311,7 +320,7 @@ _RESEARCH_IDEAS_SCHEMA = {
                 "recommended_output_mode": {"type": "string", "enum": ["youtube_and_shorts", "youtube_long_only", "shorts_only"]},
                 "recommended_visual_style": {"type": "string", "enum": _VISUAL_STYLE_VALUES},
                 "recommended_image_style": {"type": "string", "enum": _IMAGE_STYLE_VALUES},
-                "recommended_tone": {"type": "string"},
+                "recommended_tone": {"type": "string", "enum": _TONE_VALUES},
                 "recommended_target_languages": {"type": "array", "items": {"type": "string"}},
                 "recommended_platforms": {
                     "type": "array",
@@ -328,7 +337,7 @@ _RESEARCH_IDEAS_SCHEMA = {
                         "channel_name": {"type": "string"},
                         "description": {"type": "string"},
                         "niche": {"type": "string"},
-                        "tone": {"type": "string"},
+                        "tone": {"type": "string", "enum": _TONE_VALUES},
                         "script_source": {"type": "string", "enum": ["reddit", "ai_generated"]},
                         "output_mode": {"type": "string", "enum": ["youtube_and_shorts", "youtube_long_only", "shorts_only"]},
                         "visual_style": {"type": "string", "enum": _VISUAL_STYLE_VALUES},

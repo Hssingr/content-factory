@@ -493,7 +493,7 @@ _STORY_BLUEPRINT_SCHEMA: dict = {
     "properties": {
         "hook":                   {"type": "string"},
         "central_question":       {"type": "string"},
-        "major_turns":            {"type": "array", "items": {"type": "string"}, "minItems": 2},
+        "major_turns":            {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 5},
         "final_payoff":           {"type": "string"},
         "comment_trigger":        {"type": "string"},
         "midpoint_retention_trap": {"type": "string"},
@@ -504,6 +504,7 @@ _STORY_BLUEPRINT_SCHEMA: dict = {
         "hook", "central_question", "major_turns", "final_payoff", "midpoint_retention_trap",
         "comment_trigger", "suggested_section_count", "suggested_title",
     ],
+    "additionalProperties": False,
 }
 
 
@@ -754,9 +755,11 @@ _SECTION_GENERATION_SCHEMA: dict = {
                 },
             },
             "required": ["section_goal", "primary_visual_focus", "avoid_repeating"],
+            "additionalProperties": False,
         },
     },
     "required": ["script_text", "summary", "reveals", "open_questions", "suggests_outro", "visual_intent"],
+    "additionalProperties": False,
 }
 
 
@@ -1123,9 +1126,11 @@ _SINGLE_STORY_SCORING_SCHEMA: dict = {
                 for dim in _SCORING_DIMENSIONS
             },
             "required": _SCORING_DIMENSIONS,
+            "additionalProperties": False,
         }
     },
     "required": ["scores"],
+    "additionalProperties": False,
 }
 
 _SINGLE_STORY_SCORING_SYSTEM_PROMPT = """\
@@ -1272,12 +1277,14 @@ _SHORTS_PLAN_SCHEMA: dict = {
                     "part", "goal", "opening_hook",
                     "main_content_summary", "main_reveal", "cliffhanger",
                 ],
+                "additionalProperties": False,
             },
             "minItems": 3,
             "maxItems": 5,
         },
     },
     "required": ["total_parts", "parts"],
+    "additionalProperties": False,
 }
 
 
@@ -1306,7 +1313,7 @@ def generate_shorts_plan(voice_script: str, blueprint: dict, channel) -> dict:
         f"Channel niche: {channel.niche}\n"
         f"Channel tone: {channel.tone}\n\n"
         f"Blueprint:\n{json.dumps(blueprint, ensure_ascii=False)}\n\n"
-        f"Long-form voice script:\n{voice_script[:8000]}"
+        f"Long-form voice script:\n{voice_script}"
     )
     result = call_claude_structured(
         task="shorts_planner",
@@ -1388,6 +1395,9 @@ Rules:
   paraphrase, that is a signal to find a different angle into the same fact — not
   a reason to copy it. Write this part's narration as if you had never read the
   long-form script word-for-word, only learned the underlying facts from it.
+- Avoid generic clickbait filler and canned suspense phrases.
+  Do not use stock lines such as "you won't believe", "but here's the thing",
+  "little did they know", or similar formulaic hooks.
 
 Return ONLY valid JSON. No markdown. No code fence. No extra keys.
 {"title": "Part N title (≤60 chars, TikTok-optimized)", "voice_script": "Full flat narration text"}\

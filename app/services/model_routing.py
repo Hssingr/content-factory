@@ -44,6 +44,11 @@ MODEL_ROUTING: dict[str, str] = {
     "story_research":          PRIMARY_MODEL,  # uses web_search tool — secondary model does not support it by default
     "channel_suggestion":      PRIMARY_MODEL,  # Agent 1 UX — poor suggestions harm onboarding quality
     "channel_research":        PRIMARY_MODEL,  # Agent 1 market-research estimate; nuanced strategy output
+    "publish_timing_suggestion": PRIMARY_MODEL,  # Agent 1 UX — split from channel_suggestion (prompt
+                                                  # engineering audit §2.7) so cost/latency telemetry for
+                                                  # this structured scheduling call doesn't blur with
+                                                  # suggest_field()'s free-text single-value calls; same
+                                                  # slot, no behavior change
     "story_blueprint":         PRIMARY_MODEL,  # Narrative skeleton — foundation for all sections
     "section_generation":      PRIMARY_MODEL,  # Creative writing per section
     "short_script":            PRIMARY_MODEL,  # Standalone short planning: TikTok-optimised episode script

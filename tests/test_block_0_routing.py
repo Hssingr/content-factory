@@ -34,8 +34,8 @@ class TestResolveModel(unittest.TestCase):
             for task in (
                 "native_adaptation", "storyboard",
                 "story_gate_scoring", "story_research",
-                "channel_suggestion", "channel_research", "story_blueprint",
-                "section_generation", "short_script",
+                "channel_suggestion", "channel_research", "publish_timing_suggestion",
+                "story_blueprint", "section_generation", "short_script",
             ):
                 with self.subTest(task=task):
                     self.assertEqual(self._resolve(task), primary)

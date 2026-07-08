@@ -30,6 +30,7 @@ from app.services.script_checks import (
     normalize_tts_chars,
     detect_generic_documentary_phrases,
     _SECTION_NUM_RE,
+    _word_count,
 )
 
 logger = logging.getLogger(__name__)
@@ -1158,7 +1159,7 @@ def check_narrative_completeness(
 ) -> list[str]:
     """Pure Python completeness check against the story blueprint.
 
-    Four checks (no API call):
+    Five checks (no API call):
     1. INTRO hook ≤15 words and no forbidden opener (via check_hook_quality).
     2. All major_turns covered across the full script (60% token overlap).
        Turns whose index is in ``already_covered`` are skipped — section
@@ -1166,6 +1167,11 @@ def check_narrative_completeness(
        which is more reliable than reassessing from the assembled text.
     3. final_payoff referenced in OUTRO (50% token overlap).
     4. comment_trigger present as last OUTRO sentence (50% token overlap).
+    5. comment_trigger's own shape (≤20 words, ends with "?") — the blueprint
+       prompt states both constraints, but until this check nothing verified
+       either directly (check 4 above only compares the OUTRO's actual last
+       sentence against comment_trigger, which would still pass a 40-word,
+       question-mark-free trigger as long as the OUTRO echoed it closely).
 
     Args:
         voice_script:    Fully assembled voice script with [INTRO]/[SECTION N]/[OUTRO] markers.
@@ -1231,6 +1237,17 @@ def check_narrative_completeness(
                 overlap = len(trigger_tokens & last_tokens) / len(trigger_tokens)
                 if overlap < 0.5:
                     issues.append("comment_trigger not found as last sentence of OUTRO")
+
+    # ── 5. comment_trigger shape (≤20 words, ends with "?") ──────────────────
+    if comment_trigger:
+        trigger_word_count = _word_count(comment_trigger)
+        if trigger_word_count > 20:
+            issues.append(
+                f"comment_trigger too long ({trigger_word_count} words, max 20): "
+                f"{comment_trigger!r}"
+            )
+        if not comment_trigger.strip().endswith("?"):
+            issues.append(f"comment_trigger does not end with a question mark: {comment_trigger!r}")
 
     return issues
 

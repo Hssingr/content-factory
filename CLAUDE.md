@@ -606,8 +606,13 @@ Current model tier (roadmap 4.2 / audit S-2, exec-6):
   `PRIMARY_MODEL`-tier creative tasks (`script_generation`,
   `native_adaptation`, `storyboard`, `story_blueprint`, `section_generation`,
   `short_script`, plus `story_research`/`channel_suggestion`/
-  `channel_research`/`story_gate_scoring`/`revision`) resolve to the
-  configured primary model.
+  `channel_research`/`publish_timing_suggestion`/`story_gate_scoring`)
+  resolve to the configured primary model. `publish_timing_suggestion`
+  (prompt engineering audit §2.7) is `suggest_publish_timing()`'s own task
+  key, split out of the shared `channel_suggestion` key it previously reused
+  — same `PRIMARY_MODEL` slot, purely so its cost/latency logs no longer
+  blur with `suggest_field()`'s free-text single-value calls (which keep
+  `channel_suggestion`).
 - `model_routing.DEFAULT_PRIMARY_MODEL`/`DEFAULT_SECONDARY_MODEL` are kept in
   sync with `config.py`'s defaults as a documentation reference, but are not
   themselves read by `resolve_model()`/`_configured_model()` — those always
@@ -1822,6 +1827,11 @@ Rules:
 - Python validates required fields.
 - Major turns drive section progression.
 - Business logic remains in Python.
+- `major_turns` schema carries `"maxItems": 5` (prompt engineering audit
+  §2.6), matching the prompt's own stated "2-5 narrative turns" rule
+  structurally instead of leaving the ceiling to the model's self-discipline
+  — `suggested_section_count` was already clamped to `[2, 5]` in Python, but
+  `major_turns` itself was not.
 
 `midpoint_retention_trap` (roadmap 4.3 / audit S-3, §6): one concrete reveal
 or counterintuitive fact, distinct from `final_payoff`, placed at roughly the
@@ -1972,6 +1982,15 @@ be — a false negative by design.
   (Claude opens on a roster sentence) and confirming the assembled INTRO
   opens with the blueprint hook instead, with exactly one Claude call (no
   retry) in every case including the failing-hook case.
+- `check_narrative_completeness()`'s comment_trigger check (prompt
+  engineering audit §2.7) gained a fifth, shape-only check alongside its
+  existing presence check: `comment_trigger` must be ≤20 words and end with
+  `?` — both stated as rules in `_STORY_BLUEPRINT_SYSTEM_PROMPT` but
+  previously unverified by anything (the pre-existing check only compared
+  `comment_trigger` against the OUTRO's actual last sentence via 50% token
+  overlap, which tolerates a 40-word, question-mark-free trigger as long as
+  the OUTRO echoes it closely). Telemetry only, same as every other finding
+  in this function — no retry, no regeneration.
 
 Rules:
 
@@ -2306,6 +2325,14 @@ Rules:
   P1-9; see §9.3's `generate_multilingual_scripts` entry for the full
   threading rationale).
 - No child with MAJOR deterministic script issues may be marked ready.
+- `generate_shorts_plan()` receives the full parent `voice_script`
+  untruncated (prompt engineering audit §2.1) — the former `[:8000]` slice
+  was the same truncation bug class already fixed for
+  `generate_short_episode_script()` below (a script at the 1,750-word
+  `check_maximum_length()` ceiling runs ~9,600-10,500 chars), and it hit
+  the *planner* earlier in the pipeline: the part split, `main_reveal`, and
+  `cliffhanger` for parts 4-5 of a 5-part plan were being decided without
+  the planner ever seeing the story's actual ending.
 
 Structural checks and Parent/Child Overlap Detector — single generation call,
 telemetry only (Elimination Mandate, roadmap
@@ -3242,6 +3269,28 @@ Rules:
 - Allow fallback only when explicitly intended.
 - Log fallback rate.
 
+`suggested_duration_sec` input sanitization (prompt engineering audit §2.2 —
+protects the inputs the three guards below depend on):
+
+- The storyboard prompt states `suggested_duration_sec` must fall within its
+  `beat_intensity` tier as a "hard constraint" (high 1.0-2.5s, medium
+  2.5-4.0s, low 3.0-6.0s), but nothing enforced it before this fix — and this
+  value is not cosmetic: it directly feeds the expected-position accumulator
+  the hint-search proximity window compares matches against, and the
+  anchor-span-sanity gap threshold, both below. An out-of-range value from
+  Claude silently skewed the accuracy of both guards.
+- `storyboard._normalize_suggested_duration_sec(value, beat_intensity)`
+  clamps the raw value into `_INTENSITY_MIN_DURATION_SEC`/
+  `_INTENSITY_MAX_DURATION_SEC` (mirroring the prompt's own tier bounds
+  verbatim — deliberately separate from `INTENSITY_FLOOR_MS`, which floors
+  the actual POST-timestamp-mapping beat span, a different concern). Missing/
+  non-numeric/non-finite input falls back to the tier's midpoint. Applied in
+  `_build_beat_section()`, the same "Python enforces, never trusts Claude's
+  values blindly" convention already applied to every enum field there.
+- A clamp firing is logged as `STORYBOARD_DURATION_OUT_OF_TIER`
+  (beat_order/intensity/raw/normalized) — not a failure, just visibility
+  into how often Claude's raw values disagree with its own stated rule.
+
 Hint-search proximity window (frozen-frame guard):
 
 - Every beat carries an expected start position: the last real anchor's
@@ -3746,11 +3795,26 @@ Rules:
 - `visual_style`/`image_style` are threaded into the remap call (orchestrator →
   `remap_beats_for_short()`) as "Global visual direction/Global image style"
   lines so newly written child prompts match the channel look.
-- Child visual idempotency (audit §3.6): before remapping a language,
-  `_run_child_short_visuals()` reuses complete persisted `VideoSection` rows
-  (every beat has a local `cache/` image) instead of re-running the remap
-  call and regenerating every portrait — logged
-  `CHILD_SHORT_VISUALS_REUSED`.
+  `channel_niche`/`channel_tone` are threaded the same way (prompt
+  engineering audit §2.3) — every other creative prompt in the pipeline
+  (blueprint, section generation, short episode script, parent storyboard)
+  already received niche/tone; the remap call, which writes brand-new Flux
+  prompts for any `match_score < 70` phrase, did not.
+- Child visual idempotency (audit §3.6, extended by a stale-visuals guard —
+  prompt engineering audit follow-up): before remapping a language,
+  `_run_child_short_visuals()` checks whether complete persisted
+  `VideoSection` rows exist (every beat has a local `cache/` image) *and*
+  whether their stamped `source_script_sha256`/`source_audio_duration_ms`
+  fingerprints (same `_beat_extras()` persistence convention the parent's
+  own stale-visuals guard uses, §11.4 `_run_parent_visuals`) still match the
+  current child script/audio. Fresh + complete → reuse without re-running
+  remap or regenerating any portrait, logged `CHILD_SHORT_VISUALS_REUSED`.
+  Stale (script or audio changed since these beats were persisted) →
+  discard and regenerate, logged `CHILD_SHORT_VISUALS_STALE`. Rows that
+  predate this guard (no stored fingerprint) are stamped and re-saved
+  unchanged on the next run, logged
+  `CHILD_SHORT_VISUALS_FINGERPRINT_BACKFILLED` — no regeneration forced for
+  pre-existing content, matching the parent guard's own backfill contract.
 - The `short_storyboard_remap` schema includes `new_image_prompt` (roadmap 3.4 / audit V-3). For assignments with `match_score < 70`, it must be a complete portrait-safe Flux prompt for a new child Short image. `remap_beats_for_short()` uses that prompt for below-threshold beats and fails the remap with `CHILD_REMAP_NEW_PROMPT_MISSING` if it is empty, rather than inheriting a rejected parent prompt or falling back to raw narration. At-or-above-threshold beats inherit the matched parent beat's prompt; a high-score assignment whose parent beat was excluded from the candidate pool (legacy text-card / missing media) uses `new_image_prompt` when supplied, otherwise a deterministic physical fallback prompt.
 - Child remap MAJOR handling is telemetry only (Elimination Mandate D1.5, `code_report/forensic_output_audit_borrasca_run.md` — supersedes the former roadmap 3.5 / audit G-4.3 deterministic remediation primitive): after `validate_storyboard()` finds child MAJORs, `_run_child_short_visuals()` logs them and proceeds with the beats unchanged. The deleted primitive (`remediate_child_major_storyboard_issues()`) used to strip forbidden/readable-text language and regenerate `flux_prompt` from `visual_intent`/environment/motif for `forbidden_flux_word`/`ai_text_rendering_requested` MAJORs — removed because MAJOR findings never blocked the pipeline either way, so the repair pass added complexity without a provable quality gain. No Claude, Flux, or internal remap retry is invoked (unchanged).
 - Log reuse stats.
@@ -5532,6 +5596,12 @@ Short episode scripts must:
   present tense, direct address, contractions, read-aloud test
 - follow the same channel-configured `narration_pov` as the parent long-form
   script (roadmap 4a / audit P1-9)
+- avoid generic clickbait filler and canned suspense phrases (prompt
+  engineering audit §2.5) — a short, example-anchored instruction (2-4
+  stock-phrase examples), not a long banned-word list: the long-form section
+  prompt's own 15-entry banned-phrase list was deliberately not ported over
+  verbatim, to avoid re-loading a prompt this codebase just finished
+  trimming down (§9.3's section-prompt subtraction, v4.7)
 
 Short episode visual remap prompts must:
 
@@ -5690,6 +5760,9 @@ DUPLICATE_PROMPT_REPAIRED
 PARENT_VISUALS_STALE_SCRIPT_HASH
 PARENT_VISUALS_STALE_AUDIO_DURATION
 STALE_VISUALS_CHECK_BACKFILL
+CHILD_SHORT_VISUALS_STALE
+CHILD_SHORT_VISUALS_FINGERPRINT_BACKFILLED
+STORYBOARD_DURATION_OUT_OF_TIER
 TTS_SECTION_DELIVERY_SELECTED
 TTS_SECTION_DELIVERY_FALLBACK
 RESUME_TRANSCRIPT_REUSED

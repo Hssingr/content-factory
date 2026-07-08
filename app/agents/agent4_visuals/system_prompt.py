@@ -131,6 +131,12 @@ PROMPT_VERSION = "4.5"  # v4.5: fresh full-system audit §2.2 — storyboard pro
                         #        — replaced with "documentary photography style". No other
                         #        prompt text changed; _STORYBOARD_SYSTEM_PROMPT (below) was
                         #        already compliant. Phase 12.6.
+                        #        (Historical note, prompt engineering audit §2.7: the legacy
+                        #        section-splitter fallback flow these two entries describe —
+                        #        including _SPLITTER_SYSTEM_PROMPT itself — was fully removed
+                        #        by roadmap 6.3/audit §7; it no longer exists anywhere in this
+                        #        codebase. This entry is kept as accurate history of what v3.3/
+                        #        v3.4 changed at the time, not a pointer to current code.)
                         # v3.2: Added hard rules forbidding literal quotation marks in any
                         #        field value and forbidding 'beats'/'global_notes' as a
                         #        JSON-encoded string — a real, recurring production failure
@@ -565,6 +571,7 @@ _BEAT_SCHEMA: dict = {
         "effect", "color_grade", "transition_to_next", "motif",
         "beat_intensity", "suggested_duration_sec",
     ],
+    "additionalProperties": False,
 }
 
 _STORYBOARD_BATCH_SCHEMA: dict = {
@@ -578,8 +585,12 @@ _STORYBOARD_BATCH_SCHEMA: dict = {
     # (v7.1 — dead administrative weight the model paid tokens to generate);
     # `overall_style` is kept as an optional one-phrase diagnostic that feeds a
     # single log line. _check_shape() still defaults all three in place so a
-    # response carrying (or missing) any of them is tolerated.
+    # response carrying (or missing) any of them is tolerated — additionalProperties
+    # below is guidance to steer the model away from re-generating the retired
+    # fields (the exact token waste v7.1 removed them to stop), not a runtime
+    # rejection: _check_shape() never errors on an unexpected extra key.
     "required": ["beats"],
+    "additionalProperties": False,
 }
 
 
