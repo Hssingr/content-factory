@@ -643,9 +643,16 @@ Content quality rules — driven by channel configuration, not hardcoded genre:
     "in ways nobody could have imagined", "a shocking revelation", "brace yourself".
 
 Narrative progression rules — apply to every section:
-  - Prior summaries and reveals listed in the user message are FORBIDDEN MATERIAL.
-    Do not restate, rephrase, or echo them. The ONLY exception: referencing a prior fact
-    to add a direct new consequence ("X happened — which meant Y was now inevitable").
+  - Prior summaries, reveals, and full prior section text listed in the user message
+    are FORBIDDEN MATERIAL. Do not restate, rephrase, or echo them. The ONLY exception:
+    referencing a prior fact to add a direct new consequence ("X happened — which meant
+    Y was now inevitable").
+  - The prior sections' full text is LOCKED CONTINUITY. Every fact, character fate,
+    relationship, and specific claim already stated there is fixed for the rest of the
+    script — never contradict or reverse it, even implicitly. Example: if a prior
+    section states a character was killed, no later section may show or imply that
+    character was instead rescued or survived. Not restating it and not contradicting
+    it are two different rules — both apply.
   - Never write meta-commentary of any kind: "all major turns have been covered",
     "as we established", "as mentioned earlier", "to recap", "in summary", "in conclusion",
     "this brings us to", "building on what we know", "having covered X".
@@ -780,6 +787,7 @@ def generate_section(
     image_style: str = "",
     narration_pov: str = "third_person",
     midpoint_retention_trap: str | None = None,
+    prior_full_text: str = "",
 ) -> dict:
     """Generate a single narration section guided by the story blueprint.
 
@@ -806,6 +814,16 @@ def generate_section(
                                  Injected as a MUST-deliver-now clause. None for every other
                                  section — this is a targeted, one-section directive on top
                                  of the passive full-blueprint JSON already in every call.
+        prior_full_text:         Assembled script_text of every section generated so far
+                                 (INTRO + completed body sections), marker-formatted the
+                                 same way as the final assembled script. "" for INTRO.
+                                 Additive to prior_sections_summary — gives Claude the
+                                 literal prior wording, not just a compressed summary, so
+                                 it cannot contradict a fact/fate a prior section already
+                                 committed to (a real production script had one section
+                                 call the father "his own daughter's killer" and a later
+                                 section describe the daughter as alive/rescued — the
+                                 summary never carried the specific wording forward).
 
     Returns:
         Dict with script_text, summary, reveals, open_questions, suggests_outro, visual_intent.
@@ -834,6 +852,8 @@ def generate_section(
         f"Script format: {script_format}\n\n"
         f"Blueprint:\n{blueprint_json}\n\n"
         f"Prior sections summary:\n{prior_json}\n\n"
+        f"Prior sections (full text — established continuity; do not contradict any "
+        f"fact, character state, or fate stated here):\n{prior_full_text}\n\n"
         f"Visual concepts already used (do not repeat):\n{avoid_json}\n\n"
         f"Story source (for fact-grounding):\n{story.body[:MAX_SOURCE_EXCERPT_CHARS]}\n\n"
         f"Now generate: {label}"
@@ -853,7 +873,7 @@ def generate_section(
             f"midpoint_retention_trap now, as a reveal or counterintuitive fact that "
             f"recontextualizes what the viewer thought they knew so far:\n{midpoint_retention_trap}"
         )
-    return call_claude_structured(
+    result = call_claude_structured(
         task="section_generation",
         system_prompt=system_prompt,
         user_message=user_message,
@@ -861,6 +881,43 @@ def generate_section(
         input_schema=_SECTION_GENERATION_SCHEMA,
         max_tokens=3072,
     )
+    _coerce_section_array_fields(result, label)
+    return result
+
+
+def _coerce_section_array_fields(result: dict, label: str) -> None:
+    """Coerce declared-array fields that Claude returned as a bare string.
+
+    Forced tool-use is not a hard type guarantee — a real run returned
+    "reveals" as a plain string instead of the schema's declared array,
+    which crashed several functions downstream (_payoff_reached() tried to
+    concatenate it with a list). Coerce rather than drop: a bare string is
+    a degenerate single-item array, not garbage data.
+    """
+    for key in ("reveals", "open_questions"):
+        value = result.get(key)
+        if isinstance(value, str):
+            logger.warning(
+                "generate_section: %s field '%s' returned as str, not array — "
+                "coercing to a single-item list",
+                label, key,
+            )
+            result[key] = [value] if value else []
+        elif value is None:
+            result[key] = []
+
+    vi = result.get("visual_intent")
+    if isinstance(vi, dict):
+        avoid = vi.get("avoid_repeating")
+        if isinstance(avoid, str):
+            logger.warning(
+                "generate_section: %s field 'visual_intent.avoid_repeating' returned "
+                "as str, not array — coercing to a single-item list",
+                label,
+            )
+            vi["avoid_repeating"] = [avoid] if avoid else []
+        elif avoid is None:
+            vi["avoid_repeating"] = []
 
 
 # ── Global Validation — REMOVED (Elimination Mandate, D1.2) ─────────────────
@@ -1291,9 +1348,9 @@ _SHORTS_PLAN_SCHEMA: dict = {
 def generate_shorts_plan(voice_script: str, blueprint: dict, channel) -> dict:
     """Plan 3–5 standalone TikTok episodes from a long-form voice script.
 
-    Uses a Haiku structured call — the output is validated by Python for the
-    total_parts range constraint (3 ≤ n ≤ 5). Callers should retry once if the
-    constraint fails before giving up.
+    Uses a SECONDARY_MODEL structured call — the output is validated by Python
+    for the total_parts range constraint (3 ≤ n ≤ 5). Callers should retry once
+    if the constraint fails before giving up.
 
     Args:
         voice_script: Fully assembled long-form voice script (with markers).
@@ -1321,7 +1378,17 @@ def generate_shorts_plan(voice_script: str, blueprint: dict, channel) -> dict:
         user_message=user_message,
         schema_name="shorts_plan",
         input_schema=_SHORTS_PLAN_SCHEMA,
-        max_tokens=1024,
+        # 1024 was observed truncating in production: a real run hit
+        # output_tokens=1024 exactly on both attempts, and the truncated tool
+        # JSON came back with parts=[] both times — a 5-part plan (max
+        # schema size) with 6 text fields per part plus tool-call overhead
+        # does not reliably fit in 1024. The prior retry-on-ValueError loop
+        # was retrying the identical request into the identical ceiling, so
+        # it failed deterministically twice, not just unluckily. 4096 gives
+        # real headroom (same order of magnitude as generate_section()'s
+        # 3072 for a single section, here covering up to 5 short sections'
+        # worth of small fields).
+        max_tokens=4096,
     )
     total = result.get("total_parts")
     if not isinstance(total, int) or not (3 <= total <= 5):

@@ -848,11 +848,14 @@ def _log_section_input(
     label: str,
     prior_sections_summary: list[dict],
     visual_intent_accumulator: dict,
+    prior_full_text: str = "",
 ) -> None:
     logger.debug(
-        "SECTION_INPUT label=%s prior_count=%d avoid_count=%d",
+        "SECTION_INPUT label=%s prior_count=%d avoid_count=%d "
+        "prior_full_text_chars=%d prior_full_text_words=%d",
         label, len(prior_sections_summary),
         len(visual_intent_accumulator.get("avoid_repeating", [])),
+        len(prior_full_text), len(prior_full_text.split()),
     )
     for prior_section in prior_sections_summary[-3:]:
         logger.debug(
@@ -882,6 +885,7 @@ def _call_section_generation(
     image_style: str = "",
     narration_pov: str = "third_person",
     midpoint_retention_trap: str | None = None,
+    prior_full_text: str = "",
 ) -> dict | None:
     try:
         return generate_section(
@@ -901,6 +905,7 @@ def _call_section_generation(
             image_style=image_style,
             narration_pov=narration_pov,
             midpoint_retention_trap=midpoint_retention_trap,
+            prior_full_text=prior_full_text,
         )
     except Exception as exc:
         logger.error("Section %s generation error (attempt %d): %s", label, attempt, exc)
@@ -1003,6 +1008,33 @@ def _log_section_rhythm_issues(label: str, rhythm_issues: list[dict]) -> None:
         )
 
 
+_HOOK_PARAPHRASE_OVERLAP_THRESHOLD = 0.7
+
+
+def _opens_with_hook_paraphrase(script_text: str, hook: str) -> bool:
+    """True when the generated opening sentence already covers the hook's
+    content, even when it isn't a verbatim prefix match.
+
+    A real production run showed Claude's own INTRO opening was a near-exact
+    paraphrase of the blueprint hook ("...planning one night's theft" vs. the
+    generated "...planning to steal from her family for one single night") —
+    different wording, same content. The verbatim startswith() check in
+    _apply_hook_by_construction() didn't recognize this, so the hook got
+    prepended anyway, producing a visible duplicate-idea stutter as the
+    video's first two sentences. Token overlap against just the first
+    sentence (not the whole section) catches this without an AI call —
+    consistent with _match_turns()'s overlap-based matching in this same
+    file, and with the mandate that Python, not a prompt, enforces this.
+    """
+    first_sentence = (split_sentences(script_text.strip()) or [""])[0]
+    hook_tokens = _get_content_tokens(hook)
+    if not hook_tokens:
+        return False
+    first_sentence_tokens = _get_content_tokens(first_sentence)
+    overlap = len(hook_tokens & first_sentence_tokens) / len(hook_tokens)
+    return overlap >= _HOOK_PARAPHRASE_OVERLAP_THRESHOLD
+
+
 def _apply_hook_by_construction(result: dict, hook: str) -> dict:
     """Force the blueprint's hook to be the INTRO's literal opening line.
 
@@ -1018,12 +1050,18 @@ def _apply_hook_by_construction(result: dict, hook: str) -> dict:
     actually first). Constructing the opening line deterministically removes
     the validator's discretion: the hook is prepended here, not hoped for.
 
-    A no-op when the blueprint carries no hook, or when the generated INTRO
-    already opens with it verbatim (avoids a literal double hook).
+    A no-op when the blueprint carries no hook, when the generated INTRO
+    already opens with it verbatim, or when the opening sentence is already
+    a close paraphrase of it (see _opens_with_hook_paraphrase) — all three
+    avoid a duplicated-idea opening.
     """
     hook = (hook or "").strip()
     script_text = result.get("script_text", "")
-    if not hook or script_text.strip().casefold().startswith(hook.casefold()):
+    if not hook:
+        return result
+    if script_text.strip().casefold().startswith(hook.casefold()):
+        return result
+    if _opens_with_hook_paraphrase(script_text, hook):
         return result
     if hook[-1] not in ".!?":
         hook = f"{hook}."
@@ -1051,6 +1089,7 @@ def _generate_section_once(
     image_style: str = "",
     narration_pov: str = "third_person",
     midpoint_retention_trap: str | None = None,
+    prior_full_text: str = "",
 ) -> dict | None:
     """Generate a single section with exactly one Claude call — no quality-judging retry.
 
@@ -1065,7 +1104,7 @@ def _generate_section_once(
     runs — it is a mechanical text fix, not a regeneration. TTS/hook/rhythm/
     transition findings are logged as telemetry only and never trigger a re-roll.
     """
-    _log_section_input(label, prior_sections_summary, visual_intent_accumulator)
+    _log_section_input(label, prior_sections_summary, visual_intent_accumulator, prior_full_text)
     result = _call_section_generation(
         label=label,
         story=story,
@@ -1084,6 +1123,7 @@ def _generate_section_once(
         image_style=image_style,
         narration_pov=narration_pov,
         midpoint_retention_trap=midpoint_retention_trap,
+        prior_full_text=prior_full_text,
     )
     if result is None:
         return None
@@ -1385,6 +1425,7 @@ def _generate_intro_section(
         audio_tags_enabled=audio_tags_enabled,
         check_hook=True,
         prior_summary_text="",
+        prior_full_text="",
         primary_required_turn=None,
         future_uncovered_turns=None,
         visual_style=context.get("visual_style", ""),
@@ -1529,6 +1570,7 @@ def _run_body_section_loop(
             audio_tags_enabled=audio_tags_enabled,
             check_hook=False,
             prior_summary_text=state["prior_sections_summary"][-1]["summary"] if state["prior_sections_summary"] else "",
+            prior_full_text=assemble_script(state["sections"]),
             primary_required_turn=primary_turn,
             future_uncovered_turns=future_turns if future_turns else None,
             visual_style=context.get("visual_style", ""),
@@ -1594,6 +1636,7 @@ def _generate_outro_section(
         audio_tags_enabled=audio_tags_enabled,
         check_hook=False,
         prior_summary_text=state["prior_sections_summary"][-1]["summary"] if state["prior_sections_summary"] else "",
+        prior_full_text=assemble_script(state["sections"]),
         primary_required_turn=None,
         future_uncovered_turns=None,
         visual_style=context.get("visual_style", ""),

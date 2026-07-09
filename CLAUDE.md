@@ -2027,11 +2027,23 @@ be — a false negative by design.
 - `_apply_hook_by_construction(result, hook)` (`scripts.py`) is a pure,
   deterministic transform: it prepends the blueprint's `hook` string as the
   script's literal first sentence (adding terminal punctuation if missing),
-  and is a no-op when `hook` is empty or the generated text already opens
-  with it verbatim (avoids a duplicated hook). It never removes or rewrites
-  any of Claude's generated content — the previous opening sentence(s) simply
-  move to second position onward, exactly like the audited roster sentence
-  now would.
+  and is a no-op when `hook` is empty, the generated text already opens with
+  it verbatim, or the opening sentence is already a close paraphrase of it
+  (avoids a duplicated hook). It never removes or rewrites any of Claude's
+  generated content — the previous opening sentence(s) simply move to second
+  position onward, exactly like the audited roster sentence now would.
+- **Paraphrase no-op (live-canary fix):** a real production run showed the
+  original verbatim-only `startswith()` check miss a paraphrase — Claude's
+  own INTRO opened "...planning to steal from her family for one single
+  night" against a blueprint hook of "...planning one night's theft" —
+  different wording, same content, so the hook got prepended anyway,
+  producing a duplicate-idea stutter as the video's literal first two
+  sentences. `_opens_with_hook_paraphrase(script_text, hook)` closes this:
+  token overlap (words >3 chars, ≥70% of the hook's content tokens,
+  `_HOOK_PARAPHRASE_OVERLAP_THRESHOLD`) between the hook and just the
+  generated opening sentence (`split_sentences()`), reusing
+  `_get_content_tokens()` — no AI call. Runtime proof (real production
+  strings, not synthetic): `tests/test_hook_by_construction.py`.
 - Wired into `_generate_section_once()` — called immediately after the raw
   Claude section result is returned and before `_clean_generated_section()`'s
   TTS backstop, gated on the same `check_hook: bool` flag that already
@@ -2065,6 +2077,53 @@ be — a false negative by design.
   the OUTRO echoes it closely). Telemetry only, same as every other finding
   in this function — no retry, no regeneration.
 
+Prior full-text continuity (real production defect — SECTION 4 daughter-fate
+contradiction): `prior_sections_summary` only ever carried each section's
+`{label, summary, reveals, open_questions}` into later `generate_section()`
+calls — never the section's literal `script_text`. A real production horror
+script shipped internally contradictory: blueprint turn[2] said "the father,
+exposed as his own daughter's killer" (murder), but SECTION 4 said the
+daughter "was alive when firefighters broke through the hatch" (imprisonment,
+not murder) — the compressed summary/reveals never captured the specific
+wording SECTION 2 committed to, so SECTION 4 had no way to see it.
+
+- `generate_section()` (`system_prompt.py`) gained `prior_full_text: str =
+  ""`, threaded into the user message as a new "Prior sections (full text —
+  established continuity; do not contradict any fact, character state, or
+  fate stated here)" block, placed immediately after the existing "Prior
+  sections summary" block — additive to, not a replacement for,
+  `prior_sections_summary`, which still feeds `prior_summary_text` (the last
+  section's summary) into `check_section_transition()`'s recap-detection,
+  unchanged.
+- No new state field was added to `_create_section_loop_state()`:
+  `state["sections"]` already accumulates every generated section's final
+  `{label, script_text, title?}` in order, only ever appended to (via
+  `_append_generated_section()`) after that section's Claude call already
+  returned — so at the moment each later `_generate_section_once()` call is
+  made, `state["sections"]` already holds exactly "everything generated so
+  far" with nothing from the in-flight call. `assemble_script(state["sections"])`
+  is reused verbatim to format it, giving prompt content and the final
+  shipped output one identical `[INTRO]`/`[SECTION N: Title]`/`[OUTRO]`
+  marker convention, with no drift risk between them.
+  `_generate_intro_section()` passes `prior_full_text=""` (no prior sections
+  exist yet); `_run_body_section_loop()`/`_generate_outro_section()` pass
+  `assemble_script(state["sections"])`.
+- `_SECTION_GENERATION_SYSTEM_PROMPT`'s FORBIDDEN MATERIAL rule (anti-
+  repetition only) now explicitly covers the new full-text block too, and a
+  new adjacent LOCKED CONTINUITY rule tells Claude the full text is binding
+  fact context it must never contradict — deliberately two separate
+  obligations (don't repeat it; don't contradict it), not alternatives.
+- Generation-input change only — no new Claude call, no post-hoc validator.
+  Explicitly not a reintroduction of `validate_script_globally()` (removed
+  per the Elimination Mandate, D1.2, above): that was a Claude call judging
+  an already-finished script whose findings nobody ever fixed; this instead
+  gives every section-generation call richer, more literal input up front.
+- Runtime proof: `tests/test_prior_section_continuity.py` — stubbed
+  `generate_section`, full real accumulation chain (INTRO → body loop →
+  OUTRO unmocked), including a planted-fact propagation test reproducing the
+  exact production defect string ("exposed as his own daughter's killer")
+  and confirming it reaches every later call's `prior_full_text` verbatim.
+
 Rules:
 
 - One body section should primarily advance one major turn.
@@ -2078,6 +2137,11 @@ Rules:
 - The INTRO's opening line is constructed from the blueprint's `hook`
   deterministically — do not revert to relying on `check_hook_quality()`
   (or any other validator) to enforce which sentence comes first.
+- `prior_full_text` (assembled from `state["sections"]`) and
+  `prior_sections_summary` are two separate, additive continuity mechanisms
+  — do not remove or restructure one without checking the other's call
+  sites (`check_section_transition()` still depends on
+  `prior_sections_summary`).
 
 #### `run_script_quality_gate`
 

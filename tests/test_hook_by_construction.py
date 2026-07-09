@@ -80,6 +80,85 @@ class TestApplyHookByConstruction(unittest.TestCase):
         self.assertEqual(result["script_text"], "Body.")  # original untouched
         self.assertEqual(updated["other_field"], "kept")  # other keys preserved
 
+    def test_noop_on_real_production_paraphrase_duplicate(self):
+        """Real defect, not a synthetic example: a production run's INTRO
+        opened with a paraphrase of the blueprint hook — same content,
+        different wording — and the old verbatim-only startswith() check
+        didn't catch it, so the hook was prepended anyway, producing:
+
+        "A drifter knocks on a missing girl's door, wearing her face,
+        planning one night's theft. A drifter knocks on a missing girl's
+        door, wearing her face, planning to steal from her family for one
+        single night."
+
+        i.e. the video's first two sentences said the same thing twice.
+        """
+        hook = (
+            "A drifter knocks on a missing girl's door, wearing her face, "
+            "planning one night's theft."
+        )
+        generated_opening = (
+            "A drifter knocks on a missing girl's door, wearing her face, "
+            "planning to steal from her family for one single night. "
+            "She isn't Mikayla Murray. She just looks enough like her to try."
+        )
+        result = {"script_text": generated_opening}
+
+        updated = scripts._apply_hook_by_construction(result, hook)
+
+        self.assertEqual(
+            updated["script_text"], generated_opening,
+            "hook was prepended again despite the opening already covering "
+            "the hook's content — the exact production stutter this test "
+            "guards against",
+        )
+
+    def test_still_prepends_hook_when_opening_is_unrelated(self):
+        """Guards against the paraphrase check being too aggressive — an
+        opening that merely shares a couple of incidental words with the
+        hook must not be treated as a duplicate."""
+        hook = "A grinding metal sound never stops echoing from the mountain."
+        unrelated_opening = "A boy named Sam moved to a quiet town in Missouri."
+
+        updated = scripts._apply_hook_by_construction(
+            {"script_text": unrelated_opening}, hook
+        )
+
+        self.assertTrue(updated["script_text"].startswith(hook))
+        self.assertIn(unrelated_opening, updated["script_text"])
+
+
+class TestOpensWithHookParaphrase(unittest.TestCase):
+    def test_real_production_paraphrase_detected(self):
+        hook = (
+            "A drifter knocks on a missing girl's door, wearing her face, "
+            "planning one night's theft."
+        )
+        generated_opening = (
+            "A drifter knocks on a missing girl's door, wearing her face, "
+            "planning to steal from her family for one single night."
+        )
+        self.assertTrue(scripts._opens_with_hook_paraphrase(generated_opening, hook))
+
+    def test_unrelated_opening_not_flagged(self):
+        hook = "A grinding metal sound never stops echoing from the mountain."
+        opening = "A boy named Sam moved to a quiet town in Missouri."
+        self.assertFalse(scripts._opens_with_hook_paraphrase(opening, hook))
+
+    def test_empty_hook_never_flagged(self):
+        self.assertFalse(scripts._opens_with_hook_paraphrase("Some text.", ""))
+
+    def test_only_checks_first_sentence_not_whole_body(self):
+        """A hook whose content only shows up later in the section (not the
+        opening sentence) must still get prepended — only the first
+        sentence should be checked."""
+        hook = "A grinding metal sound never stops echoing from the mountain."
+        script_text = (
+            "A boy moved to a quiet town. Later, he heard a grinding metal "
+            "sound echoing from the mountain every night."
+        )
+        self.assertFalse(scripts._opens_with_hook_paraphrase(script_text, hook))
+
 
 class TestIntroGenerationConstructsHookDeterministically(unittest.TestCase):
     """Full-chain proof through the real _generate_intro_section() ->
