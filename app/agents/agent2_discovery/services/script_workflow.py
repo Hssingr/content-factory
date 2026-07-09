@@ -13,12 +13,14 @@ from app.agents.agent2_discovery.services.scripts import (
     run_script_quality_gate,
     run_shorts_planner,
 )
-from app.agents.agent2_discovery.services.story import Story
+from app.agents.agent2_discovery.services.story import MAX_SOURCE_EXCERPT_CHARS, Story
+from app.agents.agent2_discovery.services.story_generator import expand_story_premise
 from app.agents.agent2_discovery.system_prompt import generate_story_blueprint
 from app.models import Channel, ChannelConfig, ChannelVoice, Content, Script
 from app.services.local_run_paths import ensure_run_dirs
 from app.services.script_checks import check_source_material_floor
 from app.services.script_estimator import estimate_duration_sec
+from app.services.script_source import normalize_script_source
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +66,15 @@ def generate_parent_source_script(
     channel's configured ``script_format`` (see
     ``app.services.script_checks.check_source_material_floor``).
 
+    AI-generated story expansion (``ChannelConfig.script_source="ai_generated"``,
+    see ``code_report/ai_generated_story_discovery_design.md``): runs before
+    the source-material floor check above — ``content.source_excerpt`` holds
+    only the short discovery-time premise until this point, and
+    ``_ensure_ai_story_expanded()`` expands it into a full story body in
+    place. The floor check then judges the expanded body exactly like it
+    already judges a Reddit-discovered body — one shared pass/fail
+    implementation for both paths.
+
     Args:
         content: Approved parent `Content` row.
         db:      SQLAlchemy session managed by the caller.
@@ -74,11 +85,19 @@ def generate_parent_source_script(
 
     Returns:
         The persisted source voice_script text, or ``None`` when the channel
-        context could not be loaded or the source-material floor failed.
+        context could not be loaded, AI-generated expansion failed outright,
+        or the source-material floor failed.
     """
     context = context or _load_script_workflow_context(content, db)
     if context is None:
         return None
+
+    script_source = normalize_script_source(
+        context.config.script_source if context.config else "reddit"
+    )
+    if script_source == "ai_generated":
+        if not _ensure_ai_story_expanded(content, context, db):
+            return None
 
     if not _passes_source_material_floor(content, context, db):
         return None
@@ -155,6 +174,64 @@ def _passes_source_material_floor(
     content.status = "FAILED"
     db.commit()
     return False
+
+
+def _ensure_ai_story_expanded(
+    content: Content,
+    context: ScriptWorkflowContext,
+    db: Session,
+) -> bool:
+    """Expand an ``ai_generated`` content's premise into a full story body.
+
+    Idempotent: a no-op when ``content.source_excerpt`` already clears the
+    source-material floor (e.g. a stuck-state-recovery re-entry that already
+    expanded it on a prior attempt) — checked with the same
+    ``check_source_material_floor()`` the caller runs immediately after this
+    function returns, so both checks agree on "clears the floor" using one
+    shared implementation rather than two that could drift.
+
+    Otherwise calls ``expand_story_premise()`` and persists the result in
+    place to ``content.source_excerpt`` (committing immediately, matching
+    this module's per-step commit convention). Returns ``False`` (and sets
+    ``content.status = "FAILED"``) only on an outright expansion failure —
+    per the Elimination Mandate, a still-too-short-but-real expansion is
+    deliberately left for the ``_passes_source_material_floor()`` call right
+    after this one to catch, exactly like it already does for a too-thin
+    Reddit candidate, rather than being re-rolled here.
+    """
+    already_sufficient = not check_source_material_floor(
+        content.source_excerpt or "", content.source_language, context.script_format,
+    )
+    if already_sufficient:
+        logger.info(
+            "AI_STORY_EXPANSION_SKIPPED content=%s reason=already_clears_floor",
+            content.id,
+        )
+        return True
+
+    premise = content.source_excerpt or ""
+    expanded = expand_story_premise(
+        premise=premise,
+        channel=context.channel,
+        script_format=context.script_format,
+        language=content.source_language,
+    )
+    if expanded is None:
+        logger.error(
+            "AI_STORY_EXPANSION_FAILED content=%s — expand_story_premise returned no result",
+            content.id,
+        )
+        content.status = "FAILED"
+        db.commit()
+        return False
+
+    content.source_excerpt = expanded[:MAX_SOURCE_EXCERPT_CHARS]
+    db.commit()
+    logger.info(
+        "AI_STORY_EXPANSION_DONE content=%s expanded_words=%d",
+        content.id, len(expanded.split()),
+    )
+    return True
 
 
 def run_script_workflow(content: Content, db: Session) -> None:

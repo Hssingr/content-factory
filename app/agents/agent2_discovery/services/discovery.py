@@ -5,15 +5,17 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.orm import Session
 
-from app.models import Channel, ChannelConfig, ChannelSource, Content, ContentValidation, User
+from app.models import Channel, ChannelConfig, ChannelLanguage, ChannelSource, Content, ContentValidation, User
 from app.agents.agent2_discovery.services.fetcher import fetch_batch, _MAX_NUCLEAR_EXCLUSION
 from app.agents.agent2_discovery.services.story import MAX_SOURCE_EXCERPT_CHARS, Story
+from app.agents.agent2_discovery.services.story_generator import generate_story_premise
 from app.agents.agent2_discovery.services.scoring import (
     score_story_assessment,
     decide_story_acceptance,
 )
 from app.agents.agent2_discovery.system_prompt import score_story_for_gate
 from app.services.script_checks import check_source_material_floor
+from app.services.script_source import normalize_script_source
 
 logger = logging.getLogger(__name__)
 
@@ -31,15 +33,34 @@ def run_discovery(
 ) -> tuple[Content, Story, dict] | None:
     """Main entry point for Agent 2 — discover the best story for a channel.
 
+    Branches on ``ChannelConfig.script_source`` (AI-Generated Story Discovery —
+    see ``code_report/ai_generated_story_discovery_design.md``):
+      - ``"reddit"`` (default): fetches a real candidate via ``fetch_batch()``
+        (web_search against configured ``ChannelSource`` rows).
+      - ``"ai_generated"``: synthesizes a short, cheap premise via
+        ``generate_story_premise()`` — no ``ChannelSource`` requirement, no
+        web_search cost. The premise goes through the same dedup/scoring/
+        Telegram-approval machinery below unchanged; the expensive full-story
+        expansion only happens after operator APPROVE, in
+        ``script_workflow._ensure_ai_story_expanded()``.
+
     Retry escalation on duplicate detection OR source-material floor failure
     (prompt engineering follow-up — a candidate whose ``source_excerpt`` cannot
     ground a full script, e.g. a wiki/fandom summary page relayed instead of
     the primary post, is rejected and retried exactly like a duplicate, so a
-    too-thin story never reaches Telegram approval in the first place):
+    too-thin story never reaches Telegram approval in the first place).
+    The source-material floor check does not apply to ``ai_generated``
+    premises — a short premise is short by design at this stage; see
+    ``script_workflow._ensure_ai_story_expanded()`` for where the floor check
+    runs for this path instead:
       1. Initial fetch (clean or with caller-supplied ``rejected_stories``)
       2. Retry 1 — accumulated rejected list injected into fetch prompt
       3. Retry 2 — accumulated rejected list
-      4. Nuclear retry — ALL existing channel content titles+URLs sent as exclusion list
+      4. Nuclear retry — ALL existing channel content titles+URLs sent as
+         exclusion list. Skipped entirely for ``ai_generated``: synthetic
+         per-attempt-unique URLs mean duplicate detection is structurally
+         moot for this path, and the exclusion list is already proactively
+         seeded with the channel's recent content before attempt 1.
       5. Manual Telegram fallback — operator asked to submit a story manually
 
     Args:
@@ -62,36 +83,55 @@ def run_discovery(
         logger.info("Channel %s is not active — skipping discovery", channel_id)
         return None
 
-    sources: list[ChannelSource] = (
-        db.query(ChannelSource)
-        .filter(ChannelSource.channel_id == channel_id)
-        .all()
-    )
-    if not sources:
-        logger.warning("Channel %s has no sources configured", channel_id)
-        return None
-
     config: ChannelConfig | None = db.get(ChannelConfig, channel_id)
     timeout_hours = config.validation_timeout_hours if config else _DEFAULT_TIMEOUT_HOURS
     script_format = config.script_format if config else "youtube_long"
+    script_source = normalize_script_source(config.script_source if config else "reddit")
+    is_ai_generated = script_source == "ai_generated"
 
-    sources_list = [
-        (s.source_value, s.source_type, float(s.trust_score))
-        for s in sources
-    ]
+    sources_list: list[tuple[str, str, float]] = []
+    if is_ai_generated:
+        ai_language = _resolve_ai_story_language(channel_id, db)
+    else:
+        sources: list[ChannelSource] = (
+            db.query(ChannelSource)
+            .filter(ChannelSource.channel_id == channel_id)
+            .all()
+        )
+        if not sources:
+            logger.warning("Channel %s has no sources configured", channel_id)
+            return None
+        sources_list = [
+            (s.source_value, s.source_type, float(s.trust_score))
+            for s in sources
+        ]
 
     # ── Dedup retry loop ──────────────────────────────────────────────────────
     # accumulated_rejected grows each time a candidate is blocked by dedup.
     # Starts with any pre-seeded list (e.g. from a previous manual-duplicate pass).
     accumulated_rejected: list[dict] = list(rejected_stories or [])
+    if is_ai_generated and not accumulated_rejected:
+        # Synthetic per-attempt-unique URLs mean _is_duplicate() can never
+        # fire true for this path — the prompt-level exclusion list is the
+        # ONLY anti-repetition mechanism available, so it must be seeded
+        # proactively rather than growing only from in-loop rejections.
+        accumulated_rejected = _seed_ai_generated_exclusions(channel_id, db)
+
     story: Story | None = None
 
     for attempt in range(_MAX_DEDUP_RETRIES + 1):  # 0, 1, 2
-        candidates = fetch_batch(
-            sources_list,
-            niche=channel.niche,
-            rejected_stories=accumulated_rejected if accumulated_rejected else None,
-        )
+        if is_ai_generated:
+            candidates = generate_story_premise(
+                channel,
+                language=ai_language,
+                rejected_stories=accumulated_rejected if accumulated_rejected else None,
+            )
+        else:
+            candidates = fetch_batch(
+                sources_list,
+                niche=channel.niche,
+                rejected_stories=accumulated_rejected if accumulated_rejected else None,
+            )
         if not candidates:
             logger.info(
                 "Discovery: fetch returned no story (attempt=%d/%d) — stopping",
@@ -114,7 +154,7 @@ def run_discovery(
             accumulated_rejected.append({"title": candidate.title, "url": candidate.url})
             continue
 
-        floor_reason = _fails_source_material_floor(candidate, script_format)
+        floor_reason = None if is_ai_generated else _fails_source_material_floor(candidate, script_format)
         if floor_reason:
             logger.warning(
                 "Discovery: candidate too thin on attempt %d (title=%r) — %s — "
@@ -136,7 +176,8 @@ def run_discovery(
         break
 
     # ── Nuclear retry: full channel history as exclusion list ─────────────────
-    if story is None:
+    # Skipped entirely for ai_generated — see the docstring's step 4.
+    if story is None and not is_ai_generated:
         logger.warning(
             "Discovery: %d targeted attempt(s) exhausted for channel %s — "
             "running nuclear retry with full channel history",
@@ -144,6 +185,13 @@ def run_discovery(
         )
         story = _nuclear_retry(
             channel, sources_list, accumulated_rejected, db, script_format
+        )
+    elif story is None and is_ai_generated:
+        logger.warning(
+            "Discovery: %d targeted attempt(s) exhausted for ai_generated channel %s — "
+            "nuclear retry does not apply to this path (dedup is structurally moot for "
+            "synthetic premises) — falling through to manual fallback",
+            _MAX_DEDUP_RETRIES + 1, channel_id,
         )
 
     # ── All retries exhausted — send manual Telegram fallback ─────────────────
@@ -153,7 +201,8 @@ def run_discovery(
             channel_id,
         )
         _create_manual_fallback(
-            channel, config, accumulated_rejected, timeout_hours, db
+            channel, config, accumulated_rejected, timeout_hours, db,
+            is_ai_generated=is_ai_generated,
         )
         return None
 
@@ -226,6 +275,46 @@ def run_discovery(
 
 
 # ── Private helpers ───────────────────────────────────────────────────────────
+
+def _resolve_ai_story_language(channel_id: _uuid_module.UUID, db: Session) -> str:
+    """Resolve the target language for an ``ai_generated`` premise.
+
+    Uses the first ``ChannelLanguage`` row for this channel — the same
+    informal "first = primary" convention the frontend already relies on for
+    lack of a schema-guaranteed "primary language" concept (documented soft
+    spot — see ``code_report/ai_generated_story_discovery_design.md`` §5.1).
+    Falls back to ``"en"`` when no ``ChannelLanguage`` row exists at all.
+    """
+    first_language: ChannelLanguage | None = (
+        db.query(ChannelLanguage)
+        .filter(ChannelLanguage.channel_id == channel_id)
+        .first()
+    )
+    return first_language.language if first_language else "en"
+
+
+def _seed_ai_generated_exclusions(channel_id: _uuid_module.UUID, db: Session) -> list[dict]:
+    """Proactively seed the exclusion list for an ``ai_generated`` channel.
+
+    Synthetic per-attempt-unique ``discovery://ai_generated/...`` URLs mean
+    ``_is_duplicate()`` can structurally never fire true for this path — the
+    prompt-level "avoid similar plots" list is the only anti-repetition
+    mechanism available, so it must start from the channel's real history
+    instead of growing only from in-loop rejections (which would let attempt
+    1 repeat any premise the channel already published).
+    """
+    existing_rows = (
+        db.query(Content.title, Content.source_url)
+        .filter(
+            Content.channel_id == channel_id,
+            Content.status.notin_(["AWAITING_MANUAL_STORY"]),
+        )
+        .order_by(Content.created_at.desc())
+        .limit(_MAX_NUCLEAR_EXCLUSION)
+        .all()
+    )
+    return [{"title": row.title, "url": row.source_url} for row in existing_rows]
+
 
 def _is_duplicate(story: Story, db: Session) -> bool:
     """Return True if this story's URL or content hash is already in the DB."""
@@ -345,6 +434,7 @@ def _create_manual_fallback(
     rejected_stories: list[dict],
     timeout_hours: int,
     db: Session,
+    is_ai_generated: bool = False,
 ) -> None:
     """Create a placeholder Content row and notify the operator via Telegram.
 
@@ -404,16 +494,29 @@ def _create_manual_fallback(
     else:
         rejected_block = ""
 
-    message = (
-        f"⚠️ *No new story was found automatically.*\n\n"
-        f"*Channel:* {channel.name}\n"
-        f"*Niche:* {channel.niche}\n"
-        f"{rejected_block}\n"
-        f"Please send a Reddit story manually.\n\n"
-        f"*Reply to this message* with:\n"
-        f"• A Reddit post URL, OR\n"
-        f"• The full story text (title on the first line, story below)"
-    )
+    if is_ai_generated:
+        # Small honesty fix (design doc §3.3): an ai_generated channel has no
+        # ChannelSource — asking for "a Reddit post URL" would be irrelevant.
+        message = (
+            f"⚠️ *No AI-generated story premise was found automatically.*\n\n"
+            f"*Channel:* {channel.name}\n"
+            f"*Niche:* {channel.niche}\n"
+            f"{rejected_block}\n"
+            f"Please send a story premise or full story text manually.\n\n"
+            f"*Reply to this message* with the story text "
+            f"(title on the first line, story/premise below)."
+        )
+    else:
+        message = (
+            f"⚠️ *No new story was found automatically.*\n\n"
+            f"*Channel:* {channel.name}\n"
+            f"*Niche:* {channel.niche}\n"
+            f"{rejected_block}\n"
+            f"Please send a Reddit story manually.\n\n"
+            f"*Reply to this message* with:\n"
+            f"• A Reddit post URL, OR\n"
+            f"• The full story text (title on the first line, story below)"
+        )
 
     message_id = telegram_client.send_message_sync(user.telegram_chat_id, message)
     if message_id:

@@ -441,6 +441,18 @@ export default function BasicInfoSection({
               </div>
             </div>
           )}
+
+          {/* ── AI-generated stories: informational only, no new field ── */}
+          {scriptSource === 'ai_generated' && (
+            <div className="field">
+              <p className="voice-description">
+                Stories are written by Claude, grounded only in this channel's niche and tone
+                above — no Reddit source is needed. Each story starts as a short premise that
+                you approve on Telegram before the full story is written, exactly like a
+                discovered story goes through approval today.
+              </p>
+            </div>
+          )}
         </>
       )}
     </>

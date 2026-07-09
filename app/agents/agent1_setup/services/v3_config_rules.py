@@ -26,6 +26,8 @@ from __future__ import annotations
 
 from typing import TypedDict
 
+from app.services.script_source import _SCRIPT_SOURCE_ALIASES, normalize_script_source
+
 # ── Supported value sets (must stay in sync with app/schemas/channel.py's
 #    ContentMode / ScriptSource / OutputMode Literal types — "supported"
 #    here means "the V3.2 schema accepts it", not "an agent runs it") ───────
@@ -35,23 +37,16 @@ SUPPORTED_SCRIPT_SOURCES: frozenset[str] = frozenset({"reddit", "ai_generated", 
 SUPPORTED_OUTPUT_MODES:   frozenset[str] = frozenset({"youtube_and_shorts", "youtube_long_only", "shorts_only"})
 
 # Only these combinations match what Agent 2-5 actually run today.
+# ai_generated is executable (AI-Generated Story Discovery, see
+# code_report/ai_generated_story_discovery_design.md and CLAUDE.md §9.5)
+# alongside reddit — both are real discovery paths for single_story content.
 _EXECUTABLE_CONTENT_MODE = "single_story"
-_EXECUTABLE_SCRIPT_SOURCE = "reddit"
+_EXECUTABLE_SCRIPT_SOURCES = frozenset({"reddit", "ai_generated"})
 # youtube_and_shorts: the default parent + standalone Shorts architecture.
 # youtube_long_only: same parent pipeline with the Shorts planner skipped —
 # run_script_workflow() branches on ChannelConfig.output_mode (post-roadmap
 # deep audit; the first real runtime consumer of output_mode).
 _EXECUTABLE_OUTPUT_MODES = frozenset({"youtube_and_shorts", "youtube_long_only"})
-
-# script_source aliases that mean the same thing but were spelled
-# differently by an internal caller, a future schema revision, or an
-# operator-provided value that did not go through the Pydantic schema (the
-# schema itself only ever accepts "ai_generated" — "claude_generated" can
-# only reach this module via a direct Python call, not the HTTP API).
-# Pure mapping only — never mutates a DB row; see normalize_script_source().
-_SCRIPT_SOURCE_ALIASES: dict[str, str] = {
-    "claude_generated": "ai_generated",
-}
 
 
 class V3ConfigIssue(TypedDict):
@@ -62,18 +57,10 @@ class V3ConfigIssue(TypedDict):
     message:  str   # human-readable, includes a coming-soon reason where relevant
 
 
-# ── Normalization (pure — never touches the database) ──────────────────────
-
-def normalize_script_source(script_source: str) -> str:
-    """Map known aliases to their canonical V3.2-schema spelling.
-
-    Pure function: returns a new string, never writes anything. Per the
-    brief, this module must not silently change DB values — any caller
-    that wants the normalized form persisted must do so explicitly and
-    separately; this function only ever returns a value, it never updates
-    a `ChannelConfig` row itself.
-    """
-    return _SCRIPT_SOURCE_ALIASES.get(script_source, script_source)
+# normalize_script_source() is re-exported here (imported above) so existing
+# callers that reach it as `v3_config_rules.normalize_script_source(...)`
+# keep working — the canonical implementation now lives in
+# app.services.script_source (CLAUDE.md §7), shared with Agent 2.
 
 
 # ── content_mode ─────────────────────────────────────────────────────────────
@@ -102,19 +89,21 @@ def is_supported_script_source(script_source: str) -> bool:
 
 
 def is_executable_script_source(content_mode: str, script_source: str) -> bool:
-    """True only for script_source='reddit' AND content_mode='single_story'.
+    """True for script_source in {'reddit', 'ai_generated'} AND content_mode='single_story'.
 
-    Agent 2's discovery flow (run_discovery() -> fetch_batch()) always
-    fetches a real candidate story from a configured ChannelSource today —
-    there is no AI-improvised ('ai_generated'), operator-supplied
-    ('user_provided'), or mixed ('hybrid') script-origin path anywhere in
-    Agent 2, for any content_mode. The 'reddit' value is also only
-    meaningful in combination with 'single_story' — there is no per-episode
-    discovery loop for 'limited_series'/'ongoing_series' to plug a source
-    into yet.
+    Agent 2's discovery flow (run_discovery() -> fetch_batch() or
+    -> generate_story_premise()) fetches a real candidate story from a
+    configured ChannelSource for 'reddit', or synthesizes an original premise
+    grounded in channel niche/tone/description for 'ai_generated' — see
+    code_report/ai_generated_story_discovery_design.md. There is still no
+    operator-supplied ('user_provided') or mixed ('hybrid') script-origin
+    path anywhere in Agent 2, for any content_mode. Both executable sources
+    are also only meaningful in combination with 'single_story' — there is
+    no per-episode discovery loop for 'limited_series'/'ongoing_series' to
+    plug a source into yet.
     """
     normalized = normalize_script_source(script_source)
-    return content_mode == _EXECUTABLE_CONTENT_MODE and normalized == _EXECUTABLE_SCRIPT_SOURCE
+    return content_mode == _EXECUTABLE_CONTENT_MODE and normalized in _EXECUTABLE_SCRIPT_SOURCES
 
 
 # ── output_mode ───────────────────────────────────────────────────────────────
@@ -160,12 +149,6 @@ def coming_soon_reason(field: str, value: str) -> str | None:
         return None
     if field == "script_source":
         normalized = normalize_script_source(value)
-        if normalized == "ai_generated":
-            return (
-                "ai_generated (also accepted as 'claude_generated') is reserved for a future "
-                "phase where Agent 2 can write a script without a discovered source story — "
-                "today every script is grounded in a real fetched story, for every content_mode."
-            )
         if normalized == "user_provided":
             return (
                 "user_provided is reserved for a future phase where an operator can submit "
@@ -246,9 +229,9 @@ def validate_v3_channel_config(config: dict) -> dict:
     elif not is_executable_script_source(content_mode, script_source):
         normalized = normalize_script_source(script_source)
         reason = coming_soon_reason("script_source", script_source)
-        if reason is None and normalized == _EXECUTABLE_SCRIPT_SOURCE:
+        if reason is None and normalized in _EXECUTABLE_SCRIPT_SOURCES:
             reason = (
-                f"script_source='reddit' is only executable with content_mode='single_story' "
+                f"script_source={normalized!r} is only executable with content_mode='single_story' "
                 f"(got content_mode={content_mode!r})."
             )
         issues.append(V3ConfigIssue(

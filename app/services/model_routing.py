@@ -52,6 +52,9 @@ MODEL_ROUTING: dict[str, str] = {
     "story_blueprint":         PRIMARY_MODEL,  # Narrative skeleton — foundation for all sections
     "section_generation":      PRIMARY_MODEL,  # Creative writing per section
     "short_script":            PRIMARY_MODEL,  # Standalone short planning: TikTok-optimised episode script
+    "story_synthesis":         PRIMARY_MODEL,  # AI-generated story discovery (script_source="ai_generated"):
+                                                # premise pitch + post-approval expansion — original creative
+                                                # fiction grounded only in channel niche/tone/description
     # ── Fast / cheap (secondary) ─────────────────────────────────────────────
     "content_reformat":        SECONDARY_MODEL,   # reformatting prose discovery output to JSON
     "shorts_planner":          SECONDARY_MODEL,   # Standalone short planning: structural planning for Short episodes

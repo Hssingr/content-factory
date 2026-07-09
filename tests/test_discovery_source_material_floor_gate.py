@@ -135,6 +135,7 @@ def _channel_fixture():
     )
     config = SimpleNamespace(
         validation_timeout_hours=24, script_format="youtube_long",
+        script_source="reddit",
     )
     sources = [SimpleNamespace(source_value="r/nosleep", source_type="reddit", trust_score=1.0)]
     return channel, config, sources

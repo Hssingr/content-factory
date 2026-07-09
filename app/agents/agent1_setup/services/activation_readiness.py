@@ -27,6 +27,7 @@ from typing import TypedDict
 from app.models import Channel
 from app.agents.agent1_setup.services.v3_config_rules import validate_v3_channel_config
 from app.agents.agent1_setup.services.niche_tone_check import detect_niche_tone_contradiction
+from app.services.script_source import normalize_script_source
 
 
 class ReadinessIssue(TypedDict):
@@ -86,9 +87,15 @@ def check_activation_readiness(channel: Channel) -> dict:
       9. YouTube-producing output modes ("youtube_and_shorts" and
          "youtube_long_only") require a ChannelPlatform row with
          platform="youtube" among the selected platforms.
+      10. script_source="ai_generated" (AI-Generated Story Discovery — see
+          code_report/ai_generated_story_discovery_design.md) requires both
+          Channel.niche and Channel.tone to be non-empty — with no
+          ChannelSource fallback for this path, niche/tone are the only
+          grounding input generate_story_premise()/expand_story_premise()
+          have to work with.
 
     Also collects (roadmap 4a / audit P1-9, non-blocking):
-      10. A niche<->tone contradiction (e.g. niche="Reddit horror story
+      11. A niche<->tone contradiction (e.g. niche="Reddit horror story
           narration" + tone="documentary") via
           `niche_tone_check.detect_niche_tone_contradiction()` — surfaced
           as a WARNING, never BLOCKING; activation is never prevented by
@@ -130,7 +137,9 @@ def check_activation_readiness(channel: Channel) -> dict:
             ))
 
     # 5 — sources required for script_source="reddit" (the only executable source today)
-    script_source = getattr(channel.config, "script_source", "reddit") if channel.config else "reddit"
+    script_source = normalize_script_source(
+        getattr(channel.config, "script_source", "reddit") if channel.config else "reddit"
+    )
     if script_source == "reddit" and not channel.sources:
         issues.append(ReadinessIssue(
             severity="BLOCKING", code="no_sources_for_reddit_mode",
@@ -169,7 +178,22 @@ def check_activation_readiness(channel: Channel) -> dict:
                     "save credentials for YouTube in Tab 2.",
         ))
 
-    # 10 — niche<->tone contradiction (non-blocking flag only)
+    # 10 — ai_generated script_source requires non-empty niche AND tone
+    if script_source == "ai_generated":
+        if not (channel.niche or "").strip():
+            issues.append(ReadinessIssue(
+                severity="BLOCKING", code="ai_generated_missing_niche",
+                message="script_source='ai_generated' requires a non-empty channel niche — "
+                        "it is the only grounding input for synthesized premises.",
+            ))
+        if not (channel.tone or "").strip():
+            issues.append(ReadinessIssue(
+                severity="BLOCKING", code="ai_generated_missing_tone",
+                message="script_source='ai_generated' requires a non-empty channel tone — "
+                        "it is the only grounding input for synthesized premises.",
+            ))
+
+    # 11 — niche<->tone contradiction (non-blocking flag only)
     for finding in detect_niche_tone_contradiction(channel.niche, channel.tone):
         warnings.append(ReadinessIssue(
             severity="WARNING", code=finding["code"], message=finding["message"],

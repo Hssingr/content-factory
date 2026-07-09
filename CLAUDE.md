@@ -765,6 +765,43 @@ Rules:
   `app.agents.agent4_visuals`" rule is about agent-to-agent imports, not
   shared `app/services/` utilities).
 
+### 7.6 Shared Script Source Normalization
+
+File:
+
+```text
+app/services/script_source.py
+```
+
+`normalize_script_source(script_source: str) -> str` — the single canonical
+mapping of `ChannelConfig.script_source` aliases (currently only
+`"claude_generated"` → `"ai_generated"`) to their V3.2-schema spelling. Pure,
+side-effect-free: never queries or writes anything.
+
+Extracted out of `app.agents.agent1_setup.services.v3_config_rules` (§8.2)
+specifically so Agent 2 can read the canonical `script_source` value without
+importing Agent 1 business logic across the §6A ownership boundary — the
+same shared-utility precedent as `app.services.video_sections` (§7.5).
+`v3_config_rules.py` imports and re-exports it (`from
+app.services.script_source import normalize_script_source`) so existing
+callers reaching it as `v3_config_rules.normalize_script_source(...)` keep
+working unchanged.
+
+Callers: `app.agents.agent2_discovery.services.discovery` (script-source
+branching in `run_discovery()`), `app.agents.agent2_discovery.services.script_workflow`
+(the `"ai_generated"` expansion branch in `generate_parent_source_script()`),
+`app.agents.agent1_setup.services.v3_config_rules` (executability checks,
+§8.2), and `app.agents.agent1_setup.services.activation_readiness` (the
+reddit-sources and niche/tone checks, §8.3). See §9.5 for the Agent 2
+AI-Generated Story Discovery flow this module enables.
+
+Rules:
+
+- Pure/generic like the rest of §7 — no agent-specific orchestration lives
+  here.
+- Do not fork a second copy of the alias table — extend
+  `_SCRIPT_SOURCE_ALIASES` in this file if a new alias is ever needed.
+
 ---
 
 ## 8. Agent 1 — Channel Setup
@@ -811,7 +848,7 @@ acts on it.
 | Field | Type | Default | Currently supported value(s) | Coming-soon values (accepted, not yet executed) |
 |---|---|---|---|---|
 | `content_mode` | `str` (Pydantic `Literal`) | `"single_story"` | `"single_story"` — matches today's only real behavior (one discovery → one parent + standalone shorts per cycle) | `"limited_series"`, `"ongoing_series"` — reserved; no Agent 2 execution logic exists for either |
-| `script_source` | `str` (Pydantic `Literal`) | `"reddit"` | `"reddit"` — matches Agent 2's current discovery default | `"ai_generated"`, `"user_provided"`, `"hybrid"` — reserved; Agent 2 always runs the same discovery→blueprint→script flow regardless of this value today |
+| `script_source` | `str` (Pydantic `Literal`) | `"reddit"` | **Read by Agent 2** — `"reddit"` (existing discovery default; `fetch_batch()`, web_search-grounded) and `"ai_generated"` (alias `"claude_generated"`; AI-Generated Story Discovery — `generate_story_premise()`/`expand_story_premise()`, no `ChannelSource` required; see §9.5) | `"user_provided"`, `"hybrid"` — reserved; no execution logic exists for either |
 | `output_mode` | `str` (Pydantic `Literal`) | `"youtube_and_shorts"` | `"youtube_and_shorts"` (parent render + standalone shorts via `run_shorts_planner`, per §9.4) and `"youtube_long_only"` (same parent pipeline; `run_script_workflow()` skips the shorts planner, logged `SHORTS_PLANNER_SKIPPED` — post-roadmap deep audit, the first runtime consumer of this column) | `"shorts_only"` — reserved; Agent 5 always renders the parent main video, no switch exists to skip the long-form half |
 | `visual_style` | `str` (free-form, no DB enum) | `"story_driven"` (roadmap 4a / audit P1-9 — was `"documentary"`) | **Read by Agent 2 and Agent 4** — Agent 2 injects it into `generate_story_blueprint()`, `generate_section()`, and `generate_short_episode_script()` user messages as "Visual style:" so narration and hook framing align with the channel's visual aesthetic; Agent 4 injects it into every `generate_storyboard_batch()` call as "Global visual direction:" applying a consistent mood/color/lighting constraint across all beats. See §11 (Agent 4) for the Agent 4 injection contract. | **Reconciled (migration 009):** the former duplicate `video_style_type` column is dropped — its only consumer chain (Agent 5 `channel_style` → props `config.style`) ended in a Remotion prop no component ever read. `visual_style` is the single channel-level style column |
 | `image_style` | `str` (free-form, no DB enum) | `"photorealistic"` | **Read by Agent 2 and Agent 4** — Agent 2 injects it into the same three prompt functions as `visual_style` as "Image style:"; Agent 4 injects it into every `generate_storyboard_batch()` call as "Global image style:" applying a consistent Flux rendering approach across all beats. See §11 (Agent 4) for the Agent 4 injection contract. | No per-beat `image_style` override exists; the channel-level setting applies uniformly to every `flux_generated` beat |
@@ -827,10 +864,13 @@ Rules:
   via the `ScriptWorkflowContext` threading chain and
   `generate_multilingual_scripts()`'s own `ChannelConfig` load; Agent 4
   receives `visual_style`/`image_style` in `generate_storyboard_batch()` via
-  `split_into_beats()` (see §11.4). All other fields (`content_mode`,
-  `script_source`, `output_mode`) remain schema-only; do not make any other
-  agent read them until a dedicated phase explicitly wires them in,
-  documents the new behavior here, and proves it with a runtime test (§19.4).
+  `split_into_beats()` (see §11.4). `script_source` is now also read by
+  Agent 2 — see §9.5 for the `"ai_generated"` branch in
+  `run_discovery()`/`generate_parent_source_script()`. `content_mode` and
+  `output_mode` (except `output_mode`'s existing `youtube_long_only`
+  branch, §9.3) remain schema-only; do not make any other agent read them
+  until a dedicated phase explicitly wires them in, documents the new
+  behavior here, and proves it with a runtime test (§19.4).
 - `content_mode`/`script_source`/`output_mode`/`narration_pov` are Pydantic
   `Literal` types in `app/schemas/channel.py` (`ContentMode`/`ScriptSource`/
   `OutputMode`/`NarrationPov`) — the API rejects any value outside the table
@@ -863,22 +903,26 @@ and **executable** (does any agent actually run differently, or run at
 all, for this value, today?). No database access, no network call, no
 mutation of a `ChannelConfig` row.
 
-**Only one combination is executable today:**
-`content_mode="single_story"` + `script_source="reddit"` +
-`output_mode="youtube_and_shorts"` — i.e. exactly what every channel
-already does. Everything else is schema-supported (an operator can already
-save it) but not yet executable:
+**Two combinations are executable today (AI-Generated Story Discovery —
+see `code_report/ai_generated_story_discovery_design.md` and §9.5):**
+`content_mode="single_story"` + `script_source` in `{"reddit", "ai_generated"}`
++ `output_mode` in `{"youtube_and_shorts", "youtube_long_only"}`. Everything
+else is schema-supported (an operator can already save it) but not yet
+executable:
 
 | Field | Executable today | Supported, not executable | Reason |
 |---|---|---|---|
 | `content_mode` | `single_story` | `limited_series`, `ongoing_series` | Agent 2 has no multi-episode or open-ended series planning/execution logic |
-| `script_source` | `reddit` (only when `content_mode="single_story"`) | `ai_generated` (alias: `claude_generated`), `user_provided`, `hybrid` | Agent 2's discovery flow always fetches a real source story today, for every content_mode — there is no AI-improvised, operator-supplied, or mixed script-origin path |
+| `script_source` | `reddit`, `ai_generated` (alias: `claude_generated`) — both only when `content_mode="single_story"` | `user_provided`, `hybrid` | `reddit` fetches a real source story via web_search; `ai_generated` synthesizes an original premise from channel niche/tone/description (`generate_story_premise()`/`expand_story_premise()`, no `ChannelSource` needed) — no operator-supplied or mixed script-origin path exists yet |
 | `output_mode` | `youtube_and_shorts`, `youtube_long_only` | `shorts_only` | `youtube_long_only` skips `run_shorts_planner()` in `run_script_workflow()` (`SHORTS_PLANNER_SKIPPED`); `shorts_only` is not executable — Agent 5 always renders the parent main video, no switch exists to skip the long-form half |
 
-`normalize_script_source()` maps `"claude_generated"` → `"ai_generated"` —
-a pure mapping, never a DB write. The V3.2 schema itself only ever accepts
+`normalize_script_source()` (`app/services/script_source.py` — shared with
+Agent 2, see §7.6) maps `"claude_generated"` → `"ai_generated"` — a pure
+mapping, never a DB write. The V3.2 schema itself only ever accepts
 `"ai_generated"` (the alias only matters for a future internal caller that
-bypasses the Pydantic schema).
+bypasses the Pydantic schema). `v3_config_rules.py` re-exports it (imports
+it at module level) so existing callers reaching it as
+`v3_config_rules.normalize_script_source(...)` keep working.
 
 `validate_v3_channel_config(config: dict) -> dict` returns
 `{"executable": bool, "supported": bool, "issues": list[V3ConfigIssue]}`
@@ -888,12 +932,16 @@ where applicable.
 
 Rules:
 
-- **Not wired into any route, the activation check, or any agent yet** —
-  confirmed and tested directly (`scripts/smoke_agent1_v3_config_rules.py`):
-  neither `routers/channels.py` nor `services/channels.py` imports this
-  module. A future phase decides where enforcement belongs (the activation
-  route, a new dedicated endpoint, or the frontend) — do not assume this
-  module is already protecting anything.
+- **`v3_config_rules.py` itself is still never imported by
+  `routers/channels.py`, `services/channels.py`, or any Agent 2/3/4/5
+  module** — confirmed and tested directly
+  (`scripts/smoke_agent1_v3_config_rules.py`). AI-Generated Story Discovery
+  (§9.5) does not change this: Agent 2 reads `normalize_script_source()`
+  from the shared `app.services.script_source` module (§7.6), never from
+  this file directly, preserving the CLAUDE.md §6A ownership boundary
+  (Agent 2 must not import Agent 1 business logic). This file's own
+  `is_executable_*()`/`validate_v3_channel_config()` functions remain
+  Agent-1-activation-only.
 - Do not add execution logic for any "supported, not executable" value
   under this section — that remains separate, not-yet-scheduled phase
   work per the V3.1 audit's phase plan.
@@ -946,16 +994,24 @@ performed, all independent (every issue is collected, not just the first):
    activation.
 3. At least one `ChannelLanguage` row exists.
 4. Every configured language has at least one `ChannelVoice` row.
-5. `script_source="reddit"` (the only executable script source today)
-   requires at least one `ChannelSource` row.
+5. `script_source="reddit"` requires at least one `ChannelSource` row.
+   `script_source="ai_generated"` requires none (§9.5 — grounded in
+   niche/tone/description only).
 6. At least one `ChannelPublishTiming` row exists.
 7. At least one `ChannelPlatform` row exists.
 8. **Every** existing `ChannelPlatform` row is `verified=True` — not just
    one of them.
 9. `output_mode="youtube_and_shorts"` (the only executable output mode
    today) requires a `ChannelPlatform` row with `platform="youtube"`.
-10. A niche↔tone contradiction (roadmap 4a / audit P1-9, §8.7) — collected
-    into `warnings`, `severity="WARNING"`, **never** `issues`. Does not
+10. `script_source="ai_generated"` requires both `Channel.niche` and
+    `Channel.tone` to be non-empty (`ai_generated_missing_niche` /
+    `ai_generated_missing_tone`) — with no `ChannelSource` fallback for this
+    path, they are the only grounding input
+    `generate_story_premise()`/`expand_story_premise()` have to work with.
+
+Also collects (non-blocking, `warnings`, never `issues`):
+
+11. A niche↔tone contradiction (roadmap 4a / audit P1-9, §8.7). Does not
     affect the `ready` boolean.
 
 Logging: a blocked activation logs
@@ -1496,9 +1552,11 @@ Agent 2 must not:
 
 ```mermaid
 flowchart TD
-    A[run_discovery] --> B[fetch_batch]
+    A[run_discovery] -->|script_source=reddit| B[fetch_batch]
+    A -->|script_source=ai_generated, see 9.5| B2[generate_story_premise]
     B --> C[dedup check]
-    C --> C2[source-material floor check]
+    B2 --> C
+    C --> C2[source-material floor check — reddit only, see 9.5]
     C2 --> D[story gate scoring]
     D --> E[Content PENDING_APPROVAL]
     E --> F[send_for_validation]
@@ -1506,7 +1564,11 @@ flowchart TD
     G --> H[Content APPROVED]
     H --> I[run_agent2_scripts_for_content task]
     I --> J[run_script_workflow]
-    J --> K[generate_story_blueprint]
+    J --> J2[generate_parent_source_script]
+    J2 -->|ai_generated only| J3[_ensure_ai_story_expanded / expand_story_premise, see 9.5]
+    J2 --> J4[source-material floor check]
+    J3 --> J4
+    J4 --> K[generate_story_blueprint]
     K --> L[generate_script_sections]
     L --> M[run_script_quality_gate]
     M --> N[persist validated source Script]
@@ -1543,12 +1605,15 @@ Output:
 
 Responsibilities:
 
-- Load channel and sources.
-- Fetch a candidate story.
+- Load channel and sources (skipped for `script_source="ai_generated"` —
+  see §9.5).
+- Fetch a candidate story (`fetch_batch()` for `"reddit"`,
+  `generate_story_premise()` for `"ai_generated"` — see §9.5).
 - Deduplicate.
 - Score story.
 - Persist parent content if accepted.
-- Trigger manual fallback if discovery fails.
+- Trigger manual fallback if discovery fails (wording branches on
+  `script_source` — see §9.5).
 
 #### `fetch_batch`
 
@@ -1785,6 +1850,16 @@ instruction in `_SINGLE_STORY_SYSTEM_PROMPT` had nothing substantial to relay.
   body, never the rejected thin one's; and that an all-candidates-thin run
   (including the nuclear retry) falls through to the manual fallback with no
   `Content` row ever created.
+
+**Both floor checks above are `script_source="reddit"`-only.** Neither the
+discovery-time gate (`_fails_source_material_floor()` in `run_discovery()`'s
+retry loop / `_nuclear_retry()`) nor the initial post-approval check in
+`generate_parent_source_script()` (before the AI-generated-story-expansion
+step below) applies to `script_source="ai_generated"` — a short premise is
+short by design at discovery time, and `generate_parent_source_script()`
+expands it into a full story via `_ensure_ai_story_expanded()` *before*
+running this same `check_source_material_floor()` on the expanded body. See
+§9.5 for the full AI-Generated Story Discovery design.
 
 #### `send_for_validation`
 
@@ -2554,6 +2629,219 @@ Naming rule:
   - `CHILD_SHORT_AUDIO_START`
   - `SHORT_EPISODE_RENDER_DONE`
 - Existing phase-labeled logs should be renamed when touched.
+
+### 9.5 AI-Generated Story Discovery (`script_source="ai_generated"`)
+
+Design record: `code_report/ai_generated_story_discovery_design.md`.
+
+Problem this solves: `run_discovery()`'s default path (`fetch_batch()`) makes
+a real, expensive `call_claude_with_tools()` call with the `web_search` tool
+on every discovery attempt — multiple tool-use rounds and real
+`story_research` token cost just to pick one candidate. For a channel whose
+content doesn't need to be grounded in a real discovered post, this is
+avoidable spend. `ChannelConfig.script_source="ai_generated"` (alias
+`"claude_generated"`, normalized by `app.services.script_source.normalize_script_source()`,
+§7.6) is a real, executable alternative: Claude writes an original story,
+grounded only in the channel's existing `niche`/`tone`/`description` — no
+new persisted "story brief" field, and no `ChannelSource` requirement.
+
+**Two-stage design — real generation cost is spent only after operator
+approval:**
+
+1. **Discovery time (cheap):** `generate_story_premise()` synthesizes a
+   short, concrete premise (3–6 sentences) — no `web_search` tool call. This
+   premise goes through the *same* dedup/scoring/Telegram-approval machinery
+   every reddit-discovered candidate uses, completely unchanged.
+2. **On operator APPROVE (the only point real cost is spent):**
+   `expand_story_premise()` expands the approved premise into a full story
+   body, gated on the *existing* `check_source_material_floor()` failing —
+   the same fail-loud mechanism a too-thin Reddit story already uses, not a
+   new one.
+
+File:
+
+```text
+app/agents/agent2_discovery/services/story_generator.py
+```
+
+#### `generate_story_premise`
+
+Input: `channel` (niche/tone/description), target `language`, optional
+`rejected_stories` (titles + operator feedback, threaded as an "avoid
+similar plots/themes" instruction — synthetic URLs carry no meaning to
+Claude here, so only titles/feedback are used).
+
+Output: `list[Story]` — `[Story]` on success, `[]` on any failure (transport
+error, empty title/body). Mirrors `fetch_batch()`'s contract exactly so
+`run_discovery()` can call either interchangeably. Constructs
+`Story(url=f"discovery://ai_generated/{channel.id}/{uuid4()}",
+source_type="ai_generated", source_value="claude_synthesis", language=language)`
+— the URL's per-call `uuid4()` is why `_is_duplicate()` can structurally
+never fire true for this path (see the exclusion-seeding rule below).
+
+A premise longer than `_PREMISE_SOFT_WORD_CEILING` (150 words) is logged as
+a warning (`"longer than expected... Claude ignored the length instruction"`)
+but never re-rolled — Elimination Mandate (§9.3/§23): a quality judgment is
+telemetry only, not a retry trigger.
+
+Uses `call_claude_structured(task="story_synthesis", ...)` — the system
+prompt requires original fiction only (never fake Reddit framing: no
+invented usernames, no "OP", no fabricated upvote/comment counts, no claim
+this really happened to a real person online), rights/IP-safe original
+characters/settings, and instructs the premise to create curiosity without
+resolving it (the mystery/tension is left for the full expansion).
+
+#### `expand_story_premise`
+
+Input: the human-approved `premise` text, `channel`, `script_format` (drives
+the target word count), `language`.
+
+Output: the expanded story body string, or `None` on any failure (transport
+error, empty body). Single Claude call
+(`call_claude_structured(task="story_synthesis", ...)`), **no retry loop
+beyond transport-failure handling** — per the Elimination Mandate, a
+too-short-but-real result is not re-rolled here; it is left for the
+*existing* `check_source_material_floor()` call downstream to catch,
+exactly like it already does for a too-thin Reddit candidate.
+
+Word-count target scales with `script_format`
+(`_EXPANSION_WORD_TARGETS = {"youtube_long": 1200}`, default `600` for any
+other format) — the same 900/420-word floor `check_source_material_floor()`
+uses, plus a buffer, so a real expansion clears the floor with margin rather
+than skating the exact line. The system prompt requires the expansion to
+preserve the approved premise's situation/tension/tone faithfully (never
+invent a different plot), write a complete narrative with a real resolution
+(not an outline), and keep the same original-fiction/rights-safety rules as
+the premise prompt.
+
+#### `run_discovery()` branching (`discovery.py`)
+
+`run_discovery()` reads `normalize_script_source(config.script_source)`
+once, near the top, and branches on it:
+
+- **Sources:** the `ChannelSource` requirement (`if not sources: return
+  None`) is skipped entirely for `ai_generated` — `_resolve_ai_story_language()`
+  resolves the target language from the first `ChannelLanguage` row instead
+  (the same informal "first = primary" convention the frontend already
+  relies on; a documented soft spot, not a schema-guaranteed primary
+  language — see the design doc §5.1).
+- **Exclusion seeding:** since every `ai_generated` candidate carries a
+  per-call-unique synthetic URL, `_is_duplicate()` can structurally never
+  return `True` for this path — the prompt-level "avoid similar
+  plots/themes" list is the *only* anti-repetition mechanism available.
+  `_seed_ai_generated_exclusions()` proactively seeds `accumulated_rejected`
+  with the channel's recent content history (title + URL, same
+  `_MAX_NUCLEAR_EXCLUSION` cap `_nuclear_retry()` uses) **before the first**
+  `generate_story_premise()` call — not only after an in-loop rejection,
+  which would let attempt 1 repeat any premise the channel already
+  published.
+- **Source-material floor:** skipped entirely at discovery time
+  (`floor_reason = None if is_ai_generated else
+  _fails_source_material_floor(...)`) — a short premise is short by design
+  at this stage; see `generate_parent_source_script()` below for where the
+  floor check applies to this path instead.
+- **Nuclear retry:** skipped entirely — `_nuclear_retry()` is never called
+  for `ai_generated`. Dedup is structurally moot (see above), and the
+  exclusion list is already proactively seeded, so there is nothing a
+  full-history nuclear pass would add. Falls straight through to the manual
+  Telegram fallback on exhaustion.
+- **Story-gate scoring:** unchanged in position — still runs on the premise
+  text. `score_story_for_gate()` (`system_prompt.py`) detects
+  `story.source_type == "ai_generated"` and swaps the
+  upvotes/comments/`published_at` metadata line for an honest "no
+  real-world engagement signal exists for this story" note, so
+  `scroll_stopper_potential`/`social_media_clickability` are not penalized
+  for an absence that isn't real.
+- **Manual fallback wording:** `_create_manual_fallback()` takes a new
+  `is_ai_generated: bool = False` parameter and sends a different Telegram
+  message on exhaustion ("send a story premise or full story text
+  manually") instead of asking for "a Reddit post URL", which would be
+  irrelevant for a channel with no `ChannelSource`.
+- **Telegram approval message:** `build_telegram_message()` (`system_prompt.py`)
+  detects the synthetic `discovery://ai_generated/` URL prefix and renders
+  `"AI-generated original story premise (no external source)"` in the
+  `Source:` line instead of the raw internal URL.
+
+#### `generate_parent_source_script()` expansion step (`script_workflow.py`)
+
+New step, inserted before the existing `_passes_source_material_floor()`
+call and after `_load_script_workflow_context()`: when
+`normalize_script_source(context.config.script_source)  == "ai_generated"`,
+calls `_ensure_ai_story_expanded(content, context, db)` and returns `None`
+immediately if it returns `False`. Everything else in
+`generate_parent_source_script()` — `_build_story()` onward — is unchanged;
+this is the only new step in the entire blueprint→sections→quality-gate→
+persist pipeline.
+
+`_ensure_ai_story_expanded(content, context, db) -> bool`:
+
+- **Idempotent no-op** when `content.source_excerpt` already clears
+  `check_source_material_floor()` (e.g. a stuck-state-recovery re-entry that
+  already expanded it on a prior attempt) — logged
+  `AI_STORY_EXPANSION_SKIPPED reason=already_clears_floor`. Both this check
+  and the caller's subsequent floor check use the same
+  `check_source_material_floor()` implementation, so they can never disagree
+  about "clears the floor".
+- Otherwise calls `expand_story_premise()` and persists the result **in
+  place** to `content.source_excerpt` (committing immediately), so the
+  `_passes_source_material_floor()` call right after this one judges the
+  updated value, never a stale one.
+- Returns `False` (and sets `Content.status = "FAILED"`, logged
+  `AI_STORY_EXPANSION_FAILED`) only on an outright expansion failure
+  (`expand_story_premise()` returned `None` — transport failure or empty
+  body). A **real but still-too-short** expansion is deliberately *not*
+  re-rolled here (Elimination Mandate) — it returns `True`, and the existing
+  `_passes_source_material_floor()` call catches it exactly like it already
+  catches a too-thin Reddit story.
+
+#### Model routing and activation
+
+- `story_synthesis` task key (`model_routing.py`) → `PRIMARY_MODEL` — used
+  by both `generate_story_premise()` and `expand_story_premise()`.
+- `v3_config_rules.is_executable_script_source()` (§8.2) treats
+  `{"reddit", "ai_generated"}` as executable for `content_mode="single_story"`
+  — `ai_generated` is no longer "reserved for a future phase".
+- `activation_readiness.check_activation_readiness()` (§8.3) gains check 10:
+  `script_source="ai_generated"` requires both `Channel.niche` and
+  `Channel.tone` non-empty (`ai_generated_missing_niche`/
+  `ai_generated_missing_tone`) — with no `ChannelSource` fallback for this
+  path, they are the only grounding input this feature has.
+- Setup UI (`app/ui/src/constants.js`'s `SCRIPT_SOURCES`,
+  `BasicInfoSection.jsx`): the `ai_generated` option is enabled
+  (`executable: true`, no "(Coming soon)" suffix); selecting it shows an
+  informational note (no new input field, per the "no new persisted config
+  field" product decision) confirming stories are generated from the
+  niche/tone already entered on the same screen, instead of the Reddit
+  sources block.
+
+#### Explicit scope boundaries
+
+- No new DB column, no migration — `Content.source_excerpt` already holds
+  the premise pre-expansion and the full body post-expansion; no other
+  field was free for this purpose (see the design doc §2.1 for why).
+- No new `Content` status — reuses `PENDING_APPROVAL` → `APPROVED` →
+  `GENERATING_SCRIPTS` exactly as the reddit path; the expansion step is
+  folded into the existing `APPROVED` → `GENERATING_SCRIPTS` transition.
+- No changes to Agent 3, Agent 4, Agent 5, multilingual script generation,
+  or the shorts planner — all of them consume `Content`/`Script` rows the
+  same way regardless of how the parent story originated.
+- The Telegram CHANGE/feedback flow (`_handle_change()`, §9.3
+  `send_for_validation`) needed zero changes — it is already origin-agnostic.
+- `"user_provided"` and `"hybrid"` remain reserved, unexecuted
+  `script_source` values — do not wire execution logic for either without a
+  new design record and CLAUDE.md update.
+
+Runtime proof: `tests/test_ai_generated_script_source.py` — Agent 1
+executability/activation unit tests; `generate_story_premise()`/
+`expand_story_premise()` unit tests with the paid `call_claude_structured`
+boundary stubbed; a runtime proof (CLAUDE.md §19.4) driving the real
+`run_discovery()` and `generate_parent_source_script()` chains against a
+fake DB (only the paid Claude boundaries stubbed) covering: zero-
+`ChannelSource` channels succeed; exclusions are seeded before the first
+premise call; nuclear retry is never invoked; the floor check never fires
+on a short premise at discovery time; `_ensure_ai_story_expanded()`'s
+idempotency, persist-then-recheck ordering, and failure path; and the
+unmodified reddit path re-run as a regression guard.
 
 ---
 
@@ -5823,6 +6111,9 @@ High-quality/complex tasks:
 - section generation
 - short script generation
 - storyboard generation
+- AI-generated story synthesis (`story_synthesis` — premise + post-approval
+  expansion, §9.5) — original creative fiction is the sole source material
+  for the rest of the pipeline, same quality bar as a real discovered story
 
 Fast/cheap tasks:
 

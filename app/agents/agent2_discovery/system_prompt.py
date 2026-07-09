@@ -1012,11 +1012,19 @@ def build_telegram_message(
     lang_key = (user_language or "en").lower()[:2]
     t = _TELEGRAM_TEMPLATES.get(lang_key, _TELEGRAM_TEMPLATES["en"])
 
+    # AI-Generated Story Discovery (code_report/ai_generated_story_discovery_design.md):
+    # the synthetic discovery://ai_generated/... URL is an internal identifier,
+    # not a real source — showing it raw to the operator would be misleading.
+    source_display = (
+        "AI-generated original story premise (no external source)"
+        if url.startswith("discovery://ai_generated/") else url
+    )
+
     lines: list[str] = [
         t["header"],
         "",
         f"*{t['title_lbl']}:* {title}",
-        f"*{t['source_lbl']}:* {url}",
+        f"*{t['source_lbl']}:* {source_display}",
     ]
 
     if assessment and isinstance(assessment.get("scores"), dict):
@@ -1250,14 +1258,29 @@ def score_story_for_gate(
     Raises:
         ValueError: If Claude's response is malformed or missing required dimensions.
     """
+    if getattr(story, "source_type", None) == "ai_generated":
+        # AI-Generated Story Discovery (code_report/ai_generated_story_discovery_design.md):
+        # a synthesized premise has no real-world engagement signal — upvotes/
+        # comments/URL are meaningless placeholders here, not honest zeros.
+        # Presenting them as metadata would push scroll_stopper_potential/
+        # social_media_clickability to penalize an absence that isn't real.
+        metadata_line = (
+            "Metadata: this is an AI-generated original premise — no real-world engagement "
+            "signal exists for it. Do not penalize scroll_stopper_potential or "
+            "social_media_clickability for the natural absence of upvotes/comments/URL.\n"
+        )
+    else:
+        metadata_line = (
+            f"Metadata: upvotes={story.upvotes}, comments={story.comments}, "
+            f"published_at={story.published_at.isoformat()}\n"
+        )
     user_message = (
         f"Channel niche: {channel.niche}\n"
         f"Channel tone: {channel.tone}\n"
         f"Script format: {script_format}\n\n"
         f"Story title: {story.title}\n"
         f"Story URL: {story.url}\n"
-        f"Metadata: upvotes={story.upvotes}, comments={story.comments}, "
-        f"published_at={story.published_at.isoformat()}\n\n"
+        f"{metadata_line}\n"
         f"Story body:\n{story.body[:6000]}"
     )
 

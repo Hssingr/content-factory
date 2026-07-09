@@ -80,7 +80,7 @@ export const CONTENT_MODES = [
 
 export const SCRIPT_SOURCES = [
   { value: 'reddit',        label: 'Reddit (discovered stories)',        executable: true },
-  { value: 'ai_generated',  label: 'AI / Claude-generated (Coming soon)', executable: false },
+  { value: 'ai_generated',  label: 'AI-generated original story',        executable: true },
   { value: 'user_provided', label: 'User-provided script (Coming soon)',  executable: false },
   { value: 'hybrid',        label: 'Hybrid (Coming soon)',                executable: false },
 ]
