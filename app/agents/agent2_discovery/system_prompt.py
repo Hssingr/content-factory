@@ -3,6 +3,7 @@ import re
 
 from app.services.claude_client import call_claude_structured
 from app.agents.agent2_discovery.services.story import MAX_SOURCE_EXCERPT_CHARS
+from app.services.script_checks import split_sentences
 
 logger = logging.getLogger(__name__)
 
@@ -937,6 +938,7 @@ _TELEGRAM_TEMPLATES: dict[str, dict[str, str]] = {
         "header":      "📺 Nouveau contenu trouvé",
         "title_lbl":   "Titre",
         "source_lbl":  "Source",
+        "preview_lbl": "Aperçu",
         "signals_lbl": "Signaux principaux",
         "langs_lbl":   "Langues",
         "rights_lbl":  "Revue droits/IP",
@@ -946,6 +948,7 @@ _TELEGRAM_TEMPLATES: dict[str, dict[str, str]] = {
         "header":      "📺 New story found",
         "title_lbl":   "Title",
         "source_lbl":  "Source",
+        "preview_lbl": "Preview",
         "signals_lbl": "Top signals",
         "langs_lbl":   "Languages",
         "rights_lbl":  "Rights/IP review",
@@ -955,6 +958,7 @@ _TELEGRAM_TEMPLATES: dict[str, dict[str, str]] = {
         "header":      "📺 Nuevo contenido encontrado",
         "title_lbl":   "Título",
         "source_lbl":  "Fuente",
+        "preview_lbl": "Vista previa",
         "signals_lbl": "Señales principales",
         "langs_lbl":   "Idiomas",
         "rights_lbl":  "Revisión derechos/IP",
@@ -964,12 +968,22 @@ _TELEGRAM_TEMPLATES: dict[str, dict[str, str]] = {
         "header":      "📺 Nuovo contenuto trovato",
         "title_lbl":   "Titolo",
         "source_lbl":  "Fonte",
+        "preview_lbl": "Anteprima",
         "signals_lbl": "Segnali principali",
         "langs_lbl":   "Lingue",
         "rights_lbl":  "Revisione diritti/IP",
         "action":      "Rispondi *APPROVE* per procedere, o descrivi cosa vorresti cambiare.",
     },
 }
+
+# Deterministic story-preview sizing for build_telegram_message() — the
+# operator must be able to judge APPROVE/CHANGE from the message alone,
+# without following a link (and for script_source="ai_generated" there is
+# no link to follow at all — see the source_display branch below). No Claude
+# call: the preview is always the story's own opening sentences, never a
+# generated summary.
+_TELEGRAM_PREVIEW_MAX_SENTENCES = 3
+_TELEGRAM_PREVIEW_MAX_CHARS = 400
 
 
 # ── Script revision — REMOVED (fresh full-system audit §1.3) ─────────────────
@@ -985,12 +999,34 @@ _TELEGRAM_TEMPLATES: dict[str, dict[str, str]] = {
 
 # ── Public functions ───────────────────────────────────────────────────────────
 
+def _build_telegram_preview(source_excerpt: str) -> str:
+    """First 2-3 sentences of the story's own text — deterministic, no Claude call.
+
+    The operator must be able to judge APPROVE/CHANGE from the Telegram
+    message alone: title + source label say nothing about what the story is
+    actually about, and for ``script_source="ai_generated"`` there is no URL
+    to follow at all (``source_display`` above is a static label, not a
+    link). Reuses the story's own opening sentences rather than generating a
+    fresh summary — cheap, deterministic, and for the ai_generated premise
+    path the "premise" already *is* a hand-shaped 3-6 sentence pitch, so its
+    own opening sentences are already the right preview.
+    """
+    if not source_excerpt:
+        return ""
+    sentences = split_sentences(source_excerpt)[:_TELEGRAM_PREVIEW_MAX_SENTENCES]
+    preview = " ".join(s.strip() for s in sentences if s.strip()).strip()
+    if len(preview) > _TELEGRAM_PREVIEW_MAX_CHARS:
+        preview = preview[:_TELEGRAM_PREVIEW_MAX_CHARS].rstrip() + "…"
+    return preview
+
+
 def build_telegram_message(
     title: str,
     url: str,
     assessment: dict | None,
     target_languages: list[str] | None,
     user_language: str,
+    source_excerpt: str = "",
 ) -> str:
     """Build a Telegram validation message without any Claude call.
 
@@ -1005,6 +1041,11 @@ def build_telegram_message(
                           to surface top-2 dimensions. Omitted from message if None.
         target_languages: Optional list of BCP-47 language codes. Omitted if None.
         user_language:    BCP-47 code of the channel owner (determines template language).
+        source_excerpt:   Optional story/premise body text (``Content.source_excerpt``).
+                          When non-empty, its first 2-3 sentences are shown as a
+                          preview so the operator can judge the story without
+                          following a link (see ``_build_telegram_preview()``).
+                          Omitted from the message if empty.
 
     Returns:
         Formatted Telegram Markdown string ready to send.
@@ -1026,6 +1067,10 @@ def build_telegram_message(
         f"*{t['title_lbl']}:* {title}",
         f"*{t['source_lbl']}:* {source_display}",
     ]
+
+    preview = _build_telegram_preview(source_excerpt)
+    if preview:
+        lines.append(f"*{t['preview_lbl']}:* {preview}")
 
     if assessment and isinstance(assessment.get("scores"), dict):
         dims: list[tuple[str, int]] = []

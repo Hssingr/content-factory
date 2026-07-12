@@ -73,13 +73,19 @@ def generate_parent_source_script(
     ``_ensure_ai_story_expanded()`` expands it into a full story body in
     place. The floor check then judges the expanded body exactly like it
     already judges a Reddit-discovered body — one shared pass/fail
-    implementation for both paths.
+    implementation for both paths. Any ``story`` argument the caller passed
+    in is discarded and rebuilt from the just-expanded ``content`` row for
+    this path — a pre-expansion premise ``Story`` would otherwise silently
+    ground the blueprint/sections on the short premise instead of the real
+    expanded story.
 
     Args:
         content: Approved parent `Content` row.
         db:      SQLAlchemy session managed by the caller.
-        story:   Optional real discovery `Story`; when omitted, rebuilt from
-                 the content row (`source_excerpt` as body).
+        story:   Optional real discovery `Story`; when omitted (or when
+                 ``script_source="ai_generated"``, regardless of what was
+                 passed), rebuilt from the content row (`source_excerpt` as
+                 body).
         context: Optional preloaded `ScriptWorkflowContext` (saves the caller
                  a duplicate load); loaded from the DB when omitted.
 
@@ -98,6 +104,16 @@ def generate_parent_source_script(
     if script_source == "ai_generated":
         if not _ensure_ai_story_expanded(content, context, db):
             return None
+        # _ensure_ai_story_expanded() just rewrote content.source_excerpt in
+        # place (premise -> full expanded body). Any Story the caller passed
+        # in was necessarily built before expansion (test_full_pipeline.py's
+        # fresh-discovery path captures Story from run_discovery(), which for
+        # this script_source only ever holds the short discovery-time
+        # premise) and would silently ground the blueprint/sections on that
+        # stale premise instead of the real story. Always rebuild from the
+        # just-expanded content row for this path — never trust a pre-
+        # expansion story argument here.
+        story = _build_story(content)
 
     if not _passes_source_material_floor(content, context, db):
         return None

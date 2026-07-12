@@ -250,7 +250,10 @@ class TestGenerateStoryPremise(unittest.TestCase):
 
 class TestExpandStoryPremise(unittest.TestCase):
     def _channel(self):
-        return SimpleNamespace(id=uuid.uuid4(), niche="horror", tone="suspenseful")
+        return SimpleNamespace(
+            id=uuid.uuid4(), niche="horror", tone="suspenseful",
+            description="A channel about small-town urban legends.",
+        )
 
     def test_returns_expanded_body_on_success(self):
         channel = self._channel()
@@ -312,6 +315,86 @@ class TestExpandStoryPremise(unittest.TestCase):
             result = story_generator_mod.expand_story_premise(
                 premise="p", channel=channel, script_format="youtube_long", language="en",
             )
+        self.assertIsNone(result)
+
+
+class TestReviseStoryPremise(unittest.TestCase):
+    """revise_story_premise() — the conversational-revision function (CLAUDE.md
+    §9.5's "Conversational premise revision"): a CHANGE reply for
+    script_source="ai_generated" must revise the SAME premise using the full
+    prior conversation, not discard it for an unrelated new one."""
+
+    def _channel(self):
+        return SimpleNamespace(
+            id=uuid.uuid4(), niche="history", tone="documentary",
+            description="A channel about famous ancient military campaigns.",
+        )
+
+    def test_returns_revised_title_and_body_on_success(self):
+        channel = self._channel()
+        conversation = [
+            {"role": "assistant", "title": "A General's Gamble", "body": "Vague description."},
+            {"role": "operator", "feedback": "Be specific — this is about Hannibal crossing the Alps."},
+        ]
+        with patch.object(
+            story_generator_mod, "call_claude_structured",
+            return_value={"title": "Hannibal: Carthage's War Against Rome",
+                          "body": "Hannibal leads his army, elephants included, across the Alps to fight Rome."},
+        ):
+            result = story_generator_mod.revise_story_premise(
+                channel=channel, language="en", conversation=conversation,
+            )
+        self.assertEqual(result["title"], "Hannibal: Carthage's War Against Rome")
+        self.assertIn("Hannibal", result["body"])
+
+    def test_full_conversation_transcript_included_in_user_message(self):
+        """The money test: every prior premise AND every operator reply must
+        reach Claude, in order — not just the latest feedback — so a later
+        revision can never contradict an earlier one."""
+        channel = self._channel()
+        conversation = [
+            {"role": "assistant", "title": "Title A", "body": "Body A."},
+            {"role": "operator", "feedback": "Make the setting ancient Rome."},
+            {"role": "assistant", "title": "Title B", "body": "Body B, now set in Rome."},
+            {"role": "operator", "feedback": "Now make the title mention Hannibal specifically."},
+        ]
+        captured: dict = {}
+
+        def fake_call(**kwargs):
+            captured.update(kwargs)
+            return {"title": "Hannibal in Rome", "body": "Revised body."}
+
+        with patch.object(story_generator_mod, "call_claude_structured", side_effect=fake_call):
+            story_generator_mod.revise_story_premise(channel=channel, language="en", conversation=conversation)
+
+        msg = captured["user_message"]
+        self.assertIn("Title A", msg)
+        self.assertIn("Body A.", msg)
+        self.assertIn("Make the setting ancient Rome.", msg)
+        self.assertIn("Title B", msg)
+        self.assertIn("Body B, now set in Rome.", msg)
+        self.assertIn("Now make the title mention Hannibal specifically.", msg)
+        # Order matters: turn 1 must appear before turn 4 in the transcript.
+        self.assertLess(msg.index("Title A"), msg.index("Now make the title mention Hannibal"))
+
+    def test_empty_title_or_body_returns_none(self):
+        channel = self._channel()
+        conversation = [
+            {"role": "assistant", "title": "T", "body": "B"},
+            {"role": "operator", "feedback": "f"},
+        ]
+        with patch.object(story_generator_mod, "call_claude_structured", return_value={"title": "", "body": "x"}):
+            result = story_generator_mod.revise_story_premise(channel=channel, language="en", conversation=conversation)
+        self.assertIsNone(result)
+
+    def test_claude_exception_returns_none_never_raises(self):
+        channel = self._channel()
+        conversation = [
+            {"role": "assistant", "title": "T", "body": "B"},
+            {"role": "operator", "feedback": "f"},
+        ]
+        with patch.object(story_generator_mod, "call_claude_structured", side_effect=RuntimeError("boom")):
+            result = story_generator_mod.revise_story_premise(channel=channel, language="en", conversation=conversation)
         self.assertIsNone(result)
 
 
@@ -778,6 +861,46 @@ class TestGenerateParentSourceScriptAiGeneratedChain(unittest.TestCase):
 
         expand_mock.assert_not_called()
         self.assertIsNotNone(result)
+
+    def test_stale_premise_story_argument_is_discarded_after_expansion(self):
+        """Regression: a caller may pass a pre-expansion premise Story (this
+        is exactly what test_full_pipeline.py's fresh-discovery path used to
+        do, before it was fixed to stop passing story= at all — see CLAUDE.md
+        §9.5). For script_source="ai_generated" that argument must never
+        reach blueprint/section generation: it predates the real expanded
+        story _ensure_ai_story_expanded() just wrote to
+        content.source_excerpt, and would silently ground the script on a
+        3-6 sentence premise instead of the real story."""
+        premise = "A short premise about a locked attic."
+        db, content = self._fixtures(premise=premise)
+        expanded = " ".join(["word"] * 1300)
+
+        stale_story = Story(
+            url=content.source_url, title="Stale Premise Title", body=premise,
+            language="en", source_type="ai_generated", source_value="claude_synthesis",
+            upvotes=0, comments=0,
+        )
+
+        captured: dict = {}
+
+        def _capturing_blueprint(story, channel, **kwargs):
+            captured["story"] = story
+            return _fake_blueprint(story, channel, **kwargs)
+
+        with (
+            patch.object(script_workflow_mod, "expand_story_premise", return_value=expanded),
+            patch.object(script_workflow_mod, "generate_story_blueprint", side_effect=_capturing_blueprint),
+            patch.object(script_workflow_mod, "generate_script_sections", side_effect=_fake_sections),
+        ):
+            result = script_workflow_mod.generate_parent_source_script(content, db, story=stale_story)
+
+        self.assertIsNotNone(result)
+        # The story actually sent to blueprint generation must carry the
+        # EXPANDED body — never the stale pre-expansion premise the caller
+        # passed in.
+        self.assertEqual(captured["story"].body, expanded)
+        self.assertNotEqual(captured["story"].body, premise)
+        self.assertEqual(content.source_excerpt, expanded)
 
     def test_reddit_content_unaffected_expand_never_called(self):
         """Regression: a reddit-sourced content (script_source='reddit')

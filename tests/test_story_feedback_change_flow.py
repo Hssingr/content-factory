@@ -45,7 +45,9 @@ def _fixture():
         revision_count=0, script_issues_log=None, status="PENDING",
     )
     user = SimpleNamespace(telegram_chat_id="12345", primary_language="en")
-    config = SimpleNamespace(validation_max_revisions=3, validation_on_limit_reached="auto_approve")
+    config = SimpleNamespace(
+        validation_max_revisions=3, validation_on_limit_reached="auto_approve", script_source="reddit",
+    )
     db = _FakeDb({
         "ChannelConfig": config,
         "User": user,

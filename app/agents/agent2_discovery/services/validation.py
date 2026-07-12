@@ -10,6 +10,7 @@ from telegram.ext import ContextTypes
 from app.database import _get_session_factory
 from app.models import Channel, ChannelConfig, Content, ContentValidation, User
 from app.services import telegram_client
+from app.services.script_source import normalize_script_source
 from app.agents.agent2_discovery.system_prompt import build_telegram_message
 
 _REDDIT_URL_RE = re.compile(r"https?://(?:www\.)?reddit\.com/", re.IGNORECASE)
@@ -58,6 +59,7 @@ def send_for_validation(
         assessment=assessment,
         target_languages=target_languages,
         user_language=user.primary_language,
+        source_excerpt=content.source_excerpt or "",
     )
 
     # Send — sync HTTP call, safe for Celery prefork workers
@@ -300,6 +302,7 @@ def _handle_manual_story_input(
         assessment=None,
         target_languages=None,
         user_language=user.primary_language,
+        source_excerpt=content.source_excerpt or "",
     )
     db.commit()
     logger.info(
@@ -355,14 +358,20 @@ def _handle_change(
 ) -> tuple[str, str] | None:
     """Process a non-APPROVE reply as story-level feedback.
 
+    Branches on ``script_source`` (AI-Generated Story Discovery — CLAUDE.md
+    §9.5's "Conversational premise revision"): ``script_source="ai_generated"``
+    treats this as a real, continuing conversation about the SAME premise —
+    see ``_handle_change_ai_generated()``. Every other ``script_source``
+    keeps the original behavior below: reject the candidate and re-dispatch
+    discovery with the feedback threaded into the exclusion context. There is
+    no "premise" to iterate on for a real discovered post — only a different
+    post to find — so reject-and-search-again remains correct there.
+
     Fresh full-system audit §1.3: scripts are generated only AFTER approval,
     so at validation time there is never a script to revise — the previous
     revise-the-script flow was unreachable dead code that silently swallowed
     the operator's feedback (it logged "cannot regenerate" and replied with
-    nothing). A CHANGE reply now honestly does what it can at this stage:
-    reject the story, re-dispatch discovery with the rejected story AND the
-    operator's feedback threaded into the exclusion context, and tell the
-    operator what happened.
+    nothing). A CHANGE reply now honestly does what it can at this stage.
 
     Returns:
         ``(chat_id, telegram_message)`` to be sent by the caller, or ``None``
@@ -371,6 +380,11 @@ def _handle_change(
     from app.scheduler import celery_app
 
     config: ChannelConfig | None = db.get(ChannelConfig, channel.id)
+    script_source = normalize_script_source(config.script_source if config else "reddit")
+
+    if script_source == "ai_generated":
+        return _handle_change_ai_generated(validation, content, channel, config, feedback, db)
+
     max_revisions = config.validation_max_revisions if config else 3
     on_limit      = config.validation_on_limit_reached if config else "auto_approve"
 
@@ -420,6 +434,99 @@ def _handle_change(
         f"Your feedback was noted and passed to discovery:\n_{feedback[:300]}_"
     )
     return user.telegram_chat_id, message
+
+
+def _handle_change_ai_generated(
+    validation: ContentValidation,
+    content: Content,
+    channel: Channel,
+    config: ChannelConfig | None,
+    feedback: str,
+    db: Session,
+) -> tuple[str, str] | None:
+    """Revise the SAME ai_generated premise in place, using full conversation history.
+
+    Unlike the reddit CHANGE path, nothing is rejected or re-dispatched:
+    ``content`` and ``validation`` are the same rows throughout the whole
+    exchange. The full conversation (every premise Claude has proposed, every
+    operator reply, in order) is persisted in ``content.story_blueprint
+    ["ai_conversation"]`` — the same pre-approval scratch-shape convention
+    ``_handle_manual_story_input()`` already uses for ``rejected_stories`` on
+    the manual-fallback placeholder row (no new DB column). It is threaded
+    into ``revise_story_premise()`` on every round so a later revision can
+    never contradict or silently discard an earlier one.
+
+    Returns:
+        ``(chat_id, telegram_message)`` to be sent by the caller, or ``None``
+        (limit-policy applied, or no Telegram chat configured).
+    """
+    from app.agents.agent2_discovery.services.story_generator import revise_story_premise
+
+    max_revisions = config.validation_max_revisions if config else 3
+    on_limit      = config.validation_on_limit_reached if config else "auto_approve"
+
+    validation.revision_count += 1
+    issues = list(validation.script_issues_log or [])
+    issues.append({"revision": validation.revision_count, "feedback": feedback})
+    validation.script_issues_log = issues
+
+    if validation.revision_count >= max_revisions:
+        _apply_limit_policy(validation, content, on_limit, db)
+        return None
+
+    conversation: list[dict] = list((content.story_blueprint or {}).get("ai_conversation", []))
+    if not conversation:
+        # First CHANGE reply for this content — seed turn 1 with the premise
+        # the operator is actually replying to (the discovery-time premise,
+        # or whatever was last persisted), so the transcript starts complete.
+        conversation.append({
+            "role": "assistant", "title": content.title, "body": content.source_excerpt or "",
+        })
+    conversation.append({"role": "operator", "feedback": feedback})
+
+    user: User | None = db.get(User, channel.user_id)
+    if not user or not user.telegram_chat_id:
+        return None
+    chat_id = user.telegram_chat_id
+
+    revised = revise_story_premise(
+        channel=channel, language=content.source_language, conversation=conversation,
+    )
+    if revised is None:
+        logger.error(
+            "AI_PREMISE_REVISION_FAILED content=%s channel=%s revision=%d",
+            content.id, channel.id, validation.revision_count,
+        )
+        # Persist the attempted feedback turn (so the next reply's transcript
+        # still reflects it) but leave title/source_excerpt untouched — the
+        # content/validation stay PENDING on the same message; the operator
+        # can retry the feedback or approve the version already shown.
+        content.story_blueprint = {**(content.story_blueprint or {}), "ai_conversation": conversation}
+        db.commit()
+        return chat_id, (
+            "⚠️ Could not revise the story — please try your feedback again, or reply "
+            "APPROVE to keep the current version."
+        )
+
+    conversation.append({"role": "assistant", "title": revised["title"], "body": revised["body"]})
+    content.title = revised["title"]
+    content.source_excerpt = revised["body"]
+    content.story_blueprint = {**(content.story_blueprint or {}), "ai_conversation": conversation}
+    db.commit()
+    logger.info(
+        "AI_PREMISE_REVISED content=%s channel=%s revision=%d",
+        content.id, channel.id, validation.revision_count,
+    )
+
+    message = build_telegram_message(
+        title=content.title,
+        url=content.source_url,
+        assessment=None,
+        target_languages=None,
+        user_language=user.primary_language,
+        source_excerpt=content.source_excerpt or "",
+    )
+    return chat_id, message
 
 
 def _apply_limit_policy(

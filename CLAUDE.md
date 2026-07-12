@@ -1895,6 +1895,33 @@ Rules:
   `revision` task key) was unreachable dead code — no script exists while a
   validation is PENDING — and is deleted; do not pretend script revision
   exists when no script exists.
+- `build_telegram_message()` (`system_prompt.py`) includes a deterministic
+  2-3 sentence **preview** line (`_build_telegram_preview()`, first
+  `split_sentences()`-derived sentences of `Content.source_excerpt`, no
+  Claude call) between the `Source:` and `Top signals:` lines whenever
+  `source_excerpt` is non-empty — the operator otherwise sees only a title
+  and a source label with no sense of what the story is actually about,
+  which is a hard blocker for `script_source="ai_generated"` specifically
+  (there is no URL to click for that path; the source label is a static
+  "AI-generated original story premise" string). `send_for_validation()` and
+  `_handle_manual_story_input()` both pass `content.source_excerpt`; the
+  parameter defaults to `""` (omitted from the message) for any caller that
+  doesn't have it.
+- `test_pipeline/test_full_pipeline.py`'s `_run_telegram_approval()` mirrors
+  this same APPROVE/CHANGE branching, not just APPROVE — a real gap found
+  after the AI-Generated Story Discovery feature (§9.5) shipped: the
+  harness's polling loop previously marked content `APPROVED` regardless of
+  what the operator actually typed back, silently discarding a CHANGE
+  reply's feedback and proceeding to script generation on a story the
+  operator had just rejected. It now rejects the candidate exactly like
+  `_handle_change()` (`Content.status="FAILED"`,
+  `ContentValidation.status="REJECTED"`, feedback appended to
+  `script_issues_log`), calls `run_discovery()` again in-process with the
+  feedback threaded into `rejected_stories`, sends the new candidate for
+  approval, and repeats — chatbot-style iteration, capped by the same
+  `validation_max_revisions` config the production path uses (then
+  auto-approves the last candidate, mirroring `_apply_limit_policy()`'s
+  default). See §9.5 for the AI-generated-story interaction this uncovered.
 
 #### `run_agent2_scripts_for_content`
 
@@ -2687,9 +2714,38 @@ telemetry only, not a retry trigger.
 Uses `call_claude_structured(task="story_synthesis", ...)` — the system
 prompt requires original fiction only (never fake Reddit framing: no
 invented usernames, no "OP", no fabricated upvote/comment counts, no claim
-this really happened to a real person online), rights/IP-safe original
-characters/settings, and instructs the premise to create curiosity without
-resolving it (the mystery/tension is left for the full expansion).
+this really happened to a real person online) and rights/IP-safe original
+characters/settings.
+
+**Title/description must be direct, not a mystery teaser (operator
+feedback, live-canary fix):** a real run produced vague, suspense-style
+titles/descriptions ("Do not resolve the mystery/tension in the
+premise... create curiosity, not satisfy it" was the original instruction)
+that told the operator nothing about what the story actually covered before
+they had to approve it — this is an approval screen, not a viewer-facing
+hook. The prompt now requires a clear, direct title naming the specific
+subject/situation, and a 2-4 sentence description stating the situation,
+setting, and people/conflict plainly enough that the operator could
+describe the story to someone else after reading it once — e.g. title
+"Hannibal: Carthage's War Against Rome", description "The story follows
+Hannibal of Carthage leading his army, elephants included, across the
+Mediterranean and the Alps to fight Rome." The eventual resolution may
+still be left open (that's normal story structure); the *subject* must
+never be hidden to manufacture suspense. This does not reopen fiction vs.
+real-history scope — the feature remains original-fiction-only by explicit
+operator decision; only the directness of the operator-facing text changed.
+
+**Channel description is the specific subject-matter brief, not
+background color (same fix):** the prompt now explicitly tells Claude that
+`channel.description` — not just `niche`/`tone` — names the specific kind
+of story to write (e.g. "ancient military history and famous battles"),
+and that niche/tone only narrow the category/register. `expand_story_premise()`
+(below) previously omitted `channel.description` from its own user message
+entirely — grounding the full expansion on niche/tone only, with the
+description's influence surviving only indirectly through the already-
+approved premise text. It now receives `channel.description` directly too,
+so a long/nuanced channel description isn't lost between the premise and
+the full expansion.
 
 #### `expand_story_premise`
 
@@ -2794,10 +2850,134 @@ persist pipeline.
   `_passes_source_material_floor()` call catches it exactly like it already
   catches a too-thin Reddit story.
 
+**Story-staleness guard (post-implementation review):** `generate_parent_source_script()`
+accepts an optional pre-built `story` argument (§9.3's `_build_story()` doc
+above) — when `script_source == "ai_generated"`, any `story` the caller
+passed in is now discarded and rebuilt via `_build_story(content)`
+immediately after `_ensure_ai_story_expanded()` returns, *before* the
+existing `if story is None: story = _build_story(content)` line is ever
+reached. A caller-supplied `story` for this path is guaranteed to predate
+the expansion — for `test_pipeline/test_full_pipeline.py` specifically
+(the only real caller that ever passes a non-`None` `story` — see below),
+it is literally the discovery-time premise `Story` returned by
+`run_discovery()`, not the full expanded body just written to
+`content.source_excerpt`. Without this guard the blueprint/sections would
+silently ground on a 3-6 sentence premise instead of the real story.
+`run_script_workflow()` (production) is unaffected either way — it always
+calls with `story=None`.
+
+**`test_pipeline/test_full_pipeline.py` no longer threads a captured
+`Story` through at all** (root-cause fix, not just the defense above):
+`_run_step_scripts()` calls `generate_parent_source_script(content, db)`
+with no `story` argument, exactly matching production's `run_script_workflow()`
+convention. The harness used to capture `Story` from its own
+`run_discovery()` call and pass it through, which — beyond the ai_generated
+staleness case above — would also have gone stale for **any** script_source
+after a CHANGE-driven re-discovery (see the `_run_telegram_approval()` entry
+under §9.3 `send_for_validation`): the harness's own `content` variable gets
+replaced with a new row from a second `run_discovery()` call, but the
+originally-captured `story` object would still describe the first,
+now-rejected candidate. `_build_story(content)` always reads whatever
+`content.source_excerpt` currently holds, so it can never drift from the
+`content` row actually being processed — this is why `Story.upvotes`/
+`comments`/`published_at`/`source_type`/`source_value` (dropped by
+`_build_story()`, only used by `score_story_for_gate()` during discovery
+itself, never by blueprint/section generation) are safe to lose.
+
+#### Conversational premise revision (operator correction)
+
+The original CHANGE design (§9.3's `send_for_validation` entry) treated
+every non-APPROVE reply as "reject this candidate, search for a different
+one" — correct for `"reddit"` (a real discovered post can't be "revised",
+only swapped for a different one), but wrong for `"ai_generated"`: an
+operator correction pointed out that the Telegram exchange for a
+Claude-synthesized premise should be a real, continuing conversation — the
+operator comments, Claude adjusts the SAME premise, and this repeats until
+APPROVE — not a discard-and-search-again loop that throws away everything
+already discussed.
+
+`validation._handle_change()` now branches on `script_source`
+(`normalize_script_source(config.script_source)`, loaded once at the top):
+`"ai_generated"` dispatches to `_handle_change_ai_generated()`; every other
+value keeps the original reject-and-rediscover behavior unchanged (moved
+into the same function, gated behind the branch, not duplicated).
+
+`_handle_change_ai_generated(validation, content, channel, config, feedback, db)`:
+
+- **Same `content`/`ContentValidation` rows throughout the whole exchange**
+  — never rejected, never replaced. Only `content.title`/`content.source_excerpt`
+  change, round after round.
+- **Conversation history is persisted in `content.story_blueprint
+  ["ai_conversation"]`** — the same pre-approval scratch-shape convention
+  `_handle_manual_story_input()` already uses for `rejected_stories` on the
+  manual-fallback placeholder row (no new DB column; `story_blueprint` is
+  free pre-approval, since the real blueprint doesn't exist until after
+  `generate_story_blueprint()` runs post-approval). Each turn is either
+  `{"role": "assistant", "title": ..., "body": ...}` (a premise Claude
+  proposed) or `{"role": "operator", "feedback": ...}` (the operator's
+  reply). On the first CHANGE reply for a content row, turn 1 is seeded from
+  whatever `content.title`/`content.source_excerpt` currently hold (the
+  discovery-time premise) before the operator's feedback is appended, so the
+  transcript always starts complete.
+- Calls `story_generator.revise_story_premise(channel, language, conversation)`
+  — the FULL transcript, not just the latest feedback — so a later revision
+  can never contradict or silently discard an earlier one (e.g. the operator
+  asks for "set it in Rome" in round 1, then "add Hannibal" in round 2 — the
+  round-2 call still sees "set it in Rome" and must not drop it).
+- On success, appends the new `{"role": "assistant", ...}` turn, updates
+  `content.title`/`content.source_excerpt` in place, and returns a fresh
+  `build_telegram_message()` showing the revision — the caller
+  (`handle_telegram_update()`) sends it as the next message and updates
+  `ContentValidation.telegram_message_id` exactly like every other CHANGE
+  reply, so the operator's next reply anchors to the revised version.
+- On a `revise_story_premise()` transport failure, the feedback turn is
+  still persisted (so the next attempt's transcript reflects it) but
+  `title`/`source_excerpt` are left unchanged, and the operator is told to
+  retry or approve the version already shown — no silent content loss.
+- `validation.revision_count`/`script_issues_log` bookkeeping and the
+  `validation_max_revisions` cap are unchanged from the reddit path (same
+  `_apply_limit_policy()` call on exhaustion) — only what happens *below*
+  the cap differs.
+
+`story_generator.revise_story_premise(channel, language, conversation) ->
+dict | None`: single Claude call
+(`call_claude_structured(task="story_synthesis", ...)`), no retry loop
+beyond transport-failure handling (Elimination Mandate — same convention as
+`generate_story_premise()`/`expand_story_premise()`). Renders `conversation`
+into a numbered transcript in the user message (every assistant premise
+version, every operator feedback line, in order) and instructs Claude to
+address the operator's most recent feedback while staying consistent with
+everything discussed before it. Same directness/rights-safety rules as
+`generate_story_premise()`'s prompt (§9.5 above) — a revision must be just
+as direct and clear as the original, never a mystery teaser. Returns
+`{"title": ..., "body": ...}` on success, `None` on any failure.
+
+`test_pipeline/test_full_pipeline.py`'s `_run_telegram_approval()` mirrors
+the identical branch for the synchronous operator harness: a per-content
+`conversation: list[dict]` (ai_generated) alongside the existing
+`rejected_stories: list[dict]` (reddit/etc.) — a CHANGE reply either revises
+`content` in place via `revise_story_premise()` and `continue`s the loop
+(next iteration's `send_for_validation()` naturally sends the revised
+version), or rejects and calls `run_discovery()` for a replacement, exactly
+as before. `max_revisions` and the timeout/APPROVE handling are shared,
+unbranched code — only the CHANGE branch itself differs.
+
+Runtime proof: `tests/test_telegram_chatbot_and_story_freshness.py`
+(`TestHandleChangeAiGeneratedConversation`, real `_handle_change()`/
+`_handle_change_ai_generated()`, and `TestTelegramApprovalLoop`'s
+`test_ai_generated_change_revises_same_story_conversationally`, real
+`_run_telegram_approval()`) — both prove the second revision's conversation
+includes the first revision's title/body (not just the original premise),
+the content/validation rows never change identity, `run_discovery()` is
+never called for this path, and the reddit path's reject-and-rediscover
+behavior is unaffected (regression coverage in the same file plus the
+pre-existing `tests/test_story_feedback_change_flow.py`).
+
 #### Model routing and activation
 
 - `story_synthesis` task key (`model_routing.py`) → `PRIMARY_MODEL` — used
-  by both `generate_story_premise()` and `expand_story_premise()`.
+  by `generate_story_premise()`, `expand_story_premise()`, and
+  `revise_story_premise()` (conversational revision, above).
 - `v3_config_rules.is_executable_script_source()` (§8.2) treats
   `{"reddit", "ai_generated"}` as executable for `content_mode="single_story"`
   — `ai_generated` is no longer "reserved for a future phase".
@@ -2825,23 +3005,34 @@ persist pipeline.
 - No changes to Agent 3, Agent 4, Agent 5, multilingual script generation,
   or the shorts planner — all of them consume `Content`/`Script` rows the
   same way regardless of how the parent story originated.
-- The Telegram CHANGE/feedback flow (`_handle_change()`, §9.3
-  `send_for_validation`) needed zero changes — it is already origin-agnostic.
+- The production Telegram CHANGE/feedback flow (`_handle_change()`, §9.3
+  `send_for_validation`) was originally built origin-agnostic (reject and
+  re-dispatch discovery for any `script_source`) but was corrected by an
+  operator during post-implementation review: for `"ai_generated"` this is
+  now conversational premise revision, not reject-and-rediscover — see
+  "Conversational premise revision" above. The reddit path's original
+  behavior is unchanged. (The *operator harness's own* approval loop was a
+  separate, earlier-found gap — see the `_run_telegram_approval()` entry
+  under §9.3 `send_for_validation` and the story-staleness guard above.)
 - `"user_provided"` and `"hybrid"` remain reserved, unexecuted
   `script_source` values — do not wire execution logic for either without a
   new design record and CLAUDE.md update.
 
 Runtime proof: `tests/test_ai_generated_script_source.py` — Agent 1
 executability/activation unit tests; `generate_story_premise()`/
-`expand_story_premise()` unit tests with the paid `call_claude_structured`
-boundary stubbed; a runtime proof (CLAUDE.md §19.4) driving the real
-`run_discovery()` and `generate_parent_source_script()` chains against a
-fake DB (only the paid Claude boundaries stubbed) covering: zero-
-`ChannelSource` channels succeed; exclusions are seeded before the first
-premise call; nuclear retry is never invoked; the floor check never fires
-on a short premise at discovery time; `_ensure_ai_story_expanded()`'s
-idempotency, persist-then-recheck ordering, and failure path; and the
-unmodified reddit path re-run as a regression guard.
+`expand_story_premise()`/`revise_story_premise()` unit tests with the paid
+`call_claude_structured` boundary stubbed (including the conversation-
+transcript-ordering proof for `revise_story_premise()`); a runtime proof
+(CLAUDE.md §19.4) driving the real `run_discovery()` and
+`generate_parent_source_script()` chains against a fake DB (only the paid
+Claude boundaries stubbed) covering: zero-`ChannelSource` channels succeed;
+exclusions are seeded before the first premise call; nuclear retry is never
+invoked; the floor check never fires on a short premise at discovery time;
+`_ensure_ai_story_expanded()`'s idempotency, persist-then-recheck ordering,
+and failure path; and the unmodified reddit path re-run as a regression
+guard. `tests/test_telegram_chatbot_and_story_freshness.py` covers the
+conversational-revision CHANGE path specifically — see "Conversational
+premise revision" above for the full runtime-proof description.
 
 ---
 
