@@ -8,11 +8,20 @@ from app.database import Base
 
 class ChannelVoice(Base):
     __tablename__ = "channel_voices"
-    __table_args__ = (UniqueConstraint("channel_id", "language", name="uq_channel_voice_language"),)
+    __table_args__ = (
+        UniqueConstraint("channel_id", "language", "gender", name="uq_channel_voice_language_gender"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     channel_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("channels.id", ondelete="CASCADE"), nullable=False)
     language: Mapped[str] = mapped_column(String(10), nullable=False)
+    # Roadmap Phase D1 — one voice per (channel, language, gender); Agent 3
+    # selects between a language's configured genders based on the story
+    # blueprint's protagonist_gender (app/agents/agent3_audio/services/audio.py).
+    # "feminine" | "masculine". Every pre-existing row backfills to "feminine"
+    # via the migration's server_default — identical to today's single-voice
+    # behavior; the operator adds masculine rows through the Agent 1 UI.
+    gender: Mapped[str] = mapped_column(String(16), nullable=False, server_default="masculine")
     # TTS provider for this language's voice ("cartesia" | "elevenlabs").
     # The column-level default ("elevenlabs") is a legacy value never exercised
     # in practice — Agent 1 (replace_voices()) always sets this explicitly per

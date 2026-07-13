@@ -161,10 +161,10 @@ def _build_content_channel_script(*, is_short_episode: bool):
     content = SimpleNamespace(
         id=content_id, channel_id=uuid.uuid4(), is_short_episode=is_short_episode,
         parent_content_id=uuid.uuid4() if is_short_episode else None,
-        status="SCRIPTS_VALIDATED",
+        status="SCRIPTS_VALIDATED", story_blueprint=None,
     )
     channel = SimpleNamespace(id=content.channel_id)
-    voice = SimpleNamespace(language="en", voice_id="voice_en", channel_id=channel.id)
+    voice = SimpleNamespace(language="en", voice_id="voice_en", channel_id=channel.id, gender="feminine")
     script = SimpleNamespace(
         content_id=content_id, language="en", version=1, validated=True,
         voice_script="Some validated narration text for this test.",

@@ -126,7 +126,13 @@ def check_activation_readiness(channel: Channel) -> dict:
             message="No language is configured — save Section 2 (Languages) with at least one language.",
         ))
 
-    # 4 — a voice per configured language
+    # 4 — a voice per configured language. Gender-agnostic by construction
+    # (roadmap Phase D1 — ChannelVoice now allows one row per (channel,
+    # language, gender)): this set comprehension only cares that AT LEAST
+    # ONE row exists per language, regardless of how many genders are
+    # configured for it — "just feminine", "just masculine", or both all
+    # satisfy this check identically. No code change was needed here when
+    # the DB started allowing a second row per language.
     languages_with_voice = {v.language for v in channel.voices}
     for lang_row in channel.languages:
         if lang_row.language not in languages_with_voice:

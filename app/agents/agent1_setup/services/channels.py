@@ -120,6 +120,7 @@ def replace_voices(db: Session, channel_id: uuid.UUID, entries: list[VoiceEntry]
             emotion=e.emotion,
             music_style=e.music_style,
             use_case=e.use_case,
+            gender=e.gender,
         )
         for e in entries
     ])

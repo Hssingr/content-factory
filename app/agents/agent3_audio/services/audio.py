@@ -112,11 +112,77 @@ def _assert_duration_transcript_alignment(
     return False
 
 
+_VALID_VOICE_GENDERS = ("feminine", "masculine")
+_DEFAULT_VOICE_GENDER = "feminine"
+
+
+def _resolve_target_gender(content: Content, db: Session) -> str:
+    """Return the target narration-voice gender for this content (roadmap
+    Phase D1 — gender-aware voice selection).
+
+    Reads ``protagonist_gender`` from the story blueprint: ``"feminine"``,
+    ``"masculine"``, or ``"unspecified"`` (or missing entirely, for a
+    blueprint generated before this phase shipped). Anything other than a
+    real gender value normalizes to ``"feminine"`` here — a story with no
+    single clear protagonist gets the channel's default voice, never a
+    crash or a skipped language over an ambiguous blueprint value.
+
+    Child Shorts never get their own blueprint — only parent script
+    generation runs ``generate_story_blueprint()`` — so a child reads its
+    parent's blueprint instead, the same convention already used by Agent 5's
+    ``_resolve_proper_nouns_for_content()`` (roadmap Phase B2, CLAUDE.md
+    §11A.4) for the same parent/child blueprint-sharing need.
+    """
+    blueprint = content.story_blueprint
+    is_short_episode = bool(getattr(content, "is_short_episode", False))
+    parent_content_id = getattr(content, "parent_content_id", None)
+    if is_short_episode and not blueprint and parent_content_id:
+        parent_content = db.get(Content, parent_content_id)
+        blueprint = parent_content.story_blueprint if parent_content else None
+
+    gender = (blueprint or {}).get("protagonist_gender")
+    return gender if gender in _VALID_VOICE_GENDERS else _DEFAULT_VOICE_GENDER
+
+
+def _select_channel_voice(
+    voices_by_lang: dict[str, dict[str, "ChannelVoice"]], language: str, target_gender: str,
+) -> "ChannelVoice | None":
+    """Return the best-matching ``ChannelVoice`` for (language, target_gender)
+    (roadmap Phase D1).
+
+    Only one gender is required per language, not both — the operator may
+    configure just feminine, just masculine, or both. An exact match wins;
+    otherwise falls back to whichever gender IS configured for that language
+    (there is at most one alternative, since gender is binary today) and
+    logs a warning — content must never fail or skip a language solely
+    because its preferred gender isn't configured. Returns ``None`` only
+    when the language has no voice configured at all (unchanged from the
+    pre-existing "no voice configured for lang" behavior).
+    """
+    by_gender = voices_by_lang.get(language) or {}
+    exact = by_gender.get(target_gender)
+    if exact is not None:
+        return exact
+    for fallback_gender, voice in by_gender.items():
+        logger.warning(
+            "VOICE_GENDER_FALLBACK language=%s wanted=%s used=%s",
+            language, target_gender, fallback_gender,
+        )
+        return voice
+    return None
+
+
 def run_audio_generation(content_id: uuid.UUID, db: Session) -> bool:
     """Run the full Agent 3 audio pipeline for one piece of content.
 
     For every validated script language:
-      1. Look up the voice_id + emotion from channel_voices
+      1. Resolve the target narration-voice gender from the story blueprint's
+         protagonist_gender (roadmap Phase D1 — _resolve_target_gender()) and
+         select the matching channel_voices row (_select_channel_voice()) —
+         falls back to whichever gender IS configured, logged, when the
+         preferred one isn't; falls back to "feminine" when the blueprint
+         has no protagonist_gender at all (legacy content, or a genuinely
+         ambiguous story).
       2. Generate TTS audio via the configured provider (channel_voice.provider;
          model from channel_voice.tts_model; chunked at [SECTION N] boundaries)
       3. Save the mp3 to disk and measure exact duration with ffprobe
@@ -163,13 +229,14 @@ def run_audio_generation(content_id: uuid.UUID, db: Session) -> bool:
             content_id,
         )
 
-    # Build voice map: language → ChannelVoice
-    voices: dict[str, ChannelVoice] = {
-        v.language: v
-        for v in db.query(ChannelVoice)
-        .filter(ChannelVoice.channel_id == channel.id)
-        .all()
-    }
+    # Build voice map: language → gender → ChannelVoice (roadmap Phase D1 —
+    # gender-aware voice selection; a language may have one or both genders
+    # configured, see _select_channel_voice()).
+    voices_by_lang: dict[str, dict[str, ChannelVoice]] = {}
+    for v in db.query(ChannelVoice).filter(ChannelVoice.channel_id == channel.id).all():
+        voices_by_lang.setdefault(v.language, {})[v.gender] = v
+
+    target_gender = _resolve_target_gender(content, db)
 
     # Load the latest validated script per language
     scripts = _load_latest_scripts(content_id, db)
@@ -183,7 +250,7 @@ def run_audio_generation(content_id: uuid.UUID, db: Session) -> bool:
     success_count = 0
 
     for lang, script in scripts.items():
-        voice = voices.get(lang)
+        voice = _select_channel_voice(voices_by_lang, lang, target_gender)
         if not voice or not voice.voice_id:
             logger.warning("No voice configured for lang=%s — skipping", lang)
             continue

@@ -11,6 +11,11 @@ ContentMode  = Literal["single_story", "limited_series", "ongoing_series"]
 ScriptSource = Literal["reddit", "ai_generated", "user_provided", "hybrid"]
 OutputMode   = Literal["youtube_and_shorts", "youtube_long_only", "shorts_only"]
 NarrationPov = Literal["third_person", "first_person_storytime"]
+# Roadmap Phase D1 — one ChannelVoice row per (channel, language, gender);
+# the operator may configure just feminine, just masculine, or both per
+# language. Agent 3 selects between them per content based on the story
+# blueprint's protagonist_gender (see CLAUDE.md §10.3).
+VoiceGender  = Literal["feminine", "masculine"]
 
 
 class ChannelCreate(BaseModel):
@@ -55,6 +60,7 @@ class VoiceEntry(BaseModel):
     emotion: str | None = None
     music_style: str | None = None
     use_case: str | None = None
+    gender: VoiceGender = "feminine"
 
 
 class SourceEntry(BaseModel):
@@ -120,6 +126,7 @@ class VoiceResponse(BaseModel):
     emotion: str | None
     music_style: str | None
     use_case: str | None
+    gender: VoiceGender
 
 
 class SourceResponse(BaseModel):

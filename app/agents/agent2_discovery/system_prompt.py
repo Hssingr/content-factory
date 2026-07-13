@@ -7,7 +7,12 @@ from app.services.script_checks import split_sentences
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "4.8"  # v4.8: roadmap Phase C2/C3 — _STORY_BLUEPRINT_SCHEMA gained
+PROMPT_VERSION = "4.9"  # v4.9: roadmap Phase D1 — _STORY_BLUEPRINT_SCHEMA gained
+                        # protagonist_gender ("feminine"|"masculine"|"unspecified"),
+                        # generated once at blueprint time, zero extra AI calls —
+                        # consumed by Agent 3 for gender-aware voice selection
+                        # (app/agents/agent3_audio/services/audio.py).
+                        # v4.8: roadmap Phase C2/C3 — _STORY_BLUEPRINT_SCHEMA gained
                         # character_descriptors (locked name/age/physical-description
                         # entries) and era_setting (period/place phrase), both generated
                         # once at blueprint time, zero extra AI calls — consumed by
@@ -506,6 +511,13 @@ Rules:
   Midwest", "contemporary/present-day, unspecified U.S. city"). Used to keep every
   generated image's props, clothing, architecture, and technology authentic to this
   period — never invent a period the story does not support.
+- protagonist_gender: the gender of the story's central figure — whoever the story
+  is centrally about, or who narrates it in first-person mode. Return "feminine" or
+  "masculine". Return "unspecified" only when there is genuinely no single clear
+  protagonist (an ensemble cast, or an event-focused story with no central figure).
+  Used to select a matching narration voice — never invent a gender the story does
+  not support; when the story is ambiguous or silent on this, prefer "unspecified"
+  over guessing.
 
 Never invent facts not present in the story body.\
 """
@@ -536,11 +548,12 @@ _STORY_BLUEPRINT_SCHEMA: dict = {
             "maxItems": 5,
         },
         "era_setting": {"type": "string"},
+        "protagonist_gender": {"type": "string", "enum": ["feminine", "masculine", "unspecified"]},
     },
     "required": [
         "hook", "central_question", "major_turns", "final_payoff", "midpoint_retention_trap",
         "comment_trigger", "suggested_section_count", "suggested_title",
-        "character_descriptors", "era_setting",
+        "character_descriptors", "era_setting", "protagonist_gender",
     ],
     "additionalProperties": False,
 }
@@ -576,7 +589,10 @@ def generate_story_blueprint(
         comment_trigger, suggested_section_count, suggested_title,
         character_descriptors (roadmap Phase C2 — list of {name, age,
         description}, possibly empty), era_setting (roadmap Phase C3 — one
-        phrase, possibly empty string).
+        phrase, possibly empty string), protagonist_gender (roadmap Phase
+        D1 — "feminine" | "masculine" | "unspecified", consumed by Agent 3
+        for gender-aware voice selection; never normalized here — callers
+        that need a binary value treat "unspecified"/missing as "feminine").
 
     Raises:
         ValueError: If major_turns has fewer than 2 entries or required keys missing.

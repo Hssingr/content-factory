@@ -139,9 +139,10 @@ class ShortMinimumLengthTest(unittest.TestCase):
             is_short_episode=True,
             parent_content_id=uuid.uuid4(),
             status="SCRIPTS_VALIDATED",
+            story_blueprint=None,
         )
         channel = SimpleNamespace(id=content.channel_id)
-        voice = SimpleNamespace(language="en", voice_id="voice_en", channel_id=channel.id)
+        voice = SimpleNamespace(language="en", voice_id="voice_en", channel_id=channel.id, gender="feminine")
         script = SimpleNamespace(
             content_id=content_id,
             language="en",

@@ -73,6 +73,7 @@ def _voice_summary(channel: Channel) -> list[dict]:
             "provider": v.provider,
             "tts_model": v.tts_model,
             "voice_id": v.voice_id,
+            "gender": v.gender,
         }
         for v in channel.voices
     ]

@@ -179,9 +179,10 @@ def _build_content_channel_script(*, is_short_episode: bool):
         is_short_episode=is_short_episode,
         parent_content_id=uuid.uuid4() if is_short_episode else None,
         status="SCRIPTS_VALIDATED",
+        story_blueprint=None,
     )
     channel = SimpleNamespace(id=content.channel_id)
-    voice = SimpleNamespace(language="en", voice_id="voice_en", channel_id=channel.id)
+    voice = SimpleNamespace(language="en", voice_id="voice_en", channel_id=channel.id, gender="feminine")
     min_words = agent2_scripts._MIN_SHORT_WORDS if is_short_episode else 1300
     script = SimpleNamespace(
         content_id=content_id,

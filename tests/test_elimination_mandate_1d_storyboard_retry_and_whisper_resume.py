@@ -255,9 +255,11 @@ class TestWhisperResumeReusesExistingTranscript(unittest.TestCase):
         from app.agents.agent3_audio.services import audio as audio_module
 
         content_id = uuid.uuid4()
-        content = SimpleNamespace(id=content_id, channel_id=uuid.uuid4(), is_short_episode=False)
+        content = SimpleNamespace(
+            id=content_id, channel_id=uuid.uuid4(), is_short_episode=False, story_blueprint=None,
+        )
         channel = SimpleNamespace(id=content.channel_id)
-        voice = SimpleNamespace(language="en", voice_id="voice-1", provider="cartesia")
+        voice = SimpleNamespace(language="en", voice_id="voice-1", provider="cartesia", gender="feminine")
         script = SimpleNamespace(voice_script="Some validated narration.", estimated_duration_sec=None)
 
         existing_audio_file = AudioFile(

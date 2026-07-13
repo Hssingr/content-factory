@@ -1168,6 +1168,20 @@ verified when the channel first runs audio generation." This matches the
 actual architecture (no provider API call is made; the Voice ID is stored
 and used on Agent 3's first TTS run).
 
+**`VoicesSection.jsx` — two voice cards per language (roadmap Phase D1,
+gender-aware voice configuration):** each language now renders a "Feminine
+Voice" card (recommended default) and a "Masculine Voice (optional)" card,
+both independently optional — mirroring the backend's per-`(language,
+gender)` `ChannelVoice` row. `App.jsx`'s `voices` state changed from
+`{ [language]: {...} }` to `{ [language]: { feminine: {...}|null,
+masculine: {...}|null } }`; `handleVoices()` emits a `replaceVoices()` entry
+only for a `(language, gender)` pair with a non-empty `voice_id` — a
+language may end up with just feminine, just masculine, or both.
+`api.replaceVoices()`/the `PUT /channels/{id}/voices` router needed no
+change (already a generic `list[VoiceEntry]` passthrough); `VoiceEntry`
+gained a `gender: VoiceGender = "feminine"` field (§10.3 has the full
+backend consumer chain).
+
 **`Tab2Credentials.jsx` was split into two separate steps**, mirroring the
 reference design's separate Credentials/Readiness steps: `CredentialsStep.jsx`
 (the credential-row grid only — real Fernet-encrypted save + verify,
@@ -2040,6 +2054,7 @@ Output fields:
 - suggested_title
 - character_descriptors (roadmap Phase C2)
 - era_setting (roadmap Phase C3)
+- protagonist_gender (roadmap Phase D1)
 
 Rules:
 
@@ -2101,6 +2116,22 @@ per-batch generation call.
 - A blueprint generated before this phase shipped simply lacks these two
   keys — every consumer treats a missing key as "nothing to add," never
   forcing a regeneration of legacy content.
+
+`protagonist_gender` (roadmap Phase D1, gender-aware voice configuration):
+`"feminine"` | `"masculine"` | `"unspecified"` — the gender of the story's
+central figure (whoever the story is centrally about, or who narrates it in
+first-person mode), generated once at blueprint time on the same Claude call
+(no extra AI cost). `"unspecified"` is returned only when there is
+genuinely no single clear protagonist (an ensemble cast, or an event-focused
+story). `generate_story_blueprint()` returns this value completely
+untouched — normalization (`"unspecified"`/missing → `"feminine"`) is
+`_resolve_target_gender()`'s job in Agent 3 (§10.3), not this function's;
+inspecting the raw blueprint always shows exactly what Claude returned. See
+§10.3 for the full consumer chain and §8.1/§8.4 for the `ChannelVoice`
+gender configuration this drives. D2 (threading `protagonist_gender` into
+`generate_native_script()` so a translated script's grammar agrees with the
+protagonist's gender — e.g. French "tenue"/"restée" vs "tenu"/"resté") is
+explicitly out of scope for Phase D1 and not implemented.
 
 #### `generate_script_sections`
 
@@ -3238,6 +3269,58 @@ Rules:
 - Child content does not generate breakpoints, bookends, rehooks, or bridges.
 - Child content uses its own script, audio, and Whisper.
 - TTS skip-on-disk must still update/confirm `AudioFile` consistency.
+
+**Gender-aware voice selection (roadmap Phase D1, gender-aware voice
+configuration):** `ChannelVoice` now allows one row per
+`(channel_id, language, gender)` (migration `012_add_channel_voice_gender.py`
+— every pre-existing row backfills to `gender="feminine"` via
+`server_default`, identical to the single-voice behavior every channel had
+before this phase). The voice map built at the top of
+`run_audio_generation()` changed from `dict[str, ChannelVoice]` (language
+only) to `dict[str, dict[str, ChannelVoice]]` (language → gender):
+
+- `_resolve_target_gender(content, db)` reads `protagonist_gender` from
+  `content.story_blueprint` (§9.3) and normalizes anything other than a real
+  `"feminine"`/`"masculine"` value — `"unspecified"`, missing entirely (a
+  legacy blueprint predating this phase), or a malformed blueprint — to
+  `"feminine"`. Child Shorts never get their own blueprint (only parent
+  script generation runs `generate_story_blueprint()`), so a child reads its
+  parent's blueprint via `parent_content_id`, the same convention
+  `agent5_render`'s `_resolve_proper_nouns_for_content()` (§11A.4, roadmap
+  Phase B2) already established for this exact parent/child blueprint-
+  sharing need. Called once per content, before the per-language loop.
+- `_select_channel_voice(voices_by_lang, language, target_gender)` — an
+  exact `(language, target_gender)` match wins. Otherwise falls back to
+  whichever gender IS configured for that language (there is at most one
+  alternative, since gender is binary today) and logs
+  `VOICE_GENDER_FALLBACK language=<lang> wanted=<gender> used=<gender>` at
+  WARNING (CLAUDE.md §3's "no silent fallbacks" rule) — content must never
+  fail or skip a language solely because its preferred gender isn't
+  configured. Returns `None`, unchanged from the pre-existing behavior, only
+  when the language has no voice configured at all ("No voice configured for
+  lang=%s — skipping").
+- The operator may configure just feminine, just masculine, or both per
+  language — nothing requires both. `activation_readiness.py`'s voice check
+  (§8.3, rule 4) already only required "at least one row per language" via a
+  set comprehension over `channel.voices`, so it needed no code change when
+  the DB started allowing a second row per language — verified directly,
+  not assumed.
+- D2 (threading `protagonist_gender` into `generate_native_script()` so a
+  translated script's own grammar agrees with the protagonist's gender) is
+  explicitly out of scope for Phase D1 — voice selection and script
+  translation grammar are independent fixes; only the former is implemented.
+
+Runtime proof: `tests/test_gender_aware_voices.py` — real
+`generate_story_blueprint()` call (only `call_claude_structured` stubbed)
+proving `protagonist_gender` survives untouched; `_resolve_target_gender()`
+and `_select_channel_voice()` unit tests covering every normalization/
+fallback/child-inheritance case; and a real `run_audio_generation()`
+integration test (same `_FakeDb` pattern as
+`test_audio_duration_transcript_alignment_and_props_mirror.py`) proving a
+masculine-protagonist blueprint actually selects the masculine
+`ChannelVoice` row passed into the real `generate_audio()` call — not just
+that the helper functions return correct values in isolation — including
+the child-inherits-parent-gender path through a real `db.get()` lookup.
 
 **Whisper resume skips re-transcription when a transcript already exists
 (Elimination Mandate D1.6, `code_report/forensic_output_audit_borrasca_run.md`):**
@@ -6878,6 +6961,7 @@ AUDIO_LOUDNESS_NORMALIZED
 AUDIO_SECTION_BOUNDARIES_COMPUTED
 VISUAL_TIMING_SECTION_ANCHORED
 VISUAL_TIMING_WHOLE_VIDEO_STRETCH_FALLBACK
+VOICE_GENDER_FALLBACK
 ```
 
 Rules:

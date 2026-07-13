@@ -91,13 +91,19 @@ export default function App() {
       ch.languages.forEach(l => { names[l.language] = l.channel_name })
       setLangNames(names)
 
+      // Roadmap Phase D1 — one voice per (language, gender); nest by
+      // language then gender instead of one voice per language.
       const voicesObj = {}
       ch.voices.forEach(v => {
+        const gender = v.gender || 'feminine'
         voicesObj[v.language] = {
-          provider: v.provider || 'cartesia',
-          tts_model: v.tts_model || (v.provider === 'elevenlabs' ? 'eleven_v3' : 'sonic-3.5'),
-          voice_id: v.voice_id || '',
-          voice_validated: Boolean(v.voice_id),
+          ...(voicesObj[v.language] || {}),
+          [gender]: {
+            provider: v.provider || 'cartesia',
+            tts_model: v.tts_model || (v.provider === 'elevenlabs' ? 'eleven_v3' : 'sonic-3.5'),
+            voice_id: v.voice_id || '',
+            voice_validated: Boolean(v.voice_id),
+          },
         }
       })
       setVoices(voicesObj)
@@ -267,18 +273,27 @@ export default function App() {
   })
 
   const handleVoices = () => run(async () => {
-    const entries = languages.map(lang => {
-      const voice = voices[lang] || {}
-      const provider = voice.provider || 'cartesia'
-      return {
-        language: lang,
-        provider,
-        tts_model: voice.tts_model || (provider === 'elevenlabs' ? 'eleven_v3' : 'sonic-3.5'),
-        voice_id: voice.voice_id ?? '',
-        emotion: null,
-        music_style: null,
-        use_case: null,
-      }
+    // Roadmap Phase D1 — emit an entry only for a (language, gender) pair
+    // that has a non-empty voice_id; a language may end up with just
+    // feminine, just masculine, or both.
+    const entries = []
+    languages.forEach(lang => {
+      const langVoices = voices[lang] || {}
+      ;['feminine', 'masculine'].forEach(gender => {
+        const voice = langVoices[gender]
+        if (!voice || !voice.voice_id?.trim()) return
+        const provider = voice.provider || 'cartesia'
+        entries.push({
+          language: lang,
+          provider,
+          tts_model: voice.tts_model || (provider === 'elevenlabs' ? 'eleven_v3' : 'sonic-3.5'),
+          voice_id: voice.voice_id,
+          emotion: null,
+          music_style: null,
+          use_case: null,
+          gender,
+        })
+      })
     })
     await api.replaceVoices(channelId, entries)
     markDone('voices')

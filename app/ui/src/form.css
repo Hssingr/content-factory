@@ -315,6 +315,24 @@
   flex-direction: column;
   gap: 14px;
 }
+/* Roadmap Phase D1 — two voice cards (feminine/masculine) per language. */
+.voice-language-group {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding-bottom: 18px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.voice-language-group:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+.voice-language-heading {
+  font-size: 0.92rem;
+  font-weight: 700;
+  color: var(--text);
+  margin: 0;
+}
 .voice-block {
   background: var(--panel-alt);
   border: 1px solid var(--border);
