@@ -6,6 +6,12 @@ export type ColorGrade = "desaturated" | "cold_blue" | "warm_amber" | "dark_cont
 export type MediaType  = "image" | "video";
 
 // Storyboard-beat enums — present when the Storyboard Agent designed this section
+//
+// "dip_to_black" is retired (roadmap Phase A2) — Claude's storyboard schema no
+// longer offers it, so no freshly generated beat carries it. Kept in this union
+// only so a VideoSection row persisted before this fix (whose stored
+// generation_prompt JSON still has the literal string) still type-checks;
+// MediaSection.tsx treats it identically to "crossfade" at render time.
 export type Transition = "cut" | "crossfade" | "dip_to_black" | "whip_pan"
                        | "zoom_blur" | "match_cut" | "none";
 // Subtitles-only rendering (audit G-0/G-8): the retired OverlayPosition /

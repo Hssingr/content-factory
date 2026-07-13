@@ -201,7 +201,7 @@ class TestRunAudioGenerationEmptyTranscript(unittest.TestCase):
 
         with (
             patch.object(audio, "audio_path", return_value=MissingAudioPath()),
-            patch.object(audio, "generate_audio", return_value=b"mp3"),
+            patch.object(audio, "generate_audio", return_value=(b"mp3", [])),
             patch.object(
                 audio, "save_audio",
                 return_value=("cache/audio/en.mp3", audio._MIN_SHORT_AUDIO_DURATION_MS + 5_000),
@@ -222,7 +222,7 @@ class TestRunAudioGenerationEmptyTranscript(unittest.TestCase):
 
         with (
             patch.object(audio, "audio_path", return_value=MissingAudioPath()),
-            patch.object(audio, "generate_audio", return_value=b"mp3"),
+            patch.object(audio, "generate_audio", return_value=(b"mp3", [])),
             patch.object(
                 audio, "save_audio",
                 return_value=("cache/audio/en.mp3", audio._MIN_SHORT_AUDIO_DURATION_MS + 5_000),
@@ -243,7 +243,7 @@ class TestRunAudioGenerationEmptyTranscript(unittest.TestCase):
 
         with (
             patch.object(audio, "audio_path", return_value=MissingAudioPath()),
-            patch.object(audio, "generate_audio", return_value=b"mp3"),
+            patch.object(audio, "generate_audio", return_value=(b"mp3", [])),
             patch.object(audio, "save_audio", return_value=("cache/audio/en.mp3", 500_000)),
             patch.object(audio, "transcribe", return_value=[]) as transcribe,
         ):

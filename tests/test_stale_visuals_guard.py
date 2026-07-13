@@ -219,7 +219,7 @@ class TestRunParentVisualsIntegration(unittest.TestCase):
         ])
         content, channel = self._content_channel(content_id)
         scripts_by_lang = {"en": SimpleNamespace(voice_script="Original narration text")}
-        audio_by_lang = {"en": SimpleNamespace(duration_ms=6000, whisper_transcript=[])}
+        audio_by_lang = {"en": SimpleNamespace(duration_ms=6000, whisper_transcript=[], section_boundaries=None)}
 
         with patch(
             "app.agents.agent4_visuals.services.visual_orchestrator._run_visual_pass",
@@ -243,7 +243,7 @@ class TestRunParentVisualsIntegration(unittest.TestCase):
         content, channel = self._content_channel(content_id)
         new_text = "COMPLETELY DIFFERENT narration after --force-scripts"
         scripts_by_lang = {"en": SimpleNamespace(voice_script=new_text)}
-        audio_by_lang = {"en": SimpleNamespace(duration_ms=9000, whisper_transcript=[])}
+        audio_by_lang = {"en": SimpleNamespace(duration_ms=9000, whisper_transcript=[], section_boundaries=None)}
 
         fresh_beats = [_beat(0, script_text="fresh"), _beat(1, script_text="fresh")]
         calls = []
@@ -279,7 +279,7 @@ class TestRunParentVisualsIntegration(unittest.TestCase):
         content, channel = self._content_channel(content_id)
         current_text = "Whatever the current script is"
         scripts_by_lang = {"en": SimpleNamespace(voice_script=current_text)}
-        audio_by_lang = {"en": SimpleNamespace(duration_ms=3000, whisper_transcript=[])}
+        audio_by_lang = {"en": SimpleNamespace(duration_ms=3000, whisper_transcript=[], section_boundaries=None)}
 
         with patch(
             "app.agents.agent4_visuals.services.visual_orchestrator._run_visual_pass",

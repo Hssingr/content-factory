@@ -17,5 +17,12 @@ class AudioFile(Base):
     duration_ms: Mapped[int] = mapped_column(Integer, nullable=False)
     # Whisper word-level timestamps: [{"word": str, "start": float, "end": float}]
     whisper_transcript: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    # Real per-section audio spans captured at TTS-generation time (roadmap
+    # Phase B1): [{"section_type", "section_index", "start_ms", "end_ms"}].
+    # NULL when the script had no [SECTION N] markers, or the provider/model
+    # path doesn't guarantee one TTS chunk per section (legacy non-v3
+    # ElevenLabs char-limit chunking) — Agent 4 falls back to whole-video
+    # proportional stretch in that case.
+    section_boundaries: Mapped[list | None] = mapped_column(JSONB, nullable=True)
 
     content: Mapped["Content"] = relationship("Content", back_populates="audio_files")

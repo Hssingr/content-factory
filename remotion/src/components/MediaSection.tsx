@@ -200,11 +200,21 @@ function getEffectTransform(effect: Effect, progress: number, frame: number): st
 /**
  * How many frames a section should overlap with the previous one for a given
  * transition_to_next value. "cut"/"none" read as a hard cut (no overlap).
+ *
+ * "dip_to_black" is retired (roadmap Phase A2, live-canary fix): a full fade
+ * through black reads as a rendering failure while narration continues (a
+ * real production run showed ~13 of these per parent video, ~0.67s of full
+ * black each). Claude's storyboard prompt/schema no longer produce it, but a
+ * VideoSection row persisted by an older run may still carry the literal
+ * string in its stored `generation_prompt` JSON (`load_video_sections()`
+ * merges that JSON verbatim, unlike the other legacy fields it normalizes) —
+ * so it is kept here only as a case that maps onto the same crossfade
+ * treatment, never its own through-black effect.
  */
 export function transitionDurationFrames(transition?: Transition): number {
   switch (transition) {
-    case "crossfade":    return 15;  // 0.5 s — classic dissolve
-    case "dip_to_black": return 20;  // 0.67 s — fades through black
+    case "crossfade":
+    case "dip_to_black": return 15;  // 0.5 s — classic dissolve (dip_to_black: legacy alias)
     case "whip_pan":     return 10;  // 0.33 s — fast directional blur
     case "zoom_blur":    return 12;  // 0.4 s — punch-in blur
     case "match_cut":    return 6;   // 0.2 s — near-instant, slight overlap
@@ -226,12 +236,6 @@ function getTransitionStyle(
   const t = frame / crossfadeIn; // 0 → 1 across the transition window
 
   switch (transition) {
-    case "dip_to_black":
-      return {
-        opacity: t,
-        filter:  `brightness(${interpolate(t, [0, 1], [0, 100])}%)`,
-      };
-
     case "whip_pan":
       return {
         opacity:   t,

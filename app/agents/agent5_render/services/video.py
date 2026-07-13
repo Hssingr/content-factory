@@ -50,6 +50,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.services.local_run_paths import ensure_run_dirs
 from app.services.video_sections import load_video_sections
+from app.services.story_entities import extract_recurring_proper_nouns
 from app.models import (
     AudioFile, Channel, ChannelConfig, Content, Script, VideoRender,
 )
@@ -79,6 +80,27 @@ _TEXT_CARD_SENTINEL = "__text_card__"
 
 # Technical-blocker threshold: >50% of beats with no real media → block render.
 _MISSING_MEDIA_BLOCK_RATIO = 0.50
+
+
+def _resolve_proper_nouns_for_content(content: Content, db: Session) -> list[str]:
+    """Return the story's recurring proper nouns for caption Whisper-
+    mangling correction (roadmap Phase B2, see
+    ``subtitles._correct_named_entities()``).
+
+    Child Shorts never get their own ``story_blueprint`` — only parent
+    script generation runs ``generate_story_blueprint()`` — so a child reads
+    its parent's blueprint instead, the same "children inherit the parent's
+    value" convention documented for the not-yet-implemented
+    ``protagonist_gender`` field. Returns ``[]`` (never raises) when no
+    blueprint is reachable.
+    """
+    blueprint = content.story_blueprint
+    is_short_episode = bool(getattr(content, "is_short_episode", False))
+    parent_content_id = getattr(content, "parent_content_id", None)
+    if is_short_episode and not blueprint and parent_content_id:
+        parent_content = db.get(Content, parent_content_id)
+        blueprint = parent_content.story_blueprint if parent_content else None
+    return extract_recurring_proper_nouns(blueprint)
 
 
 def run_video_generation(content_id: uuid.UUID, db: Session) -> bool:
@@ -148,6 +170,8 @@ def run_video_generation(content_id: uuid.UUID, db: Session) -> bool:
     is_short_episode: bool = bool(getattr(content, "is_short_episode", False))
     parent_content_id = getattr(content, "parent_content_id", None)
 
+    proper_nouns = _resolve_proper_nouns_for_content(content, db)
+
     # Compute Short-episode render params once (used in per-language loop)
     short_order: int | None = None
     short_total_parts: int | None = None
@@ -216,6 +240,7 @@ def run_video_generation(content_id: uuid.UUID, db: Session) -> bool:
                 is_short_episode=is_short_episode,
                 short_order=short_order,
                 short_total_parts=short_total_parts,
+                proper_nouns=proper_nouns,
             )
             if ok:
                 successful += 1
@@ -298,6 +323,7 @@ def _process_language(
     is_short_episode: bool = False,
     short_order: int | None = None,
     short_total_parts: int | None = None,
+    proper_nouns: list[str] | None = None,
 ) -> bool:
     """Run the render pipeline for one language using pre-generated beat images.
 
@@ -375,8 +401,17 @@ def _process_language(
     # run_visual_generation() before this function is called.
 
     # ── Technical blocker check ────────────────────────────────────────────────
-    standard_subs = build_standard_subtitles(audio.whisper_transcript or [])
-    karaoke_subs  = build_karaoke_subtitles(audio.whisper_transcript or [], active_color=karaoke_color)
+    standard_subs = build_standard_subtitles(
+        audio.whisper_transcript or [],
+        voice_script=script.voice_script or "",
+        proper_nouns=proper_nouns,
+    )
+    karaoke_subs  = build_karaoke_subtitles(
+        audio.whisper_transcript or [],
+        active_color=karaoke_color,
+        voice_script=script.voice_script or "",
+        proper_nouns=proper_nouns,
+    )
 
     blockers = _collect_technical_blockers(beats, standard_subs, audio, is_short_episode=is_short_episode)
     if blockers:

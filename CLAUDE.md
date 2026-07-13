@@ -321,6 +321,12 @@ short_total_parts = total number of parts
 - Child `AudioFile` contains child short audio and child Whisper transcript.
 - `shorts_breakpoints`, `short_rehook_paths`, and `short_bridge_paths` are not part of the V2 schema.
 - Parent and child audio rows store only their own audio metadata and Whisper transcript.
+- `section_boundaries` (nullable JSONB, migration `011_add_audio_file_section_boundaries.py`,
+  roadmap Phase B1): real per-`[INTRO]`/`[SECTION N]`/`[OUTRO]` audio spans
+  captured at TTS-generation time — `[{"section_type", "section_index",
+  "start_ms", "end_ms"}]`. `NULL` for pre-existing rows and for any TTS path
+  that can't guarantee one chunk per section. See §10.3 `generate_audio` and
+  §11.4 `_remap_beats_timing` for the full producer/consumer chain.
 
 #### `video_sections`
 
@@ -801,6 +807,43 @@ Rules:
   here.
 - Do not fork a second copy of the alias table — extend
   `_SCRIPT_SOURCE_ALIASES` in this file if a new alias is ever needed.
+
+### 7.7 Shared Recurring-Proper-Noun Extraction (roadmap Phase B2)
+
+File:
+
+```text
+app/services/story_entities.py
+```
+
+`extract_recurring_proper_nouns(blueprint: dict | None) -> list[str]` — pure,
+deterministic, no AI call: capitalized words recurring at least twice across
+a story blueprint's own text fields (`hook`/`final_payoff`/
+`midpoint_retention_trap`/`central_question`/`major_turns`), English-only
+keyword heuristic, capped at 5, ordered by descending frequency then
+alphabetically. Returns `[]` when `blueprint` is falsy or nothing recurs.
+
+Extracted out of
+`app.agents.agent4_visuals.subagents.storyboard.build_continuity_line_from_blueprint()`
+(which now calls this function and only adds its own "Visual continuity:
+..." sentence formatting on top — behavior is unchanged, proven by the
+pre-existing `tests/test_elimination_mandate_1c_deterministic_continuity.py`
+passing unmodified) so Agent 5's caption punctuation-restoration pass
+(`app.agents.agent5_render.services.subtitles`, §11A.4) can reuse the exact
+same recurring-proper-noun list — the character/place names Whisper is most
+likely to mishear are exactly the names a viewer most needs spelled
+correctly — without importing Agent 4 business logic across the §6A
+ownership boundary. Same shared-utility precedent as
+`app.services.video_sections` (§7.5) and `app.services.script_source`
+(§7.6).
+
+Rules:
+
+- Pure/generic like the rest of §7 — no agent-specific orchestration lives
+  here.
+- Do not fork a second copy of the extraction regex/stopword list — extend
+  this file if a new field or rule is ever needed, and update both callers'
+  documentation (§11.4, §11A.4) if the change affects their behavior.
 
 ---
 
@@ -3333,6 +3376,72 @@ Rules:
   not fail solely because section delivery cannot be inferred.
 - ElevenLabs v3 uses the same deterministic section delivery selector as Cartesia, resolves `VoiceSettings` per section, and adds one deterministic v3 audio tag per marked section; non-v3 ElevenLabs models remain the configured provider/legacy char-chunk path.
 - Voice, model, pronunciation dictionary, and fallback delivery choices come from `channel_voices`.
+- **Loudness normalization (roadmap Phase A3, operator video-output audit):**
+  a real production run measured a parent's EN narration at -22.4 LUFS
+  against the SAME content's FR narration at -18.3 LUFS — no loudness
+  normalization existed anywhere in the pipeline, so perceived volume varied
+  by provider/voice/language with nothing correcting it.
+  `tts._normalize_loudness(mp3_bytes)` applies a single-pass ffmpeg
+  `loudnorm` filter (`I=-17.0:TP=-1.5:LRA=11.0`, output re-encoded at
+  192kbps) — a deliberate simplicity tradeoff (one pass, not the more
+  precise two-pass measure-then-apply variant): the goal is consistent,
+  reasonable loudness across languages/providers, not broadcast-spec-exact
+  loudness. ffmpeg is already a hard dependency of this pipeline
+  (`_concat_mp3_chunks()`, `measure_audio_duration_ms()`), so a missing/failing
+  ffmpeg raises `RuntimeError` here the same way those do rather than
+  silently skipping normalization. Applied unconditionally at both of
+  `generate_audio()`'s return points — the single point every provider path
+  (Cartesia and ElevenLabs, single-chunk and multi-chunk alike) funnels
+  through — so no call site needs its own opt-in. Empty input returns empty
+  output unchanged. Never runs on the skip-on-disk TTS resume path (an
+  already-generated file on disk was normalized once, at generation time,
+  and is trusted thereafter — same convention as CLAUDE.md §10.3's
+  `RESUME_TRANSCRIPT_REUSED` reuse contract). Logs
+  `AUDIO_LOUDNESS_NORMALIZED` with target/input/output sizes. Runtime proof:
+  `tests/test_loudness_normalization.py` — real ffmpeg both to generate test
+  audio at known loudness and to independently re-measure the normalized
+  result via a second `ebur128` pass (not a mock of the effect); covers a
+  quiet source pulled up to target, a loud source pulled down to target, the
+  ffmpeg-failure error path, and that both `generate_audio()` provider
+  branches actually route their result through it.
+- **`generate_audio()` returns `tuple[bytes, section_boundaries]`, not bare
+  bytes (roadmap Phase B1):** the second element is a list of
+  `{"section_type", "section_index", "start_ms", "end_ms"}` dicts describing
+  each `[INTRO]`/`[SECTION N]`/`[OUTRO]` section's real span in the final
+  audio — `[]` when the script had no section markers, or the provider/model
+  path can't guarantee one TTS chunk per section (the legacy non-v3
+  ElevenLabs char-limit chunking path, `_chunk_script_at_sections()`, can
+  merge several sections into one chunk to stay under `max_chars`; boundary
+  tracking is skipped entirely for it rather than computed from
+  unreliable data). Cartesia (always one chunk per section) and ElevenLabs
+  `eleven_v3` (same) both track it; every other ElevenLabs model does not.
+  `tts._generate_cartesia_audio()` likewise returns a 3-tuple (`concatenated
+  bytes, per-chunk bytes list, per-chunk section metadata`) so
+  `generate_audio()`'s shared `_finalize_audio_with_boundaries()` helper
+  (normalize loudness, then compute boundaries) can consume either
+  provider's chunks identically.
+- **`tts._compute_section_boundaries(section_meta, chunk_bytes_list,
+  final_duration_ms)`** is the deterministic (no AI call) boundary
+  calculator: it ffprobe-measures each pre-concatenation chunk's own real
+  duration, builds cumulative *raw* boundary points using the same fixed
+  silence pad `_concat_mp3_chunks()` inserts between chunks, then rescales
+  every point by one shared factor so the sequence sums exactly to
+  `final_duration_ms` — the real, independently-measured duration of the
+  actual persisted (concatenated + loudness-normalized) audio. Building
+  shared boundary points (not independently-computed start/end per section)
+  is what guarantees section *i*'s end always equals section *i+1*'s start
+  exactly — no beat can ever fall into an unmapped gap between two sections.
+  `AudioFile.section_boundaries` (§5.3) is where this list is persisted;
+  `_remap_beats_timing()` (§11.4) is its consumer.
+- On the audio-persist side, `audio.py`'s `run_audio_generation()` only has
+  real section boundaries on a **fresh** generation, or when reusing an
+  already-persisted row whose transcript was also reused (D1.6
+  `RESUME_TRANSCRIPT_REUSED` — the same on-disk-file-unchanged reuse
+  contract this section already documents). Any other resume path (file on
+  disk but no valid prior `AudioFile` row) sets `section_boundaries=None` —
+  the final concatenated file alone cannot reconstruct per-section timing —
+  which `_remap_beats_timing()` already treats as "no data available" and
+  falls back to whole-video stretch for, no regeneration forced.
 
 #### `ChannelVoice.cartesia_pronunciation_dict_id`
 
@@ -3667,6 +3776,29 @@ INTENSITY_FLOOR_MS); `visual_type="text_overlay"`/`visual_category="text"`
 and the never-read `storyboard_status`/`global_notes` fields are removed from
 the schema; and the style vocabulary documents every UI preset
 (constants.js). Details below reflect the surviving structure.
+
+**`dip_to_black` removed from the transition vocabulary (roadmap Phase A2,
+`PROMPT_VERSION` 4.6 → 4.7, `STORYBOARD_SCHEMA_VERSION` 7.1 → 7.2, operator
+video-output audit):** a real production run measured ~13 `dip_to_black`
+beats in one parent video (≈8.7s of full-black frames while narration
+continued uninterrupted) — a mid-narration fade to black reads as a
+rendering failure to a viewer, not an intentional edit. `"dip_to_black"` is
+removed from `_BEAT_SCHEMA`'s `transition_to_next` enum and from the prompt
+text enumerating the choosable values (both in `system_prompt.py`); Claude
+can no longer select it for new beats. `storyboard._VALID_TRANSITIONS`
+(the Python-side enforcement `_safe_enum()` uses in `_build_beat_section()`)
+drops it too, so a stray `"dip_to_black"` value from any source (a stale
+in-memory dict, a non-forced-tool-use path) normalizes to
+`_DEFAULT_TRANSITION` (`"cut"`) rather than passing through. Already-persisted
+legacy rows are handled at the render layer instead: `MediaSection.tsx`
+treats a legacy `dip_to_black` transition as a plain crossfade (same 15-frame/
+0.5s dissolve, no fade-through-black `filter` styling) — old rows render
+sanely without a data migration. `remotion/src/types.ts`'s `Transition` union
+keeps `"dip_to_black"` for type-compatibility with those legacy rows only; no
+code path writes it anymore. Runtime proof: `tests/test_dip_to_black_removed.py`
+(schema/prompt no longer offer it; `_safe_enum()` normalizes a stray value;
+the real `_build_beat_section()` chain proves it can never survive into a
+freshly-built beat) plus a clean `tsc --noEmit` compile for the Remotion side.
 
 **Storyboard prompt inputs:**
 `generate_storyboard_batch()` accepts optional `visual_style`, `image_style`,
@@ -4077,6 +4209,77 @@ loader, roadmap 6.5) JSON round trip — only `_run_visual_pass()`, the paid
 Claude/fal.ai boundary, is stubbed), including the exact P0-3 repair
 scenario: matching script hash, corrected duration → regenerates.
 
+#### `_remap_beats_timing` — per-language visual timing / the parent "décalage" fix (roadmap Phase B1)
+
+File:
+
+```text
+app/agents/agent4_visuals/services/visual_orchestrator.py
+```
+
+**Root cause:** the shared `__visual__` beats are timed against exactly one
+language's real Whisper transcript (`source_language`, normally English).
+Every other configured language's beats were previously produced by
+`_remap_beats_timing_whole_video()` — one global `ratio =
+target_duration_ms / source_duration_ms` applied to every beat — which
+implicitly assumes narration pacing is uniform across the whole video. It
+isn't: a real production run measured up to ±20s of visual/narration drift
+in a non-source language render, growing over the video's length wherever
+that language's phrasing pacing diverged from the source's.
+
+**Fix:** each language's real per-section audio spans
+(`AudioFile.section_boundaries` — see §5.3/§10.3, captured deterministically
+at TTS-generation time, no AI call) let beats be remapped **per
+`[INTRO]`/`[SECTION N]`/`[OUTRO]` section** instead of video-wide — bounding
+drift to within one section (~2-3s) rather than the whole video's length.
+
+- `_build_section_anchor_map(source_sections, target_sections)` pairs up
+  source/target sections 1:1, in order, by `(section_type, section_index)` —
+  **never** by label text, which is itself translated per language. Returns
+  `(None, reason)` — never guessing a correspondence — when either side is
+  missing/empty, section counts differ (a translated script legitimately can
+  drop/gain a section: §9.3's `section_loss` check is telemetry-only, not
+  blocking), a structural (type/index) mismatch exists at the same position,
+  or either side has a degenerate (non-positive) span.
+- `_remap_beats_timing()` calls this first; when it returns real pairs, beats
+  go through `_remap_beats_timing_per_section()` (each beat mapped using the
+  local stretch ratio of whichever section it *starts* within — a beat
+  straddling a section boundary is still mapped entirely by its start
+  section, a deliberately bounded simplification). Otherwise it falls back
+  to the original `_remap_beats_timing_whole_video()`, logged
+  `VISUAL_TIMING_WHOLE_VIDEO_STRETCH_FALLBACK reason=<reason>` — never
+  silent (Golden Rule 3). A successful anchored remap logs
+  `VISUAL_TIMING_SECTION_ANCHORED`.
+- The final "clamp last beat to exactly `target_duration_ms`" step is shared
+  by both paths, applied once after either produces its result — unchanged
+  from the pre-existing whole-video-stretch convention.
+- `_run_parent_visuals()` threads `source_sections` (the source language's
+  own `AudioFile.section_boundaries`) and `target_sections` (each language's
+  own) into every `_remap_beats_timing()` call in its per-language loop. The
+  source language itself is unaffected — `target_duration_ms ==
+  source_duration_ms` already short-circuits to a no-op before any section
+  logic runs.
+- Fully backward compatible with content generated before this phase: a
+  `None`/missing `section_boundaries` (pre-existing `AudioFile` rows, or any
+  language whose TTS path can't guarantee one chunk per section — see
+  §10.3) falls through to the exact pre-existing whole-video behavior, with
+  no regeneration forced.
+
+Runtime proof: `tests/test_section_anchored_visual_timing.py` — real
+ffmpeg-measured `tts._compute_section_boundaries()` unit tests; a real
+end-to-end `tts.generate_audio()` Cartesia-path test (real WAV generation +
+real ffmpeg encode/concat/normalize, only a fake `cartesia` SDK module as
+the paid boundary) proving real per-section boundaries track each section's
+actual (different) spoken duration, not a naive equal split; every
+`_build_section_anchor_map()` fallback reason; a concrete side-by-side
+comparison proving `_remap_beats_timing_per_section()`'s result differs
+from (and stays inside the correct section unlike) what
+`_remap_beats_timing_whole_video()` produces on identical input; and a
+`_run_parent_visuals()` integration test (same fake in-memory `VideoSection`
+table pattern as `test_stale_visuals_guard.py`) proving
+`AudioFile.section_boundaries` set for one language really reaches the
+persisted beats for a second, independently-processed language.
+
 #### `validate_storyboard`
 
 File:
@@ -4239,10 +4442,13 @@ Responsibilities:
   one language) and run deterministic existence/integrity checks: missing
   path, remote URL, the legacy `__text_card__` sentinel, unsafe path
   (outside the media root/run root), missing/zero-byte/unreadable/
-  unsupported-extension local file, `PIL`-unreadable image, and image aspect
+  unsupported-extension local file, `PIL`-unreadable image, image aspect
   mismatches (parent expects 16:9; Shorts expect 9:16, with small fal rounding
-  tolerance) — all `BLOCKING` (they fail the content, setting
-  `Content.status = "FAILED"`).
+  tolerance), and `near_black_image` (roadmap Phase A1 — mean grayscale
+  luminance below `_NEAR_BLACK_LUMINANCE_FLOOR = 24.0`, the same floor
+  `flux_generator.py`'s generation-time reroll uses, as a persistence-layer
+  backstop; see `generate_all_beat_images` above) — all `BLOCKING` (they fail
+  the content, setting `Content.status = "FAILED"`).
 - Optional `beats_by_lang: dict[str, list[dict]] | None` parameter — when
   the caller (`run_visual_generation_for_content()`) passes
   `result["beats_by_lang"]` from `run_visual_generation()`, this also runs
@@ -4376,6 +4582,51 @@ Rules:
   generated at all, media_urls stay empty and Agent 5's missing-media
   blocker stops the render (fail loud, never a black or text-only frame).
 - If cache reuse is controlled by prompt hash, log enough to debug repeated frames.
+
+**Image luminance gate (roadmap Phase A1, operator video-output audit):** a
+real production run shipped a beat (`ba20460bad5b66074367dcc3.jpg`) whose
+Flux generation was a 100% black JPEG (`signalstats YAVG=0.0`) — it passed
+every existing gate, since media validation only checked existence/
+readability/aspect, never pixel content, and the unrelated §11A.6 dark-frame
+guard only fires on `dark_contrast`-graded prompts (this beat was
+`warm_amber`). ~9 more images in the same run measured under the floor,
+producing multi-second blackdetect spans in the rendered video in both
+languages.
+
+- `flux_generator._mean_luminance(media_url, media_path)` — opens the local
+  image with PIL and returns `ImageStat.Stat(image.convert("L")).mean[0]`
+  (mean grayscale value, 0-255); returns `None` (logged
+  `LUMINANCE_CHECK_UNAVAILABLE`) if the file can't be read, exactly the
+  same fail-open contract `_average_pixel_hash()` already uses for the
+  pixel-duplicate check below it in the same file.
+- `_LUMINANCE_MEAN_FLOOR = 24.0` — a beat whose generated image measures
+  below this floor gets exactly **one** reroll
+  (`flux_generator._reroll_if_dark_once()`) with a `_WELL_LIT_REROLL_CLAUSE`
+  ("bright well-lit scene, strong visible ambient light source, no
+  underexposure, no near-black frame") appended to its `flux_prompt`. If the
+  reroll is still below the floor, or the reroll call itself fails, the beat
+  is handed to the existing `fill_failed_beats_from_neighbors()` mechanism
+  exactly like a hard generation failure — never shipped near-black.
+- This is a disaster check + bounded transport-style retry, not a
+  quality-judging loop (consistent with the Elimination Mandate's existing
+  precedent — the pixel-duplicate-hash reroll immediately above it in the
+  same function): it fires only on a near-total generation failure (a
+  near-uniform black frame), not on subjective darkness/mood, and retries
+  exactly once before falling back to a known-good neighbouring image.
+- Wired into both `generate_all_beat_images()` (parent path) and
+  `storyboard.generate_pending_beat_images()` (child Short path, portrait
+  images) — same call, same floor, same one-reroll contract on both paths.
+- Backstopped at persistence time: `media_validation._validate_image_luminance()`
+  re-measures every referenced local image and adds a **blocking**
+  `near_black_image` finding to `validate_visual_media_assets()` (§11.4
+  below) if a near-black image somehow still reaches the DB (e.g. a beat
+  whose reroll path was bypassed) — `Content.status` is failed rather than
+  shipping the frame.
+- Runtime proof: `tests/test_luminance_gate.py` — real PIL image I/O (only
+  the paid `_call_fal()` fal.ai boundary stubbed), covering the reroll
+  succeeding, the reroll still failing and handing off to neighbor-fill, a
+  bright image never triggering a reroll, the child Short path, and both
+  `_mean_luminance()`/`_validate_image_luminance()` directly.
 
 #### `remap_beats_for_short`
 
@@ -5278,6 +5529,138 @@ Rules:
   each half is an independent safety net (a Short that somehow reaches
   Agent 5 with an empty transcript despite Agent 3's own check is still
   blocked here).
+
+#### `build_standard_subtitles` / `build_karaoke_subtitles` — caption punctuation restoration (roadmap Phase B2)
+
+File:
+
+```text
+app/agents/agent5_render/services/subtitles.py
+```
+
+Cross-validation against the operator's own frame-by-frame video review
+confirmed OpenAI Whisper's word-level `words` array strips punctuation and
+apostrophes, splits French elisions ("Sainte Sophie n était plus" instead of
+"Sainte-Sophie n'était plus"), splits numbers into separate digit tokens
+("30"/"000" instead of one "30,000"/"30 000"), and occasionally mishears a
+recurring proper noun entirely (a real production run showed "Belisarius"
+transcribed as "Narcissus"). `_chunk_transcript()`'s own sentence/clause
+punctuation regexes (`_SENTENCE_END_RE`/`_CLAUSE_END_RE`) were always
+correct — they just never had real punctuation to match against, so
+chunking silently fell through to the hard word-count/duration ceiling on
+every caption, a hidden secondary bug this phase also fixes as a byproduct.
+
+Both functions gained two optional parameters, fully backward compatible
+(omitting `voice_script` reproduces the exact pre-existing raw-Whisper-word
+behavior — no caller is forced to change):
+
+- `voice_script: str = ""` — the punctuated narrator `Script.voice_script`
+  text for this language. When non-empty, caption display text is restored
+  from it while timing stays Whisper's own, via
+  `_restore_punctuated_words()`.
+- `proper_nouns: list[str] | None = None` — the story's recurring proper
+  nouns (`app.services.story_entities.extract_recurring_proper_nouns()`,
+  §7.7) for Whisper-mishearing correction.
+
+`_restore_punctuated_words(whisper_transcript, voice_script, proper_nouns)`
+— deterministic, no AI call, stdlib-only (`difflib`):
+
+1. `_correct_named_entities()` — a pre-pass over Whisper's raw words: any
+   word whose normalized form is a close fuzzy match
+   (`difflib.get_close_matches()`, cutoff 0.72, words ≥4 chars only) to a
+   known story proper noun is replaced with the noun's canonical spelling.
+   Timing is never touched. This is a narrow, honest safety net — it
+   catches close mishearings ("Belisaire" → "Belisarius") but not a wildly
+   different substitution (SequenceMatcher ratio for "Narcissus" vs
+   "Belisarius" is ~0.42, well under the cutoff); those are instead
+   recovered by mechanism 2 below, which doesn't depend on word similarity
+   at all.
+2. `difflib.SequenceMatcher(None, whisper_norms, script_norms,
+   autojunk=False)` — monotonic sequence alignment between the two
+   near-identical word sequences (same narration, same order), using
+   Python's well-tested Ratcliff/Obershelp algorithm rather than a
+   hand-rolled aligner. `autojunk=False` is required: the default heuristic
+   (built for text-diffing, not our use case) would down-weight common
+   connector words on a 1200+ word script, hurting alignment quality.
+   `_normalize_token()` (lowercase, strip all punctuation including
+   apostrophes) is comparison-only — display text always comes from the
+   original, unstripped token.
+3. Opcodes drive the output: `equal` blocks pair each Whisper word 1:1 with
+   its script counterpart, using the script's punctuated text for display
+   and Whisper's own timing. `replace` blocks up to `_MAX_MERGE_SPAN` (6)
+   tokens on either side are merged into ONE display unit — the script's
+   full span joined with spaces, spanning the combined Whisper timing; this
+   is what makes a split number ("30"+"000") or elision ("n"+"était")
+   display as one atomic, correctly-punctuated unit, and what recovers a
+   simple word substitution ("Narcissus"→"Belisarius") through alignment
+   alone, no dictionary needed. An oversized `replace` block, or a `delete`
+   block (Whisper-only words with no script counterpart), falls open to
+   Whisper's own raw text — never fabricated, never dropped. `insert`
+   blocks (script-only words with no Whisper timing to anchor to) are
+   skipped — never given a guessed timestamp.
+4. `_tokenize_script()` strips `[INTRO]`/`[SECTION N]`/`[OUTRO]` markers and
+   pre-merges French-style space-grouped numbers (`_merge_number_groups()`:
+   a leading all-digit token followed by one or more exact 3-digit groups,
+   e.g. "30" + "000" → "30 000") into one atomic script token before
+   alignment even runs — a script already using commas ("30,000") is
+   already one whitespace token and needs no merging.
+
+Returns the exact same shape as `whisper_transcript` itself
+(`[{"word": str, "start": float, "end": float}, ...]`) — a drop-in
+replacement anywhere a raw Whisper transcript is consumed, so
+`_chunk_transcript()` itself needed zero changes.
+
+Wiring (`agent5_render/services/video.py`):
+
+- `_resolve_proper_nouns_for_content(content, db)` — parent content reads
+  its own `story_blueprint`; child Shorts (which never get their own
+  blueprint — only parent script generation runs
+  `generate_story_blueprint()`) read the parent's instead via
+  `parent_content_id`, the same "children inherit the parent's value"
+  convention documented for the not-yet-implemented `protagonist_gender`
+  field. Returns `[]`, never raises, when no blueprint is reachable.
+  Computed once per content in `run_video_generation()`, before the
+  per-language loop.
+- `_process_language()` passes `voice_script=script.voice_script or ""` and
+  `proper_nouns=proper_nouns` into both `build_standard_subtitles()` and
+  `build_karaoke_subtitles()` calls.
+
+Runtime proof: `tests/test_caption_punctuation_restoration.py` (28 tests —
+`subtitles.py` has zero app-internal imports, stdlib-only, so these run with
+no stub harness at all) covers every mechanism above with representative
+fixtures mirroring the audited defects (French elision, English/French
+number splitting, name substitution recovered by alignment alone vs. by the
+entity dictionary, Whisper-only insertions, script-only words dropped, an
+oversized mismatch block falling back safely, and the sentence-boundary
+chunking side-effect fix) plus full backward-compatibility proof.
+`tests/test_caption_proper_nouns_wiring.py` (7 tests) proves the
+field-set-in-Agent-4-blueprint → read-in-Agent-5-render chain: parent vs.
+child blueprint resolution, and that `_process_language()` actually forwards
+`voice_script`/`proper_nouns` as real call arguments to both subtitle
+builders (not just that the parameters exist).
+
+Rules:
+
+- Never invent display text or timing — every fallback path (oversized
+  mismatch, Whisper-only word, script-only word) either uses Whisper's own
+  real text/timing or skips the word entirely; nothing is guessed.
+- `_MAX_MERGE_SPAN`, `_ENTITY_MATCH_CUTOFF`, and `_ENTITY_MIN_WORD_LEN` are
+  deliberately conservative — this is the same accepted
+  false-positive/false-negative tradeoff as every other deterministic
+  keyword/heuristic check in this codebase (CLAUDE.md §11.4's
+  storyboard-validator checks); do not "fix" a missed edge case by adding
+  an AI call here.
+- Do not fork a second alignment implementation for standard vs. karaoke
+  styles — both call the same `_restore_punctuated_words()` /
+  `_chunk_transcript()` pair; extend those, not a per-style copy.
+
+**Shorts caption vertical position (roadmap Phase B2):**
+`remotion/src/components/KaraokeSubtitles.tsx`'s `containerStyle.paddingBottom`
+was raised from `32%` to `39.8%` of the 1920px-tall Short canvas (~150px) so
+captions clear TikTok/Reels/Shorts platform UI (caption/description overlay,
+like/share rail, progress bar) that occupies the bottom of the frame.
+`StandardSubtitles.tsx` (main 16:9 video) is unaffected — no platform UI
+chrome overlaps a horizontal video the same way.
 
 ### 11A.5 Subtitle/Overlay Collision Prevention (Phase 14.10b — RETIRED)
 
@@ -6388,6 +6771,11 @@ RESUME_TRANSCRIPT_REUSED
 AUDIO_DURATION_TRANSCRIPT_MISMATCH
 PROPS_STALE_REBUILDING
 PROPS_STALENESS_CHECK_FAILED
+LUMINANCE_CHECK_UNAVAILABLE
+AUDIO_LOUDNESS_NORMALIZED
+AUDIO_SECTION_BOUNDARIES_COMPUTED
+VISUAL_TIMING_SECTION_ANCHORED
+VISUAL_TIMING_WHOLE_VIDEO_STRETCH_FALLBACK
 ```
 
 Rules:
@@ -6441,6 +6829,12 @@ Rules:
 - Downloaded image dimensions must match the render format aspect ratio: parent
   16:9, Shorts 9:16. A 4:3 generated image is a blocking media-validation
   failure, not a crop-at-render fallback.
+- A generated image whose mean grayscale luminance falls below the
+  near-black floor (24.0/255) gets one well-lit reroll, then falls back to
+  neighbor-fill (roadmap Phase A1); a near-black image that still reaches
+  the DB is a blocking `near_black_image` media-validation failure, not a
+  frame Agent 5 renders as-is. See §11.4 `generate_all_beat_images` and
+  `validate_visual_media_assets`.
 - `media_url` must be local.
 - HTTP image URLs must never reach Remotion.
 - Text cards are removed (subtitles-only rendering, §11.6/Golden Rule 11):

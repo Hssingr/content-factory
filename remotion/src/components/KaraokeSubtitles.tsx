@@ -53,7 +53,11 @@ export const KaraokeSubtitles: React.FC<Props> = ({
 const containerStyle: React.CSSProperties = {
   justifyContent: "flex-end",
   alignItems:     "center",
-  paddingBottom:  "32%",
+  // 39.8% of the 1920px-tall Short canvas — raised ~150px above the prior
+  // 32% (operator video-output audit, roadmap Phase B2) to clear TikTok/
+  // Reels/Shorts platform UI (caption/description, like/share rail,
+  // progress bar) that occupies the bottom of the frame.
+  paddingBottom:  "39.8%",
   paddingLeft:    48,
   paddingRight:   48,
 };

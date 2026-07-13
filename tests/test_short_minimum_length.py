@@ -154,7 +154,7 @@ class ShortMinimumLengthTest(unittest.TestCase):
 
         with (
             patch.object(audio, "audio_path", return_value=MissingAudioPath()),
-            patch.object(audio, "generate_audio", return_value=b"mp3") as generate_audio,
+            patch.object(audio, "generate_audio", return_value=(b"mp3", [])) as generate_audio,
             patch.object(
                 audio,
                 "save_audio",

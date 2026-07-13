@@ -194,6 +194,13 @@ def run_audio_generation(content_id: uuid.UUID, db: Session) -> bool:
         existing = audio_path(content_id, lang)
         reuse_existing_transcript = False
         transcript: list[dict] = []
+        # Real per-section audio boundaries (roadmap Phase B1) — only known
+        # at fresh-generation time or when reused from an already-persisted
+        # row; None on any other resume path (the final concatenated file
+        # on disk alone cannot reconstruct per-section timing), which Agent 4
+        # already treats as "no section data available" and falls back to
+        # whole-video proportional stretch for.
+        section_boundaries: list[dict] | None = None
         try:
             if existing.exists():
                 logger.info("Audio already on disk — skipping TTS for lang=%s", lang)
@@ -211,6 +218,7 @@ def run_audio_generation(content_id: uuid.UUID, db: Session) -> bool:
                     # audio on every retry for zero new information.
                     duration_ms = existing_audio_file.duration_ms
                     transcript  = existing_audio_file.whisper_transcript
+                    section_boundaries = existing_audio_file.section_boundaries
                     reuse_existing_transcript = True
                     logger.info(
                         "RESUME_TRANSCRIPT_REUSED content_id=%s lang=%s duration_ms=%d words=%d",
@@ -219,7 +227,9 @@ def run_audio_generation(content_id: uuid.UUID, db: Session) -> bool:
                 else:
                     duration_ms = measure_audio_duration_ms(existing)
             else:
-                audio_bytes             = generate_audio(script.voice_script, voice, is_short_episode=is_short_episode)
+                audio_bytes, section_boundaries = generate_audio(
+                    script.voice_script, voice, is_short_episode=is_short_episode
+                )
                 file_path, duration_ms  = save_audio(content_id, lang, audio_bytes)
 
             if not _assert_short_audio_min_duration(
@@ -271,7 +281,7 @@ def run_audio_generation(content_id: uuid.UUID, db: Session) -> bool:
 
         try:
             # ── Step 5: Persist AudioFile ────────────────────────────────────
-            _upsert_audio_file(db, content_id, lang, file_path, duration_ms, transcript)
+            _upsert_audio_file(db, content_id, lang, file_path, duration_ms, transcript, section_boundaries)
 
             # ── Step 6: Update Script with real duration ─────────────────────
             script.estimated_duration_sec = round(duration_ms / 1000, 1)
@@ -335,6 +345,7 @@ def _upsert_audio_file(
     file_path: str,
     duration_ms: int,
     whisper_transcript: list[dict],
+    section_boundaries: list[dict] | None = None,
 ) -> AudioFile:
     """Insert or update the AudioFile record for a content+language pair."""
     existing: AudioFile | None = (
@@ -346,6 +357,7 @@ def _upsert_audio_file(
         existing.file_path           = file_path
         existing.duration_ms         = duration_ms
         existing.whisper_transcript  = whisper_transcript
+        existing.section_boundaries  = section_boundaries
         db.flush()
         return existing
 
@@ -355,6 +367,7 @@ def _upsert_audio_file(
         file_path=file_path,
         duration_ms=duration_ms,
         whisper_transcript=whisper_transcript,
+        section_boundaries=section_boundaries,
     )
     db.add(audio_file)
     db.flush()

@@ -11,7 +11,18 @@ from app.services.claude_client import (
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "4.6"  # v4.6: added "cinematic_cartoon" to the image_style vocabulary (operator request) —
+PROMPT_VERSION = "4.7"  # v4.7: roadmap Phase A2 (operator video-output audit) — "dip_to_black" removed
+                        #        from the transition_to_next enum/prompt/schema entirely. A real
+                        #        production run showed ~13 dip_to_black beats per parent video, each
+                        #        rendering ~0.67s of full black while narration continued — indistinguishable
+                        #        from a rendering failure to a viewer. Freshly generated beats can no
+                        #        longer receive it (schema enum), and storyboard.py's
+                        #        _VALID_TRANSITIONS/_safe_enum normalizes any stray value to "cut" at
+                        #        beat-build time; a row already PERSISTED with the literal string from
+                        #        before this fix is untouched by either (load_video_sections() merges
+                        #        stored JSON verbatim, no re-validation), so MediaSection.tsx also maps
+                        #        "dip_to_black" onto the same treatment as "crossfade" at render time.
+                        # v4.6: added "cinematic_cartoon" to the image_style vocabulary (operator request) —
                         #        the "Recognized values" list now describes cinematic_cartoon rendering
                         #        (simplified illustration, bold outlines, flat color fills — distinct
                         #        from anime/digital_art), and "cinematic_cartoon" is added to the TECHNICAL
@@ -172,7 +183,10 @@ PROMPT_VERSION = "4.6"  # v4.6: added "cinematic_cartoon" to the image_style voc
 # and maps the merged beats onto Whisper timestamps. Flux Schnell then generates
 # one image per beat from the flux_prompt Claude wrote.
 
-STORYBOARD_SCHEMA_VERSION = "7.1"  # v7.1: fresh full-system audit §2.2/§4 — removed
+STORYBOARD_SCHEMA_VERSION = "7.2"  # v7.2: roadmap Phase A2 — removed "dip_to_black" from the
+                                   #        transition_to_next enum (legacy persisted values
+                                   #        normalize to "cut" via _safe_enum in storyboard.py).
+                                   # v7.1: fresh full-system audit §2.2/§4 — removed
                                    #        visual_type "text_overlay" and visual_category
                                    #        "text" (nothing they describe exists under
                                    #        subtitles-only rendering; legacy stored values
@@ -516,7 +530,9 @@ Bad examples (forbidden):
    include readable-text instructions — no quoted phrases, no "the text reads".
 7. effect — slow_zoom | zoom_out | pan | push_in | shake | cut | fade_in | parallax
 8. color_grade — desaturated | cold_blue | warm_amber | dark_contrast | neutral
-9. transition_to_next — cut | crossfade | dip_to_black | whip_pan | zoom_blur | match_cut | none
+9. transition_to_next — cut | crossfade | whip_pan | zoom_blur | match_cut | none
+   (never dip_to_black — a full fade through black reads as a rendering failure
+   while narration continues; use crossfade for a soft transition instead)
 10. motif — dominant visual motif this beat shows:
       doorway | corridor | face | hands | object | clock | phone | photo | exterior |
       text | screen | reflection | document | room | other
@@ -569,7 +585,7 @@ _BEAT_SCHEMA: dict = {
         "flux_prompt":             {"type": "string", "description": "Flux image generation prompt: specific physical subject only, no mood words, no faces, no logos, no readable text."},
         "effect":                  {"type": "string", "enum": ["slow_zoom", "zoom_out", "pan", "push_in", "shake", "cut", "fade_in", "parallax"]},
         "color_grade":             {"type": "string", "enum": ["desaturated", "cold_blue", "warm_amber", "dark_contrast", "neutral"]},
-        "transition_to_next":      {"type": "string", "enum": ["cut", "crossfade", "dip_to_black", "whip_pan", "zoom_blur", "match_cut", "none"]},
+        "transition_to_next":      {"type": "string", "enum": ["cut", "crossfade", "whip_pan", "zoom_blur", "match_cut", "none"]},
         "motif":                   {"type": "string", "enum": ["doorway", "corridor", "face", "hands", "object", "clock", "phone", "photo", "exterior", "text", "screen", "reflection", "document", "room", "other"]},
         "beat_intensity":          {"type": "string", "enum": ["high", "medium", "low"], "description": "Narrative intensity at this moment: high=reveal/shock (1–2.5s), medium=progression (2.5–4s), low=establishing/pause (3–6s)."},
         "suggested_duration_sec":  {"type": "number", "description": "Suggested display duration in seconds. Must fall within the intensity tier range."},

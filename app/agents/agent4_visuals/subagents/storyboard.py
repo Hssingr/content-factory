@@ -51,6 +51,7 @@ from app.models import VideoSection
 from app.services.claude_client import call_claude_structured_with_usage
 from app.agents.agent4_visuals.services.flux_generator import (
     _dedupe_generated_image_once,
+    _reroll_if_dark_once,
     derive_text_prop_prompt,
     fill_failed_beats_from_neighbors,
     generate_beat_image_with_routing,
@@ -60,6 +61,7 @@ from app.agents.agent4_visuals.subagents.storyboard_validator import (
     has_bright_lighting_evidence,
 )
 from app.services.script_estimator import get_calibrated_wpm
+from app.services.story_entities import extract_recurring_proper_nouns
 from app.shared.text_normalize import normalize_for_matching as _normalize_for_matching
 
 logger = logging.getLogger(__name__)
@@ -90,7 +92,14 @@ _FALLBACK_FAIL_RATIO  = 0.50
 # Enum sets — Python enforces, never trusts Claude's strings blindly
 _VALID_EFFECTS           = {"slow_zoom", "zoom_out", "pan", "push_in", "shake", "cut", "fade_in", "parallax"}
 _VALID_GRADES            = {"desaturated", "cold_blue", "warm_amber", "dark_contrast", "neutral"}
-_VALID_TRANSITIONS       = {"cut", "crossfade", "dip_to_black", "whip_pan", "zoom_blur", "match_cut", "none"}
+_VALID_TRANSITIONS       = {"cut", "crossfade", "whip_pan", "zoom_blur", "match_cut", "none"}
+# "dip_to_black" removed (roadmap Phase A2, schema v7.2/prompt v4.7) — a full
+# fade through black reads as a rendering failure while narration continues.
+# A freshly-built beat carrying it now normalizes to _DEFAULT_TRANSITION
+# ("cut") via _safe_enum; a row already persisted with the literal string
+# from before this fix is unaffected here (this only runs at beat-build
+# time) and is handled at render time instead — MediaSection.tsx maps
+# "dip_to_black" onto the same treatment as "crossfade".
 # "text_overlay"/"text" removed (schema v7.1) — nothing they describe exists under
 # subtitles-only rendering. A legacy stored beat carrying either value normalizes
 # to the default via _safe_enum on load/build.
@@ -354,17 +363,12 @@ _MAX_BEATS_PER_BATCH = 20
 # carrying forward: proper nouns (character names, named places/objects)
 # that recur across the blueprint's own text — built in pure Python, no AI
 # call, no persisted artifact.
-_CONTINUITY_ENTITY_RE = re.compile(r"\b[A-Z][a-z]{2,}\b")
-_CONTINUITY_STOPWORDS = frozenset({
-    "The", "This", "That", "These", "Those", "There", "Then", "But", "And",
-    "For", "Not", "Now", "When", "What", "Why", "How", "Where", "Who",
-    "Would", "Could", "Should", "Every", "Some", "Someone", "Something",
-    "Years", "Each", "Once", "After", "Before", "Until", "While", "Even",
-    "Still", "Just", "Only", "Never", "Always", "Maybe", "Perhaps", "Their",
-    "They", "She", "His", "Her", "Him", "Its", "Instead", "Inside", "Outside",
-})
-_CONTINUITY_MIN_REPEATS = 2
-_CONTINUITY_MAX_ENTITIES = 5
+#
+# The extraction itself moved to app.services.story_entities (roadmap Phase
+# B2) so Agent 5's caption punctuation-restoration pass can reuse the exact
+# same recurring-proper-noun list without importing Agent 4 business logic
+# across the CLAUDE.md §6A ownership boundary — same shared-utility
+# precedent as app.services.video_sections/script_source (§7.5/§7.6).
 
 
 def build_continuity_line_from_blueprint(blueprint: dict | None) -> str:
@@ -373,29 +377,7 @@ def build_continuity_line_from_blueprint(blueprint: dict | None) -> str:
     note above this function for why the AI-generated visual bible it
     replaces was deleted.
     """
-    if not blueprint:
-        return ""
-    text_fields = [
-        str(blueprint.get("hook") or ""),
-        str(blueprint.get("final_payoff") or ""),
-        str(blueprint.get("midpoint_retention_trap") or ""),
-        str(blueprint.get("central_question") or ""),
-        *[str(turn) for turn in (blueprint.get("major_turns") or [])],
-    ]
-    combined = " ".join(field for field in text_fields if field)
-    if not combined:
-        return ""
-
-    counts: dict[str, int] = {}
-    for word in _CONTINUITY_ENTITY_RE.findall(combined):
-        if word in _CONTINUITY_STOPWORDS:
-            continue
-        counts[word] = counts.get(word, 0) + 1
-
-    recurring = sorted(
-        (word for word, count in counts.items() if count >= _CONTINUITY_MIN_REPEATS),
-        key=lambda word: (-counts[word], word),
-    )[:_CONTINUITY_MAX_ENTITIES]
+    recurring = extract_recurring_proper_nouns(blueprint)
     if not recurring:
         return ""
 
@@ -2274,11 +2256,13 @@ def generate_pending_beat_images(beats: list[dict], content_id: str) -> list[dic
     Mutates every beat in-place (mirrors `generate_all_beat_images()`'s
     contract):
       - Success: sets ``beat["media_url"]`` to a local cache path.
-      - Hard failure: left empty here, then filled by
-        ``fill_failed_beats_from_neighbors()`` (subtitles-only rendering —
-        the ``__text_card__`` sentinel is never produced; a repeated
-        neighbouring image is strictly better than a text card, and a beat
-        that still has no image is caught by Agent 5's missing-media blocker).
+      - Hard failure, or a near-black frame that is still dark after one
+        well-lit reroll (`_reroll_if_dark_once()`): left empty here, then
+        filled by ``fill_failed_beats_from_neighbors()`` (subtitles-only
+        rendering — the ``__text_card__`` sentinel is never produced; a
+        repeated neighbouring image is strictly better than a text card or a
+        black frame, and a beat that still has no image is caught by Agent
+        5's missing-media blocker).
 
     Args:
         beats:      Beat dicts returned by `remap_beats_for_short()`.
@@ -2316,8 +2300,13 @@ def generate_pending_beat_images(beats: list[dict], content_id: str) -> list[dic
                 beat, new_url, content_id, tier_counts, pixel_ledger,
                 width=_SHORT_IMAGE_WIDTH, height=_SHORT_IMAGE_HEIGHT,
             )
-            beat["media_url"] = new_url
-            beat["media_type"] = "image"
+            new_url = _reroll_if_dark_once(
+                beat, new_url, content_id, tier_counts,
+                width=_SHORT_IMAGE_WIDTH, height=_SHORT_IMAGE_HEIGHT,
+            )
+            if new_url:
+                beat["media_url"] = new_url
+                beat["media_type"] = "image"
 
     fill_failed_beats_from_neighbors(beats, content_id)
 

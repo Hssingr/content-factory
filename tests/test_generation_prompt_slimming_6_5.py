@@ -318,7 +318,7 @@ class TestRealOrchestratorWritesBothHalvesCorrectly(unittest.TestCase):
         content = SimpleNamespace(id=content_id, source_language="en", story_blueprint=None)
         channel = SimpleNamespace(id=uuid.uuid4(), niche="mystery", tone="tense")
         scripts_by_lang = {"en": SimpleNamespace(voice_script="Some narration text")}
-        audio_by_lang = {"en": SimpleNamespace(duration_ms=6000, whisper_transcript=[])}
+        audio_by_lang = {"en": SimpleNamespace(duration_ms=6000, whisper_transcript=[], section_boundaries=None)}
 
         fresh_beats = [{
             "beat_order": 0,

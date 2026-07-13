@@ -68,12 +68,21 @@ class _Voice:
 
 
 def _tiny_mp3() -> bytes:
+    # A very quiet real tone, not pure digital silence: generate_audio()'s
+    # result now always passes through the real ffmpeg loudnorm pass
+    # (roadmap Phase A3) — libmp3lame's psymodel has a known assertion
+    # failure ("calc_energy: el >= 0") when loudnorm is asked to normalize
+    # a literal all-zero-amplitude source, which pure `anullsrc` silence is.
+    # This test exercises per-section delivery tags/voice settings, not
+    # silence-input robustness, so a quiet-but-real tone is the correct
+    # fixture rather than a workaround.
     with tempfile.TemporaryDirectory() as tmp:
         output = Path(tmp) / "tiny.mp3"
         subprocess.run(
             [
-                "ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono",
-                "-t", "0.05", "-c:a", "libmp3lame", "-b:a", "128k", str(output),
+                "ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=220:duration=0.05",
+                "-af", "volume=-40dB",
+                "-c:a", "libmp3lame", "-b:a", "128k", str(output),
             ],
             check=True,
             capture_output=True,
@@ -95,7 +104,7 @@ class ElevenLabsV3SectionDeliveryTest(unittest.TestCase):
         original_get_client = tts.get_client
         tts.get_client = lambda: fake_client
         try:
-            audio = tts.generate_audio(
+            audio, section_boundaries = tts.generate_audio(
                 "\n".join([
                     "[INTRO]",
                     "He heard the sound again. Then he found the missing photo inside the locked drawer.",
@@ -115,6 +124,18 @@ class ElevenLabsV3SectionDeliveryTest(unittest.TestCase):
         calls = fake_client.text_to_speech.calls
         self.assertGreater(len(audio), 0)
         self.assertEqual(len(calls), 4)
+
+        # roadmap Phase B1: eleven_v3 is always one chunk per section, so
+        # real per-section boundaries must come back — 4 sections, in
+        # order, covering [0, final_duration_ms) with no gaps/overlaps.
+        self.assertEqual(len(section_boundaries), 4)
+        self.assertEqual(
+            [(s["section_type"], s["section_index"]) for s in section_boundaries],
+            [("intro", None), ("body", 1), ("body", 3), ("outro", None)],
+        )
+        for prev, nxt in zip(section_boundaries, section_boundaries[1:]):
+            self.assertEqual(prev["end_ms"], nxt["start_ms"])
+        self.assertEqual(section_boundaries[0]["start_ms"], 0)
         self.assertTrue(calls[0]["text"].startswith("[whispers]"), calls[0]["text"])
         self.assertTrue(calls[1]["text"].startswith("[whispers]"), calls[1]["text"])
         self.assertTrue(calls[2]["text"].startswith("[gasps]"), calls[2]["text"])

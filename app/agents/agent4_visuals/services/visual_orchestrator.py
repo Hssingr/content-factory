@@ -342,10 +342,11 @@ def _run_parent_visuals(
                 len(shared_beats), content_id,
             )
 
+    src_audio = audio_by_lang.get(content.source_language)
     if source_duration_ms == 0:
         # Fallback: use source language audio duration
-        src_audio = audio_by_lang.get(content.source_language)
         source_duration_ms = src_audio.duration_ms if src_audio else 0
+    source_sections = src_audio.section_boundaries if src_audio else None
 
     beats_by_lang: dict[str, list[dict]] = {}
     for language, _script in scripts_by_lang.items():
@@ -353,7 +354,9 @@ def _run_parent_visuals(
         if not audio:
             continue
         beats_for_lang = _remap_beats_timing(
-            shared_beats, audio.duration_ms, source_duration_ms
+            shared_beats, audio.duration_ms, source_duration_ms,
+            source_sections=source_sections,
+            target_sections=audio.section_boundaries,
         )
         _save_video_sections(content_id, language, beats_for_lang, db)
         db.commit()
@@ -770,17 +773,34 @@ def _remap_beats_timing(
     beats: list[dict],
     target_duration_ms: int,
     source_duration_ms: int,
+    source_sections: list[dict] | None = None,
+    target_sections: list[dict] | None = None,
 ) -> list[dict]:
     """Return a copy of beats with timestamps scaled to target_duration_ms.
 
     When all languages have identical audio duration (common for single-language
-    channels), this is a no-op. For multilingual content the proportional scaling
-    preserves relative beat pacing across language renders.
+    channels), this is a no-op.
+
+    Per-section anchoring (roadmap Phase B1 — the parent multi-language
+    "décalage" fix): a real production run showed the whole-video
+    proportional stretch below drifting up to ±20s out of sync with real
+    non-source-language narration pacing, since narration speed is not
+    uniform across a video's length. When both ``source_sections`` and
+    ``target_sections`` are usable (see ``_build_section_anchor_map()``),
+    each beat is remapped using the local stretch ratio of the
+    ``[INTRO]``/``[SECTION N]``/``[OUTRO]`` section it falls within, instead
+    of one ratio for the whole video — bounding drift to within one section
+    (~2-3s) rather than the whole video's length. Falls back to the
+    original whole-video stretch, logged, whenever section data is missing,
+    mismatched, or structurally inconsistent between languages — never
+    guesses a correspondence.
 
     Args:
-        beats:              Source beats from the visual pass.
-        target_duration_ms: This language's audio duration.
-        source_duration_ms: Duration of the source audio used for storyboard generation.
+        beats:               Source beats from the visual pass.
+        target_duration_ms:  This language's audio duration.
+        source_duration_ms:  Duration of the source audio used for storyboard generation.
+        source_sections:     Source language's ``AudioFile.section_boundaries``, if any.
+        target_sections:     This language's ``AudioFile.section_boundaries``, if any.
 
     Returns:
         New list of beat dicts with re-scaled audio_start_ms / audio_end_ms.
@@ -788,6 +808,37 @@ def _remap_beats_timing(
     if source_duration_ms == 0 or source_duration_ms == target_duration_ms:
         return list(beats)
 
+    section_pairs, reason = _build_section_anchor_map(source_sections, target_sections)
+    if section_pairs is not None:
+        result = _remap_beats_timing_per_section(beats, section_pairs)
+        logger.debug(
+            "VISUAL_TIMING_SECTION_ANCHORED sections=%d source_duration_ms=%d target_duration_ms=%d",
+            len(section_pairs), source_duration_ms, target_duration_ms,
+        )
+    else:
+        logger.info(
+            "VISUAL_TIMING_WHOLE_VIDEO_STRETCH_FALLBACK reason=%s source_duration_ms=%d target_duration_ms=%d",
+            reason, source_duration_ms, target_duration_ms,
+        )
+        result = _remap_beats_timing_whole_video(beats, target_duration_ms, source_duration_ms)
+
+    # Clamp last beat to exactly target_duration_ms (shared final step,
+    # regardless of which remap path produced `result`).
+    if result:
+        last = result[-1]
+        last["audio_end_ms"] = target_duration_ms
+        last["duration_sec"] = (target_duration_ms - last["audio_start_ms"]) / 1000
+
+    return result
+
+
+def _remap_beats_timing_whole_video(
+    beats: list[dict],
+    target_duration_ms: int,
+    source_duration_ms: int,
+) -> list[dict]:
+    """The original single-ratio proportional stretch — used as the fallback
+    when per-section anchor data isn't usable (see _remap_beats_timing)."""
     ratio = target_duration_ms / source_duration_ms
     result: list[dict] = []
     for b in beats:
@@ -798,12 +849,94 @@ def _remap_beats_timing(
             new_beat["audio_end_ms"] - new_beat["audio_start_ms"]
         ) / 1000
         result.append(new_beat)
+    return result
 
-    # Clamp last beat to exactly target_duration_ms
-    if result:
-        last = result[-1]
-        last["audio_end_ms"] = target_duration_ms
-        last["duration_sec"] = (target_duration_ms - last["audio_start_ms"]) / 1000
+
+def _build_section_anchor_map(
+    source_sections: list[dict] | None,
+    target_sections: list[dict] | None,
+) -> tuple[list[tuple[dict, dict]] | None, str]:
+    """Pair up source/target sections 1:1, in order, by (section_type,
+    section_index) — never by label text, which is itself translated per
+    language. Returns (None, reason) when the caller must fall back to the
+    whole-video stretch instead: either side missing/empty, section counts
+    differing (a translated script legitimately can drop/gain a section —
+    CLAUDE.md §9.3's section_loss check is telemetry-only, not blocking),
+    a structural (type/index) mismatch at the same position, or a
+    degenerate (non-positive) span on either side.
+    """
+    if not source_sections or not target_sections:
+        return None, "missing_section_boundaries"
+    if len(source_sections) != len(target_sections):
+        return None, f"section_count_mismatch source={len(source_sections)} target={len(target_sections)}"
+
+    src_sorted = sorted(source_sections, key=lambda s: s.get("start_ms", 0))
+    tgt_sorted = sorted(target_sections, key=lambda s: s.get("start_ms", 0))
+
+    pairs: list[tuple[dict, dict]] = []
+    for src, tgt in zip(src_sorted, tgt_sorted):
+        if src.get("section_type") != tgt.get("section_type"):
+            return None, "section_structure_mismatch"
+        if src.get("section_index") != tgt.get("section_index"):
+            return None, "section_structure_mismatch"
+        if src.get("end_ms", 0) <= src.get("start_ms", 0):
+            return None, "degenerate_section_span"
+        if tgt.get("end_ms", 0) <= tgt.get("start_ms", 0):
+            return None, "degenerate_section_span"
+        pairs.append((src, tgt))
+
+    return pairs, "ok"
+
+
+def _find_section_pair(
+    section_pairs: list[tuple[dict, dict]], start_ms: int,
+) -> tuple[dict, dict]:
+    """Return the (source, target) section pair containing ``start_ms``.
+
+    Section pairs are contiguous and cover [0, duration_ms) by construction
+    (tts._compute_section_boundaries()), so a beat starting inside any
+    section always matches exactly one pair. A beat starting at/after the
+    last section's end, or before the first section's start (both only
+    possible from integer-rounding at the very edges), clamps to the
+    nearest section rather than raising — a boundary rounding case, not a
+    data error.
+    """
+    for src, tgt in section_pairs:
+        if src["start_ms"] <= start_ms < src["end_ms"]:
+            return src, tgt
+    if start_ms < section_pairs[0][0]["start_ms"]:
+        return section_pairs[0]
+    return section_pairs[-1]
+
+
+def _remap_beats_timing_per_section(
+    beats: list[dict], section_pairs: list[tuple[dict, dict]],
+) -> list[dict]:
+    """Remap each beat using the local stretch ratio of the section it
+    starts within, instead of one whole-video ratio (see _remap_beats_timing).
+
+    A beat that straddles a section boundary is still remapped entirely
+    using its start section's local ratio — a deliberate, bounded
+    simplification: the resulting drift for that one beat is at most the
+    difference between two adjacent sections' ratios, applied over the
+    beat's own (seconds-scale) span, nowhere near the whole-video drift
+    this mechanism replaces.
+    """
+    result: list[dict] = []
+    for b in beats:
+        start = b.get("audio_start_ms", 0)
+        end   = b.get("audio_end_ms", 0)
+        src, tgt = _find_section_pair(section_pairs, start)
+        src_span = src["end_ms"] - src["start_ms"]
+        local_ratio = (tgt["end_ms"] - tgt["start_ms"]) / src_span
+
+        new_beat = dict(b)
+        new_beat["audio_start_ms"] = int(round(tgt["start_ms"] + (start - src["start_ms"]) * local_ratio))
+        new_beat["audio_end_ms"]   = int(round(tgt["start_ms"] + (end   - src["start_ms"]) * local_ratio))
+        new_beat["duration_sec"]   = (
+            new_beat["audio_end_ms"] - new_beat["audio_start_ms"]
+        ) / 1000
+        result.append(new_beat)
 
     return result
 

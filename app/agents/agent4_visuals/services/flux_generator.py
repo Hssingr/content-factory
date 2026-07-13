@@ -17,6 +17,14 @@ nearest neighbouring beat's image — subtitles-only rendering (audit G-0): no t
 card, no on-screen text of any kind; a repeated neighbouring image is strictly
 better. A content item where NO beat generated at all keeps empty media_urls and
 is stopped by Agent 5's missing-media blocker (fail loud, never render black).
+
+Every successfully generated image also passes a deterministic luminance gate
+(``_reroll_if_dark_once()``, roadmap Phase A / live-canary fix): a real
+production run shipped a beat whose Flux generation was a 100% black JPEG,
+since nothing previously inspected pixel content. A near-black frame (mean
+grayscale luminance below ``_LUMINANCE_MEAN_FLOOR``) gets exactly one reroll
+with a well-lit prompt clause; still-dark after that is treated the same as
+a hard generation failure and handed to neighbor-fill.
 """
 
 import hashlib
@@ -28,7 +36,7 @@ from pathlib import Path
 
 import fal_client
 import httpx
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageStat, UnidentifiedImageError
 
 from app.config import settings
 from app.agents.agent4_visuals.services import image_router
@@ -45,6 +53,19 @@ _GENERATION_TIMEOUT_SEC = 60.0
 _DOWNLOAD_TIMEOUT_SEC = 20.0
 _PIXEL_HASH_SIZE = 8
 _PIXEL_HASH_COLLISION_MAX_DISTANCE = 3
+
+# Luminance gate (operator-confirmed live-canary fix): a real production run
+# shipped a beat whose Flux generation was a 100% black JPEG (mean luminance
+# 0.0/255) — it passed every existing check, since none of them inspect
+# actual pixel content, only file existence/decodability/aspect ratio. This
+# floor is the same threshold used to audit that run's cached images (ffprobe
+# signalstats YAVG < 24 correlated with visibly black/near-black rendered
+# frames once CSS color-grade filters were applied on top).
+_LUMINANCE_MEAN_FLOOR = 24.0
+_WELL_LIT_REROLL_CLAUSE = (
+    "bright well-lit scene, strong visible ambient light source, "
+    "no underexposure, no near-black frame"
+)
 
 # ── Safe fallback prompts by environment ───────────────────────────────────────
 # Used as attempt 3 when the Claude-written flux_prompt and its shortened form both
@@ -526,6 +547,96 @@ def _dedupe_generated_image_once(
     return path
 
 
+def _mean_luminance(media_url: str, media_path: Path) -> float | None:
+    """Mean grayscale luminance (0-255) of a generated image.
+
+    The same signal ffprobe's ``signalstats`` ``YAVG`` measures — used here
+    to catch a Flux generation that silently produced a pure-black or
+    near-black frame, which nothing else in this module inspects (existence/
+    decodability checks pass a black JPEG just as readily as a normal one).
+    """
+    path = Path(media_url)
+    image_path = path if path.is_absolute() else media_path / path
+    try:
+        with Image.open(image_path) as image:
+            mean = ImageStat.Stat(image.convert("L")).mean[0]
+    except (FileNotFoundError, UnidentifiedImageError, OSError, ValueError) as exc:
+        logger.warning(
+            "LUMINANCE_CHECK_UNAVAILABLE media_url=%s exception_type=%s exception_message=%s",
+            media_url, type(exc).__name__, str(exc),
+        )
+        return None
+    return mean
+
+
+def _append_well_lit_clause(prompt: str) -> str:
+    base = str(prompt or "").rstrip(". ")
+    return f"{base}, {_WELL_LIT_REROLL_CLAUSE}." if base else f"{_WELL_LIT_REROLL_CLAUSE}."
+
+
+def _reroll_if_dark_once(
+    beat: dict,
+    path: str,
+    content_id: str,
+    tier_counts: dict[str, int],
+    *,
+    width: int,
+    height: int,
+) -> str:
+    """Reroll one generated image if it is near-black, then hand off to
+    neighbor-fill if it is still too dark.
+
+    Disaster check + bounded transport-style retry — the same class of fix
+    as the pixel-duplicate reroll above (Elimination Mandate precedent), not
+    a quality-judging loop: exactly one reroll attempt with a deterministic
+    "well-lit" prompt clause. A beat still near-black after that reroll (or
+    whose reroll call fails outright) is handed to
+    ``fill_failed_beats_from_neighbors()`` — returning ``""`` so the caller
+    leaves ``beat["media_url"]`` unset — rather than ever shipping a known
+    black/near-black frame.
+
+    Returns:
+        The (possibly rerolled) local path, or ``""`` to signal hand-off to
+        neighbor-fill.
+    """
+    media_path = Path(settings.media_path)
+    idx = beat.get("beat_order", beat.get("section_order", 0))
+    luminance = _mean_luminance(path, media_path)
+    if luminance is None or luminance >= _LUMINANCE_MEAN_FLOOR:
+        return path
+
+    reroll_prompt = _append_well_lit_clause(str(beat.get("flux_prompt", "") or ""))
+    reroll_beat = dict(beat)
+    reroll_beat["media_url"] = ""
+    reroll_beat["flux_prompt"] = reroll_prompt
+    logger.warning(
+        "BEAT_IMAGE_DARK_REROLL content=%s beat=%s luminance=%.1f floor=%.0f",
+        content_id, idx, luminance, _LUMINANCE_MEAN_FLOOR,
+    )
+
+    reroll_path = generate_beat_image_with_routing(
+        reroll_beat, content_id, tier_counts, width=width, height=height,
+    )
+    if reroll_path:
+        beat["flux_prompt"] = reroll_prompt
+        reroll_luminance = _mean_luminance(reroll_path, media_path)
+        if reroll_luminance is not None and reroll_luminance < _LUMINANCE_MEAN_FLOOR:
+            logger.error(
+                "BEAT_IMAGE_DARK_REROLL_STILL_DARK content=%s beat=%s luminance=%.1f "
+                "floor=%.0f — handing off to neighbor-fill",
+                content_id, idx, reroll_luminance, _LUMINANCE_MEAN_FLOOR,
+            )
+            return ""
+        return reroll_path
+
+    logger.error(
+        "BEAT_IMAGE_DARK_REROLL_FAILED content=%s beat=%s original_media_url=%s "
+        "— handing off to neighbor-fill",
+        content_id, idx, path,
+    )
+    return ""
+
+
 def fill_failed_beats_from_neighbors(beats: list[dict], content_id: str) -> int:
     """Fill beats without a local image by reusing the nearest neighbour's image.
 
@@ -586,6 +697,9 @@ def generate_all_beat_images(beats: list[dict], content_id: str) -> list[dict]:
         then ``fill_failed_beats_from_neighbors()`` reuses the nearest
         neighbouring beat's image. Never a text card, never on-screen text
         (subtitles-only rendering, audit G-0/G-8).
+      - Near-black frame: ``_reroll_if_dark_once()`` rerolls once with a
+        well-lit prompt clause; still-dark after that also falls through to
+        neighbor-fill rather than shipping a black/near-black frame.
 
     Args:
         beats:      Storyboard beat dicts with a ``flux_prompt`` field.
@@ -632,8 +746,13 @@ def generate_all_beat_images(beats: list[dict], content_id: str) -> list[dict]:
                 beat, path, content_id, tier_counts, pixel_ledger,
                 width=_DEFAULT_WIDTH, height=_DEFAULT_HEIGHT,
             )
-            beat["media_url"]  = path
-            beat["media_type"] = "image"
+            path = _reroll_if_dark_once(
+                beat, path, content_id, tier_counts,
+                width=_DEFAULT_WIDTH, height=_DEFAULT_HEIGHT,
+            )
+            if path:
+                beat["media_url"]  = path
+                beat["media_type"] = "image"
 
         time.sleep(_INTER_BEAT_SLEEP_SEC)
         return beat

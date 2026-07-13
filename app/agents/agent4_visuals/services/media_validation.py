@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageStat, UnidentifiedImageError
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -21,6 +21,11 @@ _REMOTE_PREFIXES = ("http://", "https://")
 _PARENT_IMAGE_ASPECT_RATIO = 16 / 9
 _SHORT_IMAGE_ASPECT_RATIO = 9 / 16
 _IMAGE_ASPECT_TOLERANCE = 0.03
+# Same floor as flux_generator.py's generation-time luminance gate — this is
+# the backstop for a near-black frame that reached persistence anyway (e.g.
+# a row generated before the gate existed, or CSS color-grade filters could
+# still darken a borderline-passing frame further at render time).
+_NEAR_BLACK_LUMINANCE_FLOOR = 24.0
 
 
 @dataclass(frozen=True)
@@ -175,6 +180,11 @@ def validate_visual_media_assets(
             if file_issue[0] == "local_media_missing":
                 missing_media_count += 1
             blocking.append(_issue(row, file_issue[0], file_issue[1], media_path))
+            continue
+
+        luminance_issue = _validate_image_luminance(resolved)
+        if luminance_issue is not None:
+            blocking.append(_issue(row, luminance_issue[0], luminance_issue[1], media_path))
             continue
 
         valid_local_media_count += 1
@@ -377,6 +387,34 @@ def _validate_image_dimensions(
             "local_image_aspect_mismatch",
             f"Local image dimensions {width}x{height} have aspect {actual:.3f}; "
             f"expected {expected_aspect_ratio:.3f} within {_IMAGE_ASPECT_TOLERANCE:.0%}.",
+        )
+    return None
+
+
+def _validate_image_luminance(path: Path) -> tuple[str, str] | None:
+    """Reject a persisted image that is pure-black or near-black.
+
+    A real production run persisted a beat whose Flux generation was a 100%
+    black JPEG — it passed every other check here, since none of them
+    inspect actual pixel content. Opens the file independently of
+    ``_validate_local_image_file()`` (which already called ``.verify()`` on
+    its own handle — PIL documents ``verify()`` as a one-shot, load-before-
+    anything-else call, so pixel data is read from a fresh handle here
+    rather than reused).
+    """
+    try:
+        with Image.open(path) as image:
+            mean = ImageStat.Stat(image.convert("L")).mean[0]
+    except (UnidentifiedImageError, OSError, ValueError):
+        # Already caught by _validate_local_image_file()'s own open/verify —
+        # do not double-report a corrupt/unreadable file under a second code.
+        return None
+    if mean < _NEAR_BLACK_LUMINANCE_FLOOR:
+        return (
+            "near_black_image",
+            f"Local image is near-black (mean luminance {mean:.1f}/255, floor "
+            f"{_NEAR_BLACK_LUMINANCE_FLOOR:.0f}) — a Flux generation likely "
+            "produced a blank/failed frame.",
         )
     return None
 

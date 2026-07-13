@@ -181,7 +181,7 @@ class TestRunAudioGenerationEnforcesAlignment(unittest.TestCase):
 
         with (
             patch.object(audio_module, "audio_path", return_value=_MissingAudioPath()),
-            patch.object(audio_module, "generate_audio", return_value=b"mp3"),
+            patch.object(audio_module, "generate_audio", return_value=(b"mp3", [])),
             patch.object(audio_module, "save_audio", return_value=("audio/en.mp3", 161_724)),
             patch.object(audio_module, "transcribe", return_value=mismatched_transcript),
         ):
@@ -197,7 +197,7 @@ class TestRunAudioGenerationEnforcesAlignment(unittest.TestCase):
 
         with (
             patch.object(audio_module, "audio_path", return_value=_MissingAudioPath()),
-            patch.object(audio_module, "generate_audio", return_value=b"mp3"),
+            patch.object(audio_module, "generate_audio", return_value=(b"mp3", [])),
             patch.object(audio_module, "save_audio", return_value=("audio/en.mp3", 616_835)),
             patch.object(audio_module, "transcribe", return_value=aligned_transcript),
         ):

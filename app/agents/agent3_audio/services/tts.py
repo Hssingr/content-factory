@@ -223,6 +223,17 @@ def _split_long_sentence(sentence: str) -> str:
 _MAX_PAUSE_INSERTIONS = 6   # hard cap — never insert more than 6 pause markers per script
 _CHUNK_BOUNDARY_SILENCE_SECONDS = 0.08
 
+# Loudness normalization targets (roadmap Phase A3, operator video-output
+# audit): a real production run measured a parent's EN narration at -22.4
+# LUFS against the SAME content's FR narration at -18.3 LUFS — no
+# normalization existed anywhere in this pipeline, so loudness varied by
+# provider/voice/language with nothing correcting it. -17 LUFS is the
+# midpoint of a -16..-18 LUFS online-narration target band; -1.5 dBTP
+# leaves headroom against inter-sample peaks after mp3 re-encoding.
+_LOUDNORM_TARGET_I_LUFS  = -17.0
+_LOUDNORM_TARGET_TP_DBTP = -1.5
+_LOUDNORM_TARGET_LRA_LU  = 11.0  # ffmpeg loudnorm's own default LRA target
+
 _REVEAL_SENTENCE_RE = re.compile(
     r"([\.\!\?]\s+)((?:That|Then|But|And then|Until|Except|Until then|"
     r"What they found|What he found|What she found|"
@@ -951,6 +962,206 @@ def _concat_mp3_chunks(chunk_bytes_list: list[bytes]) -> bytes:
         return result
 
 
+def _normalize_loudness(mp3_bytes: bytes) -> bytes:
+    """Normalize final narration audio to a consistent loudness via ffmpeg.
+
+    A real production run measured a parent's EN narration at -22.4 LUFS
+    against the SAME content's FR narration at -18.3 LUFS — no loudness
+    normalization existed anywhere in this pipeline, so perceived volume
+    varied by provider/voice/language with nothing correcting it.
+
+    Single-pass ``loudnorm`` (one ffmpeg call) rather than the more precise
+    two-pass measure-then-apply variant — a deliberate simplicity tradeoff:
+    the goal is "consistent and reasonable across languages/providers," not
+    broadcast-spec-exact loudness. ffmpeg is already a hard dependency of
+    this pipeline (``_concat_mp3_chunks()``, ``_wav_to_mp3()``,
+    ``measure_audio_duration_ms()``), so its absence here raises the same
+    way those do rather than silently skipping normalization.
+
+    Applied once, unconditionally, at the single point every provider path
+    funnels through (``generate_audio()``'s return points below) — covers
+    both single-chunk and multi-chunk audio, Cartesia and ElevenLabs alike.
+    Never runs on the skip-on-disk resume path, since that path never reads
+    the audio bytes back into memory at all (CLAUDE.md §10.3's
+    ``RESUME_TRANSCRIPT_REUSED`` contract) — an already-generated file on
+    disk was normalized once, at generation time, and is trusted thereafter.
+
+    Args:
+        mp3_bytes: Raw MP3 bytes for one language's complete narration.
+
+    Returns:
+        Loudness-normalized MP3 bytes at 192 kbps. Empty input returns empty
+        output unchanged (nothing to normalize).
+
+    Raises:
+        RuntimeError: If ffmpeg is unavailable or the normalization pass fails.
+    """
+    if not mp3_bytes:
+        return mp3_bytes
+
+    import subprocess
+    import tempfile
+    import os
+
+    with tempfile.TemporaryDirectory() as tmp:
+        in_path  = os.path.join(tmp, "in.mp3")
+        out_path = os.path.join(tmp, "out.mp3")
+        with open(in_path, "wb") as f:
+            f.write(mp3_bytes)
+
+        cmd = [
+            "ffmpeg", "-y", "-i", in_path,
+            "-af", (
+                f"loudnorm=I={_LOUDNORM_TARGET_I_LUFS}:"
+                f"TP={_LOUDNORM_TARGET_TP_DBTP}:"
+                f"LRA={_LOUDNORM_TARGET_LRA_LU}"
+            ),
+            "-c:a", "libmp3lame", "-b:a", "192k",
+            out_path,
+        ]
+        proc = subprocess.run(cmd, capture_output=True)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"ffmpeg loudnorm failed (rc={proc.returncode}): "
+                f"{proc.stderr[-300:].decode(errors='replace')}"
+            )
+
+        with open(out_path, "rb") as f:
+            result = f.read()
+
+    logger.info(
+        "AUDIO_LOUDNESS_NORMALIZED target_i=%.1fLUFS target_tp=%.1fdBTP "
+        "input_bytes=%d output_bytes=%d",
+        _LOUDNORM_TARGET_I_LUFS, _LOUDNORM_TARGET_TP_DBTP,
+        len(mp3_bytes), len(result),
+    )
+    return result
+
+
+def _measure_mp3_bytes_duration_ms(mp3_bytes: bytes) -> int:
+    """ffprobe-measure the duration of in-memory MP3 bytes.
+
+    Writes to a temp file and reuses ``storage.measure_audio_duration_ms()``
+    — the single duration-measurement point (CLAUDE.md §10.3) — rather than
+    a second ffprobe-invocation implementation, so this measurement and
+    ``audio.py``'s later measurement of the same bytes once written to their
+    final on-disk path can never disagree in method.
+    """
+    if not mp3_bytes:
+        return 0
+
+    import tempfile
+    from pathlib import Path
+    from app.agents.agent3_audio.services.storage import measure_audio_duration_ms
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "measure.mp3"
+        path.write_bytes(mp3_bytes)
+        return measure_audio_duration_ms(path)
+
+
+def _compute_section_boundaries(
+    section_meta: list[dict],
+    chunk_bytes_list: list[bytes],
+    final_duration_ms: int,
+) -> list[dict]:
+    """Derive each section's real [start_ms, end_ms) span in the final audio
+    (roadmap Phase B1 — per-language visual timing for parent renders).
+
+    Deterministic, no AI call: measures each pre-concatenation chunk's own
+    duration via ffprobe and accumulates offsets using the same fixed
+    silence pad ``_concat_mp3_chunks()`` inserts between chunks, then
+    rescales the whole sequence so it sums exactly to ``final_duration_ms``
+    — the real, independently-measured duration of the actual persisted
+    (concatenated + loudness-normalized) audio. Rescaling corrects for the
+    small encoder-rounding drift that always exists between "sum of
+    independently measured chunks" and "duration of the single re-encoded,
+    concatenated file" — without it, boundaries would very slightly overrun
+    or underrun the real audio length.
+
+    Args:
+        section_meta:      One ``{"section_type", "section_index"}`` dict per
+                            chunk, in the same order as ``chunk_bytes_list``.
+        chunk_bytes_list:  Raw MP3 bytes for each TTS chunk, pre-concatenation.
+        final_duration_ms: Real measured duration of the final persisted audio.
+
+    Returns:
+        List of ``{"section_type", "section_index", "start_ms", "end_ms"}``
+        dicts in playback order, or ``[]`` when there is nothing usable to
+        compute from (mismatched/empty inputs, or a degenerate duration) —
+        callers must treat an empty list as "no section data available",
+        never as "one section covering nothing".
+    """
+    if not section_meta or not chunk_bytes_list or len(section_meta) != len(chunk_bytes_list):
+        return []
+    if final_duration_ms <= 0:
+        return []
+
+    pad_ms = _CHUNK_BOUNDARY_SILENCE_SECONDS * 1000
+    raw_spans = [_measure_mp3_bytes_duration_ms(chunk) for chunk in chunk_bytes_list]
+
+    # Raw (unscaled) cumulative boundary POINTS — N+1 of them for N chunks:
+    # point[0] = 0, point[i+1] = point[i] + span_i (+ pad after every chunk
+    # except the last, matching _concat_mp3_chunks()'s own pad placement).
+    # Building shared boundary points (rather than each section computing
+    # its own start/end independently) is what guarantees section i's
+    # end_ms always equals section i+1's start_ms exactly — a beat can
+    # never fall into an unmapped gap between two sections.
+    raw_points = [0.0]
+    cursor = 0.0
+    for i, span in enumerate(raw_spans):
+        cursor += span
+        if i < len(raw_spans) - 1:
+            cursor += pad_ms
+        raw_points.append(cursor)
+
+    raw_total = raw_points[-1]
+    if raw_total <= 0:
+        return []
+
+    scale = final_duration_ms / raw_total
+    scaled_points = [int(round(p * scale)) for p in raw_points]
+    # Exact clamp at both ends: avoids leaving a few ms of rounding drift
+    # at the very start/tail, matching _remap_beats_timing()'s own
+    # last-beat clamp convention.
+    scaled_points[0]  = 0
+    scaled_points[-1] = final_duration_ms
+
+    return [
+        {
+            "section_type": meta.get("section_type"),
+            "section_index": meta.get("section_index"),
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+        }
+        for meta, start_ms, end_ms in zip(section_meta, scaled_points[:-1], scaled_points[1:])
+    ]
+
+
+def _finalize_audio_with_boundaries(
+    raw_bytes: bytes,
+    chunk_bytes_list: list[bytes],
+    section_meta: list[dict],
+) -> tuple[bytes, list[dict]]:
+    """Normalize loudness and compute real per-section boundaries — the one
+    place both provider branches of ``generate_audio()`` funnel through
+    (roadmap Phase A3 + Phase B1), so neither concern needs its own opt-in
+    per call site.
+    """
+    normalized = _normalize_loudness(raw_bytes)
+    if not section_meta:
+        return normalized, []
+
+    final_duration_ms = _measure_mp3_bytes_duration_ms(normalized)
+    boundaries = _compute_section_boundaries(section_meta, chunk_bytes_list, final_duration_ms)
+    if boundaries:
+        logger.info(
+            "AUDIO_SECTION_BOUNDARIES_COMPUTED sections=%d final_duration_ms=%d",
+            len(boundaries), final_duration_ms,
+        )
+    return normalized, boundaries
+
+
 def _wav_to_mp3(wav_bytes: bytes) -> bytes:
     """Convert raw WAV bytes to MP3 bytes at 128 kbps using ffmpeg.
 
@@ -983,7 +1194,9 @@ def _wav_to_mp3(wav_bytes: bytes) -> bytes:
             return f.read()
 
 
-def _generate_cartesia_audio(voice_script: str, channel_voice, is_short_episode: bool = False) -> bytes:
+def _generate_cartesia_audio(
+    voice_script: str, channel_voice, is_short_episode: bool = False,
+) -> tuple[bytes, list[bytes], list[dict]]:
     """Generate MP3 audio via Cartesia TTS (provider='cartesia').
 
     Sends long-form section-marked scripts as one Cartesia request per section
@@ -999,7 +1212,11 @@ def _generate_cartesia_audio(voice_script: str, channel_voice, is_short_episode:
                           TikTok-optimised pacing.
 
     Returns:
-        Raw MP3 bytes ready to be written to disk.
+        Tuple of ``(concatenated MP3 bytes, per-chunk MP3 bytes list,
+        per-chunk section metadata list)`` — the latter two are consumed by
+        ``generate_audio()``'s ``_finalize_audio_with_boundaries()`` call to
+        derive real per-section audio boundaries (roadmap Phase B1); the
+        first is not yet loudness-normalized (the caller normalizes it).
 
     Raises:
         RuntimeError: If CARTESIA_API_KEY is not configured or a chunk fails.
@@ -1039,6 +1256,7 @@ def _generate_cartesia_audio(voice_script: str, channel_voice, is_short_episode:
     )
 
     all_bytes: list[bytes] = []
+    section_meta: list[dict] = []
     for i, unit in enumerate(prepared_units):
         prepared = unit["prepared"]
         if not prepared.strip():
@@ -1073,16 +1291,20 @@ def _generate_cartesia_audio(voice_script: str, channel_voice, is_short_episode:
             )
             raise
         all_bytes.append(_wav_to_mp3(wav_bytes))
+        section_meta.append({
+            "section_type": unit.get("section_type"),
+            "section_index": unit.get("section_index"),
+        })
 
     audio_bytes = _concat_mp3_chunks(all_bytes) if all_bytes else b""
     logger.debug(
         "Cartesia TTS complete: %d chunk(s) → %d bytes (%.1f KB)",
         len(prepared_units), len(audio_bytes), len(audio_bytes) / 1024,
     )
-    return audio_bytes
+    return audio_bytes, all_bytes, section_meta
 
 
-def generate_audio(voice_script: str, channel_voice, is_short_episode: bool = False) -> bytes:
+def generate_audio(voice_script: str, channel_voice, is_short_episode: bool = False) -> tuple[bytes, list[dict]]:
     """Convert a voice script to MP3 audio via the configured TTS provider.
 
     Routes to Cartesia or ElevenLabs based on ``channel_voice.provider``.
@@ -1128,16 +1350,35 @@ def generate_audio(voice_script: str, channel_voice, is_short_episode: bool = Fa
         is_short_episode: When ``True``, applies TikTok-optimised pacing in
                           ``prepare_script_for_tts`` (pause cap=10, no slow-open).
 
+    Both paths' final audio passes through ``_normalize_loudness()`` (roadmap
+    Phase A3) before returning — a single ffmpeg loudnorm pass applied
+    uniformly regardless of provider or chunk count. Both paths also compute
+    real per-section audio boundaries (roadmap Phase B1) via
+    ``_finalize_audio_with_boundaries()`` whenever the script produced one
+    TTS chunk per ``[INTRO]``/``[SECTION N]``/``[OUTRO]`` section (always
+    true for Cartesia; true for ElevenLabs only when ``tts_model="eleven_v3"``
+    — the legacy non-v3 char-limit chunking path can merge multiple sections
+    into one chunk, so no boundary data is computed for it).
+
     Returns:
-        Raw MP3 bytes ready to be written to disk.
+        Tuple of ``(loudness-normalized MP3 bytes ready to be written to
+        disk, section_boundaries)``. ``section_boundaries`` is a list of
+        ``{"section_type", "section_index", "start_ms", "end_ms"}`` dicts in
+        playback order, or ``[]`` when the script had no section markers or
+        the provider/model path can't guarantee one chunk per section.
 
     Raises:
-        RuntimeError: If the required API key is not configured or a chunk fails.
+        RuntimeError: If the required API key is not configured, a chunk
+                      fails, or loudness normalization fails (ffmpeg missing
+                      or the loudnorm pass itself errors).
     """
     provider = (getattr(channel_voice, "provider", None) or "cartesia").lower()
 
     if provider == "cartesia":
-        return _generate_cartesia_audio(voice_script, channel_voice, is_short_episode=is_short_episode)
+        raw_bytes, chunk_bytes_list, section_meta = _generate_cartesia_audio(
+            voice_script, channel_voice, is_short_episode=is_short_episode
+        )
+        return _finalize_audio_with_boundaries(raw_bytes, chunk_bytes_list, section_meta)
 
     # ── ElevenLabs path ───────────────────────────────────────────────────────
     model_id = getattr(channel_voice, "tts_model", None) or "eleven_multilingual_v2"
@@ -1206,7 +1447,15 @@ def generate_audio(voice_script: str, channel_voice, is_short_episode: bool = Fa
         stitching_path = "none (SDK too old)"
     logger.debug("ElevenLabs TTS stitching path: %s (%d chunk(s))", stitching_path, len(prepared_chunks))
 
+    # Section boundaries (roadmap Phase B1) can only be trusted when each
+    # chunk is guaranteed to be exactly one script section — true for
+    # eleven_v3 (one TTS request per section, above), never guaranteed for
+    # the legacy non-v3 char-limit chunking path (_chunk_script_at_sections()
+    # can merge several sections into one chunk to stay under max_chars).
+    track_sections = model_id == "eleven_v3"
+
     all_bytes: list[bytes] = []
+    section_meta: list[dict] = []
 
     for i, chunk in enumerate(prepared_chunks):
         prepared = chunk["prepared"]
@@ -1239,10 +1488,15 @@ def generate_audio(voice_script: str, channel_voice, is_short_episode: bool = Fa
 
         audio_iter = client.text_to_speech.convert(**kwargs)
         all_bytes.append(b"".join(audio_iter))
+        if track_sections:
+            section_meta.append({
+                "section_type": chunk.get("section_type"),
+                "section_index": chunk.get("section_index"),
+            })
 
     audio_bytes = _concat_mp3_chunks(all_bytes) if all_bytes else b""
     logger.debug(
         "ElevenLabs TTS complete: %d chunk(s) %d bytes (%.1f KB)",
         len(prepared_chunks), len(audio_bytes), len(audio_bytes) / 1024,
     )
-    return audio_bytes
+    return _finalize_audio_with_boundaries(audio_bytes, all_bytes, section_meta)

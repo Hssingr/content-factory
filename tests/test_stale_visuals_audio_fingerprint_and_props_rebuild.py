@@ -215,7 +215,7 @@ class TestCombinedStalenessGuardIntegration(unittest.TestCase):
         # Same script text as before (so the script hash matches)...
         scripts_by_lang = {"en": SimpleNamespace(voice_script="Original narration text")}
         # ...but the AudioFile row's duration has since been corrected.
-        audio_by_lang = {"en": SimpleNamespace(duration_ms=616_834, whisper_transcript=[])}
+        audio_by_lang = {"en": SimpleNamespace(duration_ms=616_834, whisper_transcript=[], section_boundaries=None)}
 
         fresh_beats = [_beat(0, script_text="regenerated"), _beat(1, script_text="regenerated")]
         calls = []
@@ -248,7 +248,7 @@ class TestCombinedStalenessGuardIntegration(unittest.TestCase):
         ])
         content, channel = self._content_channel(content_id)
         scripts_by_lang = {"en": SimpleNamespace(voice_script="Original narration text")}
-        audio_by_lang = {"en": SimpleNamespace(duration_ms=616_834, whisper_transcript=[])}
+        audio_by_lang = {"en": SimpleNamespace(duration_ms=616_834, whisper_transcript=[], section_boundaries=None)}
 
         with patch(
             "app.agents.agent4_visuals.services.visual_orchestrator._run_visual_pass",
@@ -273,7 +273,7 @@ class TestCombinedStalenessGuardIntegration(unittest.TestCase):
         _seed_visual_beats(db, content_id, [legacy_beat])
         content, channel = self._content_channel(content_id)
         scripts_by_lang = {"en": SimpleNamespace(voice_script="Original narration text")}
-        audio_by_lang = {"en": SimpleNamespace(duration_ms=616_834, whisper_transcript=[])}
+        audio_by_lang = {"en": SimpleNamespace(duration_ms=616_834, whisper_transcript=[], section_boundaries=None)}
 
         with patch(
             "app.agents.agent4_visuals.services.visual_orchestrator._run_visual_pass",
@@ -384,7 +384,7 @@ class TestProcessLanguageRebuildsWhenPropsAreStale(unittest.TestCase):
                 # to observe that we fell through past it without needing to
                 # mock the entire render pipeline.
                 result = video_module._process_language(
-                    content_id=content_id, language="en", script=SimpleNamespace(),
+                    content_id=content_id, language="en", script=SimpleNamespace(voice_script=""),
                     audio=audio, beats=[], channel=channel,
                     karaoke_color="#fff", db=db,
                 )
@@ -401,7 +401,7 @@ class TestProcessLanguageRebuildsWhenPropsAreStale(unittest.TestCase):
                 patch.object(video_module, "_render_from_existing_props", return_value=True),
             ):
                 result = video_module._process_language(
-                    content_id=content_id, language="en", script=SimpleNamespace(),
+                    content_id=content_id, language="en", script=SimpleNamespace(voice_script=""),
                     audio=audio, beats=[{"audio_end_ms": 9000}], channel=channel,
                     karaoke_color="#fff", db=db,
                 )
