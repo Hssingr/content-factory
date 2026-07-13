@@ -7,7 +7,13 @@ from app.services.script_checks import split_sentences
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "4.7"  # v4.7: fresh full-system audit §2.1 — section-prompt subtraction.
+PROMPT_VERSION = "4.8"  # v4.8: roadmap Phase C2/C3 — _STORY_BLUEPRINT_SCHEMA gained
+                        # character_descriptors (locked name/age/physical-description
+                        # entries) and era_setting (period/place phrase), both generated
+                        # once at blueprint time, zero extra AI calls — consumed by
+                        # Agent 4's build_continuity_line_from_blueprint() for
+                        # storyboard visual/period consistency.
+                        # v4.7: fresh full-system audit §2.1 — section-prompt subtraction.
                         # Three changes, all removals/reconciliations, no new rules:
                         # (1) "EXACTLY ONE narrative function" vs "a new revelation every
                         # 110-150 words" contradiction resolved — a section serves ONE
@@ -485,6 +491,21 @@ Rules:
   something that happened to the narrator ("I heard it three nights in a row"), not
   as an observation about someone else. For "third_person" (default), phrase them
   about the story's people using third-person pronouns and names, as usual.
+- character_descriptors: identify this story's recurring NAMED characters — people
+  who appear more than once and matter to the plot, not every person mentioned.
+  For each, provide name (as used in the story), age (approximate — e.g. "mid-30s",
+  "elderly", "teenager"), and description (ONE concrete visual sentence: build, hair,
+  clothing style, distinguishing features). Ground every detail in what the story
+  states, or what is plausible for its setting/era where the story is silent — never
+  invent a detail that contradicts the story. This locks each character's visual
+  identity so every generated image depicts them consistently. Maximum 5 characters.
+  Return an empty list for an event-focused or ensemble story with no describable
+  individual character — never force one.
+- era_setting: one concise phrase naming this story's historical period AND physical
+  setting (e.g. "6th-century Byzantine Constantinople", "1920s rural American
+  Midwest", "contemporary/present-day, unspecified U.S. city"). Used to keep every
+  generated image's props, clothing, architecture, and technology authentic to this
+  period — never invent a period the story does not support.
 
 Never invent facts not present in the story body.\
 """
@@ -500,10 +521,26 @@ _STORY_BLUEPRINT_SCHEMA: dict = {
         "midpoint_retention_trap": {"type": "string"},
         "suggested_section_count": {"type": "integer", "minimum": 2, "maximum": 5},
         "suggested_title":        {"type": "string"},
+        "character_descriptors": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name":        {"type": "string"},
+                    "age":         {"type": "string"},
+                    "description": {"type": "string"},
+                },
+                "required": ["name", "age", "description"],
+                "additionalProperties": False,
+            },
+            "maxItems": 5,
+        },
+        "era_setting": {"type": "string"},
     },
     "required": [
         "hook", "central_question", "major_turns", "final_payoff", "midpoint_retention_trap",
         "comment_trigger", "suggested_section_count", "suggested_title",
+        "character_descriptors", "era_setting",
     ],
     "additionalProperties": False,
 }
@@ -536,7 +573,10 @@ def generate_story_blueprint(
 
     Returns:
         Dict with keys: hook, central_question, major_turns, final_payoff,
-        comment_trigger, suggested_section_count, suggested_title.
+        comment_trigger, suggested_section_count, suggested_title,
+        character_descriptors (roadmap Phase C2 — list of {name, age,
+        description}, possibly empty), era_setting (roadmap Phase C3 — one
+        phrase, possibly empty string).
 
     Raises:
         ValueError: If major_turns has fewer than 2 entries or required keys missing.
@@ -561,9 +601,10 @@ def generate_story_blueprint(
         input_schema=_STORY_BLUEPRINT_SCHEMA,
         # 768 was sized before midpoint_retention_trap became a required
         # schema field (roadmap 4.3); a detailed 5-turn blueprint can approach
-        # that. max_tokens is a cap, not a spend — 1024 is free headroom
-        # against a truncated forced-tool-use response.
-        max_tokens=1024,
+        # that. Raised 1024 -> 1536 (roadmap Phase C2) for character_descriptors
+        # (up to 5 entries) + era_setting — max_tokens is a cap, not a spend,
+        # this is free headroom against a truncated forced-tool-use response.
+        max_tokens=1536,
     )
     major_turns = result.get("major_turns") or []
     if len(major_turns) < 2:

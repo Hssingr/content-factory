@@ -2038,6 +2038,8 @@ Output fields:
 - midpoint_retention_trap
 - suggested_section_count
 - suggested_title
+- character_descriptors (roadmap Phase C2)
+- era_setting (roadmap Phase C3)
 
 Rules:
 
@@ -2068,6 +2070,37 @@ system prompt instructs phrasing `hook`/`central_question`/`final_payoff` so
 they can be delivered in the configured POV — first-person ("I heard it
 three nights in a row") for `"first_person_storytime"`, or the default
 third-person register otherwise. See §8.1 for the full threading chain.
+
+`character_descriptors` / `era_setting` (roadmap Phase C2/C3, operator
+video-output audit): a real production run showed a story's protagonist
+rendered as 6+ visually different women across beats, and a separate run
+shipped modern anachronisms (a modern flag, a modern waterfront, contemporary
+clothing) inside a 6th-century Byzantine story — nothing locked character
+appearance or period/setting across the storyboard. Both fields are generated
+ONCE at blueprint time, piggybacking on the existing blueprint Claude call
+(`max_tokens` raised 1024 → 1536 for the added headroom) — zero extra AI
+calls, and NOT a revert of the deleted visual bible (Elimination Mandate
+D2.1, §11.4) — deterministic, blueprint-derived data consumed by Python, no
+per-batch generation call.
+
+- `character_descriptors`: up to 5 `{name, age, description}` entries for
+  the story's recurring NAMED characters (not every mentioned person) — a
+  locked, one-line physical description each. Required in the schema, but a
+  legitimately empty list (`[]`) is valid for an event-focused/ensemble
+  story with no describable individual character — never forced.
+- `era_setting`: one phrase naming the story's historical period AND
+  physical setting (e.g. "6th-century Byzantine Constantinople"). Required
+  in the schema; the model estimates it even for a story that doesn't state
+  it explicitly ("contemporary/present-day, unspecified U.S. city" for a
+  modern story).
+- Neither field is post-processed or validated in Python beyond passthrough
+  (same fail-open convention as `midpoint_retention_trap` above) — consumed
+  deterministically by Agent 4's `build_continuity_line_from_blueprint()`
+  (§11.4) via the existing `continuity_line` mechanism, no new parameter
+  chain needed anywhere downstream.
+- A blueprint generated before this phase shipped simply lacks these two
+  keys — every consumer treats a missing key as "nothing to add," never
+  forcing a regeneration of legacy content.
 
 #### `generate_script_sections`
 
@@ -3837,6 +3870,75 @@ Visual continuity: these names recur throughout this story — give each a
 stable, consistent physical identity/appearance across beats: Sam, Whitney,
 Borrasca.
 ```
+
+**`continuity_line` gained two more lines (roadmap Phase C2/C3, operator
+video-output audit):** `build_continuity_line_from_blueprint()` now returns
+up to three newline-joined sentences — the pre-existing recurring-proper-noun
+line above, plus:
+
+```
+Character identities (use these exact physical descriptions whenever
+depicting them, in every beat, for consistency): Belisarius, mid-30s — tall,
+dark beard, bronze cuirass.
+Era/setting lock: this story is set in 6th-century Byzantine Constantinople
+— every beat's props, clothing, architecture, technology, and background
+details must be authentic to this period and place; no anachronistic modern
+elements unless the story is explicitly contemporary.
+```
+
+Both lines are built from `content.story_blueprint`'s `character_descriptors`/
+`era_setting` fields (§9.3) by `_format_character_descriptors_line()`/
+`_format_era_setting_line()` — pure formatting, no AI call, each independently
+skipped (returns `""`) when its blueprint field is absent/empty, including for
+every blueprint generated before this phase shipped (no regeneration forced).
+This directly targets two real production defects: a story's protagonist
+rendered as 6+ visually different women with nothing enforcing consistency,
+and modern anachronisms (a modern flag, a modern waterfront, contemporary
+clothing) inside a 6th-century Byzantine story.
+
+**Style-negative-constraints per `image_style` (roadmap Phase C2):** the same
+run also shipped ONE video mixing photoreal-cinematic, flat cartoon, and
+anime-style beats. `_IMAGE_STYLE_NEGATIVE_CONSTRAINTS` (a deterministic
+Python dict keyed by the 9 canonical `image_style` values, kept in sync with
+`app/ui/src/constants.js`'s `IMAGE_STYLE_OPTIONS` per §8.4) adds one more
+`direction_lines` entry whenever `image_style` matches a known key:
+
+```
+Style constraints (this image style must NOT look like): no photorealism, no
+live-action photography, no anime linework, no comic-book panel borders, not
+a flat/childish kids-cartoon look
+```
+
+An unrecognized/custom `image_style` value gets no constraint line — fail-open,
+matching the existing "apply the closest reading for any other string"
+convention already used for `visual_style`. The prompt instructs Claude to
+honor this by choosing `flux_prompt`'s own descriptive words, never by
+copying the negative phrase into `flux_prompt` itself (which stays purely
+positive/descriptive, per the pre-existing "no Avoid: suffix" rule).
+
+**Beat-count and hint-length prompt tightening (roadmap Phase C4):** two real
+production defects — beat under-delivery (Claude returning as few as ~65% of
+the requested `target_beat_count`, e.g. 12 of 18) and a 100%-invalid-hint-rate
+segment from under-length `start_hint`/`end_hint` values — traced to soft
+prompt language ("aim for this count", a bare "6-10 words" range with no
+stated floor rationale). Both the strict-rules beat-count instruction and the
+per-beat hint-length instruction were rewritten as explicit requirements with
+stated consequences (a low beat count forces long static holds that read as a
+slideshow; a short hint is ambiguous and gets treated as lower-confidence,
+degrading that beat's timing accuracy) — prompt-only, no schema change, so
+`STORYBOARD_SCHEMA_VERSION` did not bump (only `PROMPT_VERSION`, 4.7 → 4.8).
+
+Runtime proof for all of Phase C2/C3/C4 above:
+`tests/test_character_era_style_continuity.py` — real `generate_story_blueprint()`
+call (only `call_claude_structured` stubbed) proving `character_descriptors`/
+`era_setting` survive untouched; `_format_character_descriptors_line()`/
+`_format_era_setting_line()`/`build_continuity_line_from_blueprint()` unit
+tests including the legacy-blueprint (missing-keys) degrade-to-pre-existing-
+output proof; and a real `generate_storyboard_batch()` call (only
+`call_claude_structured_with_usage` stubbed) capturing the actual constructed
+`user_message` to prove the character-identity line, era-lock line, and
+per-`image_style` constraint line all reach the real Claude-call boundary —
+not just that the formatting functions produce correct strings in isolation.
 
 **The entire visual-bible layer is deleted (Elimination Mandate, roadmap
 `code_report/forensic_output_audit_borrasca_run.md` D2.1):** the Claude
@@ -7086,7 +7188,7 @@ These are current engineering risks to monitor, not future feature promises.
 |---|---|
 | Duplicate task dispatch | Beat and inline orchestration may enqueue same child if guards fail |
 | Stale props | Mitigated (roadmap 2d / audit P0-3): `_props_are_stale()` rebuilds when the props file's duration/section-count/last-section-end no longer match the current DB beats. Heuristic, not a full content hash — a change that doesn't move any of those three proxies (e.g. `flux_prompt` text edited with identical timing) would not be caught |
-| Visual quality | Character identity and visual continuity need stronger controls |
+| Visual quality | Mitigated (roadmap Phase C2): blueprint-derived `character_descriptors`/`era_setting` lock each recurring character's physical identity and the story's period/setting into every storyboard batch. Still a prompt-level instruction, not an enforced constraint — Claude can still drift on a given beat; no deterministic validator checks character-appearance consistency across beats (would require image analysis, not just text) |
 | Storyboard cost | Storyboard output tokens per beat can be high |
 | Child short script quality | Short scripts must not validate with remaining MAJOR TTS issues |
 | Legacy fields | Breakpoint/bookend fields still exist and could be misused |
@@ -7115,7 +7217,7 @@ These are current engineering risks to monitor, not future feature promises.
 
 - Storyboard cost logs: required
 - Reuse stats logs: required
-- Character consistency controls: should be strengthened
+- Character consistency controls: blueprint-derived locked descriptors implemented (roadmap Phase C2) — prompt-level, not a deterministic validator
 - Repetition diagnostics: should be monitored
 - Cache reuse diagnostics: should be monitored
 - Object-shot rate diagnostics: should be monitored

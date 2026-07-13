@@ -371,21 +371,87 @@ _MAX_BEATS_PER_BATCH = 20
 # precedent as app.services.video_sections/script_source (§7.5/§7.6).
 
 
+_MAX_CHARACTER_DESCRIPTORS_LINE = 5  # mirrors _STORY_BLUEPRINT_SCHEMA's character_descriptors maxItems
+
+
+def _format_character_descriptors_line(character_descriptors) -> str:
+    """Format the blueprint's locked character_descriptors (roadmap Phase C2
+    — name/age/physical-description entries generated once at blueprint
+    time) into one continuity line. Skips any malformed entry rather than
+    raising — this is a visual-consistency aid, not load-bearing data.
+    """
+    if not character_descriptors:
+        return ""
+    entries: list[str] = []
+    for entry in character_descriptors[:_MAX_CHARACTER_DESCRIPTORS_LINE]:
+        if not isinstance(entry, dict):
+            continue
+        name        = str(entry.get("name") or "").strip()
+        age         = str(entry.get("age") or "").strip()
+        description = str(entry.get("description") or "").strip()
+        if not name or not description:
+            continue
+        entries.append(f"{name}{f', {age}' if age else ''} — {description}")
+    if not entries:
+        return ""
+    return (
+        "Character identities (use these exact physical descriptions whenever "
+        "depicting them, in every beat, for consistency): " + "; ".join(entries) + "."
+    )
+
+
+def _format_era_setting_line(era_setting) -> str:
+    """Format the blueprint's era_setting (roadmap Phase C3 — one phrase
+    naming this story's period and place, generated once at blueprint time)
+    into one continuity line. "" when absent/empty (legacy blueprints
+    predating this field, or a story the model judged had no clear period)."""
+    era = str(era_setting or "").strip()
+    if not era:
+        return ""
+    return (
+        f"Era/setting lock: this story is set in {era} — every beat's props, "
+        "clothing, architecture, technology, and background details must be "
+        "authentic to this period and place; no anachronistic modern elements "
+        "unless the story is explicitly contemporary."
+    )
+
+
 def build_continuity_line_from_blueprint(blueprint: dict | None) -> str:
-    """Return a one-line visual-continuity hint built deterministically from
-    the story blueprint, or "" if nothing recurs. No AI call — see the module
+    """Return a deterministic visual-continuity hint built from the story
+    blueprint, or "" if nothing recurs/locks. No AI call — see the module
     note above this function for why the AI-generated visual bible it
     replaces was deleted.
+
+    Three independent, additive lines (roadmap Phase B2's recurring-name
+    extraction, plus Phase C2/C3's locked character identities and era/
+    setting lock) — any subset may be empty; only the non-empty ones are
+    joined (newline-separated) into the returned string. A blueprint
+    predating character_descriptors/era_setting (both roadmap Phase C2/C3)
+    simply lacks those keys, so this degrades to exactly the pre-existing
+    single-line (or empty) output — no regeneration forced on legacy content.
     """
-    recurring = extract_recurring_proper_nouns(blueprint)
-    if not recurring:
+    if not blueprint:
         return ""
 
-    return (
-        "Visual continuity: these names recur throughout this story — give "
-        "each a stable, consistent physical identity/appearance across beats: "
-        + ", ".join(recurring) + "."
-    )
+    lines: list[str] = []
+
+    recurring = extract_recurring_proper_nouns(blueprint)
+    if recurring:
+        lines.append(
+            "Visual continuity: these names recur throughout this story — give "
+            "each a stable, consistent physical identity/appearance across beats: "
+            + ", ".join(recurring) + "."
+        )
+
+    character_line = _format_character_descriptors_line(blueprint.get("character_descriptors"))
+    if character_line:
+        lines.append(character_line)
+
+    era_line = _format_era_setting_line(blueprint.get("era_setting"))
+    if era_line:
+        lines.append(era_line)
+
+    return "\n".join(lines)
 
 
 def split_into_beats(

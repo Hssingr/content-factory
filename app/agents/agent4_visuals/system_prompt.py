@@ -11,7 +11,19 @@ from app.services.claude_client import (
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "4.7"  # v4.7: roadmap Phase A2 (operator video-output audit) — "dip_to_black" removed
+PROMPT_VERSION = "4.8"  # v4.8: roadmap Phase C2/C3/C4 (operator video-output audit) — four
+                        #        additive changes, no schema field changes: (1) style-negative-
+                        #        constraints line per image_style (_IMAGE_STYLE_NEGATIVE_CONSTRAINTS)
+                        #        so a beat's rendering can't drift into a neighboring style (a real
+                        #        run mixed photoreal/cartoon/anime in one video); (2) "Character
+                        #        identities:"/"Era/setting lock:" continuity-line sentences documented
+                        #        (data comes from Agent 2's new blueprint fields, threaded via the
+                        #        existing continuity_line parameter — see storyboard.py); (3) beat-count
+                        #        adherence language strengthened from "aim for" to an explicit
+                        #        requirement (real runs under-delivered ~65% of target); (4) hint-length
+                        #        (6-10 verbatim words) language strengthened with an explicit floor
+                        #        rationale (real runs logged 100%-invalid-hint segments from short hints).
+                        # v4.7: roadmap Phase A2 (operator video-output audit) — "dip_to_black" removed
                         #        from the transition_to_next enum/prompt/schema entirely. A real
                         #        production run showed ~13 dip_to_black beats per parent video, each
                         #        rendering ~0.67s of full black while narration continued — indistinguishable
@@ -218,6 +230,30 @@ STORYBOARD_SCHEMA_VERSION = "7.2"  # v7.2: roadmap Phase A2 — removed "dip_to_
                                    # v2.5: query_style field
                                    # v2.4: stock_query + broad_query fields
 
+# Style-negative-constraints (roadmap Phase C2, operator video-output audit):
+# a real production run shipped ONE video mixing photoreal-cinematic (cover
+# frame), flat cartoon (several mid-video beats), and anime-style rendering
+# (one beat) — the storyboard prompt's own image-style vocabulary already
+# distinguishes these, but nothing told Claude a given style must NOT drift
+# into a neighboring one. Deterministic Python lookup, keyed by the exact
+# `image_style` values in the vocabulary above/app/ui/src/constants.js's
+# IMAGE_STYLE_OPTIONS (CLAUDE.md §8.4 keeps the two lists in sync) — an
+# unrecognized/custom image_style value simply gets no constraint line
+# (fail-open, matches the existing "apply the closest reading for any other
+# string" convention for visual_style).
+_IMAGE_STYLE_NEGATIVE_CONSTRAINTS: dict[str, str] = {
+    "photorealistic":    "no illustration, no painting, no cartoon, no anime, no visible brushstrokes or line art",
+    "cinematic_realism":  "no illustration, no painting, no cartoon, no anime — real photographic detail only",
+    "dark_realistic":     "no illustration, no painting, no cartoon, no anime, no bright/cheerful color grading",
+    "vintage_film":       "no digital-clean modern look, no illustration, no cartoon, no anime",
+    "digital_art":        "no photorealistic photography, no live-action imagery, no anime linework, no comic-panel framing",
+    "cinematic_cartoon":  "no photorealism, no live-action photography, no anime linework, no comic-book panel borders, not a flat/childish kids-cartoon look",
+    "oil_painting":       "no photorealistic photography, no clean digital/vector look, no anime, no flat cartoon shading",
+    "watercolor":         "no photorealistic photography, no clean digital/vector look, no anime, no flat cartoon shading, no heavy black outlines",
+    "anime":              "no photorealistic photography, no live-action imagery, no Western flat-cartoon look, no painterly oil/watercolor texture",
+}
+
+
 _STORYBOARD_SYSTEM_PROMPT = """\
 You are a visual director and editor for an automated multilingual video \
 production system. Think like a human video editor, not a stock-search generator.
@@ -296,6 +332,25 @@ consistent in every beat that shows it — invent the identity once, then reuse 
 Never add an "Avoid:" suffix or a negative-prompt list to flux_prompt; describe
 only what the image should contain.
 
+When a "Character identities:" line appears, it gives you the story's own locked
+name/age/physical-description for its recurring characters — generated once at
+blueprint time, grounded in the story. Use these EXACT descriptions whenever a
+beat depicts one of these people; do not invent a conflicting appearance, and do
+not silently drop a described detail (hair, build, clothing) in a later beat
+showing the same person. This is the deterministic replacement for keeping one
+character looking like the same person across 100+ beats — a real production
+run showed a story's protagonist rendered as 6+ visually different women with
+nothing enforcing consistency.
+
+When an "Era/setting lock:" line appears, it names this story's historical period
+and physical setting. Every beat's props, clothing, architecture, technology, and
+background details must be authentic to that period and place — no modern flags,
+modern clothing silhouettes, contemporary street furniture, or anachronistic
+technology unless the story is explicitly contemporary. A real production run
+shipped modern anachronisms (a modern flag, a modern city waterfront, suit-like
+contemporary clothing) inside a 6th-century Byzantine story; this line exists
+specifically to stop that.
+
 == Global Visual Direction (operator-configured) ==
 When "Global visual direction:" and "Global image style:" lines appear in the user
 message, apply them as consistent stylistic constraints across every beat:
@@ -328,6 +383,14 @@ message, apply them as consistent stylistic constraints across every beat:
     (narrative relevance) or the anti-slideshow rules.
   - When no global direction is specified in the user message, default to
     story_driven / photorealistic.
+  - When a "Style constraints (this image style must NOT look like):" line
+    appears, it names the neighboring rendering styles this beat's image must
+    stay clearly distinct from (a real production run shipped ONE video mixing
+    photoreal-cinematic, flat cartoon, and anime-style beats — exactly what
+    this line prevents). Honor it by choosing flux_prompt's own descriptive
+    words so the image cannot read as one of those neighboring styles — do NOT
+    copy the negative phrase itself into flux_prompt (flux_prompt stays purely
+    positive/descriptive, per the "no Avoid: suffix" rule above).
 
 == Beat category rotation (sequence diversity) ==
 Use the EXISTING visual_category / visual_type / motif fields below to express
@@ -519,6 +582,14 @@ Bad examples (forbidden):
 1. start_hint / end_hint — copy the exact first 6–10 words and the exact last 6–10
    words of the narration THIS BEAT covers, verbatim from the segment text given to
    you. These are used to locate the beat in the audio — they MUST match word-for-word.
+   Use the FULL 6–10 word range whenever the beat's own narration span is at least
+   that long — never stop at 2-3 words just because a natural phrase break appears
+   earlier. A hint shorter than 6 words is frequently ambiguous (it can match more
+   than one place in the narration) and is treated as lower-confidence, degrading
+   this beat's timing accuracy — a real production run logged a 100% invalid-hint
+   rate on some segments from exactly this under-length pattern. Only go below 6
+   words when the beat's own narration span genuinely contains fewer than 6 words
+   in total.
 2. visual_intent — one sentence describing what the viewer should see and feel.
 3. visual_type — b-roll | action | document | map | screenshot | generated_visual
 4. visual_category — person | place | object | document | screen | map | abstract
@@ -556,7 +627,13 @@ Bad examples (forbidden):
 
 Strict rules:
 1. Generate ONLY beats for THIS segment. beat_order values must be sequential integers
-   starting at 0, in narration order. Aim for the target_beat_count provided (±2).
+   starting at 0, in narration order. The target beat count provided is a
+   REQUIREMENT, not a suggestion — generate that many beats, within ±2. Do not
+   stop early or under-deliver to save effort: a segment that returns
+   significantly fewer beats than its target forces each remaining beat to hold
+   the screen far longer than intended, which reads as a slideshow, not a video.
+   If you are unsure whether a stretch of narration deserves its own beat, split
+   it into two beats rather than merging it into a neighboring one.
 2. Every beat's start_hint/end_hint must be copied EXACTLY from the segment text you
    received — never paraphrased, and never including the marker label.
 3. Every beat must include a ``motif`` field chosen from the allowed list.\
@@ -666,7 +743,8 @@ def generate_storyboard_batch(
     """
     def _build_message(beat_count: int) -> str:
         count_line = (
-            f"Target beat count for this segment: {beat_count} beats (aim for this count, ±2)\n"
+            f"Target beat count for this segment: {beat_count} beats — a requirement, "
+            f"not a suggestion; generate this many, within ±2\n"
             if beat_count > 0 else ""
         )
         direction_lines = ""
@@ -675,6 +753,9 @@ def generate_storyboard_batch(
                 f"Global visual direction: {visual_style or 'story_driven'}\n"
                 f"Global image style: {image_style or 'photorealistic'}\n"
             )
+            style_constraint = _IMAGE_STYLE_NEGATIVE_CONSTRAINTS.get(image_style)
+            if style_constraint:
+                direction_lines += f"Style constraints (this image style must NOT look like): {style_constraint}\n"
         continuity_lines = f"{continuity_line}\n" if continuity_line else ""
         return (
             f"Channel niche: {channel.niche}\n"
