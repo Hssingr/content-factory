@@ -132,6 +132,8 @@ export const IMAGE_STYLE_OPTIONS = [
     description: '35mm grain, muted tones, and the warm/cool shift of analog photography. Suits archival storytelling and nostalgia-driven channels.' },
   { value: 'digital_art',       label: 'Digital Art',
     description: 'Polished digital illustration with clean lines and vivid colours. Works well for tech, science, and modern editorial storytelling.' },
+  { value: 'cinematic_cartoon',           label: 'Cinematic cartoon',
+    description: 'Bold, simplified character and environment design with clean outlines and flat, bright colour fills — friendlier and more stylized than digital art, but without anime linework or comic-panel framing. Suits approachable historical, educational, or biography storytelling.' },
   { value: 'oil_painting',      label: 'Oil Painting',
     description: 'Rich, textured brushwork with classical compositional depth. Well-suited to historical, biographical, and literary content.' },
   { value: 'watercolor',        label: 'Watercolor',

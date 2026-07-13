@@ -11,7 +11,13 @@ from app.services.claude_client import (
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "4.5"  # v4.5: fresh full-system audit §2.2 — storyboard prompt repair.
+PROMPT_VERSION = "4.6"  # v4.6: added "cinematic_cartoon" to the image_style vocabulary (operator request) —
+                        #        the "Recognized values" list now describes cinematic_cartoon rendering
+                        #        (simplified illustration, bold outlines, flat color fills — distinct
+                        #        from anime/digital_art), and "cinematic_cartoon" is added to the TECHNICAL
+                        #        step's illustrated/painted-styles list so it is never suffixed with
+                        #        "sharp focus, no motion blur" or the word "photorealistic".
+                        # v4.5: fresh full-system audit §2.2 — storyboard prompt repair.
                         #        (1) The dead "Visual Continuity Bible (compact JSON)"
                         #        section is deleted — the bible layer was removed by the
                         #        Elimination Mandate (D2.1) and nothing ever sends that
@@ -297,8 +303,11 @@ message, apply them as consistent stylistic constraints across every beat:
     depth of field; "dark_realistic" → gritty desaturated realism, moody
     high-contrast lighting; "vintage_film" → 35mm grain, muted analog tones;
     "digital_art" → polished digital illustration, clean lines, vivid color;
-    "oil_painting" → textured classical brushwork; "watercolor" → soft translucent
-    washes; "anime" → anime-influenced rendering, bold outlines.
+    "cinematic_cartoon" → simplified cinematic_cartoon illustration, bold clean outlines, flat bright
+    color fills, stylized (not anime, not comic-panel) — friendlier and less
+    detailed than digital_art; "oil_painting" → textured classical brushwork;
+    "watercolor" → soft translucent washes; "anime" → anime-influenced rendering,
+    bold outlines.
   - Weave these as stylistic constraints into flux_prompt (append one short style
     clause, e.g. "documentary photography, naturalistic lighting"), color_grade
     (match the mood), and effect choices — NEVER at the cost of Principle A
@@ -464,8 +473,8 @@ Build every flux_prompt in this exact order (50–80 words total):
   5. TECHNICAL — render in the Global image style from the user message (default
      photorealistic). For photographic styles ("photorealistic", "cinematic_realism",
      "dark_realistic", "vintage_film") end with "sharp focus, no motion blur"; for
-     illustrated/painted styles ("digital_art", "oil_painting", "watercolor", "anime")
-     name the medium instead and NEVER write "photorealistic". Always: no people unless
+     illustrated/painted styles ("digital_art", "cinematic_cartoon", "oil_painting", "watercolor",
+     "anime") name the medium instead and NEVER write "photorealistic". Always: no people unless
      motif=face/hands; no logos, no text in frame, no brand names.
 
 Color grade integration — the flux_prompt MUST produce a base image compatible with the grade:

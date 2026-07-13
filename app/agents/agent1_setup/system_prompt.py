@@ -6,7 +6,12 @@ from app.services.claude_client import call_claude, call_claude_structured
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "1.4"  # v1.4: post-roadmap deep audit — suggest prompt's tone vocabulary
+PROMPT_VERSION = "1.5"  # v1.5: added "cinematic_cartoon" image_style preset (operator request — historical
+                        #        channel wanted a cinematic_cartoon-like look distinct from anime/digital_art).
+                        #        _IMAGE_STYLE_VALUES gains "cinematic_cartoon", mirrored in
+                        #        app/ui/src/constants.js IMAGE_STYLE_OPTIONS and Agent 4's
+                        #        storyboard prompt vocabulary (agent4_visuals/system_prompt.py).
+                        # v1.4: post-roadmap deep audit — suggest prompt's tone vocabulary
                         #        expanded to include tension registers (suspenseful/ominous/
                         #        dramatic/...) matching the UI TONES dropdown, closing the
                         #        P1-9 root cause (horror channels were forced into
@@ -230,7 +235,7 @@ _VISUAL_STYLE_VALUES = [
 ]
 _IMAGE_STYLE_VALUES = [
     "photorealistic", "cinematic_realism", "dark_realistic", "vintage_film",
-    "digital_art", "oil_painting", "watercolor", "anime",
+    "digital_art", "cinematic_cartoon", "oil_painting", "watercolor", "anime",
 ]
 # Mirrors app/ui/src/constants.js TONES exactly, same reason as the two style
 # lists above: recommended_tone/editable_config.tone were previously free
