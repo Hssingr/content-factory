@@ -321,6 +321,10 @@ short_total_parts = total number of parts
 - Child `AudioFile` contains child short audio and child Whisper transcript.
 - `shorts_breakpoints`, `short_rehook_paths`, and `short_bridge_paths` are not part of the V2 schema.
 - Parent and child audio rows store only their own audio metadata and Whisper transcript.
+- `generated_at` (migration `013_add_audio_generated_at.py`) records when the
+  persisted audio generation was produced. Agent 3 refreshes it on regeneration;
+  WPM calibration orders by it because the UUIDv4 primary key has no chronological
+  meaning.
 - `section_boundaries` (nullable JSONB, migration `011_add_audio_file_section_boundaries.py`,
   roadmap Phase B1): real per-`[INTRO]`/`[SECTION N]`/`[OUTRO]` audio spans
   captured at TTS-generation time — `[{"section_type", "section_index",
@@ -696,12 +700,13 @@ the ground truth for every completed generation (`duration_ms` +
 `get_calibrated_wpm()` compute a rolling per-language average from the most
 recent real generations (`_ROLLING_WINDOW_SIZE` = 20 rows,
 `_MIN_SAMPLES_FOR_CALIBRATION` = 3 before the measured average is trusted
-over the static fallback) — no new table or persisted state; the calibration
-is a live query over existing `AudioFile` rows.
+over the static fallback). Recency uses `AudioFile.generated_at`, never its
+random UUIDv4 primary key. The calibration is a live query over existing
+`AudioFile` rows; no rolling aggregate is persisted.
 
 Responsibilities:
 
-- `compute_measured_wpm(db, language, is_short_episode=None)` — rolling
+- `compute_measured_wpm(db, language, is_short_episode=None, channel_id=None)` — rolling
   average of `len(whisper_transcript) / (duration_ms / 60_000)` over the most
   recent real `AudioFile` rows for a language; `None` if fewer than
   `_MIN_SAMPLES_FOR_CALIBRATION` usable rows exist (fail-open).
@@ -709,14 +714,17 @@ Responsibilities:
   parent long-form (`False`) or child Short (`True`) rows via a `Content`
   join — the two run at measurably different rates (~135 vs ~120 wpm), and a
   blended average drifts with whichever kind dominates the recent window.
+  `channel_id` scopes samples to the content channel because TTS provider,
+  model, voice, and speed settings are channel-owned; script-duration callers
+  pass it so unrelated channels cannot contaminate their estimate.
   Callers that know the content kind pass it (script_workflow: parent;
   generate_multilingual_scripts: `content.is_short_episode`;
   split_into_beats diagnostics: parent).
-- `get_calibrated_wpm(db, language)` — the single call site wpm-dependent
+- `get_calibrated_wpm(db, language, is_short_episode=None, channel_id=None)` — the single call site wpm-dependent
   callers should use: the measured rolling average when `db` is provided and
   enough samples exist, otherwise the static `SPEECH_RATES` table (now only
   ever a cold-start fallback).
-- `estimate_duration_sec(voice_script, language, db=None)` — unchanged
+- `estimate_duration_sec(voice_script, language, db=None, is_short_episode=None, channel_id=None)` — unchanged
   static-fallback behavior when `db` is omitted (every pre-existing caller
   that does not pass `db` is unaffected); uses the calibrated rate when a
   session is passed. Wired into `script_workflow.py`'s
@@ -6768,9 +6776,14 @@ Avoid:
 
 Short episode scripts must:
 
-- be standalone
+- be standalone, including the literal first sentence
 - use dedicated hooks
-- work without parent context
+- work without a title card, part number, earlier sentence, or parent context
+- pass the cold-open deletion test in the planner, source Short writer, and
+  child-Short native adaptation prompt: the opening must name the person,
+  event, object, or situation needed to understand it; backward-dependent
+  fragments such as "they weren't hypothetical" must have their missing
+  referent repaired without adding recap or revealing the payoff
 - be optimized for short-form retention
 - maintain factual connection to parent story
 - avoid `[SECTION N]` markers

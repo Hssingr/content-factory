@@ -1,5 +1,6 @@
 import logging
 import uuid
+from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
@@ -259,6 +260,7 @@ def run_audio_generation(content_id: uuid.UUID, db: Session) -> bool:
 
         # ── Step 1: TTS (skip if file already on disk) ───────────────────────
         existing = audio_path(content_id, lang)
+        audio_was_generated = False
         reuse_existing_transcript = False
         transcript: list[dict] = []
         # Real per-section audio boundaries (roadmap Phase B1) — only known
@@ -297,6 +299,7 @@ def run_audio_generation(content_id: uuid.UUID, db: Session) -> bool:
                 audio_bytes, section_boundaries = generate_audio(
                     script.voice_script, voice, is_short_episode=is_short_episode
                 )
+                audio_was_generated = True
                 file_path, duration_ms  = save_audio(content_id, lang, audio_bytes)
 
             if not _assert_short_audio_min_duration(
@@ -348,7 +351,10 @@ def run_audio_generation(content_id: uuid.UUID, db: Session) -> bool:
 
         try:
             # ── Step 5: Persist AudioFile ────────────────────────────────────
-            _upsert_audio_file(db, content_id, lang, file_path, duration_ms, transcript, section_boundaries)
+            _upsert_audio_file(
+                db, content_id, lang, file_path, duration_ms, transcript, section_boundaries,
+                refresh_generated_at=audio_was_generated,
+            )
 
             # ── Step 6: Update Script with real duration ─────────────────────
             script.estimated_duration_sec = round(duration_ms / 1000, 1)
@@ -413,6 +419,7 @@ def _upsert_audio_file(
     duration_ms: int,
     whisper_transcript: list[dict],
     section_boundaries: list[dict] | None = None,
+    refresh_generated_at: bool = True,
 ) -> AudioFile:
     """Insert or update the AudioFile record for a content+language pair."""
     existing: AudioFile | None = (
@@ -425,6 +432,8 @@ def _upsert_audio_file(
         existing.duration_ms         = duration_ms
         existing.whisper_transcript  = whisper_transcript
         existing.section_boundaries  = section_boundaries
+        if refresh_generated_at:
+            existing.generated_at = datetime.now(timezone.utc)
         db.flush()
         return existing
 

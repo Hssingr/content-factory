@@ -1,5 +1,6 @@
 import uuid
-from sqlalchemy import String, Integer, Text, ForeignKey, UniqueConstraint
+from datetime import datetime
+from sqlalchemy import DateTime, String, Integer, Text, ForeignKey, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 
@@ -15,6 +16,12 @@ class AudioFile(Base):
     language: Mapped[str] = mapped_column(String(10), nullable=False)
     file_path: Mapped[str] = mapped_column(Text, nullable=False)
     duration_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Timestamp of the audio generation represented by this row. Unlike the
+    # UUIDv4 primary key, this provides a real recency key for rolling WPM
+    # calibration. Agent 3 refreshes it when an existing row is regenerated.
+    generated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False,
+    )
     # Whisper word-level timestamps: [{"word": str, "start": float, "end": float}]
     whisper_transcript: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     # Real per-section audio spans captured at TTS-generation time (roadmap

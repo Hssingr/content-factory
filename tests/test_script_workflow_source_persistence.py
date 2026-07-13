@@ -74,6 +74,7 @@ class SourceScriptPersistenceTest(unittest.TestCase):
         content_id = uuid.uuid4()
         content = SimpleNamespace(
             id=content_id,
+            channel_id=uuid.uuid4(),
             title="Old title",
             source_language="en",
         )
@@ -103,7 +104,12 @@ class SourceScriptPersistenceTest(unittest.TestCase):
         self.assertEqual(db.commits, 1)
 
     def test_persist_source_script_starts_at_version_one_when_missing(self) -> None:
-        content = SimpleNamespace(id=uuid.uuid4(), title="Title", source_language="en")
+        content = SimpleNamespace(
+            id=uuid.uuid4(),
+            channel_id=uuid.uuid4(),
+            title="Title",
+            source_language="en",
+        )
         db = FakeDb()
 
         script_workflow._persist_source_script(

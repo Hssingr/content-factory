@@ -73,6 +73,7 @@ class _FakeQuery:
         return self
 
     def order_by(self, *args, **kwargs):
+        self._tracker.setdefault("order_by", []).extend(args)
         return self
 
     def limit(self, n):
@@ -127,6 +128,41 @@ class TestContentKindScopedCalibration(unittest.TestCase):
             "word " * 100, "en", db=db, is_short_episode=True,
         )
         self.assertTrue(db.tracker.get("joined"))
+
+
+class TestChannelScopedCalibration(unittest.TestCase):
+    """Phase E2: channel-owned voices must not consume other channels' rates."""
+
+    def _rows(self):
+        return [_FakeAudioFile("en", 60_000, _transcript(144)) for _ in range(3)]
+
+    def test_channel_scope_joins_content_and_filters_channel_id(self):
+        db = _FakeDb(self._rows())
+        channel_id = uuid.uuid4()
+
+        result = script_estimator.compute_measured_wpm(
+            db, "en", is_short_episode=False, channel_id=channel_id,
+        )
+
+        self.assertAlmostEqual(result, 144.0)
+        self.assertTrue(db.tracker.get("joined"))
+        filter_strs = [str(value) for value in db.tracker.get("filters", [])]
+        self.assertTrue(any("channel_id" in value for value in filter_strs), filter_strs)
+
+    def test_estimate_duration_threads_channel_scope_to_query(self):
+        db = _FakeDb(self._rows())
+        script_estimator.estimate_duration_sec(
+            "word " * 144, "en", db=db, is_short_episode=False,
+            channel_id=uuid.uuid4(),
+        )
+        filter_strs = [str(value) for value in db.tracker.get("filters", [])]
+        self.assertTrue(any("channel_id" in value for value in filter_strs), filter_strs)
+
+    def test_rolling_window_orders_by_generated_at_not_random_uuid_alone(self):
+        db = _FakeDb(self._rows())
+        script_estimator.compute_measured_wpm(db, "en", channel_id=uuid.uuid4())
+        order_strs = [str(value) for value in db.tracker.get("order_by", [])]
+        self.assertTrue(any("generated_at" in value for value in order_strs), order_strs)
 
 
 class TestComputeMeasuredWpm(unittest.TestCase):

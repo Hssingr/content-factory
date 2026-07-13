@@ -7,7 +7,12 @@ from app.services.script_checks import split_sentences
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "4.9"  # v4.9: roadmap Phase D1 — _STORY_BLUEPRINT_SCHEMA gained
+PROMPT_VERSION = "5.0"  # v5.0: Phase E1 — standalone Short cold opens now have an
+                        # explicit no-prior-context/referent-completeness contract in
+                        # the planner, source Short writer, and child-Short native
+                        # adaptation prompt. Word-cap and parent/child-overlap findings
+                        # remain deterministic telemetry only; no retry or trim added.
+                        # v4.9: roadmap Phase D1 — _STORY_BLUEPRINT_SCHEMA gained
                         # protagonist_gender ("feminine"|"masculine"|"unspecified"),
                         # generated once at blueprint time, zero extra AI calls —
                         # consumed by Agent 3 for gender-aware voice selection
@@ -344,6 +349,13 @@ Standalone Short rules — apply strictly, this is NOT a long-form script:
   output — the source has none, and the adaptation must not introduce any.
 - Preserve standalone clarity: a viewer who has never seen any other part of this
   story must be able to follow the adapted narration on its own, with no assumed context.
+- Preserve a self-contained cold open: read the first sentence as if it is the first
+  thing the viewer ever hears, with no title card, caption, earlier sentence, or earlier
+  part available. It must name the person, event, object, or situation needed to understand
+  it. Never introduce backward-dependent wording such as "they weren't hypothetical",
+  "that changed everything", "but then", or an unexplained he/she/they/this/that unless
+  the same sentence supplies the missing referent. If the source opening violates this
+  rule, repair only the missing referent without adding recap or revealing the payoff.
 - Preserve only the minimum context the source narration itself includes to orient a
   first-time viewer. Do not add extra recap, setup, or background beyond what the
   source narration already contains — do not summarize earlier parts.
@@ -1422,8 +1434,13 @@ Rules:
   ~120 wpm real Short narration rate).
 - Every part must be independently watchable: a viewer who starts on Part 3 must
   understand the situation from the first 5 seconds without having seen prior parts.
-- opening_hook: 1–2 sentences, each ≤15 words, drops the viewer mid-story. No recap.
-  Must reference something SPECIFIC from the story — not a generic "wait for it" tease.
+- opening_hook: 1–2 sentences, each ≤15 words, starts at a high-tension story moment. No recap.
+  Apply the cold-open deletion test: read it with the title, part number, previous part,
+  and every earlier sentence removed. It must still identify the person, event, object,
+  or situation needed to understand the hook. Never open with backward-dependent wording
+  such as "they weren't hypothetical", "that changed everything", "but then", or an
+  unexplained he/she/they/this/that. Must reference something SPECIFIC from the story —
+  not a generic "wait for it" tease — while withholding the part's payoff.
 - Part N's cliffhanger must be directly answered by Part N+1's main_reveal.
   The final part's cliffhanger is replaced by a comment trigger question (ends with "?").
   That final question must be unique to this story and must not copy blueprint.comment_trigger
@@ -1546,10 +1563,17 @@ Rules:
   until the count is at or below 180. Do not return until the word count is ≤180.
   (180 words ≈ 90 seconds at the measured ~120 wpm real Short narration rate —
   calibrated from production audio, not the raw "words per second" of the TTS voice.)
-- First sentence = the opening_hook from the plan, ≤15 words, drops viewer mid-story.
-  If opening_hook or main_reveal already states the story's final answer or mechanism,
-  do not restate it that directly here — open on the situation or the unresolved
-  question instead, and let the reveal land later in this part's narration.
+- First sentence uses the opening_hook from the plan, ≤15 words, and starts at a
+  high-tension story moment. It must also pass the cold-open deletion test: read it as
+  the first thing a viewer ever hears, with no title, part number, previous part, or
+  earlier sentence. It must name the person, event, object, or situation needed to
+  understand it; never begin with backward-dependent wording such as "they weren't
+  hypothetical", "that changed everything", "but then", or an unexplained
+  he/she/they/this/that. If the planned hook lacks its own referent, repair that missing
+  context in the first sentence instead of copying the fragment. If opening_hook or
+  main_reveal already states the story's final answer or mechanism, do not restate it
+  that directly here — open on the situation or the unresolved question instead, and
+  let the reveal land later in this part's narration.
 - Re-hook every 7–10 seconds of narration: a new curiosity gap, question, or micro-reveal
   that prevents the viewer from scrolling away. These are not summaries — they are new angles.
 - Spoken-video delivery — this is heard, not read silently as prose: default to present

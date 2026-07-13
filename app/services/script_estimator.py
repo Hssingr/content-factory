@@ -48,7 +48,10 @@ _MIN_SAMPLES_FOR_CALIBRATION = 3
 
 
 def compute_measured_wpm(
-    db: "Session", language: str, is_short_episode: bool | None = None,
+    db: "Session",
+    language: str,
+    is_short_episode: bool | None = None,
+    channel_id: object | None = None,
 ) -> float | None:
     """Compute the rolling average measured wpm for a language from real audio.
 
@@ -67,6 +70,10 @@ def compute_measured_wpm(
             average drifts with whichever kind dominates the recent window.
             ``None`` preserves the original blended behavior for callers that
             do not know the content kind.
+        channel_id: When set, restrict the window to content generated for this
+            channel. TTS voice/provider configuration is channel-owned, so
+            cross-channel language averages can mix incompatible speaking rates.
+            ``None`` preserves unscoped behavior for callers lacking a channel.
 
     Returns:
         The rolling average wpm, or ``None`` if fewer than
@@ -80,13 +87,15 @@ def compute_measured_wpm(
     query = db.query(AudioFile).filter(
         AudioFile.language == language, AudioFile.duration_ms > 0,
     )
+    if is_short_episode is not None or channel_id is not None:
+        query = query.join(Content, Content.id == AudioFile.content_id)
     if is_short_episode is not None:
-        query = query.join(Content, Content.id == AudioFile.content_id).filter(
-            Content.is_short_episode.is_(is_short_episode)
-        )
+        query = query.filter(Content.is_short_episode.is_(is_short_episode))
+    if channel_id is not None:
+        query = query.filter(Content.channel_id == channel_id)
     rows: list[AudioFile] = (
         query
-        .order_by(desc(AudioFile.id))
+        .order_by(desc(AudioFile.generated_at), desc(AudioFile.id))
         .limit(_ROLLING_WINDOW_SIZE)
         .all()
     )
@@ -107,7 +116,10 @@ def compute_measured_wpm(
 
 
 def get_calibrated_wpm(
-    db: "Session | None", language: str, is_short_episode: bool | None = None,
+    db: "Session | None",
+    language: str,
+    is_short_episode: bool | None = None,
+    channel_id: object | None = None,
 ) -> float:
     """Return the best-known narration speed (wpm) for a language.
 
@@ -124,7 +136,9 @@ def get_calibrated_wpm(
     whether it is estimating for a parent long-form or a child Short.
     """
     if db is not None:
-        measured = compute_measured_wpm(db, language, is_short_episode=is_short_episode)
+        measured = compute_measured_wpm(
+            db, language, is_short_episode=is_short_episode, channel_id=channel_id,
+        )
         if measured is not None:
             return measured
     return SPEECH_RATES.get(language, _DEFAULT_RATE)
@@ -135,6 +149,7 @@ def estimate_duration_sec(
     language: str,
     db: "Session | None" = None,
     is_short_episode: bool | None = None,
+    channel_id: object | None = None,
 ) -> float:
     """Estimate narration duration from a voice script's word count.
 
@@ -152,11 +167,15 @@ def estimate_duration_sec(
         is_short_episode: Optional content-kind filter for the calibration
                       window (fresh full-system audit §3.4) — parents and
                       Shorts run at measurably different rates.
+        channel_id: Optional channel filter that excludes speaking-rate
+                      samples generated for unrelated channel voice settings.
 
     Returns:
         Estimated duration in seconds, rounded to 1 decimal place.
     """
-    rate = get_calibrated_wpm(db, language, is_short_episode=is_short_episode)
+    rate = get_calibrated_wpm(
+        db, language, is_short_episode=is_short_episode, channel_id=channel_id,
+    )
     word_count = len(voice_script.split())
     result = round((word_count / rate) * 60.0, 1)
     return result

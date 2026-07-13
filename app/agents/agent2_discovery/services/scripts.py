@@ -466,6 +466,7 @@ def generate_multilingual_scripts(
             existing.estimated_duration_sec = estimate_duration_sec(
                 adapted["voice_script"], lang, db=db,
                 is_short_episode=content.is_short_episode,
+                channel_id=content.channel_id,
             )
             db.flush()
             result.append(existing)
@@ -480,6 +481,7 @@ def generate_multilingual_scripts(
                 estimated_duration_sec=estimate_duration_sec(
                     adapted["voice_script"], lang, db=db,
                     is_short_episode=content.is_short_episode,
+                    channel_id=content.channel_id,
                 ),
             )
             db.add(script)
