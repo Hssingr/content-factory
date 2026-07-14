@@ -91,6 +91,16 @@ export const MediaSection: React.FC<Props> = ({ section, crossfadeIn = 0, incomi
   // Each clip gets an equal share of the section, with an overlap for crossfade
   const clipShareFrames = Math.ceil(sectionDurFrames / validClips.length);
 
+  // The outer <Sequence> (MainVideo.tsx/Short.tsx) mounts this component for
+  // sectionDurFrames + crossfadeIn frames total — the crossfadeIn runway is
+  // added at the FRONT (an early start) so this beat's own incoming transition
+  // can play, with the true nominal end preserved. The last clip must cover
+  // that full local window, not just sectionDurFrames, or its image vanishes
+  // crossfadeIn frames before the mount window actually ends — a real
+  // mid-video black gap whenever the NEXT beat's incoming transition is
+  // shorter than this beat's own (roadmap Tier 1 R1 / deep-audit Finding 1).
+  const totalMountFrames = sectionDurFrames + crossfadeIn;
+
   return (
     <AbsoluteFill style={{ overflow: "hidden", ...transitionStyle }}>
       {validClips.map((clip, i) => {
@@ -98,7 +108,7 @@ export const MediaSection: React.FC<Props> = ({ section, crossfadeIn = 0, incomi
         const clipFrom = Math.max(0, i * clipShareFrames - (i > 0 ? CLIP_CROSSFADE : 0));
         const clipEnd  =
           i === validClips.length - 1
-            ? sectionDurFrames
+            ? totalMountFrames
             : (i + 1) * clipShareFrames;
         const clipDur = Math.max(1, clipEnd - clipFrom);
 
@@ -110,6 +120,7 @@ export const MediaSection: React.FC<Props> = ({ section, crossfadeIn = 0, incomi
               colorGrade={section.color_grade}
               crossfadeIn={i > 0 ? CLIP_CROSSFADE : 0}
               durationFrames={clipDur}
+              effectSeed={section.order}
             />
           </Sequence>
         );
@@ -126,6 +137,8 @@ interface ClipProps {
   colorGrade:    ColorGrade;
   crossfadeIn:   number;   // frames to fade in from 0 → 1
   durationFrames: number;  // full duration of this clip sequence
+  /** The beat's own section order — deterministic seed for effect-direction variation. */
+  effectSeed:    number;
 }
 
 const SingleClip: React.FC<ClipProps> = ({
@@ -134,6 +147,7 @@ const SingleClip: React.FC<ClipProps> = ({
   colorGrade,
   crossfadeIn,
   durationFrames,
+  effectSeed,
 }) => {
   const frame    = useCurrentFrame();
   const progress = durationFrames > 1 ? frame / (durationFrames - 1) : 0;
@@ -147,7 +161,7 @@ const SingleClip: React.FC<ClipProps> = ({
     height:    "100%",
     objectFit: "cover",
     filter:    GRADE_FILTER[colorGrade] ?? "none",
-    transform: getEffectTransform(effect, progress, frame),
+    transform: getEffectTransform(effect, progress, frame, effectSeed),
     opacity,
   };
 
@@ -164,7 +178,13 @@ const SingleClip: React.FC<ClipProps> = ({
 
 // ── Effect transform ───────────────────────────────────────────────────────────
 
-function getEffectTransform(effect: Effect, progress: number, frame: number): string {
+function getEffectTransform(effect: Effect, progress: number, frame: number, seed: number = 0): string {
+  // Deterministic direction alternation (roadmap Tier 1 R2 / deep-audit Q5a) — no AI
+  // call, no schema change; the same beat-order-parity pattern already used elsewhere
+  // in this codebase for composition-slot variation on duplicate Flux prompts. Without
+  // this, every pan/parallax beat in every video performed the identical camera move.
+  const directionSign = seed % 2 === 0 ? 1 : -1;
+
   switch (effect) {
     case "slow_zoom":
       return `scale(${interpolate(progress, [0, 1], [1.0, 1.08])})`;
@@ -173,13 +193,13 @@ function getEffectTransform(effect: Effect, progress: number, frame: number): st
       return `scale(${interpolate(progress, [0, 1], [1.08, 1.0])})`;
 
     case "pan":
-      return `translateX(${interpolate(progress, [0, 1], [0, -5])}%) scale(1.06)`;
+      return `translateX(${interpolate(progress, [0, 1], [0, -5 * directionSign])}%) scale(1.06)`;
 
     case "push_in":
       return `scale(${interpolate(progress, [0, 1], [1.0, 1.18])})`;
 
     case "parallax":
-      return `scale(${interpolate(progress, [0, 1], [1.05, 1.14])}) translateX(${interpolate(progress, [0, 1], [-3, 3])}%)`;
+      return `scale(${interpolate(progress, [0, 1], [1.05, 1.14])}) translateX(${interpolate(progress, [0, 1], [-3 * directionSign, 3 * directionSign])}%)`;
 
     case "shake": {
       // Small per-frame jitter — sine/cosine at different rates avoid a circular pattern
@@ -191,7 +211,10 @@ function getEffectTransform(effect: Effect, progress: number, frame: number): st
     case "fade_in":
     case "cut":
     default:
-      return "scale(1.0)";
+      // Whisper-subtle residual zoom instead of a hard freeze (roadmap Tier 1 R3 /
+      // deep-audit Q5b) — a beat can otherwise sit completely still for up to 9s,
+      // which reads as stalled/broken video rather than a deliberate static choice.
+      return `scale(${interpolate(progress, [0, 1], [1.0, 1.02])})`;
   }
 }
 

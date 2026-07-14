@@ -5749,6 +5749,149 @@ short flash-like image fragments at every chunk seam.
   database: same chunk count (9) as before the fix, zero straddling sections, max 4.1 s drift
   from the nominal 90-second marks.
 
+#### `MediaSection.tsx` — clip mount window, effect direction variety, and crossfade clamp (render pipeline remediation, Tier 1)
+
+File:
+
+```text
+remotion/src/components/MediaSection.tsx
+remotion/src/compositions/MainVideo.tsx
+remotion/src/compositions/Short.tsx
+```
+
+Deep-audit findings (`code_report/render_pipeline_python_to_remotion_deep_audit.md`,
+`code_report/render_pipeline_remediation_roadmap.md` Tier 1, R1–R4) — a second, independent root
+cause of "transitions are inconsistent/missing" beyond the chunk-boundary fix above, since it
+occurs within a single composition at ordinary beat-to-beat cuts, chunked or not:
+
+- **R1 — transition frame-budget mismatch (real mid-video black gaps).** `MainVideo.tsx`/
+  `Short.tsx` mount a beat's `<MediaSection>` for `sectionDurFrames + crossfadeIn` frames, with the
+  extra `crossfadeIn` runway added entirely at the **front** (an early start, so the beat's own
+  incoming fade-in can play) — the true nominal end is unchanged. Inside `MediaSection.tsx`, the
+  last clip's inner `<Sequence>` previously covered only `sectionDurFrames` — `crossfadeIn` frames
+  short of the outer mount window's real end — so the clip's image vanished before the mount
+  window actually closed. Whether that produced a visible black flash depended on the *next*
+  beat's own incoming transition being cheaper (fewer frames) than the current beat's, a pattern
+  with no coordination between consecutive beats and confirmed to recur throughout real production
+  data (e.g. a `crossfade`-then-`cut` pair produces a 15-frame/0.5s gap). Fixed by sizing the last
+  clip's `Sequence` to `totalMountFrames = sectionDurFrames + crossfadeIn` instead of just
+  `sectionDurFrames` — the clip's own visible window now exactly matches the outer mount span.
+- **R2 — `pan`/`parallax` direction variety.** Both effects previously moved in one fixed direction
+  in every beat of every video (`pan`: always `translateX(0 → -5%)`; `parallax`: always
+  `translateX(-3% → 3%)`) — a real, visible repetitiveness pattern across an entire render.
+  `getEffectTransform()` now takes a `seed` parameter (`SingleClip`'s new `effectSeed` prop, fed
+  from the beat's own `section.order`); `directionSign = seed % 2 === 0 ? 1 : -1` flips both
+  effects' direction — deterministic alternation, no AI call, no schema change, the same
+  beat-order-parity pattern already used for composition-slot variation on duplicate Flux prompts
+  (§11.4).
+- **R3 — residual motion for static effects.** `fade_in`/`cut` previously fell through to a hard
+  `scale(1.0)` freeze — a beat could sit completely still for up to 9 seconds (the parent visual
+  hold cap, §11.4), reading as stalled/broken video rather than a deliberate static choice. Now
+  returns a whisper-subtle `scale(interpolate(progress, [0,1], [1.0, 1.02]))` instead.
+- **R4 — defensive crossfade-length clamp.** `MainVideo.tsx`/`Short.tsx` now compute
+  `crossfadeIn = Math.min(rawCrossfadeIn, ownDurFrames, prevDurFrames)` (own/previous beat duration
+  derived independently from each section's `audio_start_ms`/`audio_end_ms`) before using it for
+  both the outer `Sequence` timing and the `MediaSection` `crossfadeIn` prop — a crossfade can no
+  longer be requested longer than either neighboring beat's own real duration. Safe by construction
+  today (Agent 4's `INTENSITY_FLOOR_MS` already floors every beat well above the longest possible
+  crossfade, §11.4), but the render layer now has its own defense if that upstream invariant is
+  ever violated by a future change.
+
+Verification: `npx tsc --noEmit` (clean compile, all `remotion/src/` sources type-checked) plus the
+existing static-source-inspection Python test suite
+(`tests/test_subtitles_only_rendering.py`, `tests/test_dip_to_black_removed.py`,
+`tests/test_chunked_render_boundary_fix.py`, and the broader render/transition/short/chunk-scoped
+subset — 123/123 passing, zero regressions). No Jest/component-render test harness exists for the
+Remotion side (§19.1 forbids live renders regardless); `tsc --noEmit` plus static Python checks are
+this codebase's established verification method for Remotion source changes.
+
+#### `renderer.py` — subprocess timeouts, pinned encode settings, chunk artifact lifecycle, bundle lock, concurrency cap (render pipeline remediation, Tier 2)
+
+File:
+
+```text
+app/agents/agent5_render/services/renderer.py
+```
+
+`code_report/render_pipeline_python_to_remotion_deep_audit.md` /
+`code_report/render_pipeline_remediation_roadmap.md` Tier 2, R5–R10 — operational hardening,
+independent of the Tier 1 viewer-visible fixes above:
+
+- **R5 — explicit CRF on the chunk-concat fallback re-encode.** `_concatenate_chunks()` tries a
+  lossless stream-copy concat first; if that fails (mismatched codec parameters between
+  independently-rendered chunks — a real, non-hypothetical failure mode), it falls back to a
+  libx264/aac re-encode. That fallback now passes `-crf 18` (module-level `_TARGET_CRF = 18`,
+  shared with R7) instead of leaving CRF unset — ffmpeg's own libx264 default is CRF 23, a real,
+  silent quality regression against the CRF 18 every chunk was already rendered at, previously
+  with zero log signal that the recovery path had produced a softer result than normal.
+- **R6 — subprocess timeouts.** No layer above `renderer.py` recovers a genuine hang (Celery sets
+  no `task_time_limit`/`soft_time_limit`; `run_agent5_render_for_content`'s retry only fires from a
+  raised exception, which a hung subprocess never raises on its own) — a single stuck Chromium
+  process would occupy a worker slot forever. Every `subprocess.run()` call site now passes
+  `timeout=` and catches `subprocess.TimeoutExpired` alongside the existing non-zero-exit handling:
+  `_run_remotion()` (`_REMOTION_TIMEOUT_SEC = 600`, comfortably above the `--timeout 300000`
+  Remotion is itself already told to target internally for per-frame/per-asset waits — raises
+  `RemotionRenderError` on expiry, matching the shape callers already handle), the bundle-build
+  call inside `_build_and_move_bundle()` (`_BUNDLE_TIMEOUT_SEC = 300`, returns `None`),
+  `_slice_audio_for_chunk()` (`_AUDIO_SLICE_TIMEOUT_SEC = 120`, returns `False`), and
+  `_concatenate_chunks()`'s `_run_concat()` (`_CONCAT_TIMEOUT_SEC = 600`, treated as an ordinary
+  concat failure so the stream-copy→re-encode fallback ladder still applies on a timeout, not just
+  a non-zero exit).
+- **R7 — pinned final encode settings.** `_run_remotion()`'s CLI invocation now passes
+  `--crf 18 --pixel-format yuv420p --audio-bitrate 320k` explicitly instead of relying on
+  `@remotion/renderer`'s implicit library defaults (which happen to already be these exact values
+  today) — a deliberate, version-stable quality target that can't silently drift on a future
+  dependency bump with no diff in this repository to review. Flag names were confirmed against the
+  installed `@remotion/renderer`/`@remotion/cli` package source
+  (`options/crf.js`'s `cliFlag = 'crf'`, `options/audio-bitrate.js`'s `cliFlag = 'audio-bitrate'`,
+  `parse-command-line.js`'s `parsedCli['pixel-format']`), never guessed.
+- **R8 — chunk artifact cleanup.** Confirmed on real disk: every chunked render's per-chunk
+  MP4s/audio-slices/props-JSONs previously persisted forever after a successful concat (roughly
+  doubling that render's on-disk footprint), and stale chunks from a prior differently-sized run
+  were never cleaned either (`_concatenate_chunks()` only ever reads the current run's own
+  `final_chunk_paths`, so e.g. an orphaned `chunk_008.mp4` from a prior 9-chunk run would silently
+  persist even after a later run produces only 8 chunks). `render_main_video_chunked()` now
+  `shutil.rmtree()`s then recreates the `chunks/{language}/` directory at the very start, before
+  writing anything (fixes stale orphans), and `shutil.rmtree()`s it again immediately after
+  `_concatenate_chunks()` returns successfully (fixes the steady-state doubling) — success-path-only:
+  any exception raised before that point (a chunk crash, a concat failure) leaves the directory in
+  place, since the per-chunk MP4s/props remain genuinely useful for manual post-mortem inspection.
+- **R9 — `ensure_bundle()` concurrent-render lock.** `remotion bundle` ignores `--out` and always
+  writes to the single shared `remotion/build/` directory — two workers hitting a cold bundle cache
+  for the same source hash at once (the normal situation right after a code deploy) would otherwise
+  both bundle into, and then both try to move, that same path. Currently dormant
+  (`settings.remotion_pre_bundle` defaults to `False`) but a real landmine for whoever enables it.
+  The check-build-move sequence is now serialized with a per-tree-hash advisory file lock
+  (`fcntl.flock(LOCK_EX)` on `bundles/{hash}.lock`, blocking-acquire); the bundle existence check is
+  repeated once the lock is held (double-checked locking), so a caller that was blocked waiting for
+  another worker to finish bundling the identical hash reuses the completed bundle instead of
+  building its own. The actual build-and-move logic moved into a new `_build_and_move_bundle()`
+  helper, called only while the lock is held.
+- **R10 — beat-density concurrency cap.** `app/config.py`'s `render_concurrency` comment has long
+  documented "High-video-count renders (>40 video sections) are capped at render_concurrency // 2
+  (min 1)," but no code implemented it — chunking-by-duration bounds how long a single Remotion
+  composition plays for, not how many simultaneously-decoded images it may ask Chromium to hold in
+  memory at once, which is exactly what a beat-dense chunk/render can still pressure regardless of
+  chunk duration. New `_capped_concurrency(base, n_sections)` (halves, floor 1, above
+  `_HIGH_SECTION_COUNT_THRESHOLD = 40`) and `_count_props_sections(props_path)` (reads
+  `len(props["sections"])`; `0` on any read failure — fail-open, never blocks a render) are wired
+  into `render_main_video()` and `render_short()` (capped against that render's own total section
+  count) and into `render_main_video_chunked()`'s `_render_chunk()` closure — capped **per chunk**,
+  using each chunk's own `n_sections` (already tracked in `chunk_specs`), not the whole render's
+  total, since a chunk's own beat density is what pressures its own independent Chromium process.
+  `app/config.py`'s existing comment needed no wording change — it now accurately describes real
+  behavior.
+
+Verification: `ast.parse` (clean), the full existing Python test suite (743 passed / 145 subtests
+passed, zero regressions), and 19 new runtime-proof tests in
+`tests/test_render_pipeline_remediation_tier2.py` — real `renderer.py` code paths throughout
+(`_capped_concurrency()`, `_count_props_sections()`, `render_main_video()`,
+`render_main_video_chunked()`, `ensure_bundle()`, `_concatenate_chunks()`, `_run_remotion()`,
+`_slice_audio_for_chunk()` all run unmodified); only `subprocess.run()` itself is ever mocked, per
+§19.1 — no live API/render calls anywhere, including a real-threads proof for R9 (two
+`threading.Thread`s actually racing to acquire the same `fcntl.flock`, with a real 0.2s sleep
+forcing genuine overlap, proving the second caller's bundle-build subprocess call never fires).
+
 #### `render_short`
 
 File:

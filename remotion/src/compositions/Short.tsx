@@ -60,7 +60,18 @@ export const Short: React.FC<ShortProps> = ({
         const sectionStartMs = section.audio_start_ms - start_ms;
         const sectionDurMs   = section.audio_end_ms - section.audio_start_ms;
         const incomingTransition = idx > 0 ? sections[idx - 1].transition_to_next : undefined;
-        const crossfadeIn = idx > 0 ? transitionDurationFrames(incomingTransition) : 0;
+        const rawCrossfadeIn = idx > 0 ? transitionDurationFrames(incomingTransition) : 0;
+        // Defensive clamp (roadmap Tier 1 R4 / deep-audit Finding 9) — see
+        // MainVideo.tsx for the full rationale; identical logic here.
+        const ownDurFrames = Math.max(1, Math.round((sectionDurMs / 1000) * fps));
+        const prevDurFrames = idx > 0
+          ? Math.max(1, Math.round(
+              ((sections[idx - 1].audio_end_ms - sections[idx - 1].audio_start_ms) / 1000) * fps,
+            ))
+          : 0;
+        const crossfadeIn = idx > 0
+          ? Math.min(rawCrossfadeIn, ownDurFrames, prevDurFrames)
+          : 0;
         const from = Math.max(
           0,
           Math.round((sectionStartMs / 1000) * fps) - crossfadeIn,

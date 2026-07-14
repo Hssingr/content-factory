@@ -23,10 +23,12 @@ The function raises ``RemotionCrashError`` (Page crashed) or
 distinct REMOTION_FAILED status.
 """
 
+import fcntl
 import hashlib
 import json
 import logging
 import os
+import shutil
 import subprocess
 import tempfile
 import time
@@ -48,6 +50,53 @@ _SAFE_CHROME_FLAGS = (
     "--disable-software-rasterizer"
 )
 
+# Explicit final-encode quality target (roadmap Tier 2 R5/R7, deep-audit Q1/Q3).
+# Matches @remotion/renderer's own current default (h264 CRF 18) — pinning it
+# explicitly makes the target a deliberate, version-stable choice instead of
+# an implicit library default that could silently change on a dependency
+# bump, and gives the chunk-concat re-encode fallback (which has no Remotion
+# default to inherit) the same quality target every individually-rendered
+# chunk was already produced at.
+_TARGET_CRF = 18
+
+# Subprocess wall-clock timeouts (roadmap Tier 2 R6, deep-audit Finding 2) —
+# nothing above this layer recovers a genuine hang: Celery sets no
+# task_time_limit, and retry logic only fires from a raised exception, which
+# a hung subprocess never raises. `_run_remotion`'s own 600s sits comfortably
+# above the `--timeout 300000` (300s) Remotion is itself already told to
+# target internally — that flag bounds Remotion's per-frame/per-asset wait,
+# not the wall-clock ceiling on the whole CLI process.
+_REMOTION_TIMEOUT_SEC       = 600
+_BUNDLE_TIMEOUT_SEC         = 300
+_AUDIO_SLICE_TIMEOUT_SEC    = 120
+_CONCAT_TIMEOUT_SEC         = 600
+
+# Beat-density concurrency safeguard (roadmap Tier 2 R10, deep-audit
+# Finding 5) — documented in app/config.py's render_concurrency comment but
+# previously unimplemented anywhere. Chunking-by-duration bounds how long a
+# single Remotion composition plays for, not how many simultaneously-decoded
+# images it may ask Chromium to hold in memory at once; a beat-dense
+# render/chunk can still pressure Chromium the way a concurrency reduction
+# would relieve.
+_HIGH_SECTION_COUNT_THRESHOLD = 40
+
+
+def _capped_concurrency(base_concurrency: int, n_sections: int) -> int:
+    """Halve concurrency (floor 1) for renders/chunks above the section-count threshold."""
+    if n_sections > _HIGH_SECTION_COUNT_THRESHOLD:
+        return max(1, base_concurrency // 2)
+    return base_concurrency
+
+
+def _count_props_sections(props_path: str) -> int:
+    """Return len(props["sections"]) for concurrency capping; 0 on any read failure."""
+    try:
+        with open(props_path, encoding="utf-8") as fh:
+            return len(json.load(fh).get("sections", []))
+    except Exception as exc:
+        logger.warning("Could not read section count from %s for concurrency capping: %s", props_path, exc)
+        return 0
+
 
 # ── Pre-bundling ─────────────────────────────────────────────────────────────
 # Enabled via REMOTION_PRE_BUNDLE=true in .env.
@@ -68,6 +117,17 @@ def ensure_bundle() -> str | None:
     Called at the start of any render when ``settings.remotion_pre_bundle`` is True.
     Returns ``None`` on failure (caller falls back to src/index.ts direct mode).
 
+    Concurrency (roadmap Tier 2 R9, deep-audit Finding 4): ``remotion bundle``
+    ignores ``--out`` and always writes to the single shared ``remotion/build/``
+    directory. Two workers hitting a cold cache for the same source hash at
+    once — the normal situation right after a code deploy — would otherwise
+    both bundle into, and then both try to move, that same path. The
+    check-build-move sequence below is serialized with an advisory file lock
+    per tree hash so concurrent callers queue instead of racing; the bundle
+    existence check is repeated once the lock is held, since another worker
+    may have already finished bundling this exact hash while this call was
+    waiting to acquire it.
+
     Returns:
         Absolute path to the bundle directory, or None if bundling failed or disabled.
     """
@@ -77,6 +137,7 @@ def ensure_bundle() -> str | None:
     remotion_dir = Path(settings.remotion_path).resolve()
     src_dir      = remotion_dir / "src"
     bundles_dir  = remotion_dir / "bundles"
+    bundles_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Hash the Remotion source tree ─────────────────────────────────────────
     h = hashlib.sha256()
@@ -95,11 +156,34 @@ def ensure_bundle() -> str | None:
         logger.info("Remotion [BUNDLE_HIT] hash=%s bundle=%s", tree_hash, bundle_dir)
         return str(bundle_dir)
 
-    # ── Bundle not cached — run npx remotion bundle ───────────────────────────
+    lock_path = bundles_dir / f"{tree_hash}.lock"
+    with open(lock_path, "w") as lock_fh:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        try:
+            # Re-check inside the lock: another worker may have finished
+            # bundling this exact hash while we were waiting.
+            if bundle_dir.exists() and any(bundle_dir.iterdir()):
+                logger.info(
+                    "Remotion [BUNDLE_HIT] hash=%s bundle=%s (built while waiting for lock)",
+                    tree_hash, bundle_dir,
+                )
+                return str(bundle_dir)
+            return _build_and_move_bundle(remotion_dir, bundles_dir, bundle_dir, tree_hash)
+        finally:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+
+
+def _build_and_move_bundle(
+    remotion_dir: Path, bundles_dir: Path, bundle_dir: Path, tree_hash: str,
+) -> str | None:
+    """Run ``npx remotion bundle`` and move its output into ``bundle_dir``.
+
+    Must be called with the per-hash bundle lock already held — see
+    ``ensure_bundle()``.
+    """
     # NOTE: `remotion bundle` ignores --out and always writes to remotion/build/.
     # We run without --out, then move the build/ output to bundles/{hash}/.
     logger.info("Remotion [BUNDLE_MISS] hash=%s — bundling now", tree_hash)
-    bundles_dir.mkdir(parents=True, exist_ok=True)
     build_dir = remotion_dir / "build"
 
     remotion_bin = str(remotion_dir / "node_modules" / ".bin" / "remotion")
@@ -112,7 +196,11 @@ def ensure_bundle() -> str | None:
         result = subprocess.run(
             cmd, cwd=str(remotion_dir),
             capture_output=True, text=True, check=False,
+            timeout=_BUNDLE_TIMEOUT_SEC,
         )
+    except subprocess.TimeoutExpired:
+        logger.error("Remotion bundle timed out after %ds", _BUNDLE_TIMEOUT_SEC)
+        return None
     except Exception as exc:
         logger.error("Remotion bundle failed: %s", exc)
         return None
@@ -125,7 +213,6 @@ def ensure_bundle() -> str | None:
         return None
 
     # Move remotion/build/ → bundles/{hash}/
-    import shutil
     if bundle_dir.exists():
         shutil.rmtree(bundle_dir, ignore_errors=True)
     try:
@@ -149,7 +236,6 @@ def ensure_bundle() -> str | None:
     for old_bundle in to_prune:
         logger.info("Remotion [BUNDLE_PRUNE] removing old bundle=%s", old_bundle)
         try:
-            import shutil
             shutil.rmtree(old_bundle, ignore_errors=True)
         except Exception as exc:
             logger.warning("Bundle prune failed for %s: %s", old_bundle, exc)
@@ -200,6 +286,7 @@ def render_main_video(
     """
     output_path = _ensure_output_path(content_id, f"{language}_main.mp4")
     conc = concurrency if concurrency is not None else settings.render_concurrency
+    conc = _capped_concurrency(conc, _count_props_sections(props_path))
 
     try:
         render_time = _run_remotion(_COMP_MAIN, output_path, props_path, conc, bundle_dir=bundle_dir)
@@ -267,6 +354,7 @@ def render_short(
     file_name   = f"{language}_short_{short_index}.mp4"
     output_path = _ensure_output_path(content_id, file_name)
     conc = concurrency if concurrency is not None else settings.render_concurrency
+    conc = _capped_concurrency(conc, _count_props_sections(props_path))
 
     try:
         render_time = _run_remotion(_COMP_SHORT, output_path, props_path, conc, bundle_dir=bundle_dir)
@@ -426,6 +514,13 @@ def render_main_video_chunked(
     }
 
     chunk_dir = media_root / "video" / content_id / "chunks" / language
+    # Recreate (not just mkdir) so a re-render whose new chunk count differs
+    # from a prior run never leaves that prior run's now-unused chunk files
+    # behind (roadmap Tier 2 R8, deep-audit Finding 3) — _concatenate_chunks()
+    # below only ever reads this run's own final_chunk_paths, so an orphaned
+    # e.g. chunk_008.mp4 from a prior 9-chunk run would otherwise silently
+    # persist even after this run produces only 8 chunks.
+    shutil.rmtree(chunk_dir, ignore_errors=True)
     chunk_dir.mkdir(parents=True, exist_ok=True)
     audio_dir = chunk_dir / "audio"
     audio_dir.mkdir(exist_ok=True)
@@ -529,13 +624,20 @@ def render_main_video_chunked(
         cdur_sec      = spec["chunk_dur_sec"]
         cstart_sec    = spec["chunk_start_sec"]
         n_secs        = spec["n_sections"]
+        # Beat-density cap (roadmap Tier 2 R10, deep-audit Finding 5): capped
+        # per CHUNK, not per whole render — chunking-by-duration already
+        # bounds how long a single composition plays for, but a chunk with
+        # many short beats can still hold far more simultaneously-decoded
+        # images in memory than a chunk of the same duration with sparse,
+        # long-holding beats. See app/config.py's render_concurrency comment.
+        chunk_conc    = _capped_concurrency(conc, n_secs)
 
         logger.debug(
-            "Rendering chunk %d/%d: sections=%d dur=%.1fs offset=%.1fs",
-            cidx + 1, n_chunks, n_secs, cdur_sec, cstart_sec,
+            "Rendering chunk %d/%d: sections=%d dur=%.1fs offset=%.1fs concurrency=%d",
+            cidx + 1, n_chunks, n_secs, cdur_sec, cstart_sec, chunk_conc,
         )
         try:
-            _run_remotion(_COMP_MAIN, chunk_out_p, cprops_path, conc,
+            _run_remotion(_COMP_MAIN, chunk_out_p, cprops_path, chunk_conc,
                           bundle_dir=bundle_dir)
         except RemotionCrashError:
             logger.warning("Chunk %d crashed — retrying with concurrency=1 + safe flags", cidx + 1)
@@ -570,6 +672,15 @@ def render_main_video_chunked(
     output_path = _ensure_output_path(content_id, f"{language}_main.mp4")
     logger.debug("Concatenating %d chunks → %s", len(final_chunk_paths), output_path)
     _concatenate_chunks(final_chunk_paths, str(output_path))
+
+    # Clean up intermediate chunk artifacts now that concat succeeded
+    # (roadmap Tier 2 R8, deep-audit Finding 3) — confirmed on real disk to
+    # otherwise persist forever, roughly doubling a chunked render's on-disk
+    # footprint. Deliberately success-path-only: an exception raised above
+    # (a chunk render or the concat step itself failing) leaves chunk_dir in
+    # place so per-chunk MP4s/props remain available for manual post-mortem
+    # inspection.
+    shutil.rmtree(chunk_dir, ignore_errors=True)
 
     total_time = time.monotonic() - t0
     logger.debug(
@@ -617,7 +728,10 @@ def _slice_audio_for_chunk(
         output_path,
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, check=False,
+            timeout=_AUDIO_SLICE_TIMEOUT_SEC,
+        )
         if result.returncode != 0:
             logger.warning(
                 "ffmpeg audio slice failed (exit %d): %s",
@@ -625,6 +739,9 @@ def _slice_audio_for_chunk(
             )
             return False
         return True
+    except subprocess.TimeoutExpired:
+        logger.warning("ffmpeg audio slice timed out after %ds", _AUDIO_SLICE_TIMEOUT_SEC)
+        return False
     except Exception as exc:
         logger.warning("ffmpeg audio slice exception: %s", exc)
         return False
@@ -661,7 +778,14 @@ def _concatenate_chunks(chunk_paths: list[str], output_path: str) -> None:
                 *extra_codec_flags,
                 output_path,
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            try:
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True, check=False,
+                    timeout=_CONCAT_TIMEOUT_SEC,
+                )
+            except subprocess.TimeoutExpired:
+                logger.warning("ffmpeg concat timed out after %ds", _CONCAT_TIMEOUT_SEC)
+                return False
             if result.returncode != 0:
                 logger.warning(
                     "ffmpeg concat failed (exit %d): %s",
@@ -673,7 +797,15 @@ def _concatenate_chunks(chunk_paths: list[str], output_path: str) -> None:
         if _run_concat(["-c", "copy"]):
             return
         logger.warning("Stream-copy concat failed — retrying with libx264/aac re-encode")
-        if not _run_concat(["-c:v", "libx264", "-c:a", "aac", "-preset", "fast"]):
+        # Explicit -crf (roadmap Tier 2 R5, deep-audit Q1): every chunk was
+        # already rendered by Remotion at CRF _TARGET_CRF. Without an explicit
+        # value here, ffmpeg's own libx264 default is CRF 23 — a real, silent
+        # quality regression on the one recovery path meant to keep a long
+        # parent render resilient, with no log signal that the fallback
+        # produced a softer result than normal.
+        if not _run_concat([
+            "-c:v", "libx264", "-crf", str(_TARGET_CRF), "-c:a", "aac", "-preset", "fast",
+        ]):
             raise RemotionRenderError(
                 f"ffmpeg concat failed for {len(chunk_paths)} chunks → {output_path}"
             )
@@ -737,11 +869,22 @@ def _run_remotion(
         entry_point,
         composition,
         str(output_path.resolve()),
-        "--props",       str(Path(props_path).resolve()),
-        "--public-dir",  str(media_dir),
-        "--concurrency", str(concurrency),
-        "--timeout",     "300000",
-        "--log",         "error",
+        "--props",         str(Path(props_path).resolve()),
+        "--public-dir",    str(media_dir),
+        "--concurrency",   str(concurrency),
+        "--timeout",       "300000",
+        "--log",           "error",
+        # Pin final encode settings explicitly (roadmap Tier 2 R7, deep-audit
+        # Q3) instead of relying on @remotion/renderer's implicit library
+        # defaults. Today's defaults happen to match these exact values (h264
+        # CRF 18, yuv420p, 320k AAC) — this makes the quality target a
+        # deliberate, version-stable choice instead of one dependency bump
+        # away from silently shifting every render's quality with no diff in
+        # this repository to review. _TARGET_CRF is the same constant the
+        # chunk-concat fallback (R5, _concatenate_chunks) reuses.
+        "--crf",            str(_TARGET_CRF),
+        "--pixel-format",   "yuv420p",
+        "--audio-bitrate",  "320k",
     ]
     if chrome_flags.strip():
         cmd.extend(["--chrome-flags", chrome_flags.strip()])
@@ -773,10 +916,20 @@ def _run_remotion(
             capture_output=True,
             text=True,
             check=False,
+            timeout=_REMOTION_TIMEOUT_SEC,
         )
     except FileNotFoundError as exc:
         raise RemotionRenderError(
             f"Remotion CLI not found — set NODE_BIN in .env to your Node ≥18 path. ({exc})"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        # No layer above this recovers a genuine hang (roadmap Tier 2 R6,
+        # deep-audit Finding 2): Celery sets no task_time_limit, and retry
+        # logic only fires from a raised exception, which a hung subprocess
+        # never raises on its own — without this, a stuck Chromium process
+        # would occupy a worker slot forever.
+        raise RemotionRenderError(
+            f"Remotion render timed out after {_REMOTION_TIMEOUT_SEC}s for {composition}"
         ) from exc
 
     elapsed = time.monotonic() - t0
