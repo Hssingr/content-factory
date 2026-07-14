@@ -923,35 +923,26 @@ def _render_from_existing_props(
 
     # ── Main video path ────────────────────────────────────────────────────────
     main_props_path = str(props_dir / f"{cid_str}_{language}_main.json")
-    bundle_dir = ensure_bundle()
 
     if not _render_exists(content_id, language, "main", None, db):
-        main_result = render_main_video(
-            content_id=cid_str,
-            language=language,
-            props_path=main_props_path,
-            duration_ms=audio.duration_ms,
-            bundle_dir=bundle_dir,
-        )
-        if settings.verify_renders:
-            issues = verify_render(
-                mp4_path=main_result["file_path"],
-                audio_file_path=audio.file_path,
-                fmt="main",
-            )
-            if issues:
-                raise VerifyFailedError(
-                    f"Main render (existing-props) verification failed for language={language}: {issues}"
-                )
-        db.add(VideoRender(
+        # Delegates to _run_renders() — the same chunked-vs-single decision,
+        # render, verify, and VideoRender persistence the fresh-build path
+        # uses (live-canary fix: this branch used to call render_main_video()
+        # directly and unconditionally, never checking duration_ms against
+        # chunk_duration_sec, so a resume that hit "props already on disk"
+        # always rendered a long parent video as one giant unchunked Chromium
+        # composition instead of chunked, even though the original fresh
+        # render of the same content had correctly chunked it). Raises the
+        # same VerifyFailedError/RemotionCrashError/RemotionRenderError this
+        # function's caller already catches.
+        _run_renders(
             content_id=content_id,
             language=language,
-            format="main",
-            short_order=None,
-            duration_seconds=main_result["duration_seconds"],
-                render_time_seconds=main_result["render_time_seconds"],
-        ))
-        db.commit()
+            cid_str=cid_str,
+            audio=audio,
+            main_props_path=main_props_path,
+            db=db,
+        )
     else:
         logger.info("Main render already done for language=%s — skipping", language)
 

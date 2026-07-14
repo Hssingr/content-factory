@@ -5618,6 +5618,60 @@ cases, and a wiring-level test proving `_process_language()` actually skips
 `_render_from_existing_props()` when `_props_are_stale()` returns `True` and
 takes the shortcut when it returns `False`.
 
+#### `_render_from_existing_props` — resume path must make the same chunking decision as a fresh build (live-canary fix)
+
+File:
+
+```text
+app/agents/agent5_render/services/video.py
+```
+
+**Root cause (real production incident, surfaced while investigating the R6
+timeout revert above):** content `2704ad21-853c-47ff-b496-c92d147b9339`'s
+first render attempt went through the fresh-build path
+(`_process_language()` → `build_main_props()` → `_run_renders()`), which
+correctly chunked its ~12.7-minute EN parent video
+(`use_chunked = settings.chunked_render_enabled and audio.duration_ms >
+settings.chunk_duration_sec * 1000`, §11A.4's `_run_renders`/
+`render_main_video_chunked`). The process was interrupted before every
+language finished. On resume, `en_main.json` already existed on disk and
+`_props_are_stale()` (above) correctly judged it not stale — nothing about
+the beat/audio data had changed — so `_process_language()` took the
+"props found on disk → skip to render" shortcut into
+`_render_from_existing_props()`. That function's main-video branch used to
+call `render_main_video()` **directly and unconditionally**, with no
+`duration_ms`-vs-`chunk_duration_sec` check of any kind — the same
+12.7-minute video that had correctly chunked on its first attempt rendered
+as one giant unchunked Chromium composition on resume, exactly the memory/
+time pressure chunking exists to relieve. Two independent code paths
+(`_run_renders()` for a fresh build; `_render_from_existing_props()`'s own
+inline render+verify+persist block for a resume) reached the renderer with
+logic that had silently drifted apart.
+
+**Fix:** `_render_from_existing_props()`'s main-video branch now delegates
+directly to `_run_renders()` — the exact same function the fresh-build path
+already calls — instead of duplicating render+`verify_render()`+
+`VideoRender` persistence inline. `_run_renders()` already computes its own
+`bundle_dir` via `ensure_bundle()`, so `_render_from_existing_props()` no
+longer needs its own separate call to it either. The chunking decision,
+post-render verification, and `VideoRender` persistence can no longer drift
+between the two entry points, because there is only one implementation now.
+The pre-existing `_render_exists()` already-rendered short-circuit
+(§11A.4's `render_short_render`/`_render_exists`) is unchanged — it still
+guards the call to `_run_renders()` exactly as it guarded the old inline
+block.
+
+Runtime proof: `tests/test_existing_props_chunking_consistency.py` (5
+tests) — a real `_render_from_existing_props()` → `_run_renders()` call
+chain (only `render_main_video`/`render_main_video_chunked`, the paid
+Remotion boundary, are mocked) proving: the exact audited 759,864ms
+duration now dispatches to `render_main_video_chunked()` on the
+existing-props path; a duration under `chunk_duration_sec` still uses the
+single-pass `render_main_video()`; `settings.chunked_render_enabled=False`
+is still honored on this path; the `VideoRender` row is still persisted
+with the correct `content_id`/`language`/`format`; and the pre-existing
+already-rendered short-circuit still skips both renderers entirely.
+
 #### `build_main_props`
 
 File:
@@ -5805,7 +5859,7 @@ subset — 123/123 passing, zero regressions). No Jest/component-render test har
 Remotion side (§19.1 forbids live renders regardless); `tsc --noEmit` plus static Python checks are
 this codebase's established verification method for Remotion source changes.
 
-#### `renderer.py` — subprocess timeouts, pinned encode settings, chunk artifact lifecycle, bundle lock, concurrency cap (render pipeline remediation, Tier 2)
+#### `renderer.py` — pinned encode settings, chunk artifact lifecycle, bundle lock, concurrency cap (render pipeline remediation, Tier 2)
 
 File:
 
@@ -5814,7 +5868,7 @@ app/agents/agent5_render/services/renderer.py
 ```
 
 `code_report/render_pipeline_python_to_remotion_deep_audit.md` /
-`code_report/render_pipeline_remediation_roadmap.md` Tier 2, R5–R10 — operational hardening,
+`code_report/render_pipeline_remediation_roadmap.md` Tier 2, R5, R7–R10 — operational hardening,
 independent of the Tier 1 viewer-visible fixes above:
 
 - **R5 — explicit CRF on the chunk-concat fallback re-encode.** `_concatenate_chunks()` tries a
@@ -5824,19 +5878,28 @@ independent of the Tier 1 viewer-visible fixes above:
   shared with R7) instead of leaving CRF unset — ffmpeg's own libx264 default is CRF 23, a real,
   silent quality regression against the CRF 18 every chunk was already rendered at, previously
   with zero log signal that the recovery path had produced a softer result than normal.
-- **R6 — subprocess timeouts.** No layer above `renderer.py` recovers a genuine hang (Celery sets
-  no `task_time_limit`/`soft_time_limit`; `run_agent5_render_for_content`'s retry only fires from a
-  raised exception, which a hung subprocess never raises on its own) — a single stuck Chromium
-  process would occupy a worker slot forever. Every `subprocess.run()` call site now passes
-  `timeout=` and catches `subprocess.TimeoutExpired` alongside the existing non-zero-exit handling:
-  `_run_remotion()` (`_REMOTION_TIMEOUT_SEC = 600`, comfortably above the `--timeout 300000`
-  Remotion is itself already told to target internally for per-frame/per-asset waits — raises
-  `RemotionRenderError` on expiry, matching the shape callers already handle), the bundle-build
-  call inside `_build_and_move_bundle()` (`_BUNDLE_TIMEOUT_SEC = 300`, returns `None`),
-  `_slice_audio_for_chunk()` (`_AUDIO_SLICE_TIMEOUT_SEC = 120`, returns `False`), and
-  `_concatenate_chunks()`'s `_run_concat()` (`_CONCAT_TIMEOUT_SEC = 600`, treated as an ordinary
-  concat failure so the stream-copy→re-encode fallback ladder still applies on a timeout, not just
-  a non-zero exit).
+- **R6 — subprocess timeouts — implemented, then REVERTED the same day.** Every `subprocess.run()`
+  call site briefly gained a `timeout=`/`except subprocess.TimeoutExpired` guard
+  (`_run_remotion()` at 600s, `_build_and_move_bundle()`'s bundle-build call at 300s,
+  `_slice_audio_for_chunk()` at 120s, `_concatenate_chunks()`'s `_run_concat()` at 600s), reasoning
+  that no layer above `renderer.py` recovers a genuine hang. On the very first real resume after
+  this shipped, a genuinely long parent render (content `2704ad21-853c-47ff-b496-c92d147b9339`,
+  ~12.7 min EN audio, hitting the `_render_from_existing_props()` non-chunked path — see the open
+  observation below) was killed at exactly 600s while still legitimately in progress:
+  `Remotion render timed out after 600s for MainVideo`. Operator's explicit instruction: *"we
+  don't need any timeout here it must take whatever time it needs."* Every `timeout=` kwarg and
+  `TimeoutExpired` handler was removed; all four `subprocess.run()` calls are unbounded again,
+  matching pre-Tier-2 behavior exactly. **Do not reintroduce a subprocess timeout anywhere in this
+  file without a new, explicit operator decision** — a long render legitimately taking longer than
+  any fixed ceiling is normal, expected behavior for this pipeline, not a hang. Regression-guarded
+  by `tests/test_render_pipeline_remediation_tier2.py::TestNoSubprocessTimeoutEnforced` (asserts no
+  `timeout` kwarg reaches `subprocess.run()` at any of the four call sites, plus a direct proof
+  that a call still "succeeds" with no kwarg present regardless of how long it notionally runs).
+  **Open observation surfaced by this same incident, not yet actioned:** the log showed
+  `_render_from_existing_props()` (`video.py`) calling non-chunked `render_main_video()` directly
+  for a 12.7-minute video — that fast-resume path never checks `duration_ms` against
+  `settings.chunk_duration_sec` the way `_run_renders()` does, so it bypasses chunking entirely
+  regardless of video length. This is a separate, real gap, not fixed as part of this reversal.
 - **R7 — pinned final encode settings.** `_run_remotion()`'s CLI invocation now passes
   `--crf 18 --pixel-format yuv420p --audio-bitrate 320k` explicitly instead of relying on
   `@remotion/renderer`'s implicit library defaults (which happen to already be these exact values
@@ -5882,15 +5945,16 @@ independent of the Tier 1 viewer-visible fixes above:
   `app/config.py`'s existing comment needed no wording change — it now accurately describes real
   behavior.
 
-Verification: `ast.parse` (clean), the full existing Python test suite (743 passed / 145 subtests
-passed, zero regressions), and 19 new runtime-proof tests in
+Verification: `ast.parse` (clean), the full existing Python test suite (742 passed / 145 subtests
+passed, zero regressions), and 18 runtime-proof tests in
 `tests/test_render_pipeline_remediation_tier2.py` — real `renderer.py` code paths throughout
 (`_capped_concurrency()`, `_count_props_sections()`, `render_main_video()`,
 `render_main_video_chunked()`, `ensure_bundle()`, `_concatenate_chunks()`, `_run_remotion()`,
 `_slice_audio_for_chunk()` all run unmodified); only `subprocess.run()` itself is ever mocked, per
 §19.1 — no live API/render calls anywhere, including a real-threads proof for R9 (two
 `threading.Thread`s actually racing to acquire the same `fcntl.flock`, with a real 0.2s sleep
-forcing genuine overlap, proving the second caller's bundle-build subprocess call never fires).
+forcing genuine overlap, proving the second caller's bundle-build subprocess call never fires) and
+`TestNoSubprocessTimeoutEnforced` guarding R6's reversal.
 
 #### `render_short`
 

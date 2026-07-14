@@ -59,17 +59,17 @@ _SAFE_CHROME_FLAGS = (
 # chunk was already produced at.
 _TARGET_CRF = 18
 
-# Subprocess wall-clock timeouts (roadmap Tier 2 R6, deep-audit Finding 2) —
-# nothing above this layer recovers a genuine hang: Celery sets no
-# task_time_limit, and retry logic only fires from a raised exception, which
-# a hung subprocess never raises. `_run_remotion`'s own 600s sits comfortably
-# above the `--timeout 300000` (300s) Remotion is itself already told to
-# target internally — that flag bounds Remotion's per-frame/per-asset wait,
-# not the wall-clock ceiling on the whole CLI process.
-_REMOTION_TIMEOUT_SEC       = 600
-_BUNDLE_TIMEOUT_SEC         = 300
-_AUDIO_SLICE_TIMEOUT_SEC    = 120
-_CONCAT_TIMEOUT_SEC         = 600
+# Roadmap Tier 2 R6 (deep-audit Finding 2) originally added a 600s wall-clock
+# timeout to _run_remotion()'s subprocess.run() call, reasoning that nothing
+# above this layer recovers a genuine hang. Reverted per explicit operator
+# instruction after a real long parent render (content 2704ad21, ~12.7 min
+# audio, rendered non-chunked via the existing-props fast path) was killed at
+# exactly 600s while still legitimately in progress — a long video can
+# genuinely take longer than any fixed ceiling to render, and a hard kill
+# converts a slow-but-working render into a false failure, which is worse
+# than the rare-hang risk the timeout was meant to guard against. Do not
+# reintroduce a subprocess timeout on any renderer.py call without a new,
+# explicit operator decision.
 
 # Beat-density concurrency safeguard (roadmap Tier 2 R10, deep-audit
 # Finding 5) — documented in app/config.py's render_concurrency comment but
@@ -196,11 +196,7 @@ def _build_and_move_bundle(
         result = subprocess.run(
             cmd, cwd=str(remotion_dir),
             capture_output=True, text=True, check=False,
-            timeout=_BUNDLE_TIMEOUT_SEC,
         )
-    except subprocess.TimeoutExpired:
-        logger.error("Remotion bundle timed out after %ds", _BUNDLE_TIMEOUT_SEC)
-        return None
     except Exception as exc:
         logger.error("Remotion bundle failed: %s", exc)
         return None
@@ -728,10 +724,7 @@ def _slice_audio_for_chunk(
         output_path,
     ]
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, check=False,
-            timeout=_AUDIO_SLICE_TIMEOUT_SEC,
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if result.returncode != 0:
             logger.warning(
                 "ffmpeg audio slice failed (exit %d): %s",
@@ -739,9 +732,6 @@ def _slice_audio_for_chunk(
             )
             return False
         return True
-    except subprocess.TimeoutExpired:
-        logger.warning("ffmpeg audio slice timed out after %ds", _AUDIO_SLICE_TIMEOUT_SEC)
-        return False
     except Exception as exc:
         logger.warning("ffmpeg audio slice exception: %s", exc)
         return False
@@ -778,14 +768,7 @@ def _concatenate_chunks(chunk_paths: list[str], output_path: str) -> None:
                 *extra_codec_flags,
                 output_path,
             ]
-            try:
-                result = subprocess.run(
-                    cmd, capture_output=True, text=True, check=False,
-                    timeout=_CONCAT_TIMEOUT_SEC,
-                )
-            except subprocess.TimeoutExpired:
-                logger.warning("ffmpeg concat timed out after %ds", _CONCAT_TIMEOUT_SEC)
-                return False
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
             if result.returncode != 0:
                 logger.warning(
                     "ffmpeg concat failed (exit %d): %s",
@@ -916,20 +899,10 @@ def _run_remotion(
             capture_output=True,
             text=True,
             check=False,
-            timeout=_REMOTION_TIMEOUT_SEC,
         )
     except FileNotFoundError as exc:
         raise RemotionRenderError(
             f"Remotion CLI not found — set NODE_BIN in .env to your Node ≥18 path. ({exc})"
-        ) from exc
-    except subprocess.TimeoutExpired as exc:
-        # No layer above this recovers a genuine hang (roadmap Tier 2 R6,
-        # deep-audit Finding 2): Celery sets no task_time_limit, and retry
-        # logic only fires from a raised exception, which a hung subprocess
-        # never raises on its own — without this, a stuck Chromium process
-        # would occupy a worker slot forever.
-        raise RemotionRenderError(
-            f"Remotion render timed out after {_REMOTION_TIMEOUT_SEC}s for {composition}"
         ) from exc
 
     elapsed = time.monotonic() - t0

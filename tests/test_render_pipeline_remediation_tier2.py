@@ -1,10 +1,9 @@
-"""Runtime proof for render pipeline remediation roadmap Tier 2 (R5-R10).
+"""Runtime proof for render pipeline remediation roadmap Tier 2 (R5, R7-R10).
 
 code_report/render_pipeline_remediation_roadmap.md Tier 2 — reliability and
 operational hardening of app/agents/agent5_render/services/renderer.py:
 
   R5  explicit -crf on the chunk-concat libx264 fallback re-encode
-  R6  subprocess.run() timeouts (nothing above this layer recovers a hang)
   R7  pinned final encode settings (--crf/--pixel-format/--audio-bitrate)
   R8  chunked-render intermediate artifact cleanup (stale-orphan clear at
       start, success-only rmtree at the end)
@@ -12,6 +11,14 @@ operational hardening of app/agents/agent5_render/services/renderer.py:
       cold-cache race
   R10 beat-density concurrency cap (>40 sections halves concurrency, per
       render/per chunk)
+
+R6 (subprocess.run() timeouts) was implemented and then REVERTED per explicit
+operator instruction: a real long parent render (content 2704ad21, ~12.7 min
+audio, rendered non-chunked) was killed at exactly 600s while still
+legitimately in progress. TestNoSubprocessTimeoutEnforced below is the
+regression guard for that reversal — it proves no `timeout=` kwarg reaches
+`subprocess.run()` at any of the four call sites, so this class of premature
+kill can't silently come back.
 
 Per CLAUDE.md Sec19.1 and explicit operator instruction: no live API or
 external render calls anywhere in this file. Every subprocess.run() call is
@@ -23,7 +30,6 @@ from __future__ import annotations
 
 import json
 import shutil
-import subprocess
 import tempfile
 import threading
 import time
@@ -172,9 +178,9 @@ class TestConcurrencyCapWiredIntoRenders(unittest.TestCase):
         self.assertEqual(calls, [4, 8], "dense chunk (45 beats) halved, sparse chunk (3 beats) unchanged")
 
 
-# ── R6 / R7: subprocess timeouts and pinned encode flags on _run_remotion ──
+# ── R7: pinned encode flags on _run_remotion ────────────────────────────────
 
-class TestRunRemotionTimeoutAndEncodeFlags(unittest.TestCase):
+class TestRunRemotionEncodeFlags(unittest.TestCase):
     def setUp(self):
         self.tmp_dir = tempfile.mkdtemp(prefix="tier2_run_remotion_test_")
         self.addCleanup(shutil.rmtree, self.tmp_dir, ignore_errors=True)
@@ -195,19 +201,6 @@ class TestRunRemotionTimeoutAndEncodeFlags(unittest.TestCase):
         Path(props_path).write_text("{}")
         return output_path, props_path
 
-    def test_timeout_kwarg_passed_to_subprocess(self):
-        output_path, props_path = self._output_and_props()
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-            renderer._run_remotion("MainVideo", output_path, props_path, concurrency=4)
-        self.assertEqual(mock_run.call_args.kwargs.get("timeout"), renderer._REMOTION_TIMEOUT_SEC)
-
-    def test_timeout_expired_raises_render_error_not_crash_error(self):
-        output_path, props_path = self._output_and_props()
-        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd=["node"], timeout=600)):
-            with self.assertRaises(renderer.RemotionRenderError):
-                renderer._run_remotion("MainVideo", output_path, props_path, concurrency=4)
-
     def test_cmd_includes_pinned_encode_flags(self):
         output_path, props_path = self._output_and_props()
         with patch("subprocess.run") as mock_run:
@@ -221,19 +214,6 @@ class TestRunRemotionTimeoutAndEncodeFlags(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--pixel-format") + 1], "yuv420p")
         self.assertIn("--audio-bitrate", cmd)
         self.assertEqual(cmd[cmd.index("--audio-bitrate") + 1], "320k")
-
-
-class TestSliceAudioTimeout(unittest.TestCase):
-    def test_timeout_returns_false_not_raises(self):
-        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd=["ffmpeg"], timeout=120)):
-            result = renderer._slice_audio_for_chunk("/fake/audio.mp3", 0.0, 10.0, "/fake/out.mp3")
-        self.assertFalse(result)
-
-    def test_timeout_kwarg_passed(self):
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-            renderer._slice_audio_for_chunk("/fake/audio.mp3", 0.0, 10.0, "/fake/out.mp3")
-        self.assertEqual(mock_run.call_args.kwargs.get("timeout"), renderer._AUDIO_SLICE_TIMEOUT_SEC)
 
 
 # ── R5: explicit CRF on the concat fallback ─────────────────────────────────
@@ -258,10 +238,104 @@ class TestConcatFallbackCRF(unittest.TestCase):
         self.assertIn("-crf", fallback_cmd)
         self.assertEqual(fallback_cmd[fallback_cmd.index("-crf") + 1], str(renderer._TARGET_CRF))
 
-    def test_timeout_on_both_attempts_raises_render_error(self):
-        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd=["ffmpeg"], timeout=600)):
-            with self.assertRaises(renderer.RemotionRenderError):
-                renderer._concatenate_chunks(["/fake/chunk0.mp4"], "/fake/out.mp4")
+
+# ── R6 reversion guard: no subprocess.run() call may carry a timeout ───────
+#
+# A real long parent render (content 2704ad21, ~12.7 min audio) was killed at
+# exactly 600s by the timeout R6 originally added, while still legitimately
+# in progress — long videos can genuinely take longer than any fixed ceiling.
+# Reverted per explicit operator instruction ("we don't need any timeout
+# here it must take whatever time it needs"). These tests are the permanent
+# regression guard against that specific premature-kill behavior returning.
+
+class TestNoSubprocessTimeoutEnforced(unittest.TestCase):
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp(prefix="tier2_no_timeout_test_")
+        self.addCleanup(shutil.rmtree, self.tmp_dir, ignore_errors=True)
+
+    def test_run_remotion_passes_no_timeout(self):
+        media_dir = Path(self.tmp_dir) / "media"
+        media_dir.mkdir()
+        output_path = Path(self.tmp_dir) / "out.mp4"
+        props_path = str(Path(self.tmp_dir) / "props.json")
+        Path(props_path).write_text("{}")
+        for name, value in (
+            ("remotion_path", self.tmp_dir),
+            ("media_path", str(media_dir)),
+            ("node_bin", "node"),
+        ):
+            patcher = patch.object(renderer.settings, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            renderer._run_remotion("MainVideo", output_path, props_path, concurrency=4)
+        self.assertNotIn("timeout", mock_run.call_args.kwargs)
+
+    def test_slice_audio_passes_no_timeout(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            renderer._slice_audio_for_chunk("/fake/audio.mp3", 0.0, 10.0, "/fake/out.mp3")
+        self.assertNotIn("timeout", mock_run.call_args.kwargs)
+
+    def test_concatenate_chunks_passes_no_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = str(Path(tmp) / "out.mp4")
+            with patch("subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+                renderer._concatenate_chunks(["/fake/chunk0.mp4"], out)
+        self.assertNotIn("timeout", mock_run.call_args.kwargs)
+
+    def test_bundle_build_passes_no_timeout(self):
+        for name, value in (
+            ("remotion_pre_bundle", True),
+            ("remotion_path", self.tmp_dir),
+            ("node_bin", "node"),
+        ):
+            patcher = patch.object(renderer.settings, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        def _fake_bundle_subprocess(cmd, cwd=None, **kwargs):
+            build_dir = Path(cwd) / "build"
+            build_dir.mkdir(parents=True, exist_ok=True)
+            (build_dir / "index.js").write_text("bundled")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch("subprocess.run", side_effect=_fake_bundle_subprocess) as mock_run:
+            renderer.ensure_bundle()
+        self.assertNotIn("timeout", mock_run.call_args.kwargs)
+
+    def test_a_genuinely_slow_render_is_not_killed(self):
+        """Direct proof of the real production scenario: a subprocess.run()
+        call that takes far longer than the old 600s ceiling must still
+        succeed, not raise."""
+        media_dir = Path(self.tmp_dir) / "media"
+        media_dir.mkdir()
+        output_path = Path(self.tmp_dir) / "out.mp4"
+        props_path = str(Path(self.tmp_dir) / "props.json")
+        Path(props_path).write_text("{}")
+        for name, value in (
+            ("remotion_path", self.tmp_dir),
+            ("media_path", str(media_dir)),
+            ("node_bin", "node"),
+        ):
+            patcher = patch.object(renderer.settings, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        def _slow_but_successful(*args, **kwargs):
+            # A real subprocess.run(timeout=600) would have raised
+            # TimeoutExpired for any call exceeding 600s; asserting no
+            # `timeout` kwarg is present is what actually guarantees this
+            # never happens for a real long-running Remotion process.
+            self.assertNotIn("timeout", kwargs)
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch("subprocess.run", side_effect=_slow_but_successful):
+            elapsed = renderer._run_remotion("MainVideo", output_path, props_path, concurrency=4)
+        self.assertIsInstance(elapsed, float)
 
 
 # ── R8: chunk artifact lifecycle ────────────────────────────────────────────
@@ -405,11 +479,6 @@ class TestEnsureBundleLock(unittest.TestCase):
         self.assertIsNotNone(results[0])
         self.assertIsNotNone(results[1])
         self.assertEqual(results[0], results[1], "both callers must resolve to the same bundle directory")
-
-    def test_bundle_build_timeout_returns_none(self):
-        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd=["node"], timeout=300)):
-            result = renderer.ensure_bundle()
-        self.assertIsNone(result)
 
 
 if __name__ == "__main__":
