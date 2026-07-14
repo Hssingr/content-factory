@@ -24,6 +24,7 @@ export const MainVideo: React.FC<MainVideoProps> = ({
   audio_file,
   sections,
   subtitles,
+  leading_transition,
 }) => {
   const { fps } = useVideoConfig();
   const audioSrc = staticFile(audio_file);
@@ -35,8 +36,13 @@ export const MainVideo: React.FC<MainVideoProps> = ({
       {sections.map((section, idx) => {
         const sectionDurMs = section.audio_end_ms - section.audio_start_ms;
         // The PREVIOUS section's transition_to_next decides how long this section
-        // overlaps with it (and which entrance style MediaSection plays).
-        const incomingTransition = idx > 0 ? sections[idx - 1].transition_to_next : undefined;
+        // overlaps with it (and which entrance style MediaSection plays). For a
+        // chunked render, this chunk's own first section (idx === 0) has no local
+        // predecessor to read that off of — leading_transition carries it in from
+        // the real previous section, which lives in the prior chunk's own
+        // composition (see renderer.py's render_main_video_chunked).
+        const incomingTransition =
+          idx > 0 ? sections[idx - 1].transition_to_next : leading_transition;
         const crossfadeIn = idx > 0 ? transitionDurationFrames(incomingTransition) : 0;
         const from = Math.max(
           0,

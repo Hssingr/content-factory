@@ -1014,8 +1014,8 @@ _HOOK_PARAPHRASE_OVERLAP_THRESHOLD = 0.7
 
 
 def _opens_with_hook_paraphrase(script_text: str, hook: str) -> bool:
-    """True when the generated opening sentence already covers the hook's
-    content, even when it isn't a verbatim prefix match.
+    """True when the generated opening already covers the hook's content,
+    even when it isn't a verbatim prefix match.
 
     A real production run showed Claude's own INTRO opening was a near-exact
     paraphrase of the blueprint hook ("...planning one night's theft" vs. the
@@ -1027,13 +1027,29 @@ def _opens_with_hook_paraphrase(script_text: str, hook: str) -> bool:
     sentence (not the whole section) catches this without an AI call —
     consistent with _match_turns()'s overlap-based matching in this same
     file, and with the mandate that Python, not a prompt, enforces this.
+
+    The comparison window matches the hook's own sentence count, not a fixed
+    single sentence (live-canary fix): a real production run shipped a
+    two-sentence blueprint hook ("I swore my father's oath at nine. Now I
+    stand on a mountain that wants to bury forty thousand men.") whose
+    generated INTRO opened with a paraphrase spanning its own first TWO
+    sentences. Comparing the full two-sentence hook against only the
+    generated text's first sentence structurally caps achievable overlap at
+    roughly half the hook's tokens — under the 70% threshold even though the
+    opening fully covered the hook's content — so the hook was prepended
+    again, shipping the exact "said twice" duplicate this function exists to
+    prevent. Taking a leading window sized to the hook's own sentence count
+    reproduces the original single-sentence behavior unchanged for a
+    single-sentence hook (window size 1) while correctly covering a
+    multi-sentence hook.
     """
-    first_sentence = (split_sentences(script_text.strip()) or [""])[0]
     hook_tokens = _get_content_tokens(hook)
     if not hook_tokens:
         return False
-    first_sentence_tokens = _get_content_tokens(first_sentence)
-    overlap = len(hook_tokens & first_sentence_tokens) / len(hook_tokens)
+    hook_sentence_count = len(split_sentences(hook.strip())) or 1
+    opening_window = (split_sentences(script_text.strip()) or [""])[:hook_sentence_count]
+    opening_tokens = _get_content_tokens(" ".join(opening_window))
+    overlap = len(hook_tokens & opening_tokens) / len(hook_tokens)
     return overlap >= _HOOK_PARAPHRASE_OVERLAP_THRESHOLD
 
 

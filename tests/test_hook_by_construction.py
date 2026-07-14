@@ -113,6 +113,33 @@ class TestApplyHookByConstruction(unittest.TestCase):
             "guards against",
         )
 
+    def test_noop_on_real_production_two_sentence_hook_duplicate(self):
+        """Real defect (content 2704ad21-853c-47ff-b496-c92d147b9339): a
+        two-sentence hook produced a visible duplicated opening because the
+        old check only ever compared the hook against the generated text's
+        first sentence. See test_real_production_two_sentence_hook_paraphrase_detected
+        for the mechanism; this proves the fix end-to-end through
+        _apply_hook_by_construction."""
+        hook = (
+            "I swore my father's oath at nine. Now I stand on a mountain "
+            "that wants to bury forty thousand men."
+        )
+        generated_opening = (
+            "I swore my father's oath at nine years old. Now I stand on a "
+            "mountain that wants to bury forty thousand men. The wind up "
+            "here has no name."
+        )
+        result = {"script_text": generated_opening}
+
+        updated = scripts._apply_hook_by_construction(result, hook)
+
+        self.assertEqual(
+            updated["script_text"], generated_opening,
+            "hook was prepended again despite the opening already covering "
+            "the hook's two-sentence content — the exact production stutter "
+            "this test guards against",
+        )
+
     def test_still_prepends_hook_when_opening_is_unrelated(self):
         """Guards against the paraphrase check being too aggressive — an
         opening that merely shares a couple of incidental words with the
@@ -156,6 +183,42 @@ class TestOpensWithHookParaphrase(unittest.TestCase):
         script_text = (
             "A boy moved to a quiet town. Later, he heard a grinding metal "
             "sound echoing from the mountain every night."
+        )
+        self.assertFalse(scripts._opens_with_hook_paraphrase(script_text, hook))
+
+    def test_real_production_two_sentence_hook_paraphrase_detected(self):
+        """Real defect (content 2704ad21-853c-47ff-b496-c92d147b9339): a
+        two-sentence blueprint hook whose generated INTRO opened with a
+        paraphrase spanning its own first two sentences. The old
+        single-sentence-only comparison window structurally capped overlap
+        at ~36% (only the hook's first-sentence tokens could ever match),
+        under the 70% threshold, so the paraphrase went undetected and the
+        hook was prepended again — shipping:
+
+        "I swore my father's oath at nine. Now I stand on a mountain that
+        wants to bury forty thousand men. I swore my father's oath at nine
+        years old. Now I stand on a mountain that wants to bury forty
+        thousand men."
+        """
+        hook = (
+            "I swore my father's oath at nine. Now I stand on a mountain "
+            "that wants to bury forty thousand men."
+        )
+        generated_opening = (
+            "I swore my father's oath at nine years old. Now I stand on a "
+            "mountain that wants to bury forty thousand men. The wind up "
+            "here has no name."
+        )
+        self.assertTrue(scripts._opens_with_hook_paraphrase(generated_opening, hook))
+
+    def test_two_sentence_hook_window_does_not_bleed_into_third_sentence(self):
+        """A two-sentence hook must still only compare against the generated
+        text's first TWO sentences — content that only appears in a third
+        sentence must not count toward the overlap."""
+        hook = "A door creaks somewhere below. Nobody else is home tonight."
+        script_text = (
+            "The house was quiet and cold. Rain tapped the window glass. "
+            "A door creaks somewhere below, and nobody else is home tonight."
         )
         self.assertFalse(scripts._opens_with_hook_paraphrase(script_text, hook))
 

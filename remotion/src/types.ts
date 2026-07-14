@@ -86,6 +86,15 @@ export interface MainVideoProps extends RemotionProps {
   duration_ms: number;
   sections:    SectionData[];
   subtitles:   StandardSubtitles;
+  // Chunked rendering only (renderer.py's render_main_video_chunked): each
+  // chunk is its own independent Remotion composition, so this chunk's own
+  // first section has no local sections[idx - 1] to read an incoming
+  // transition off of. leading_transition carries the real
+  // transition_to_next of the section that immediately precedes this
+  // chunk (the last section of the previous chunk) so it isn't silently
+  // discarded as a hard cut. Absent/undefined for a non-chunked render and
+  // for the very first chunk, where there is genuinely nothing before it.
+  leading_transition?: Transition;
 }
 
 export interface ShortProps extends RemotionProps {

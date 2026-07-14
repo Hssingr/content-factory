@@ -295,6 +295,68 @@ def render_short(
     }
 
 
+def _compute_chunk_boundaries(
+    all_sections: list[dict], duration_ms: int, chunk_sec: int,
+) -> list[tuple[int, int]]:
+    """Return (start_ms, end_ms) pairs for each chunk, with every internal
+    boundary snapped to a real section edge so no VideoSection beat is ever
+    split — and therefore duplicated — across two chunks.
+
+    Root cause this replaces (live-canary fix): the previous fixed
+    chunk_idx * chunk_sec boundary landed inside whichever beat happened to
+    be playing at that exact millisecond, on every single internal boundary
+    of a real production render (8/8 in a 9-chunk video). Each straddling
+    beat's image was independently clipped into BOTH adjacent chunks — full
+    playback at the tail of one chunk, then an immediate replay from its own
+    progress=0 for a short fragment (as little as 240ms) at the head of the
+    next. Because each chunk is an entirely separate Remotion composition,
+    MainVideo.tsx's own idx===0 first-section case also always treated that
+    fragment's arrival as having no incoming transition, discarding whatever
+    crossfade/whip_pan/match_cut was actually authored there. Together these
+    produced exactly the reported symptoms: missing/inconsistent transitions
+    and short flash-like image fragments at every chunk seam.
+
+    Sections are assumed contiguous (section[i].audio_end_ms ==
+    section[i+1].audio_start_ms) — true by construction for every persisted
+    VideoSection row (map_storyboard_beats_to_timestamps() never leaves a
+    gap) — so any section's audio_end_ms is safe to use as a hard split
+    point: nothing on either side of it belongs to a different beat.
+
+    A nominal boundary with no unused section-edge candidate left near it
+    (or no candidates at all) is simply dropped, producing fewer/longer
+    chunks than the nominal target rather than falling back to a
+    beat-splitting cut — a few seconds of drift around the configured
+    chunk_duration_sec is harmless to the crash-avoidance goal chunking
+    exists for.
+    """
+    nominal_ms = chunk_sec * 1000
+    n_nominal  = max(1, -(-duration_ms // nominal_ms))
+    if n_nominal <= 1:
+        return [(0, duration_ms)]
+
+    candidates = sorted({
+        int(s["audio_end_ms"])
+        for s in all_sections
+        if 0 < s.get("audio_end_ms", 0) < duration_ms
+    })
+    if not candidates:
+        return [(0, duration_ms)]
+
+    boundaries: list[int] = []
+    used: set[int] = set()
+    for i in range(1, n_nominal):
+        nominal   = i * nominal_ms
+        available = [c for c in candidates if c not in used]
+        if not available:
+            break
+        best = min(available, key=lambda c: abs(c - nominal))
+        used.add(best)
+        boundaries.append(best)
+
+    edges = [0, *sorted(boundaries), duration_ms]
+    return [(edges[i], edges[i + 1]) for i in range(len(edges) - 1) if edges[i + 1] > edges[i]]
+
+
 def render_main_video_chunked(
     content_id: str,
     language: str,
@@ -328,25 +390,40 @@ def render_main_video_chunked(
         RemotionCrashError: A chunk crashed on both the normal and safe-retry pass.
         RemotionRenderError: Any chunk or the ffmpeg concat step failed non-zero.
     """
-    chunk_sec  = settings.chunk_duration_sec
-    n_chunks   = max(1, -(-duration_ms // (chunk_sec * 1000)))   # ceiling division
-    conc       = concurrency if concurrency is not None else settings.render_concurrency
+    chunk_sec       = settings.chunk_duration_sec
+    n_chunks_nominal = max(1, -(-duration_ms // (chunk_sec * 1000)))   # ceiling division
+    conc            = concurrency if concurrency is not None else settings.render_concurrency
+
+    if n_chunks_nominal == 1:
+        return render_main_video(content_id, language, props_path, duration_ms, concurrency)
+
+    with open(props_path, encoding="utf-8") as fh:
+        full_props = json.load(fh)
+
+    all_sections  = sorted(full_props.get("sections", []), key=lambda s: s.get("audio_start_ms", 0))
+    all_captions  = (full_props.get("subtitles") or {}).get("captions", [])
+    media_root    = Path(settings.media_path).resolve()
+    audio_ext     = Path(audio_file_path).suffix or ".mp3"
+
+    chunk_boundaries = _compute_chunk_boundaries(all_sections, duration_ms, chunk_sec)
+    n_chunks = len(chunk_boundaries)
+
+    if n_chunks == 1:
+        return render_main_video(content_id, language, props_path, duration_ms, concurrency)
 
     logger.debug(
         "Chunked render enabled: duration=%ds chunks=%d chunk_duration=%ds",
         duration_ms // 1000, n_chunks, chunk_sec,
     )
 
-    if n_chunks == 1:
-        return render_main_video(content_id, language, props_path, duration_ms, concurrency)
-
-    with open(props_path, encoding="utf-8") as fh:
-        full_props = json.load(fh)
-
-    all_sections  = full_props.get("sections", [])
-    all_captions  = (full_props.get("subtitles") or {}).get("captions", [])
-    media_root    = Path(settings.media_path).resolve()
-    audio_ext     = Path(audio_file_path).suffix or ".mp3"
+    # transition_to_next of whichever section ends exactly at a given chunk
+    # boundary — every internal boundary in chunk_boundaries is, by
+    # construction, some section's real audio_end_ms.
+    end_to_transition = {
+        s["audio_end_ms"]: s.get("transition_to_next")
+        for s in all_sections
+        if "audio_end_ms" in s
+    }
 
     chunk_dir = media_root / "video" / content_id / "chunks" / language
     chunk_dir.mkdir(parents=True, exist_ok=True)
@@ -358,9 +435,7 @@ def render_main_video_chunked(
 
     # ── Prepare all chunk data (audio slice + props) sequentially ─────────────
     chunk_specs: list[dict] = []
-    for chunk_idx in range(n_chunks):
-        chunk_start_ms  = chunk_idx * chunk_sec * 1000
-        chunk_end_ms    = min((chunk_idx + 1) * chunk_sec * 1000, duration_ms)
+    for chunk_idx, (chunk_start_ms, chunk_end_ms) in enumerate(chunk_boundaries):
         chunk_dur_ms    = chunk_end_ms - chunk_start_ms
         chunk_start_sec = chunk_start_ms / 1000
         chunk_dur_sec   = chunk_dur_ms / 1000
@@ -374,15 +449,20 @@ def render_main_video_chunked(
             )
         chunk_audio_rel = str(Path(chunk_audio_abs).relative_to(media_root))
 
-        # ── Filter and re-offset sections ─────────────────────────────────────
+        # ── Filter and re-offset sections ───────────────────────────────────────
+        # Exclusive, start-based membership (live-canary fix): chunk_boundaries
+        # snaps every internal cut to a real section edge, so a section's own
+        # start now falls in exactly one [chunk_start_ms, chunk_end_ms) window —
+        # the old overlap test (s_start < chunk_end and s_end > chunk_start)
+        # could and did match the same straddling section in two consecutive
+        # chunks, each independently (and differently) clipping and replaying it.
         chunk_sections: list[dict] = []
         for sec in all_sections:
             s_start = sec.get("audio_start_ms", 0)
-            s_end   = sec.get("audio_end_ms", 0)
-            if s_start < chunk_end_ms and s_end > chunk_start_ms:
+            if chunk_start_ms <= s_start < chunk_end_ms:
                 s = dict(sec)
-                s["audio_start_ms"] = max(0, s_start - chunk_start_ms)
-                s["audio_end_ms"]   = min(chunk_dur_ms, s_end - chunk_start_ms)
+                s["audio_start_ms"] = s_start - chunk_start_ms
+                s["audio_end_ms"]   = sec.get("audio_end_ms", 0) - chunk_start_ms
                 chunk_sections.append(s)
 
         if not chunk_sections:
@@ -403,13 +483,22 @@ def render_main_video_chunked(
             if c.get("start_ms", 0) >= chunk_start_ms and c.get("end_ms", 0) <= chunk_end_ms
         ]
 
+        # ── Leading transition ──────────────────────────────────────────────────
+        # Each chunk is rendered as its own independent Remotion composition, so
+        # MainVideo.tsx's own idx===0 case has no prior local section to read a
+        # transition_to_next off of. Without this, the transition actually
+        # authored into this chunk's first beat (crossfade/whip_pan/match_cut)
+        # was silently discarded as a hard cut on every chunk boundary.
+        leading_transition = end_to_transition.get(chunk_start_ms) if chunk_idx > 0 else None
+
         # ── Write chunk props ─────────────────────────────────────────────────
         chunk_props = {
             **full_props,
-            "audio_file":  chunk_audio_rel,
-            "duration_ms": chunk_dur_ms,
-            "sections":    chunk_sections,
-            "subtitles":   {"style": "standard", "captions": chunk_captions},
+            "audio_file":          chunk_audio_rel,
+            "duration_ms":         chunk_dur_ms,
+            "sections":            chunk_sections,
+            "subtitles":           {"style": "standard", "captions": chunk_captions},
+            "leading_transition":  leading_transition,
         }
         chunk_props_path = str(chunk_dir / f"chunk_{chunk_idx:03d}.json")
         with open(chunk_props_path, "w", encoding="utf-8") as fh:

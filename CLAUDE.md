@@ -2261,6 +2261,22 @@ be — a false negative by design.
   generated opening sentence (`split_sentences()`), reusing
   `_get_content_tokens()` — no AI call. Runtime proof (real production
   strings, not synthetic): `tests/test_hook_by_construction.py`.
+- **Multi-sentence hook window (live-canary fix,
+  `code_report/render_pipeline_media_assembly_audit_2704ad21.md`):** a real
+  production run shipped a **two-sentence** blueprint `hook` ("I swore my
+  father's oath at nine. Now I stand on a mountain that wants to bury forty
+  thousand men.") whose generated INTRO opened with a paraphrase spanning
+  its own first two sentences. Comparing the full two-sentence hook against
+  only the generated text's first sentence structurally capped achievable
+  overlap at ~36% of the hook's tokens — under the 70% threshold even
+  though the opening fully covered the hook's content — so the hook was
+  prepended again, shipping the exact "said twice" duplicate this mechanism
+  exists to prevent. `_opens_with_hook_paraphrase()` now sizes its
+  comparison window to the hook's own sentence count
+  (`split_sentences(hook)`) rather than a fixed single sentence — an
+  *N*-sentence hook is compared against the generated text's first *N*
+  sentences. A single-sentence hook (every pre-existing case) reproduces
+  the exact prior behavior unchanged (window size 1).
 - Wired into `_generate_section_once()` — called immediately after the raw
   Claude section result is returned and before `_clean_generated_section()`'s
   TTS backstop, gated on the same `check_hook: bool` flag that already
@@ -5680,6 +5696,58 @@ Rules:
 - Render 1920×1080.
 - Use chunked render for long durations.
 - Verify final output.
+
+#### `render_main_video_chunked` — chunk boundaries snap to real beat edges (live-canary fix)
+
+File:
+
+```text
+app/agents/agent5_render/services/renderer.py
+```
+
+**Root cause (`code_report/render_pipeline_media_assembly_audit_2704ad21.md`):** a long parent
+video is rendered as several independent ~`settings.chunk_duration_sec`-second Remotion
+compositions, concatenated with an ffmpeg stream-copy concat (`_concatenate_chunks()`, no
+re-encode). Chunk boundaries used to be the fixed timestamp `chunk_idx * chunk_duration_sec *
+1000`, and a beat (`VideoSection`) was assigned to a chunk by an **overlap** test
+(`s_start < chunk_end and s_end > chunk_start`) — a beat whose span straddled that exact
+millisecond matched both the chunk ending there and the chunk starting there, so it was
+independently clipped and rendered into **both**: full playback at the tail of one chunk, then
+an immediate replay from its own animation progress = 0 for a short fragment (real production
+data measured fragments as small as 240 ms) at the head of the next. A real production render
+hit this at **8 of 8** internal chunk boundaries in a 9-chunk video. Separately, because each
+chunk is its own independent composition, `MainVideo.tsx`'s `idx === 0` case for a chunk's own
+first section always read as "no incoming transition" (a hard cut), discarding whatever
+`crossfade`/`whip_pan`/`match_cut` was actually authored into the storyboard at that spot — the
+real preceding beat lives in the *previous* chunk's composition and is invisible to this one.
+Together these produced exactly the reported symptoms: missing/inconsistent transitions and
+short flash-like image fragments at every chunk seam.
+
+- `_compute_chunk_boundaries(all_sections, duration_ms, chunk_sec)` — a pure function that
+  snaps every **internal** chunk boundary to the nearest real section edge (some beat's own
+  `audio_end_ms`) instead of a fixed multiple of `chunk_sec`. Sections are contiguous by
+  construction (`map_storyboard_beats_to_timestamps()` never leaves a gap), so any beat's
+  `audio_end_ms` is always a safe hard split point. A nominal boundary with no unused
+  section-edge candidate nearby is simply dropped (fewer/longer chunks, never a beat-splitting
+  cut) — a few seconds of drift around the configured `chunk_duration_sec` is harmless to the
+  crash-avoidance goal chunking exists for.
+- Section membership changed from the old overlap test to an exclusive, start-based test
+  (`chunk_start_ms <= s_start < chunk_end_ms`) — unambiguous once boundaries are guaranteed real
+  section edges, so a beat can never again land in two chunks.
+- Each chunk's props now carry `leading_transition`: the real `transition_to_next` of the
+  section that truly precedes this chunk (looked up from the full, un-chunked section list, not
+  discarded). `MainVideoProps` (`remotion/src/types.ts`) and `MainVideo.tsx` read this for the
+  chunk's own first section (`idx === 0`) instead of hardcoding `undefined`; a non-chunked
+  render and the very first chunk are unaffected (nothing legitimately precedes them).
+- Runtime proof: `tests/test_chunked_render_boundary_fix.py` — `_compute_chunk_boundaries()`
+  unit coverage (no section ever straddles a returned boundary; the no-candidates fallback), and
+  a full-chain integration test through the real `render_main_video_chunked()` (only the
+  ffmpeg/Remotion subprocess calls stubbed) reading back the real chunk props files written to
+  disk, proving every beat appears in exactly one chunk at its exact original timestamp span and
+  that `leading_transition` matches the real preceding beat on every chunk after the first. Also
+  re-verified directly against content 2704ad21's real 180-beat EN section list pulled from the
+  database: same chunk count (9) as before the fix, zero straddling sections, max 4.1 s drift
+  from the nominal 90-second marks.
 
 #### `render_short`
 
