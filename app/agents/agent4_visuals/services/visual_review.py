@@ -15,6 +15,9 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models import AudioFile, Content, Script, VideoSection
+from app.agents.agent4_visuals.review_metadata import (
+    REVIEW_METADATA_FIELDS as _REVIEW_METADATA_FIELDS,
+)
 from app.services.local_run_paths import ensure_run_dirs, get_review_dir, get_run_root, get_visuals_dir
 from app.agents.agent4_visuals.services.visual_bible import get_visual_bible_path, load_visual_bible_for_content
 
@@ -22,20 +25,6 @@ _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 _REMOTE_PREFIXES = ("http://", "https://")
 _TEXT_CARD_SENTINEL = "__text_card__"
 _DASH = "—"
-
-# Roadmap 6.5 / audit AR-3: review-only beat metadata (first15 diagnostics,
-# cinematic continuity tags, prompt quality warnings) — nothing in the live
-# pipeline queries these after generation; only this review page does. They
-# are written here, to the run folder, instead of into generation_prompt
-# (which used to carry them, bloating every DB load and the delete-then-
-# insert per language).
-_REVIEW_METADATA_FIELDS: tuple[str, ...] = (
-    "negative_prompt", "shot_type", "subject", "action", "emotion", "camera",
-    "lighting", "composition", "continuity_tags", "visual_bible_refs",
-    "location", "character", "is_first_15_seconds", "prompt_quality_warnings",
-    "first15_validation_status", "first15_issues", "first15_strength_tags",
-    "first15_enhanced", "first15_validation_summary",
-)
 
 
 def get_review_metadata_path(content_id: int | str | UUID) -> Path:
@@ -47,7 +36,7 @@ def save_beat_review_metadata(
     language: str,
     beats: list[dict],
 ) -> None:
-    """Persist this language's review-only beat metadata to the run folder.
+    """Persist this language's beat-review snapshot to the run folder.
 
     Merges into any existing file so each language's entry can be written
     independently (mirroring how `_save_video_sections()` persists one

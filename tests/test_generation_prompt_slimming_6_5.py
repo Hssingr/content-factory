@@ -2,11 +2,10 @@
   1. The `_load_sections_from_db()`/`_load_video_sections()` duplication
      (visual_orchestrator.py vs video.py) is now one shared function,
      `app.services.video_sections.load_video_sections()`.
-  2. `generation_prompt`'s ~19 review-only fields (first15 diagnostics,
-     cinematic continuity tags, prompt quality warnings) no longer persist
-     to the DB — they move to a run-folder JSON file
-     (`visual_review.save_beat_review_metadata()`), read back by the local
-     HTML review page only.
+  2. `generation_prompt`'s ~19 legacy review-only fields remain out of
+     the DB, while the run-folder JSON snapshots fields the live storyboard
+     actually produces (`visual_review.save_beat_review_metadata()`), read
+     back by the local HTML review page only.
 
 Only the real internal functions are exercised; no paid API is involved on
 this path at all (pure DB/filesystem read-write).
@@ -25,6 +24,11 @@ from unittest.mock import patch
 
 from app.agents.agent4_visuals.services import visual_orchestrator as vo
 from app.agents.agent4_visuals.services import visual_review
+from app.agents.agent4_visuals.review_metadata import (
+    LEGACY_REVIEW_METADATA_FIELDS,
+    LIVE_REVIEW_SNAPSHOT_FIELDS,
+)
+from app.agents.agent4_visuals.subagents.storyboard import _build_beat_section
 from app.agents.agent5_render.services import video as agent5_video
 from app.models import VideoSection
 from app.services import video_sections
@@ -108,13 +112,7 @@ class TestSharedLoaderBehavior(unittest.TestCase):
 
 # ── Part 2: generation_prompt slimming ──────────────────────────────────────
 
-_REVIEW_ONLY_FIELDS = (
-    "negative_prompt", "shot_type", "subject", "action", "emotion", "camera",
-    "lighting", "composition", "continuity_tags", "visual_bible_refs",
-    "location", "character", "is_first_15_seconds", "prompt_quality_warnings",
-    "first15_validation_status", "first15_issues", "first15_strength_tags",
-    "first15_enhanced", "first15_validation_summary",
-)
+_REVIEW_ONLY_FIELDS = LEGACY_REVIEW_METADATA_FIELDS
 # overlay_text/overlay_position are no longer persisted at all (review finding
 # A2): the shared loader forces ""/"none" on every load, so writing them was
 # two dead keys per row per language.
@@ -157,6 +155,47 @@ class TestReviewMetadataRoundTrip(unittest.TestCase):
     """Real write (save_beat_review_metadata) -> real read
     (_load_review_metadata_by_key / _extract_row) round trip through the
     actual filesystem, no DB involved."""
+
+    def test_live_storyboard_metadata_survives_builder_remap_and_real_file_write(self):
+        """F1 regression: the writer used to select only fields that no current
+        producer emits, yielding section_order-only objects in every language."""
+        content_id = uuid.uuid4()
+        raw = {
+            "beat_order": 0,
+            "start_hint": "the crowd closes around the empress",
+            "end_hint": "but she refuses to leave",
+            "visual_intent": "The empress faces the crowd",
+            "visual_type": "b-roll",
+            "visual_category": "person",
+            "environment": "other",
+            "flux_prompt": "Byzantine empress facing a tense crowd, wide shot, daylight",
+            "effect": "slow_zoom",
+            "color_grade": "desaturated",
+            "transition_to_next": "cut",
+            "motif": "face",
+            "beat_intensity": "medium",
+            "suggested_duration_sec": 3.0,
+        }
+
+        mapped = _build_beat_section(raw, 0, 0, 3000, "The crowd closes in.")
+        remapped = vo._remap_beats_timing([mapped], 6000, 3000)
+
+        with TemporaryDirectory() as tmp:
+            with patch("app.services.local_run_paths.settings.media_path", tmp):
+                visual_review.save_beat_review_metadata(content_id, "__visual__", [mapped])
+                visual_review.save_beat_review_metadata(content_id, "fr", remapped)
+                persisted = json.loads(
+                    visual_review.get_review_metadata_path(content_id).read_text()
+                )
+
+        for language in ("__visual__", "fr"):
+            row = persisted[language][0]
+            self.assertEqual(row["visual_intent"], "The empress faces the crowd")
+            self.assertEqual(row["beat_intensity"], "medium")
+            self.assertEqual(row["start_hint"], "the crowd closes around the empress")
+            self.assertGreater(len(row), 1, "metadata row must not be section_order-only")
+            for field in LIVE_REVIEW_SNAPSHOT_FIELDS:
+                self.assertIn(field, row)
 
     def test_saved_metadata_is_read_back_and_merged_into_row(self):
         content_id = uuid.uuid4()

@@ -4184,11 +4184,11 @@ requires and type-checks (with the existing string-coercion fallback)
 **only** `beats` — the one field every downstream consumer
 (`_build_beat_section()`, `validate_storyboard()`, Flux generation) actually
 reads. A missing or wrong-typed auxiliary field is defaulted in place
-(`""`/`""`/`[]`) with a logged `STORYBOARD_SHAPE_AUX_FIELD_MISSING`/
-`STORYBOARD_SHAPE_AUX_FIELD_WRONG_TYPE` warning rather than raising — this is
-a logged fallback on genuinely inert fields, not a silent one, and does not
-loosen validation on `beats` itself (still fatal + retried if missing or
-wrong-typed, exactly as before). Runtime proof:
+(`""`/`""`/`[]`) rather than raising. Expected missing fields log
+`STORYBOARD_SHAPE_AUX_FIELD_MISSING` at DEBUG; a present but wrong-typed value
+still logs `STORYBOARD_SHAPE_AUX_FIELD_WRONG_TYPE` at WARNING because it is a
+real schema mismatch. Neither case loosens validation on `beats` itself
+(still fatal + retried if missing or wrong-typed, exactly as before). Runtime proof:
 `tests/test_storyboard_batch_auxiliary_field_defaults.py`.
 
 #### `map_storyboard_beats_to_timestamps`
@@ -4676,8 +4676,9 @@ Rules:
 Files:
 
 ```text
-app/agents/agent4_visuals/services/visual_orchestrator.py   (_beat_extras)
-app/agents/agent4_visuals/services/visual_review.py          (save_beat_review_metadata)
+app/agents/agent4_visuals/review_metadata.py                 (canonical field sets)
+app/agents/agent4_visuals/services/visual_orchestrator.py     (_beat_extras)
+app/agents/agent4_visuals/services/visual_review.py           (save_beat_review_metadata)
 ```
 
 `generation_prompt` (the DB-persisted JSON blob per `VideoSection` row) used
@@ -4698,8 +4699,8 @@ local-debug-only purpose.
 the first15 diagnostics and cinematic continuity fields (`continuity_tags`,
 `visual_bible_refs`, first15's fields) are no longer produced by anything —
 `cinematic_prompts.py` and `first15_validator.py` (the two generators of
-these fields) are deleted entirely, not just skipped. `visual_review.py`'s
-`_REVIEW_METADATA_FIELDS` list and its HTML rendering still reference these
+these fields) are deleted entirely, not just skipped. `review_metadata.py`'s
+`LEGACY_REVIEW_METADATA_FIELDS` and the HTML rendering still reference these
 keys, degrading gracefully to empty/dash for any content generated after
 this change while still rendering correctly for pre-existing
 `beat_review_metadata.json` files left by older runs — the same read-only
@@ -4715,7 +4716,16 @@ tooling (§13), not a production consumer.
   guard, §11.4 above). `overlay_text`/`overlay_position` are not persisted at
   all — the shared loader forces `""`/`"none"` on every load
   (subtitles-only rendering), so writing them was two dead keys per row.
-- The 19 review-only fields instead go to a run-folder JSON file —
+- `review_metadata.py` separates `LEGACY_REVIEW_METADATA_FIELDS` (the 19
+  historical enrichment keys retained for old-artifact compatibility) from
+  `LIVE_REVIEW_SNAPSHOT_FIELDS` (the fields the current structured storyboard
+  and timestamp pipeline actually produces: visual intent/type/category,
+  environment, Flux prompt, effect/grade/transition/motif, intensity/duration,
+  hints, and media identity). `REVIEW_METADATA_FIELDS` combines both for the
+  artifact writer. This fixes the empty-file regression: the old writer selected
+  only legacy keys whose producers had been deleted, so every current row
+  contained `section_order` and nothing else. No AI fields or calls were added.
+- The combined live snapshot and any present legacy review fields go to a run-folder JSON file —
   `save_beat_review_metadata(content_id, language, beats)`
   (`visual_review.py`) writes `{media_path}/runs/{content_id}/visuals/beat_review_metadata.json`,
   keyed by language then a list of `{section_order, ...fields present on the
@@ -4735,7 +4745,9 @@ tooling (§13), not a production consumer.
 Rules:
 
 - Do not add review-only fields back to `_beat_extras()`/`generation_prompt`
-  — extend `_REVIEW_METADATA_FIELDS` in `visual_review.py` instead.
+  — add live artifact fields to `LIVE_REVIEW_SNAPSHOT_FIELDS` or legacy-only
+  compatibility fields to `LEGACY_REVIEW_METADATA_FIELDS` in
+  `review_metadata.py`; never fork a second field list in the writer.
 - `save_beat_review_metadata()` must be called for every language
   `_save_video_sections()` is called for, at the same call site — a
   language saved to the DB but not to the review-metadata file silently
@@ -6053,10 +6065,12 @@ which nothing in the live pipeline queried back):
 {media_path}/runs/{content_id}/visuals/beat_review_metadata.json
 ```
 
-Prompt-quality telemetry and per-beat descriptive fields (`subject`,
-`emotion`, `camera`, etc.) live here, keyed by language then
-`section_order`. Written by `save_beat_review_metadata()` once per language,
-alongside every `_save_video_sections()` call. Local-debug/review
+Current storyboard fields (`visual_intent`, `flux_prompt`, visual enums,
+timing hints, intensity/duration, and media identity) are snapshotted here,
+keyed by language then `section_order`; legacy prompt-quality/descriptive keys
+(`subject`, `emotion`, `camera`, etc.) are retained when an older input carries
+them. Written by `save_beat_review_metadata()` once per language, alongside
+every `_save_video_sections()` call. Local-debug/review
 infrastructure only — `visual_review.html` reads it; nothing else does, and
 Agent 5 never depends on it. Its `continuity_tags`/`visual_bible_refs` and
 first15 diagnostic fields are dead going forward (nothing generates them

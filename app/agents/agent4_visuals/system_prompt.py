@@ -851,7 +851,7 @@ def generate_storyboard_batch(
         arrived with a complete, valid ``beats`` array but none of the other
         three keys — treating that as fatal discarded good beat data over
         fields nothing reads. Auxiliary fields are defaulted in place with a
-        logged warning rather than aborting the segment.
+        DEBUG diagnostic rather than aborting the segment.
 
         Before treating ``beats`` itself as wrong-typed, attempt one narrow
         coercion via ``_coerce_string_to_expected_type``: a real, observed
@@ -874,7 +874,7 @@ def generate_storyboard_batch(
         """
         for key, (default, expected_type) in _AUXILIARY_FIELD_DEFAULTS.items():
             if key not in storyboard:
-                logger.warning(
+                logger.debug(
                     "STORYBOARD_SHAPE_AUX_FIELD_MISSING segment=%s key=%s — "
                     "administrative field absent, defaulting to %r (never read "
                     "downstream beyond this check)",

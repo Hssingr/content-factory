@@ -10,7 +10,7 @@ Grep confirms none of the three auxiliary fields have a real downstream
 consumer (storyboard_status is never read past shape validation, global_notes
 is never read at all, overall_style only feeds one diagnostic log line) — so
 ``_check_shape()`` now only hard-requires ``beats`` and defaults the rest with
-a logged warning instead of raising.
+a DEBUG diagnostic instead of raising. Wrong-typed values remain warnings.
 
 Only the paid Claude boundary (``call_claude_structured_with_usage``) is
 stubbed — the real ``generate_storyboard_batch()`` function (including
@@ -57,10 +57,14 @@ class TestAuxiliaryFieldsDefaultedNotFatal(unittest.TestCase):
     def test_missing_all_three_auxiliary_fields_still_returns_beats(self):
         """Reproduces the exact real-run shape: only `beats` present."""
         response = {"beats": [_valid_beat(0), _valid_beat(1)]}
-        with patch.object(
-            system_prompt, "call_claude_structured_with_usage",
-            return_value=(response, {"input_tokens": 100, "output_tokens": 200}),
-        ) as fake_call:
+        with (
+            patch.object(
+                system_prompt, "call_claude_structured_with_usage",
+                return_value=(response, {"input_tokens": 100, "output_tokens": 200}),
+            ) as fake_call,
+            patch.object(system_prompt.logger, "debug") as debug_log,
+            patch.object(system_prompt.logger, "warning") as warning_log,
+        ):
             storyboard, usage, diag = system_prompt.generate_storyboard_batch(
                 segment_label="[INTRO]",
                 segment_text="A grinding metal sound never stops echoing from the mountain.",
@@ -69,6 +73,17 @@ class TestAuxiliaryFieldsDefaultedNotFatal(unittest.TestCase):
                 channel=_Channel(),
                 target_beat_count=5,
             )
+
+        missing_debugs = [
+            call for call in debug_log.call_args_list
+            if call.args and "STORYBOARD_SHAPE_AUX_FIELD_MISSING" in call.args[0]
+        ]
+        missing_warnings = [
+            call for call in warning_log.call_args_list
+            if call.args and "STORYBOARD_SHAPE_AUX_FIELD_MISSING" in call.args[0]
+        ]
+        self.assertEqual(len(missing_debugs), 3)
+        self.assertEqual(missing_warnings, [])
 
         # No retry needed — this must succeed on the first attempt.
         self.assertEqual(fake_call.call_count, 1)
@@ -85,10 +100,13 @@ class TestAuxiliaryFieldsDefaultedNotFatal(unittest.TestCase):
             "overall_style": None,          # wrong type
             "global_notes": "not a list",   # wrong type
         }
-        with patch.object(
-            system_prompt, "call_claude_structured_with_usage",
-            return_value=(response, {"input_tokens": 100, "output_tokens": 200}),
-        ) as fake_call:
+        with (
+            patch.object(
+                system_prompt, "call_claude_structured_with_usage",
+                return_value=(response, {"input_tokens": 100, "output_tokens": 200}),
+            ) as fake_call,
+            patch.object(system_prompt.logger, "warning") as warning_log,
+        ):
             storyboard, _usage, _diag = system_prompt.generate_storyboard_batch(
                 segment_label="[SECTION 1]",
                 segment_text="Body narration.",
@@ -97,6 +115,12 @@ class TestAuxiliaryFieldsDefaultedNotFatal(unittest.TestCase):
                 channel=_Channel(),
                 target_beat_count=5,
             )
+
+        wrong_type_warnings = [
+            call for call in warning_log.call_args_list
+            if call.args and "STORYBOARD_SHAPE_AUX_FIELD_WRONG_TYPE" in call.args[0]
+        ]
+        self.assertEqual(len(wrong_type_warnings), 3)
 
         self.assertEqual(fake_call.call_count, 1)
         self.assertEqual(storyboard["storyboard_status"], "")
