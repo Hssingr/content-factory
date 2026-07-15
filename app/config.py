@@ -97,11 +97,12 @@ class Settings(BaseSettings):
     # desync. Set to 0 (or negative) to disable compression entirely.
     audio_max_interior_silence_ms: int = 650
 
-    # Agent 4 image model routing (Phase 14.6 foundation) — conservative by
-    # default. With routing disabled (the default), every generated beat uses
-    # Flux Schnell exactly as before that phase.
-    image_routing_enabled: bool = False
-    image_routing_allow_dev: bool = False
+    # Agent 4 image model routing (Phase 14.6 foundation; Tier 5 R16 enabled by
+    # operator decision). Qualifying cover/high-intensity/person/reveal beats
+    # use Flux Dev; ordinary beats remain on Schnell. Environment variables can
+    # still disable either switch for a cost-constrained deployment.
+    image_routing_enabled: bool = True
+    image_routing_allow_dev: bool = True
     image_routing_allow_pro: bool = False
     # Hard cap on Pro-family images per content item. Default 0 means Pro is
     # never selected even if image_routing_allow_pro is true, until an

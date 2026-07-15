@@ -87,9 +87,9 @@ _STORY_PREMISE_SCHEMA: dict = {
 }
 
 _STORY_PREMISE_SYSTEM_PROMPT = """\
-You are an original-fiction premise writer for an automated video channel system.
+You are a story-premise writer for an automated video channel system.
 
-Your task: invent a concrete original story idea that fits the channel's niche, tone, AND
+Your task: create a concrete story idea that fits the channel's niche, tone, AND
 description exactly, and describe it PLAINLY. A human operator will read only this title and
 description on a phone screen and decide whether to greenlight full production — this is an
 approval screen, not a viewer-facing hook. The operator must know EXACTLY what the story is
@@ -104,12 +104,12 @@ Rules:
 - The channel description below is the most specific signal you have for what to write about —
   it is not background color, it is the actual subject-matter brief. If it names a topic, era,
   theme, or focus (e.g. "ancient military history and famous battles", "small-town urban
-  legends"), the story you invent must be a concrete instance of exactly that — not a
+  legends"), the story you create must be a concrete instance of exactly that — not a
   generically-themed substitute that only loosely fits the niche/tone. Niche and tone narrow
   the category and register; the description tells you the specific kind of story to write.
-- This is ORIGINAL FICTION, written by you, not a real discovered post. Never frame it as a
-  real Reddit/forum post: no invented usernames, no "OP", no fake upvote/comment counts, no
-  "as told by u/...", no claim that this really happened to a real person online.
+- Unless the channel brief explicitly requests a real historical subject, write ORIGINAL
+  FICTION. Never frame any result as a real discovered Reddit/forum post: no invented
+  usernames, no "OP", no fake upvote/comment counts, no "as told by u/...".
 - Title: state the specific subject/situation plainly — name who or what the story is about
   and the core situation, not a cryptic or clickbait phrase.
 - Description (body): write 2-4 sentences that plainly state the situation, the setting, and
@@ -123,9 +123,15 @@ Rules:
 - Ground it tightly in the channel's niche, tone, AND description provided below — it must
   read as something that channel would actually publish, not a generic story that merely fits
   the broad category.
-- Rights/IP safe: never use a real named public figure, a real named franchise/character/
-  fictional world, or present a real identifiable person's real biography as fact. Original
-  characters and settings only.
+- Historical accuracy: when the channel brief explicitly concerns real historical subjects,
+  every verifiable fact — geography, distance, chronology, named people, roles, and outcomes —
+  must be accurate. Never invent a route, time span, relationship, or event for drama.
+- Frame debated traditions as attributed tradition (for example, "later chroniclers claimed")
+  rather than settled fact. Introduce every named person by role or relationship on first
+  mention (for example, "my brother Mago" or "Maharbal, commander of his cavalry").
+- Rights/IP safe: long-deceased historical figures are permitted only under the accuracy rule
+  above. Never use a living/recent public figure, real named franchise/character, or fictional
+  world, and never present invented biography as fact.
 - Never pad length to hit a target — stop once the description is clear and complete.
 
 Return ONLY valid JSON. No markdown. No code fence.
@@ -137,7 +143,7 @@ _STORY_EXPANSION_SCHEMA: dict = {
     "properties": {
         "body": {
             "type": "string",
-            "description": "The full original story, in prose, in the target language.",
+            "description": "The full narrative, in prose, in the target language.",
         },
     },
     "required": ["body"],
@@ -145,15 +151,16 @@ _STORY_EXPANSION_SCHEMA: dict = {
 }
 
 _STORY_EXPANSION_SYSTEM_PROMPT = """\
-You are an original-fiction writer for an automated video channel system.
+You are a narrative writer for an automated video channel system.
 
-Your task: expand a human-approved story premise into a complete original story that will be
+Your task: expand a human-approved story premise into a complete narrative that will be
 the sole source material for a video script. Nothing outside what you write here will be used
 to ground the script — write the real story, not another summary.
 
 Rules:
-- This is ORIGINAL FICTION, written by you. Never frame it as a real Reddit/forum post, never
-  invent usernames/upvotes/"OP", never claim this really happened to a real person online.
+- Unless the approved premise explicitly concerns a real historical subject, write ORIGINAL
+  FICTION. Never frame any result as a real discovered Reddit/forum post and never invent
+  usernames/upvotes/"OP".
 - Preserve the approved premise faithfully — the situation, central tension/mystery, and tone
   it establishes must carry through unchanged. Do not invent a different plot or twist the
   premise into a different story than what was approved.
@@ -163,10 +170,19 @@ Rules:
 - Ground it in the channel's niche, tone, AND description provided below — the description is
   the specific subject-matter brief the approved premise was itself written from; stay
   faithful to it, not just to the broader niche/tone category.
-- Rights/IP safe: original characters and settings only — never a real named public figure or
-  a real named franchise/character/fictional world.
+- Historical accuracy: when the approved premise concerns real historical subjects, every
+  verifiable fact — geography, distance, chronology, named people, roles, and outcomes — must
+  be accurate. Never invent a route, time span, relationship, or event for drama.
+- Frame debated traditions as attributed tradition (for example, "later chroniclers claimed")
+  rather than settled fact. Introduce every named person by role or relationship on first
+  mention (for example, "my brother Mago" or "Maharbal, commander of his cavalry").
+- Rights/IP safe: long-deceased historical figures are permitted only under the accuracy rule
+  above. Never use a living/recent public figure, real named franchise/character, or fictional
+  world, and never present invented biography as fact.
 - Never pad with filler or repetition to reach a length target — write a genuinely complete
-  story; length follows naturally from telling it properly.
+  story. Treat the target length supplied below as a ceiling as well as a goal: plan the arc
+  before writing, stay close to the target, and do not exceed it. If the story is complete
+  sooner, stop rather than padding.
 - Write in the target language provided below.
 
 Return ONLY valid JSON. No markdown. No code fence.
@@ -297,14 +313,21 @@ Rules:
   subject/situation, and a 2-4 sentence description that plainly states the situation, setting,
   and people/conflict involved — never a mystery teaser that withholds the subject. The
   operator is deciding whether to approve from this text alone.
-- This is ORIGINAL FICTION, written by you, not a real discovered post. Never frame it as a
-  real Reddit/forum post: no invented usernames, no "OP", no fake upvote/comment counts, no
-  claim this really happened to a real person online.
+- Unless the channel brief or operator's requested direction explicitly concerns a real
+  historical subject, write ORIGINAL FICTION. Never frame any result as a real discovered
+  Reddit/forum post: no invented usernames, no "OP", no fake upvote/comment counts.
 - Ground it in the channel's niche, tone, AND description provided below — the description
   names the specific kind of story to write, not just the broad category.
-- Rights/IP safe: never use a real named public figure, a real named franchise/character/
-  fictional world, or present a real identifiable person's real biography as fact. Original
-  characters and settings only.
+- Historical accuracy: when the channel brief, conversation, or requested revision concerns
+  real historical subjects, every verifiable fact — geography, distance, chronology, named
+  people, roles, and outcomes — must be accurate. Never invent a route, time span,
+  relationship, or event for drama.
+- Frame debated traditions as attributed tradition (for example, "later chroniclers claimed")
+  rather than settled fact. Introduce every named person by role or relationship on first
+  mention (for example, "my brother Mago" or "Maharbal, commander of his cavalry").
+- Rights/IP safe: long-deceased historical figures are permitted only under the accuracy rule
+  above. Never use a living/recent public figure, real named franchise/character, or fictional
+  world, and never present invented biography as fact.
 - If the operator's feedback clearly asks for a different story entirely (not an adjustment to
   this one), treat that as the new direction — you are not required to preserve the old
   subject if the operator explicitly wants to abandon it.
@@ -426,7 +449,8 @@ def expand_story_premise(
         f"Channel tone: {channel.tone}\n"
         f"Channel description: {channel.description or '(none provided)'}\n"
         f"Target language: {language}\n"
-        f"Target length: approximately {word_target} words (a complete story, not a summary).\n\n"
+        f"Target length: {word_target} words (a complete story, not a summary); "
+        f"stay close to this target and do not exceed it.\n\n"
         f"Approved premise to expand:\n{premise}"
     )
 

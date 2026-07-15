@@ -156,7 +156,7 @@ class TestShortsPlannerChecksChildrenBeforePlanCall(unittest.TestCase):
         db, channel, config, parent_id = self._fixtures(with_children=False)
         calls = []
 
-        def fake_plan(voice_script, blueprint, channel_arg):
+        def fake_plan(voice_script, blueprint, channel_arg, narration_pov="third_person"):
             calls.append(1)
             return None  # planner declines — planner exits cleanly after the call
 

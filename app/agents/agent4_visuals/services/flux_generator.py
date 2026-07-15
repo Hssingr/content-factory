@@ -370,9 +370,9 @@ def generate_beat_image_with_routing(
     (``tier_counts``, shared across one content item's generation run —
     caller-owned, not persisted).
 
-    With routing disabled (the default), this always resolves to ``"schnell"``
-    — identical to calling ``generate_beat_image()`` directly, as every
-    caller did before this phase. A beat whose ``media_url`` is already a
+    With routing explicitly disabled, this resolves to ``"schnell"``. The
+    operator-enabled default routes qualifying beats to Dev while ordinary
+    beats stay on Schnell. A beat whose ``media_url`` is already a
     local ``cache/`` path short-circuits (``route.source == "reuse"``):
     the existing path is returned untouched with no generation call and no
     tier-count increment.

@@ -267,7 +267,8 @@ _SHORT_REMAP_SYSTEM_PROMPT = (
     "Divide the narration into phrases of roughly 3-5 seconds each. "
     "For each phrase, assign the most thematically relevant parent beat.\n\n"
     "For each assignment:\n"
-    "- narration_phrase: the exact narration text this beat covers (verbatim excerpt)\n"
+    "- narration_phrase: COPY/PASTE one contiguous substring from the Short narration "
+    "that this beat covers, verbatim and in narration order\n"
     "- long_beat_order: integer index from the parent beat index that best matches this phrase\n"
     "- match_score: 0-100 integer\n"
     "  90-100: Same subject and setting — inherit the parent prompt\n"
@@ -282,6 +283,8 @@ _SHORT_REMAP_SYSTEM_PROMPT = (
     "  'medium': story progression, context\n"
     "  'low':    setup, establishing, pause\n\n"
     "Rules:\n"
+    "- narration_phrase must occur literally in the supplied Short narration. Never "
+    "translate, paraphrase, summarize, change accents/apostrophes, or rewrite punctuation\n"
     "- Multiple phrases may share the same long_beat_order\n"
     "- Prefer variety: if two phrases have similar scores, pick different parent beats\n"
     "- new_image_prompt must describe a concrete vertical/portrait physical scene: subject, "
@@ -289,7 +292,7 @@ _SHORT_REMAP_SYSTEM_PROMPT = (
     "copied as a sentence. When global visual direction / image style lines are present, "
     "write the prompt in that style (matching the parent prompts' look)\n"
     "- Return ONLY valid JSON. No markdown. No code fence. No extra keys.\n"
-    "PROMPT_VERSION = \"2.0\""
+    "PROMPT_VERSION = \"2.1\""
 )
 
 _SHORT_REMAP_MAX_TOKENS = 4096
@@ -651,7 +654,12 @@ def split_into_beats(
             # continuity summary — sub-calls of one oversized segment get the
             # same continuity treatment as separate segments.
             _update_ledger(ledger, beats)
-            previous_summary = _summarize_batch_for_continuity(sub_label, beats, ledger)
+            previous_summary = _summarize_batch_for_continuity(
+                sub_label,
+                beats,
+                ledger,
+                era_locked="Era/setting lock:" in continuity_line,
+            )
 
     beats = _merge_batches(raw_batches)
     beats = _collapse_duplicate_hint_runs(beats, language=language)
@@ -874,7 +882,13 @@ def _overused_motifs(ledger: dict) -> list[str]:
     })
 
 
-def _summarize_batch_for_continuity(label: str, beats: list[dict], ledger: dict) -> str:
+def _summarize_batch_for_continuity(
+    label: str,
+    beats: list[dict],
+    ledger: dict,
+    *,
+    era_locked: bool = False,
+) -> str:
     """Build a continuity/diversity note for the next segment's prompt.
 
     Includes the closing 3 beats' descriptors, cumulative environment/motif
@@ -902,7 +916,10 @@ def _summarize_batch_for_continuity(label: str, beats: list[dict], ledger: dict)
             f"Last 6 visual_types: {recent_vt}"
         )
 
-    forbidden_envs = _overused_environments(ledger)
+    # R18: in a locked historical setting, an environment-frequency ban can
+    # force the next batch into anachronistic labels. Keep environment totals
+    # as telemetry but constrain motif/framing diversity instead.
+    forbidden_envs = [] if era_locked else _overused_environments(ledger)
     forbidden_motifs = _overused_motifs(ledger)
     if forbidden_envs:
         closing += (
@@ -915,6 +932,12 @@ def _summarize_batch_for_continuity(label: str, beats: list[dict], ledger: dict)
             ". FORBIDDEN motifs for the next segment: "
             + ", ".join(forbidden_motifs)
             + ". Choose different motif values unless the narration explicitly makes one unavoidable"
+        )
+    if era_locked:
+        closing += (
+            ". ERA-LOCKED DIVERSITY: environment totals are telemetry only; preserve the "
+            "historically accurate setting, use environment=other when no listed value fits, "
+            "and vary motif, camera distance/angle, composition, or effect instead"
         )
     if forbidden_envs or forbidden_motifs:
         logger.warning(
@@ -2146,6 +2169,51 @@ def _derive_child_alignment_hints(narration_phrase: str) -> tuple[str, str]:
     return " ".join(words[:n]), " ".join(words[-n:])
 
 
+def _reslice_child_narration_phrase(
+    voice_script: str,
+    narration_phrase: str,
+    *,
+    start_offset: int = 0,
+    language: str = "en",
+) -> tuple[str, int, bool]:
+    """Return an exact source substring for a sequential remap phrase.
+
+    The remap can preserve every word but change case or punctuation, especially
+    around French apostrophes. Match normalized source-token spans, then slice
+    the original script so hints retain authoritative accents and punctuation.
+    A real paraphrase is unchanged; the caller records it as telemetry.
+    """
+    if not voice_script or not narration_phrase:
+        return narration_phrase, start_offset, False
+
+    exact_at = voice_script.find(narration_phrase, start_offset)
+    if exact_at >= 0:
+        end = exact_at + len(narration_phrase)
+        return voice_script[exact_at:end], end, True
+
+    token_pattern = re.compile(r"\w+(?:[\u2019\u0027]\w+)*", re.UNICODE)
+    source_tokens = [
+        (match.start(), match.end(), _normalize_for_matching(match.group(0), language))
+        for match in token_pattern.finditer(voice_script, start_offset)
+    ]
+    phrase_tokens = [
+        _normalize_for_matching(match.group(0), language)
+        for match in token_pattern.finditer(narration_phrase)
+    ]
+    phrase_tokens = [token for token in phrase_tokens if token]
+    if not phrase_tokens:
+        return narration_phrase, start_offset, False
+
+    width = len(phrase_tokens)
+    for index in range(0, len(source_tokens) - width + 1):
+        candidate = [token[2] for token in source_tokens[index:index + width]]
+        if candidate == phrase_tokens:
+            raw_start = source_tokens[index][0]
+            raw_end = source_tokens[index + width - 1][1]
+            return voice_script[raw_start:raw_end], raw_end, True
+    return narration_phrase, start_offset, False
+
+
 def _parent_media_reusable(parent_media: str, extras: dict) -> bool:
     """True when a parent beat's image may be reused by a child Short beat.
 
@@ -2358,6 +2426,9 @@ def remap_beats_for_short(
     inherited_count = 0
     new_prompt_count = 0
     missing_hint_count = 0
+    phrase_mismatch_count = 0
+    phrase_reslice_count = 0
+    phrase_cursor = 0
 
     for i, assignment in enumerate(assignments):
         long_order       = int(assignment.get("long_beat_order", -1))
@@ -2373,6 +2444,25 @@ def remap_beats_for_short(
                 "— assignment has no narration_phrase, alignment hints will be empty for this beat",
                 content_id_str, i, long_order,
             )
+        else:
+            source_phrase, next_cursor, phrase_matched = _reslice_child_narration_phrase(
+                short_voice_script,
+                narration_phrase,
+                start_offset=phrase_cursor,
+                language=getattr(short_audio_file, "language", "en") or "en",
+            )
+            if phrase_matched:
+                if source_phrase != narration_phrase:
+                    phrase_reslice_count += 1
+                narration_phrase = source_phrase
+                phrase_cursor = next_cursor
+            else:
+                phrase_mismatch_count += 1
+                logger.warning(
+                    "CHILD_REMAP_NON_VERBATIM_PHRASE content_id=%s assignment_index=%d "
+                    "long_beat_order=%d phrase=%r",
+                    content_id_str, i, long_order, narration_phrase[:180],
+                )
 
         start_hint, end_hint = _derive_child_alignment_hints(narration_phrase)
 
@@ -2458,6 +2548,12 @@ def remap_beats_for_short(
         "CHILD_SHORT_PROMPT_INHERITANCE_STATS content_id=%s beats=%d "
         "inherited_parent_prompts=%d new_prompts=%d inherited_rate=%.1f%%",
         content_id_str, total_beats, inherited_count, new_prompt_count, inherited_rate,
+    )
+    logger.info(
+        "CHILD_REMAP_VERBATIM_STATS content_id=%s beats=%d exact_or_resliced=%d "
+        "resliced=%d non_verbatim=%d",
+        content_id_str, total_beats, total_beats - missing_hint_count - phrase_mismatch_count,
+        phrase_reslice_count, phrase_mismatch_count,
     )
 
     # 5. Map to real timestamps via Short's own Whisper transcript

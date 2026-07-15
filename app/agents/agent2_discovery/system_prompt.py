@@ -7,7 +7,12 @@ from app.services.script_checks import split_sentences
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "5.2"  # v5.2: pre-next-test roadmap Tier 2 R6 — all three native-
+PROMPT_VERSION = "5.3"  # v5.3: pre-next-test roadmap Tier 4 R11/R13/R14 — first-person
+                        # cold-open identity stays first-person in both Shorts prompts;
+                        # cliffhangers must name a concrete unresolved subject and sunk-cost
+                        # logic is narrator rationalization; Short target tightened to 140-170
+                        # words (telemetry remains non-blocking, no trim/retry mechanism).
+                        # v5.2: pre-next-test roadmap Tier 2 R6 — all three native-
                         # adaptation base prompts gained "a question stays a question":
                         # an interrogative source sentence must stay interrogative in
                         # the target language (a real FR adaptation shipped the final
@@ -1460,8 +1465,9 @@ Rules:
 - total_parts must be between 3 and 5 (inclusive). Never fewer than 3 or more than 5.
 - Split at narrative boundaries: reveals, discoveries, reversals, or escalations.
   Never split primarily by time — narrative logic is paramount.
-- Each part covers 65–90 seconds of spoken narration (≈135–180 words at the measured
-  ~120 wpm real Short narration rate).
+- Each part targets 70–85 seconds of spoken narration (≈140–170 words at the measured
+  ~120 wpm real Short narration rate). Keep the plan scoped tightly enough for the writer
+  to stay within that range without omitting the main reveal.
 - Every part must be independently watchable: a viewer who starts on Part 3 must
   understand the situation from the first 5 seconds without having seen prior parts.
 - opening_hook: 1–2 sentences, each ≤15 words, starts at a high-tension story moment. No recap.
@@ -1471,11 +1477,20 @@ Rules:
   such as "they weren't hypothetical", "that changed everything", "but then", or an
   unexplained he/she/they/this/that. Must reference something SPECIFIC from the story —
   not a generic "wait for it" tease — while withholding the part's payoff.
+- Narration POV is provided below. In "first_person_storytime" mode, satisfy the
+  cold-open identity requirement IN the narrator's own first-person voice (for example,
+  "I am Hannibal Barca" or "I led Carthage's army"). Never add a third-person naming
+  sentence and then switch to I/me/my. In "third_person" mode, name the subject normally.
 - Part N's cliffhanger must be directly answered by Part N+1's main_reveal.
+  Every cliffhanger must name the concrete unresolved threat, person, event, place, or
+  object — never tease only "something", "what came next", or another unnamed abstraction.
   The final part's cliffhanger is replaced by a comment trigger question (ends with "?").
   That final question must be unique to this story and must not copy blueprint.comment_trigger
   verbatim or near-verbatim; avoid reusable CTAs such as "what would you do?".
 - Never invent facts not present in the voice script or blueprint.
+- If a part uses sunk-cost reasoning ("we came this far", "turning back would waste it"),
+  frame it explicitly as the narrator's or character's rationalization under pressure,
+  never as objective wisdom or advice endorsed by the script.
 - goal, main_content_summary, and main_reveal: one concise sentence each.
 
 Output ONLY the tool schema. No prose, no extra keys.\
@@ -1517,7 +1532,12 @@ _SHORTS_PLAN_SCHEMA: dict = {
 }
 
 
-def generate_shorts_plan(voice_script: str, blueprint: dict, channel) -> dict:
+def generate_shorts_plan(
+    voice_script: str,
+    blueprint: dict,
+    channel,
+    narration_pov: str = "third_person",
+) -> dict:
     """Plan 3–5 standalone TikTok episodes from a long-form voice script.
 
     Uses a SECONDARY_MODEL structured call — the output is validated by Python
@@ -1528,6 +1548,8 @@ def generate_shorts_plan(voice_script: str, blueprint: dict, channel) -> dict:
         voice_script: Fully assembled long-form voice script (with markers).
         blueprint:    Blueprint dict from generate_story_blueprint().
         channel:      Channel ORM object (provides niche and tone).
+        narration_pov: Canonical channel narration perspective. The planner uses
+                       it to phrase cold-open identity in the correct person.
 
     Returns:
         Dict with ``total_parts`` (int) and ``parts`` (list of part plan dicts).
@@ -1541,6 +1563,7 @@ def generate_shorts_plan(voice_script: str, blueprint: dict, channel) -> dict:
     user_message = (
         f"Channel niche: {channel.niche}\n"
         f"Channel tone: {channel.tone}\n\n"
+        f"Narration POV: {narration_pov or 'third_person'}\n\n"
         f"Blueprint:\n{json.dumps(blueprint, ensure_ascii=False)}\n\n"
         f"Long-form voice script:\n{voice_script}"
     )
@@ -1588,10 +1611,10 @@ You are writing a TikTok episode script — one standalone part of a multi-part 
 This is NOT a cut of a longer video. It is purpose-built for TikTok.
 
 Rules:
-- Hard limit: 135–180 words. Count every word in voice_script before returning.
-  If voice_script exceeds 180 words, cut it — remove the least essential sentences
-  until the count is at or below 180. Do not return until the word count is ≤180.
-  (180 words ≈ 90 seconds at the measured ~120 wpm real Short narration rate —
+- Target 140–170 words. Count every word in voice_script before returning.
+  If voice_script exceeds 170 words, remove the least essential sentences until
+  the count is at or below 170. Do not pad a complete script merely to reach 140.
+  (170 words ≈ 85 seconds at the measured ~120 wpm real Short narration rate —
   calibrated from production audio, not the raw "words per second" of the TTS voice.)
 - First sentence uses the opening_hook from the plan, ≤15 words, and starts at a
   high-tension story moment. It must also pass the cold-open deletion test: read it as
@@ -1619,6 +1642,9 @@ Rules:
 - Do not state the same fact or implication twice in this script, even in different
   words. Once something is established, move forward — do not circle back to it.
 - End by delivering the planned cliffhanger while preserving its narrative intent — this is what drives the viewer to Part N+1
+- The cliffhanger must name the concrete unresolved threat, person, event, place,
+  or object. Never end only on an unnamed "something", "what came next", or a
+  similarly abstract tease.
 - CTA diversity: the final question/CTA must be specific to THIS Short's unresolved
   moment and must not copy blueprint.comment_trigger verbatim or near-verbatim. Do
   not reuse generic channel endings such as "what would you do?", "would you go
@@ -1634,6 +1660,11 @@ Rules:
   protagonist retelling their own experience directly to the viewer, using
   "I"/"me"/"my" throughout (the r/nosleep-style storytime format). Never mix POV
   within this part's narration.
+- In "first_person_storytime" mode, satisfy the cold-open identity requirement in
+  first person (for example, "I am Hannibal Barca" or "I led Carthage's army").
+  Never insert a third-person naming sentence and then switch to I/me/my.
+- Any sunk-cost reasoning must be framed as my/the character's rationalization
+  under pressure, never as objective wisdom or advice endorsed by the narration.
 - ORIGINALITY — this is the most strictly enforced rule in this prompt: you will be
   given the long-form voice script for story grounding only. You must NEVER lift a
   run of 6 or more consecutive words directly from it, even when the long-form
@@ -1654,7 +1685,7 @@ _SHORT_EPISODE_SCHEMA: dict = {
     "type": "object",
     "properties": {
         "title":        {"type": "string", "description": "Part N title (≤60 chars, TikTok-optimized)."},
-        "voice_script": {"type": "string", "description": "Full flat narration text, 135-180 words."},
+        "voice_script": {"type": "string", "description": "Full flat narration text, target 140-170 words."},
     },
     "required": ["title", "voice_script"],
     "additionalProperties": False,

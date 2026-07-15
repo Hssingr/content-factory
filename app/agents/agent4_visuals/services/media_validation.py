@@ -26,6 +26,9 @@ _IMAGE_ASPECT_TOLERANCE = 0.03
 # a row generated before the gate existed, or CSS color-grade filters could
 # still darken a borderline-passing frame further at render time).
 _NEAR_BLACK_LUMINANCE_FLOOR = 24.0
+_LETTERBOX_EDGE_LUMINANCE_CEILING = 12.0
+_LETTERBOX_CENTER_LUMINANCE_FLOOR = 48.0
+_LETTERBOX_EDGE_FRACTION = 0.03
 
 
 @dataclass(frozen=True)
@@ -185,6 +188,11 @@ def validate_visual_media_assets(
         luminance_issue = _validate_image_luminance(resolved)
         if luminance_issue is not None:
             blocking.append(_issue(row, luminance_issue[0], luminance_issue[1], media_path))
+            continue
+
+        letterbox_issue = _validate_image_letterbox(resolved)
+        if letterbox_issue is not None:
+            blocking.append(_issue(row, letterbox_issue[0], letterbox_issue[1], media_path))
             continue
 
         valid_local_media_count += 1
@@ -415,6 +423,48 @@ def _validate_image_luminance(path: Path) -> tuple[str, str] | None:
             f"Local image is near-black (mean luminance {mean:.1f}/255, floor "
             f"{_NEAR_BLACK_LUMINANCE_FLOOR:.0f}) — a Flux generation likely "
             "produced a blank/failed frame.",
+        )
+    return None
+
+
+def _validate_image_letterbox(path: Path) -> tuple[str, str] | None:
+    """Reject baked-in black horizontal or vertical border pairs.
+
+    A border pair must be near-black while the inset center is clearly bright;
+    this avoids classifying an intentionally dark full-frame image as letterboxed.
+    The check is local and deterministic, in the same validation class as the
+    near-black luminance gate.
+    """
+    try:
+        with Image.open(path) as image:
+            gray = image.convert("L")
+            width, height = gray.size
+            if width < 8 or height < 8:
+                return None
+            x_band = max(1, round(width * _LETTERBOX_EDGE_FRACTION))
+            y_band = max(1, round(height * _LETTERBOX_EDGE_FRACTION))
+            inset_x = min(width // 4, max(x_band + 1, round(width * 0.15)))
+            inset_y = min(height // 4, max(y_band + 1, round(height * 0.15)))
+
+            def mean(box: tuple[int, int, int, int]) -> float:
+                return float(ImageStat.Stat(gray.crop(box)).mean[0])
+
+            top = mean((0, 0, width, y_band))
+            bottom = mean((0, height - y_band, width, height))
+            left = mean((0, 0, x_band, height))
+            right = mean((width - x_band, 0, width, height))
+            center = mean((inset_x, inset_y, width - inset_x, height - inset_y))
+    except (UnidentifiedImageError, OSError, ValueError):
+        return None
+
+    horizontal = max(top, bottom) <= _LETTERBOX_EDGE_LUMINANCE_CEILING
+    vertical = max(left, right) <= _LETTERBOX_EDGE_LUMINANCE_CEILING
+    if center >= _LETTERBOX_CENTER_LUMINANCE_FLOOR and (horizontal or vertical):
+        orientation = "horizontal" if horizontal else "vertical"
+        return (
+            "letterboxed_image",
+            f"Local image has near-black {orientation} edge borders "
+            f"(center luminance {center:.1f}/255) baked into the pixels.",
         )
     return None
 

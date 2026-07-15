@@ -6,8 +6,7 @@ for whichever fal.ai Flux endpoint is selected. It does not call fal.ai itself
 — `flux_generator.py` remains the only direct `fal_client` integration point
 (CLAUDE.md §27.1/§7.1-style boundary: provider calls stay behind one wrapper).
 
-Conservative-by-default contract (do not relax without an explicit config
-change from the operator):
+Routing contract (Tier 5 R16 was explicitly enabled by the operator):
   - Ordinary generated beats route to Schnell unless
     `settings.image_routing_enabled` is True AND the relevant tier flag
     (`image_routing_allow_dev` / `image_routing_allow_pro`) is True AND the
@@ -134,8 +133,8 @@ class ImageRoute:
 def _heuristic_qualifies_for_higher_tier(beat: dict) -> bool:
     """First-pass Dev/Pro eligibility heuristic (Phase 14.5 recommendation).
 
-    Disabled by default at the call site (routing/tier flags default False) —
-    this function only matters once an operator explicitly opts in.
+    The pure function keeps conservative argument defaults for isolated callers;
+    production passes the operator-enabled settings from app.config.
     """
     if int(beat.get("beat_order", 0)) == 0:
         return True  # cover frame

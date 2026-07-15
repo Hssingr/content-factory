@@ -15,6 +15,7 @@ from app.agents.agent2_discovery.services.scripts import (
 )
 from app.agents.agent2_discovery.services.story import MAX_SOURCE_EXCERPT_CHARS, Story
 from app.agents.agent2_discovery.services.story_generator import expand_story_premise
+from app.agents.agent2_discovery.services.narration_pov import normalize_narration_pov
 from app.agents.agent2_discovery.system_prompt import generate_story_blueprint
 from app.models import Channel, ChannelConfig, ChannelVoice, Content, Script
 from app.services.local_run_paths import ensure_run_dirs
@@ -341,7 +342,9 @@ def _load_script_workflow_context(
     tts_provider = src_voice.provider if src_voice else "cartesia"
     visual_style = config.visual_style if config else ""
     image_style = config.image_style if config else ""
-    narration_pov = config.narration_pov if config else "third_person"
+    narration_pov = normalize_narration_pov(
+        getattr(config, "narration_pov", None), channel_id=channel.id,
+    )
 
     return ScriptWorkflowContext(
         channel=channel,

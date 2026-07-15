@@ -11,7 +11,10 @@ from app.services.claude_client import (
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "4.9"  # v4.9: Tier 3 alignment rules — never split one narration span into
+PROMPT_VERSION = "5.0"  # v5.0: Tier 5 R18 era-aware diversity — locked-era stories use
+                        #        motif/camera-framing diversity and never invent an anachronistic
+                        #        environment merely to evade an environment-frequency cap.
+                        # v4.9: Tier 3 alignment rules — never split one narration span into
                         #        consecutive beats with identical hint pairs; align sensory-reveal
                         #        imagery to the beat containing the reveal rather than a prior callback.
                         # v4.8: roadmap Phase C2/C3/C4 (operator video-output audit) — four
@@ -353,6 +356,10 @@ technology unless the story is explicitly contemporary. A real production run
 shipped modern anachronisms (a modern flag, a modern city waterfront, suit-like
 contemporary clothing) inside a 6th-century Byzantine story; this line exists
 specifically to stop that.
+For an era-locked story, never choose a laboratory, industrial, vehicle, office,
+or other environment merely to increase label diversity. If none of the fixed
+environment values honestly fits the period/location shown, use other and
+create diversity through motif, camera distance/angle, composition, and effect.
 
 == Global Visual Direction (operator-configured) ==
 When "Global visual direction:" and "Global image style:" lines appear in the user
@@ -600,6 +607,8 @@ Bad examples (forbidden):
      underwater | indoor_office | indoor_domestic | forest_nature | urban_street |
      corridor_interior | abstract_dark | open_landscape | laboratory | industrial |
      vehicle | other
+   If an Era/setting lock is present and none of these is historically honest,
+   use other. Never force an anachronistic label to satisfy diversity guidance.
 6. flux_prompt — Flux Schnell image generation prompt (see rules above). Never
    include readable-text instructions — no quoted phrases, no "the text reads".
 7. effect — slow_zoom | zoom_out | pan | push_in | shake | cut | fade_in | parallax
@@ -1020,6 +1029,5 @@ def generate_storyboard_batch(
         "elapsed_ms":    _total_elapsed_ms,
     }
     return storyboard, usage, diag
-
 
 

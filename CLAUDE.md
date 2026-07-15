@@ -903,7 +903,7 @@ acts on it.
 | `output_mode` | `str` (Pydantic `Literal`) | `"youtube_and_shorts"` | `"youtube_and_shorts"` (parent render + standalone shorts via `run_shorts_planner`, per §9.4) and `"youtube_long_only"` (same parent pipeline; `run_script_workflow()` skips the shorts planner, logged `SHORTS_PLANNER_SKIPPED` — post-roadmap deep audit, the first runtime consumer of this column) | `"shorts_only"` — reserved; Agent 5 always renders the parent main video, no switch exists to skip the long-form half |
 | `visual_style` | `str` (free-form, no DB enum) | `"story_driven"` (roadmap 4a / audit P1-9 — was `"documentary"`) | **Read by Agent 2 and Agent 4** — Agent 2 injects it into `generate_story_blueprint()`, `generate_section()`, and `generate_short_episode_script()` user messages as "Visual style:" so narration and hook framing align with the channel's visual aesthetic; Agent 4 injects it into every `generate_storyboard_batch()` call as "Global visual direction:" applying a consistent mood/color/lighting constraint across all beats. See §11 (Agent 4) for the Agent 4 injection contract. | **Reconciled (migration 009):** the former duplicate `video_style_type` column is dropped — its only consumer chain (Agent 5 `channel_style` → props `config.style`) ended in a Remotion prop no component ever read. `visual_style` is the single channel-level style column |
 | `image_style` | `str` (free-form, no DB enum) | `"photorealistic"` | **Read by Agent 2 and Agent 4** — Agent 2 injects it into the same three prompt functions as `visual_style` as "Image style:"; Agent 4 injects it into every `generate_storyboard_batch()` call as "Global image style:" applying a consistent Flux rendering approach across all beats. See §11 (Agent 4) for the Agent 4 injection contract. | No per-beat `image_style` override exists; the channel-level setting applies uniformly to every `flux_generated` beat |
-| `narration_pov` | `str` (Pydantic `Literal`, roadmap 4a / audit P1-9) | `"third_person"` | **Read by Agent 2 only** — `"third_person"` (standard narrator voice) or `"first_person_storytime"` (narrate as the protagonist, "I"/"me"/"my" — the r/nosleep storytime format). Threaded via `ScriptWorkflowContext` into `generate_story_blueprint()`, `generate_section()`, `generate_short_episode_script()`, and `generate_native_script()` (native adaptation is instructed to preserve the source's POV, never convert it) as "Narration POV:". Real behavioral rules exist in `_STORY_BLUEPRINT_SYSTEM_PROMPT`, `_SECTION_GENERATION_SYSTEM_PROMPT`, and `_SHORT_EPISODE_SYSTEM_PROMPT` — this is not a passthrough label. | Not read by Agent 4 — visual storyboard direction does not depend on narration person |
+| `narration_pov` | `str` (Pydantic `Literal`, roadmap 4a / audit P1-9) | `"third_person"` | **Read by Agent 2 only** — `"third_person"` (standard narrator voice) or `"first_person_storytime"` (narrate as the protagonist, "I"/"me"/"my" — the r/nosleep storytime format). Threaded via `ScriptWorkflowContext` into `generate_story_blueprint()`, `generate_section()`, `generate_shorts_plan()`, `generate_short_episode_script()`, and `generate_native_script()` (native adaptation is instructed to preserve the source's POV, never convert it) as "Narration POV:". Real behavioral rules exist in `_STORY_BLUEPRINT_SYSTEM_PROMPT`, `_SECTION_GENERATION_SYSTEM_PROMPT`, `_SHORTS_PLANNER_SYSTEM_PROMPT`, and `_SHORT_EPISODE_SYSTEM_PROMPT` — this is not a passthrough label. | Not read by Agent 4 — visual storyboard direction does not depend on narration person |
 
 Rules:
 
@@ -927,6 +927,14 @@ Rules:
   `OutputMode`/`NarrationPov`) — the API rejects any value outside the table
   above. `visual_style`/`image_style` are plain strings (no enum), matching
   the existing looseness those descriptors have always had (no DB enum).
+- Every Agent 2 `ChannelConfig.narration_pov` read passes through
+  `services/narration_pov.py::normalize_narration_pov()`. Canonical values
+  pass unchanged; missing config defaults silently to `third_person`; a
+  non-empty legacy/unknown value maps to the closest supported value and
+  logs `NARRATION_POV_NORMALIZED` at WARNING with channel ID, raw value, and
+  result. Migration `014_normalize_legacy_narration_pov.py` repairs the
+  observed persisted `first_person` token to `first_person_storytime`; the
+  read-time backstop remains for stale snapshots or manually written rows.
 - All six columns are `NOT NULL` with a `server_default` (migrations
   `alembic/versions/004_add_v3_channel_config_fields.py` for the first five,
   `008_add_narration_pov_and_story_driven_default.py` for `narration_pov`
@@ -2695,11 +2703,11 @@ Rules:
   calls, not one discarded planning call.
 - Existing child rows in `SCRIPTS_VALIDATED` are picked up by normal Agent 3 audio pickup.
 - Reads `config.narration_pov` (falling back to `"third_person"` when
-  `config` is `None`) alongside `visual_style`/`image_style` and forwards it
-  to `_generate_short_script()` → `generate_short_episode_script()` — same
-  channel-wide value every other Agent 2 call site uses (roadmap 4a / audit
-  P1-9; see §9.3's `generate_multilingual_scripts` entry for the full
-  threading rationale).
+  `config` is `None`, and normalizing invalid persisted values as described
+  in §8.1) alongside `visual_style`/`image_style`; it forwards the canonical
+  value both to `generate_shorts_plan()` and to `_generate_short_script()` →
+  `generate_short_episode_script()` — the same channel-wide value every
+  other Agent 2 call site uses.
 - No child with MAJOR deterministic script issues may be marked ready.
 - `generate_shorts_plan()` receives the full parent `voice_script`
   untruncated (prompt engineering audit §2.1) — the former `[:8000]` slice
@@ -2748,6 +2756,16 @@ telemetry only (Elimination Mandate, roadmap
   attempt. Applies only to source-language Short generation against the
   parent long-form script — not to parent long-form generation itself, and
   not to Phase 12.4's multilingual child-Short translation/adaptation path.
+- **Tier 4 content prompt rules (`PROMPT_VERSION` 5.2 → 5.3):** planner and
+  Short-writer cold-open identity must stay in first person when
+  `narration_pov="first_person_storytime"` (never a third-person naming
+  sentence followed by I/me/my); every cliffhanger names its concrete
+  unresolved threat/person/event/place/object; sunk-cost logic is explicitly
+  a pressured narrator/character rationalization, not objective advice.
+  Generation guidance is now 140–170 words in both prompts/schema
+  description. Python's existing 135–180 structural band remains
+  telemetry-only for tolerance — no trim, regeneration, or AI quality gate
+  was added.
 - Deterministic code still owns the hard duration band: `_MIN_SHORT_WORDS`
   (135 — raised from 125 by the fresh full-system audit §2.4: 125 words at
   120 wpm left only 1.5 s of margin over Agent 3's hard 61 s floor) through
@@ -2805,8 +2823,9 @@ on every discovery attempt — multiple tool-use rounds and real
 content doesn't need to be grounded in a real discovered post, this is
 avoidable spend. `ChannelConfig.script_source="ai_generated"` (alias
 `"claude_generated"`, normalized by `app.services.script_source.normalize_script_source()`,
-§7.6) is a real, executable alternative: Claude writes an original story,
-grounded only in the channel's existing `niche`/`tone`/`description` — no
+§7.6) is a real, executable alternative: Claude writes an original story or,
+when the channel explicitly requests it, an accuracy-bound historical
+narrative, grounded only in the channel's existing `niche`/`tone`/`description` — no
 new persisted "story brief" field, and no `ChannelSource` requirement.
 
 **Two-stage design — real generation cost is spent only after operator
@@ -2849,10 +2868,11 @@ but never re-rolled — Elimination Mandate (§9.3/§23): a quality judgment is
 telemetry only, not a retry trigger.
 
 Uses `call_claude_structured(task="story_synthesis", ...)` — the system
-prompt requires original fiction only (never fake Reddit framing: no
-invented usernames, no "OP", no fabricated upvote/comment counts, no claim
-this really happened to a real person online) and rights/IP-safe original
-characters/settings.
+prompt defaults to original fiction and never permits fake Reddit framing
+(no invented usernames, "OP", or fabricated engagement). A channel brief
+explicitly about long-deceased historical figures/events may use those real
+subjects under the accuracy contract below; living/recent public figures and
+named franchises/fictional worlds remain forbidden.
 
 **Title/description must be direct, not a mystery teaser (operator
 feedback, live-canary fix):** a real run produced vague, suspense-style
@@ -2868,9 +2888,17 @@ describe the story to someone else after reading it once — e.g. title
 Hannibal of Carthage leading his army, elephants included, across the
 Mediterranean and the Alps to fight Rome." The eventual resolution may
 still be left open (that's normal story structure); the *subject* must
-never be hidden to manufacture suspense. This does not reopen fiction vs.
-real-history scope — the feature remains original-fiction-only by explicit
-operator decision; only the directness of the operator-facing text changed.
+never be hidden to manufacture suspense.
+
+**Historical-accuracy framing (pre-next-test roadmap Tier 4 R12):** all
+three `story_generator.py` system prompts — premise, expansion, and
+conversational revision — apply the same conditional rule when the channel
+brief/premise/operator direction concerns real history: verifiable geography,
+distance, chronology, people, roles, relationships, and outcomes must be
+accurate; no invented route/time span/event for drama; debated traditions are
+attributed (for example, "later chroniclers claimed"); every named person is
+introduced by role or relationship on first mention. This is prompt grounding,
+not an AI judge/retry loop.
 
 **Channel description is the specific subject-matter brief, not
 background color (same fix):** the prompt now explicitly tells Claude that
@@ -2901,11 +2929,14 @@ Word-count target scales with `script_format`
 (`_EXPANSION_WORD_TARGETS = {"youtube_long": 1200}`, default `600` for any
 other format) — the same 900/420-word floor `check_source_material_floor()`
 uses, plus a buffer, so a real expansion clears the floor with margin rather
-than skating the exact line. The system prompt requires the expansion to
+than skating the exact line. The target is explicitly both goal and ceiling
+(`1200` for `youtube_long`): plan the arc, stay close, do not exceed, and stop
+rather than pad when complete. Python returns the single model result unchanged
+— there is no trim/retry mechanism. The system prompt requires the expansion to
 preserve the approved premise's situation/tension/tone faithfully (never
 invent a different plot), write a complete narrative with a real resolution
-(not an outline), and keep the same original-fiction/rights-safety rules as
-the premise prompt.
+(not an outline), and keep the same conditional fiction/history and rights-
+safety rules as the premise prompt.
 
 #### `run_discovery()` branching (`discovery.py`)
 
@@ -3084,9 +3115,9 @@ beyond transport-failure handling (Elimination Mandate — same convention as
 into a numbered transcript in the user message (every assistant premise
 version, every operator feedback line, in order) and instructs Claude to
 address the operator's most recent feedback while staying consistent with
-everything discussed before it. Same directness/rights-safety rules as
-`generate_story_premise()`'s prompt (§9.5 above) — a revision must be just
-as direct and clear as the original, never a mystery teaser. Returns
+everything discussed before it. Same directness/rights-safety and historical-
+accuracy rules as `generate_story_premise()`'s prompt (§9.5 above) — a revision
+must be just as direct and clear as the original, never a mystery teaser. Returns
 `{"title": ..., "body": ...}` on success, `None` on any failure.
 
 `test_pipeline/test_full_pipeline.py`'s `_run_telegram_approval()` mirrors
@@ -5172,8 +5203,7 @@ Core exports:
   hash input, backward-compatible with every pre-Phase-14.6 cache entry for
   the Schnell tier (see Cache keys below).
 
-Conservative-by-default contract (the load-bearing invariant of this
-section — do not relax without an explicit operator config change):
+Operator-enabled Dev-routing contract:
 
 - The former `purpose="text_card_background"` short-circuit in
   `select_route()` (and the `purpose` parameter itself) is deleted — text
@@ -5198,16 +5228,14 @@ section — do not relax without an explicit operator config change):
   documented name (`"fal-ai/flux/schnell"`, per Phase 14.5's research) —
   changing a live-traffic endpoint string cannot be verified without a live
   fal.ai call, which this and prior phases are forbidden from making. Dev/Pro
-  endpoints use the Phase-14.5-verified documented names since they are
-  never called by default and have no pre-existing production traffic to
-  preserve.
+  endpoints use the Phase-14.5-verified documented names. Dev is enabled by
+  default under the Tier 5 R16 operator decision; Pro remains disabled.
 
-Config flags (`app/config.py`, all default to preserving exact pre-14.6
-behavior):
+Config flags (`app/config.py`; Tier 5 R16 defaults):
 
 ```text
-image_routing_enabled              default False
-image_routing_allow_dev            default False
+image_routing_enabled              default True
+image_routing_allow_dev            default True
 image_routing_allow_pro            default False
 image_routing_max_pro_per_content  default 0
 ```
@@ -5291,7 +5319,7 @@ Rules:
   and `flux_generator.py`'s single `_call_fal()` call site.
 - Do not change `MODEL_CAPABILITIES["schnell"]["endpoint"]` without an
   operator-run live canary outside Claude Code/Codex first (CLAUDE.md §19.1).
-- Do not enable Dev/Pro tiers by default; do not raise
+- Dev routing is operator-enabled by default. Do not enable Pro by default or raise
   `image_routing_max_pro_per_content` above `0` without an explicit
   operator decision.
 
@@ -5574,6 +5602,11 @@ app/scheduler/tasks.py
 ```
 
 Responsibilities:
+
+- Tier 5 R19 blocks a baked-in horizontal or vertical letterbox when both
+  opposing edge bands are near-black while the inset center is bright. The
+  blocking finding code is letterboxed_image; uniformly dark frames remain
+  the responsibility of the existing near-black luminance gate.
 
 - Find `AUDIO_DONE` content with an `AudioFile`.
 - Skip content that already has the relevant `VideoRender` row.
@@ -7259,8 +7292,9 @@ High-quality/complex tasks:
 - short script generation
 - storyboard generation
 - AI-generated story synthesis (`story_synthesis` — premise + post-approval
-  expansion, §9.5) — original creative fiction is the sole source material
-  for the rest of the pipeline, same quality bar as a real discovered story
+  expansion, §9.5) — original creative fiction or an explicitly requested,
+  accuracy-bound historical narrative becomes the sole source material for
+  the rest of the pipeline, same quality bar as a real discovered story
 
 Fast/cheap tasks:
 
@@ -7340,6 +7374,7 @@ CHILD_SHORT_VISUALS_FINGERPRINT_BACKFILLED
 STORYBOARD_DURATION_OUT_OF_TIER
 STORYBOARD_DUPLICATE_HINT_RUN_COLLAPSED
 STORYBOARD_HINT_EXPANDED
+NARRATION_POV_NORMALIZED
 TTS_SECTION_DELIVERY_SELECTED
 TTS_SECTION_DELIVERY_FALLBACK
 RESUME_TRANSCRIPT_REUSED
@@ -7692,7 +7727,10 @@ These are current engineering risks to monitor, not future feature promises.
 
 - Storyboard cost logs: required
 - Reuse stats logs: required
-- Character consistency controls: blueprint-derived locked descriptors implemented (roadmap Phase C2) — prompt-level, not a deterministic validator
+- Character consistency controls: blueprint-derived locked descriptors plus Dev routing for qualifying person beats; reference-image identity lock remains design-only
+- Era-aware diversity: locked-era environment frequency is telemetry-only; vary motif/framing and use other when needed
+- Local image integrity: near-black and baked-in letterbox frames are blocking
+- Child remap phrase integrity: exact/resliced/non-verbatim telemetry; normalized matches are re-sliced from authoritative narration
 - Repetition diagnostics: should be monitored
 - Cache reuse diagnostics: should be monitored
 - Object-shot rate diagnostics: should be monitored

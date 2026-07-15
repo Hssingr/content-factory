@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.models import Channel, ChannelConfig, ChannelLanguage, ChannelVoice, Content, Script
 from app.services.script_estimator import estimate_duration_sec
+from app.agents.agent2_discovery.services.narration_pov import normalize_narration_pov
 from app.agents.agent2_discovery.system_prompt import (
     generate_native_script,
     _extract_hook_context,
@@ -342,7 +343,9 @@ def generate_multilingual_scripts(
         .first()
     )
     script_format = config.script_format if config else "youtube_long"
-    narration_pov = config.narration_pov if config else "third_person"
+    narration_pov = normalize_narration_pov(
+        getattr(config, "narration_pov", None), channel_id=channel.id,
+    )
 
     # content_kind drives native-prompt selection (Phase 12.4) — child Standalone
     # Short episodes always use the dedicated flat-narration native prompt,
@@ -2056,7 +2059,9 @@ def run_shorts_planner(
     channel_voice = _load_short_source_voice(long_content, channel, db)
     visual_style: str = config.visual_style if config else ""
     image_style: str = config.image_style if config else ""
-    narration_pov: str = config.narration_pov if config else "third_person"
+    narration_pov = normalize_narration_pov(
+        getattr(config, "narration_pov", None), channel_id=channel.id,
+    )
 
     # Roadmap 6.1 / audit S-8, C-2: check for existing children BEFORE the
     # paid Claude plan call — a re-run against a parent whose Shorts already
@@ -2064,7 +2069,9 @@ def run_shorts_planner(
     if _child_shorts_already_exist(long_content_id, db):
         return
 
-    plan = _generate_shorts_plan_with_retry(voice_script, blueprint, channel)
+    plan = _generate_shorts_plan_with_retry(
+        voice_script, blueprint, channel, narration_pov=narration_pov,
+    )
     if plan is None:
         return
 
@@ -2163,10 +2170,13 @@ def _generate_shorts_plan_with_retry(
     voice_script: str,
     blueprint: dict,
     channel: Channel,
+    narration_pov: str = "third_person",
 ) -> dict | None:
     for attempt in (1, 2):
         try:
-            return generate_shorts_plan(voice_script, blueprint, channel)
+            return generate_shorts_plan(
+                voice_script, blueprint, channel, narration_pov=narration_pov,
+            )
         except ValueError as exc:
             if attempt == 1:
                 logger.warning(
