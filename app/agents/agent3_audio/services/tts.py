@@ -335,7 +335,13 @@ def _apply_pacing_markers(
 
     Applied only to dramatic / suspense / horror / tense tones (long-form only):
       - ellipsis path: replace the first short sentence's terminal period with ``"..."``.
-      - v3 path: prepend ``[dramatic pause]`` before the first content sentence.
+      - v3 path: prepend ``[dramatic pause]`` before the first content sentence —
+        UNLESS the section text already carries an authored v3 tag anywhere
+        (pre-next-test roadmap Tier 1 R3): a section whose script embeds its own
+        AUDIO_TAGS_INSTRUCTION tag already has intentional pacing, and the generic
+        slow-open must not stack a third tag source onto it (a real run measured
+        31% of the runtime as silence with authored tags + slow-opens + the
+        per-section delivery prefix all contributing pauses to the same section).
       - Skipped for Short episodes — Shorts need immediate energy, not a slow open.
 
     Args:
@@ -350,6 +356,10 @@ def _apply_pacing_markers(
     """
     max_pause = 10 if is_short_episode else _MAX_PAUSE_INSERTIONS
     use_v3 = tts_model == "eleven_v3"
+    # Tier 1 R3: captured at entry, before any pacing insertion — only tags
+    # authored into the script itself (AUDIO_TAGS_INSTRUCTION) count, never
+    # tags this function inserts below.
+    has_authored_v3_tag = use_v3 and bool(_ANY_V3_TAG_RE.search(text))
     insertion_count = 0
 
     def _insert_pause(match: re.Match) -> str:
@@ -378,9 +388,11 @@ def _apply_pacing_markers(
         and insertion_count < max_pause
     ):
         if use_v3:
-            # Skip the slow-open tag when the text already opens on a v3 tag
+            # Skip the slow-open tag when the section already carries an
+            # authored v3 tag anywhere (Tier 1 R3 — its pacing is already
+            # intentional), or when the text opens on a v3 tag
             # (script-embedded or section-delivery) — never two tags together.
-            if not _ANY_V3_TAG_RE.match(text.lstrip()):
+            if not has_authored_v3_tag and not _ANY_V3_TAG_RE.match(text.lstrip()):
                 text = "[dramatic pause] " + text.lstrip()
                 insertion_count += 1
         else:
@@ -1038,6 +1050,131 @@ def _normalize_loudness(mp3_bytes: bytes) -> bytes:
     return result
 
 
+_SILENCE_COMPRESS_THRESHOLD_DB = -40
+# TTS inter-utterance silence is near-digital (well below -60 dB); -40 dB
+# detects it reliably while never clipping quiet speech or breath tails.
+
+
+def _compress_interior_silence(mp3_bytes: bytes) -> bytes:
+    """Cap interior narration silences at ``settings.audio_max_interior_silence_ms``
+    (pre-next-test roadmap Tier 1 R1).
+
+    A real production run measured 31% of a 12:40 video as near-digital
+    silence — 219 gaps ≥0.5s, median 1.1s — the single largest viewer-facing
+    audio defect ("narration assembled from isolated TTS sentences"). The
+    stack that produces it (paragraph-per-sentence scripts × ElevenLabs v3
+    per-utterance pauses × pacing-tag insertion) had no pause bound anywhere.
+
+    Deterministic two-pass ffmpeg, no AI call:
+
+    1. ``silencedetect`` pre-pass (read-only) counts silences at least as
+       long as the cap. When none exist the input bytes are returned
+       **unchanged** — no re-encode, no quality-generation loss, which is
+       the common case for short chunks.
+    2. ``silenceremove`` with ``stop_periods=-1`` (interior mode) and
+       ``stop_duration=<cap>`` trims every qualifying silence run down to
+       ~the cap itself (verified empirically on this ffmpeg build: silence
+       shorter than ``stop_duration`` is copied verbatim; a longer run is
+       copied up to ``stop_duration`` and the remainder dropped).
+
+    Applied per TTS chunk in ``generate_audio()``'s provider paths — BEFORE
+    ``_concat_mp3_chunks()`` and BEFORE ``_compute_section_boundaries()`` —
+    so the chunk durations that section boundaries are measured from are the
+    compressed ones, and every downstream timeline (Whisper, beats,
+    captions) derives from the same compressed audio. Never runs on the
+    skip-on-disk resume path (same contract as ``_normalize_loudness()``):
+    an on-disk file was compressed once, at generation time.
+
+    Leading silence of a chunk is never trimmed (``start_periods`` is left
+    at 0); a chunk's trailing silence is treated as one more interior run
+    and capped — after concatenation it sits between sections anyway.
+
+    Args:
+        mp3_bytes: Raw MP3 bytes for one TTS chunk.
+
+    Returns:
+        MP3 bytes with every interior silence capped, or the input object
+        unchanged when compression is disabled (cap <= 0), the input is
+        empty, or no qualifying silence exists.
+
+    Raises:
+        RuntimeError: If ffmpeg is unavailable or either pass fails.
+    """
+    if not mp3_bytes:
+        return mp3_bytes
+
+    from app.config import settings
+
+    cap_ms = settings.audio_max_interior_silence_ms
+    if cap_ms <= 0:
+        return mp3_bytes
+    cap_s = cap_ms / 1000.0
+
+    import os
+    import re as _re
+    import subprocess
+    import tempfile
+
+    from app.agents.agent3_audio.services.storage import measure_audio_duration_ms
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmp:
+        in_path = os.path.join(tmp, "in.mp3")
+        out_path = os.path.join(tmp, "out.mp3")
+        with open(in_path, "wb") as f:
+            f.write(mp3_bytes)
+
+        # Pass 1 — read-only detection: is there anything to compress?
+        detect_cmd = [
+            "ffmpeg", "-i", in_path,
+            "-af", (
+                f"silencedetect=noise={_SILENCE_COMPRESS_THRESHOLD_DB}dB:"
+                f"d={cap_s:.3f}"
+            ),
+            "-f", "null", "-",
+        ]
+        detect_proc = subprocess.run(detect_cmd, capture_output=True)
+        if detect_proc.returncode != 0:
+            raise RuntimeError(
+                f"ffmpeg silencedetect failed (rc={detect_proc.returncode}): "
+                f"{detect_proc.stderr[-300:].decode(errors='replace')}"
+            )
+        qualifying = len(
+            _re.findall(rb"silence_duration:", detect_proc.stderr)
+        )
+        if qualifying == 0:
+            return mp3_bytes
+
+        # Pass 2 — cap every qualifying silence run.
+        compress_cmd = [
+            "ffmpeg", "-y", "-i", in_path,
+            "-af", (
+                f"silenceremove=stop_periods=-1:"
+                f"stop_duration={cap_s:.3f}:"
+                f"stop_threshold={_SILENCE_COMPRESS_THRESHOLD_DB}dB"
+            ),
+            "-c:a", "libmp3lame", "-b:a", "192k",
+            out_path,
+        ]
+        proc = subprocess.run(compress_cmd, capture_output=True)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"ffmpeg silenceremove failed (rc={proc.returncode}): "
+                f"{proc.stderr[-300:].decode(errors='replace')}"
+            )
+
+        in_ms = measure_audio_duration_ms(Path(in_path))
+        out_ms = measure_audio_duration_ms(Path(out_path))
+        with open(out_path, "rb") as f:
+            result = f.read()
+
+    logger.info(
+        "AUDIO_SILENCE_COMPRESSED n=%d cap_ms=%d in_ms=%d out_ms=%d removed_ms=%d",
+        qualifying, cap_ms, in_ms, out_ms, in_ms - out_ms,
+    )
+    return result
+
+
 def _measure_mp3_bytes_duration_ms(mp3_bytes: bytes) -> int:
     """ffprobe-measure the duration of in-memory MP3 bytes.
 
@@ -1296,6 +1433,10 @@ def _generate_cartesia_audio(
             "section_index": unit.get("section_index"),
         })
 
+    # Tier 1 R1: cap interior silences per chunk BEFORE concat — the same
+    # (compressed) chunk list is returned for section-boundary computation,
+    # so boundaries always measure the audio that actually ships.
+    all_bytes = [_compress_interior_silence(b) for b in all_bytes]
     audio_bytes = _concat_mp3_chunks(all_bytes) if all_bytes else b""
     logger.debug(
         "Cartesia TTS complete: %d chunk(s) → %d bytes (%.1f KB)",
@@ -1350,9 +1491,13 @@ def generate_audio(voice_script: str, channel_voice, is_short_episode: bool = Fa
         is_short_episode: When ``True``, applies TikTok-optimised pacing in
                           ``prepare_script_for_tts`` (pause cap=10, no slow-open).
 
-    Both paths' final audio passes through ``_normalize_loudness()`` (roadmap
-    Phase A3) before returning — a single ffmpeg loudnorm pass applied
-    uniformly regardless of provider or chunk count. Both paths also compute
+    Both paths cap interior narration silences per chunk via
+    ``_compress_interior_silence()`` (pre-next-test roadmap Tier 1 R1) before
+    concatenation — so section boundaries, Whisper, beats, and captions all
+    derive from the compressed audio. Both paths' final audio then passes
+    through ``_normalize_loudness()`` (roadmap Phase A3) before returning —
+    a single ffmpeg loudnorm pass applied uniformly regardless of provider
+    or chunk count. Both paths also compute
     real per-section audio boundaries (roadmap Phase B1) via
     ``_finalize_audio_with_boundaries()`` whenever the script produced one
     TTS chunk per ``[INTRO]``/``[SECTION N]``/``[OUTRO]`` section (always
@@ -1494,6 +1639,10 @@ def generate_audio(voice_script: str, channel_voice, is_short_episode: bool = Fa
                 "section_index": chunk.get("section_index"),
             })
 
+    # Tier 1 R1: cap interior silences per chunk BEFORE concat and BEFORE
+    # _finalize_audio_with_boundaries() measures the chunk list for section
+    # boundaries — every downstream timeline sees the compressed audio.
+    all_bytes = [_compress_interior_silence(b) for b in all_bytes]
     audio_bytes = _concat_mp3_chunks(all_bytes) if all_bytes else b""
     logger.debug(
         "ElevenLabs TTS complete: %d chunk(s) %d bytes (%.1f KB)",

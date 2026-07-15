@@ -86,6 +86,17 @@ class Settings(BaseSettings):
     # stays primary in production (quality: word timings from the hosted model).
     whisper_local_primary: bool = False
 
+    # Agent 3 TTS post-processing (pre-next-test roadmap Tier 1 R1): any
+    # interior narration silence longer than this is capped to this length.
+    # A real production run measured 31% of a 12:40 video as near-digital
+    # silence (219 gaps ≥0.5s, median 1.1s) — paragraph-per-sentence scripts
+    # × ElevenLabs v3 per-utterance pauses, with nothing bounding pause
+    # length anywhere. Applied per TTS chunk, BEFORE concatenation and
+    # section-boundary computation, so Whisper, beats, captions, and
+    # section_boundaries all derive from the compressed audio and can never
+    # desync. Set to 0 (or negative) to disable compression entirely.
+    audio_max_interior_silence_ms: int = 650
+
     # Agent 4 image model routing (Phase 14.6 foundation) — conservative by
     # default. With routing disabled (the default), every generated beat uses
     # Flux Schnell exactly as before that phase.

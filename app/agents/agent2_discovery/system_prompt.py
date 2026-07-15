@@ -7,7 +7,14 @@ from app.services.script_checks import split_sentences
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "5.0"  # v5.0: Phase E1 — standalone Short cold opens now have an
+PROMPT_VERSION = "5.1"  # v5.1: pre-next-test roadmap Tier 1 R2 — _TTS_SHARED_CORE's
+                        # blank-line rule inverted: a blank line ONLY at a genuine
+                        # scene/beat change (3-6 paragraphs per long-form section,
+                        # at most 3-4 breaks in a Short). The old "one blank line
+                        # between narrative beats" produced 78 one-to-two-sentence
+                        # paragraphs in a real run — each break renders as a ~1s
+                        # TTS pause, totalling 31% of the video as silence.
+                        # v5.0: Phase E1 — standalone Short cold opens now have an
                         # explicit no-prior-context/referent-completeness contract in
                         # the planner, source Short writer, and child-Short native
                         # adaptation prompt. Word-cap and parent/child-overlap findings
@@ -139,7 +146,11 @@ e.g. → for example, Mr. → Mister, St. → Saint.
 - No ALL-CAPS words of three or more letters — use mixed case or spell the word out.
 - Prefer one main idea per sentence — avoid chaining several distinct thoughts into one
   long compound sentence. (Short connected clauses used deliberately for pacing are fine.)
-- One blank line between narrative beats (breathing room for the voice).
+- A blank line becomes a LONG audible pause in the finished narration — paragraph \
+density directly programs the pacing. Use a blank line ONLY at a genuine scene or \
+narrative-beat change, NEVER after every sentence. Sentences that continue the same \
+moment stay in the same paragraph. A long-form section should contain roughly 3-6 \
+paragraphs; a standalone Short at most 3-4 paragraph breaks in total.
 - No stage directions, no parenthetical notes, no editorial asides in brackets.
 - Square brackets are allowed ONLY for section markers: [INTRO], [SECTION N], [OUTRO].\
 """

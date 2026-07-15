@@ -3544,6 +3544,31 @@ Rules:
   quiet source pulled up to target, a loud source pulled down to target, the
   ffmpeg-failure error path, and that both `generate_audio()` provider
   branches actually route their result through it.
+- **Interior-silence compression (pre-next-test roadmap Tier 1 R1):** a real
+  production run measured 31% of a 12:40 video as near-digital silence (219
+  gaps ≥0.5s, median 1.1s) — paragraph-per-sentence scripts × ElevenLabs v3
+  per-utterance pauses, with no pause bound anywhere.
+  `tts._compress_interior_silence(mp3_bytes)` caps every interior silence at
+  `settings.audio_max_interior_silence_ms` (default 650; ≤0 disables) via a
+  deterministic two-pass ffmpeg: a read-only `silencedetect` pre-pass returns
+  the input **unchanged** when no qualifying silence exists (no re-encode
+  generation loss), otherwise `silenceremove` (interior mode, `-40dB`
+  threshold, semantics verified empirically against the installed ffmpeg
+  build) trims each run to ~the cap. **Applied per TTS chunk, in both
+  provider paths, BEFORE `_concat_mp3_chunks()` and BEFORE
+  `_compute_section_boundaries()`** — the chunk list handed to boundary
+  computation is the compressed one, so `section_boundaries`, Whisper,
+  beats, and captions all derive from the same compressed audio and can
+  never desync (compressing the final file after boundaries were measured
+  would corrupt Phase B1's spans non-uniformly). Leading chunk silence is
+  never trimmed; a chunk's trailing silence is capped (it sits between
+  sections after concat). Fails loud (`RuntimeError`) on ffmpeg failure,
+  same contract as loudnorm/concat. Never runs on the skip-on-disk resume
+  path. Logs `AUDIO_SILENCE_COMPRESSED n=… cap_ms=… in_ms=… out_ms=…
+  removed_ms=…`. Runtime proof: `tests/test_tier1_audio_continuity.py`
+  (real ffmpeg synthesizes known speech/silence layouts and independently
+  re-measures results, including the compression-before-boundaries ordering
+  proof through the real `generate_audio()` chain).
 - **`generate_audio()` returns `tuple[bytes, section_boundaries]`, not bare
   bytes (roadmap Phase B1):** the second element is a list of
   `{"section_type", "section_index", "start_ms", "end_ms"}` dicts describing
@@ -3744,7 +3769,14 @@ audit §2.6 P-6): the pacing inserter skips a sentence already carrying any
 tag, and the per-section delivery prefix replaces a generic leading
 `[dramatic pause]` slow-open (the more intentional tag wins) but yields to
 any other script-embedded leading tag — v3's contract is max one tag per
-sentence. Text-conditioning
+sentence. Additionally (pre-next-test roadmap Tier 1 R3), the generic
+slow-open is suppressed for the whole section when the section's script
+text already carries an **authored** v3 tag anywhere — captured at
+`_apply_pacing_markers()` entry, before any insertion, so tags the function
+itself inserts never count: a section that embeds its own
+AUDIO_TAGS_INSTRUCTION tag already has intentional pacing, and stacking the
+generic slow-open onto it measurably inflated dead air in a real run.
+Text-conditioning
 (`previous_text`/`next_text`) remains non-v3 only when the SDK supports it, and
 all multi-chunk/multi-section output still passes through `_concat_mp3_chunks()`
 (Phase 11.6) for final concatenation.
@@ -6965,6 +6997,11 @@ Script prompts must:
 - Keep section generation focused on one primary turn.
 - Keep TTS constraints visible.
 - Avoid long sentences.
+- A blank line is a long audible TTS pause — scripts use one ONLY at a
+  genuine scene/beat change (roughly 3-6 paragraphs per long-form section,
+  at most 3-4 breaks in a Short), never after every sentence (pre-next-test
+  roadmap Tier 1 R2, `_TTS_SHARED_CORE`; a real run's per-sentence
+  paragraphs rendered 31% of the video as silence).
 - End with a strong, relevant comment trigger when required.
 - Comment triggers and Short final CTAs must be story-specific, not reusable
   channel boilerplate. Child Shorts must not copy the parent's
@@ -7255,6 +7292,7 @@ STORYBOARD_DURATION_OUT_OF_TIER
 TTS_SECTION_DELIVERY_SELECTED
 TTS_SECTION_DELIVERY_FALLBACK
 RESUME_TRANSCRIPT_REUSED
+AUDIO_SILENCE_COMPRESSED
 AUDIO_DURATION_TRANSCRIPT_MISMATCH
 PROPS_STALE_REBUILDING
 PROPS_STALENESS_CHECK_FAILED
