@@ -3942,8 +3942,8 @@ Responsibilities:
 - Ask Claude for structured visual beats.
 - Return schema-validated storyboard batch.
 
-**Storyboard prompt inputs (`PROMPT_VERSION` 4.5, `STORYBOARD_SCHEMA_VERSION`
-7.1 — fresh full-system audit §2.2):** the dead "Visual Continuity Bible"
+**Storyboard prompt inputs (`PROMPT_VERSION` 4.9, `STORYBOARD_SCHEMA_VERSION`
+7.2):** the dead "Visual Continuity Bible"
 prompt section is replaced by documentation of the real one-line
 "Visual continuity:" hint; the TECHNICAL flux-prompt step is image-style-aware
 (never appends "photorealistic" to an illustrated/painted style); the
@@ -4072,6 +4072,42 @@ stated consequences (a low beat count forces long static holds that read as a
 slideshow; a short hint is ambiguous and gets treated as lower-confidence,
 degrading that beat's timing accuracy) — prompt-only, no schema change, so
 `STORYBOARD_SCHEMA_VERSION` did not bump (only `PROMPT_VERSION`, 4.7 → 4.8).
+
+**Beat/timestamp alignment hardening (pre-next-test roadmap Tier 3,
+`PROMPT_VERSION` 4.8 → 4.9; schema unchanged):** the Hannibal audit found five
+consecutive montage beats claiming one identical oath/frostbite narration span;
+four could not produce distinct anchors and were interpolated over later audio.
+It also found 113/360 hints below the six-word floor.
+
+- `_harden_hints()` now expands a 1–5-word hint deterministically from its real
+  occurrence in the current segment text. Start hints extend right and end hints
+  extend left to six words (with boundary-only expansion in the other direction),
+  using the existing language-aware matching normalization and literal-quote
+  stripping. Searches advance with beat order so a repeated phrase cannot jump
+  back to an earlier occurrence. Already-valid hints are untouched; an unlocatable
+  or otherwise unsafe hint is also untouched and remains telemetry-only in
+  `HINT_QUALITY_SUMMARY`. No AI call or regeneration loop is involved.
+- After `_merge_batches()` and immediately before timestamp mapping,
+  `_collapse_duplicate_hint_runs()` merges every consecutive run whose normalized
+  `(start_hint, end_hint)` pair is identical. The first beat/`flux_prompt` stays
+  authoritative, raw suggested durations are summed then clamped once to that
+  beat's intensity tier, the run's final transition is retained, and global beat
+  order is renumbered. Log: `STORYBOARD_DUPLICATE_HINT_RUN_COLLAPSED` (INFO).
+- The storyboard prompt now forbids consecutive identical hint pairs, requires a
+  montage over one narration span to be one strongest-image beat, and requires a
+  sensory reveal's `visual_intent`/`flux_prompt` to depict the reveal in the beat
+  containing it rather than an earlier callback or later phrase.
+- A successful per-section language remap now logs
+  `VISUAL_TIMING_SECTION_ANCHORED` at INFO (formerly DEBUG); its fallback remains
+  INFO. Normal production logs therefore identify which remap path actually ran.
+
+Runtime proof: `tests/test_tier3_beat_timestamp_alignment.py` (8 tests, no live
+API calls; the sole prompt boundary is stubbed) covers normalized five-beat run
+collapse through the real timestamp mapper, tier-capped duration/transition/order
+behavior, quote-stripped expansion, forward repeated-phrase selection,
+idempotence, telemetry-only unsafe fallback, real prompt assembly, and the INFO
+anchoring marker. Full offline suite: 748 test methods + 145 subtests, zero
+regressions.
 
 Runtime proof for all of Phase C2/C3/C4 above:
 `tests/test_character_era_style_continuity.py` — real `generate_story_blueprint()`
@@ -4496,7 +4532,7 @@ drift to within one section (~2-3s) rather than the whole video's length.
   to the original `_remap_beats_timing_whole_video()`, logged
   `VISUAL_TIMING_WHOLE_VIDEO_STRETCH_FALLBACK reason=<reason>` — never
   silent (Golden Rule 3). A successful anchored remap logs
-  `VISUAL_TIMING_SECTION_ANCHORED`.
+    `VISUAL_TIMING_SECTION_ANCHORED` at INFO.
 - The final "clamp last beat to exactly `target_duration_ms`" step is shared
   by both paths, applied once after either produces its result — unchanged
   from the pre-existing whole-video-stretch convention.
@@ -7302,6 +7338,8 @@ STALE_VISUALS_CHECK_BACKFILL
 CHILD_SHORT_VISUALS_STALE
 CHILD_SHORT_VISUALS_FINGERPRINT_BACKFILLED
 STORYBOARD_DURATION_OUT_OF_TIER
+STORYBOARD_DUPLICATE_HINT_RUN_COLLAPSED
+STORYBOARD_HINT_EXPANDED
 TTS_SECTION_DELIVERY_SELECTED
 TTS_SECTION_DELIVERY_FALLBACK
 RESUME_TRANSCRIPT_REUSED

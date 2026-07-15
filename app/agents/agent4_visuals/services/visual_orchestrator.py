@@ -811,7 +811,7 @@ def _remap_beats_timing(
     section_pairs, reason = _build_section_anchor_map(source_sections, target_sections)
     if section_pairs is not None:
         result = _remap_beats_timing_per_section(beats, section_pairs)
-        logger.debug(
+        logger.info(
             "VISUAL_TIMING_SECTION_ANCHORED sections=%d source_duration_ms=%d target_duration_ms=%d",
             len(section_pairs), source_duration_ms, target_duration_ms,
         )

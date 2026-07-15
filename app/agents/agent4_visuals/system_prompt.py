@@ -11,7 +11,10 @@ from app.services.claude_client import (
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "4.8"  # v4.8: roadmap Phase C2/C3/C4 (operator video-output audit) — four
+PROMPT_VERSION = "4.9"  # v4.9: Tier 3 alignment rules — never split one narration span into
+                        #        consecutive beats with identical hint pairs; align sensory-reveal
+                        #        imagery to the beat containing the reveal rather than a prior callback.
+                        # v4.8: roadmap Phase C2/C3/C4 (operator video-output audit) — four
                         #        additive changes, no schema field changes: (1) style-negative-
                         #        constraints line per image_style (_IMAGE_STYLE_NEGATIVE_CONSTRAINTS)
                         #        so a beat's rendering can't drift into a neighboring style (a real
@@ -611,6 +614,13 @@ Bad examples (forbidden):
 == Hard rules ==
 - Never invent names, dates, places, facts, people, URLs, or statistics.
 - Do not repeat the same visual idea on consecutive beats.
+- Consecutive beats must NEVER use the same start_hint/end_hint pair. A montage
+  over one sentence or one narration span must be expressed as ONE beat using
+  the strongest image for that span, not several beats sharing its anchors.
+- When a beat's narration span contains a sensory reveal — what is newly seen,
+  heard, felt, smelled, or otherwise discovered — visual_intent and flux_prompt
+  must depict that reveal in THIS beat. Do not show an earlier callback instead
+  or delay the reveal image into the following narration phrase.
 - start_hint and end_hint must be copied EXACTLY from the segment text, in
   order, EXCEPT: omit any literal quotation mark character (") that appears
   in the segment text — copy the surrounding words exactly, just drop the
@@ -1010,7 +1020,6 @@ def generate_storyboard_batch(
         "elapsed_ms":    _total_elapsed_ms,
     }
     return storyboard, usage, diag
-
 
 
 

@@ -623,8 +623,11 @@ def split_into_beats(
                 )
                 return None
 
-            # Hint hardening: fix any hints that are out-of-range or contain digits
-            beats, _seg_hint_stats = _harden_hints(beats, sub_text)
+            # Hint hardening: deterministically expand locatable short hints,
+            # then retain telemetry for every violation that remains.
+            beats, _seg_hint_stats = _harden_hints(
+                beats, sub_text, language=language,
+            )
             _hint_total   += _seg_hint_stats["total_hints"]
             _hint_valid   += _seg_hint_stats["valid_hints"]
             _hint_invalid += _seg_hint_stats["invalid_hints"]
@@ -651,6 +654,7 @@ def split_into_beats(
             previous_summary = _summarize_batch_for_continuity(sub_label, beats, ledger)
 
     beats = _merge_batches(raw_batches)
+    beats = _collapse_duplicate_hint_runs(beats, language=language)
 
     _actual_beats = len(beats)
     _estimate_error_pct = abs(_actual_beats - estimated_beats) / max(estimated_beats, 1) * 100
@@ -920,58 +924,238 @@ def _summarize_batch_for_continuity(label: str, beats: list[dict], ledger: dict)
     return closing
 
 
-def _harden_hints(beats: list[dict], segment_text: str) -> tuple[list[dict], dict]:
-    """Log quality warnings for start_hint/end_hint that violate verbatim-word rules.
+def _harden_hints(
+    beats: list[dict], segment_text: str, *, language: str = "en",
+) -> tuple[list[dict], dict]:
+    """Expand short verbatim hints, then report remaining hint violations.
 
     Rules Claude is required to follow (enforced in the schema prompt):
       - 6–10 verbatim words copied from the narration
       - no digit characters
       - no marker text (INTRO/OUTRO/SECTION)
 
-    When a hint violates these rules we log a WARNING and leave it unchanged.
-    The matching pipeline (_locate_phrase) handles unmatched beats via real
-    anchor timestamps from adjacent matched beats — proportional text
-    substitution here inflated the fallback rate by replacing valid short phrases
-    with wrong-position text that couldn't match the Whisper transcript.
+    A hint below six words is expanded deterministically from the surrounding
+    words in ``segment_text`` when its normalized token sequence can be found
+    in forward narration order. Start hints extend right; end hints extend
+    left, with boundary-only expansion on the opposite side when required.
+    Already-valid hints are untouched. Other invalid shapes (digits, markers,
+    overlong or unlocatable hints) remain unchanged and are logged.
 
     Returns:
-        ``(beats, stats)`` — beats is the same list (unchanged); stats has
-        ``total_hints``, ``valid_hints``, ``invalid_hints`` counts for aggregation
-        into a ``HINT_QUALITY_SUMMARY`` log after all segments are processed.
+        ``(beats, stats)`` — beats is mutated in place only for successful
+        short-hint expansions; stats describes the final post-expansion shape.
     """
-    _DIGIT_IN_HINT_RE = re.compile(r"\d")
-    _MARKER_IN_HINT_RE = re.compile(r"\[(INTRO|OUTRO|SECTION)", re.IGNORECASE)
+    digit_re = re.compile(r"\d")
+    marker_re = re.compile(r"\[(INTRO|OUTRO|SECTION)", re.IGNORECASE)
 
-    _total = 0
-    _invalid = 0
+    total = 0
+    invalid = 0
+    source_words = segment_text.replace('"', "").split()
+    source_norm, norm_to_word = _normalized_words_with_source_indexes(
+        source_words, language,
+    )
+    forward_norm_cursor = 0
 
     for beat in beats:
+        # Both hints belong to the same beat span, so search both from the
+        # beat's forward position. Advance the next beat only after the start
+        # hint is found; advancing inside the inner loop would skip a short
+        # end_hint that occurs within the current beat.
+        next_forward_norm_cursor = forward_norm_cursor
         for hint_key in ("start_hint", "end_hint"):
             raw = str(beat.get(hint_key, "") or "").strip()
+            if 0 < len(raw.split()) < _CHILD_HINT_MIN_WORDS:
+                expanded, _match_end = _expand_short_hint(
+                    raw,
+                    hint_key=hint_key,
+                    source_words=source_words,
+                    source_norm=source_norm,
+                    norm_to_word=norm_to_word,
+                    from_norm_index=forward_norm_cursor,
+                    language=language,
+                )
+                if expanded is not None:
+                    beat[hint_key] = expanded
+                    logger.debug(
+                        "STORYBOARD_HINT_EXPANDED beat=%s key=%s old=%r new=%r",
+                        beat.get("beat_order"), hint_key, raw, expanded,
+                    )
+                    raw = expanded
+
+            if hint_key == "start_hint":
+                normalized_start = _normalize_phrase(raw, language)
+                match_start = _find_token_sequence(
+                    source_norm, normalized_start, forward_norm_cursor,
+                )
+                if match_start is not None:
+                    next_forward_norm_cursor = match_start + len(normalized_start)
+
             hint_words = raw.split()
             valid = (
-                6 <= len(hint_words) <= 10
-                and not _DIGIT_IN_HINT_RE.search(raw)
-                and not _MARKER_IN_HINT_RE.search(raw)
+                _CHILD_HINT_MIN_WORDS <= len(hint_words) <= _CHILD_HINT_MAX_WORDS
+                and not digit_re.search(raw)
+                and not marker_re.search(raw)
             )
-            _total += 1
+            total += 1
             if not valid:
-                _invalid += 1
+                invalid += 1
                 logger.warning(
                     "Hint quality: beat=%s %s %r is invalid "
                     "(words=%d has_digit=%s has_marker=%s) — kept as-is for matching",
                     beat.get("beat_order"), hint_key, raw[:60],
-                    len(hint_words),
-                    bool(_DIGIT_IN_HINT_RE.search(raw)),
-                    bool(_MARKER_IN_HINT_RE.search(raw)),
+                    len(hint_words), bool(digit_re.search(raw)),
+                    bool(marker_re.search(raw)),
                 )
+        forward_norm_cursor = next_forward_norm_cursor
 
-    _stats = {
-        "total_hints":   _total,
-        "valid_hints":   _total - _invalid,
-        "invalid_hints": _invalid,
+    stats = {
+        "total_hints": total,
+        "valid_hints": total - invalid,
+        "invalid_hints": invalid,
     }
-    return beats, _stats
+    return beats, stats
+
+
+def _normalized_words_with_source_indexes(
+    source_words: list[str], language: str,
+) -> tuple[list[str], list[int]]:
+    """Flatten normalized source tokens while retaining whitespace-word indexes."""
+    normalized: list[str] = []
+    source_indexes: list[int] = []
+    for word_index, word in enumerate(source_words):
+        for token in _normalize_phrase(word, language):
+            normalized.append(token)
+            source_indexes.append(word_index)
+    return normalized, source_indexes
+
+
+def _expand_short_hint(
+    hint: str,
+    *,
+    hint_key: str,
+    source_words: list[str],
+    source_norm: list[str],
+    norm_to_word: list[int],
+    from_norm_index: int,
+    language: str,
+) -> tuple[str | None, int | None]:
+    """Expand one short hint from its real contiguous segment-text occurrence."""
+    hint_norm = _normalize_phrase(hint, language)
+    if not hint_norm or not source_norm:
+        return None, None
+
+    match_start = _find_token_sequence(source_norm, hint_norm, from_norm_index)
+    if match_start is None:
+        return None, None
+    match_end = match_start + len(hint_norm)
+    first_word = norm_to_word[match_start]
+    last_word = norm_to_word[match_end - 1]
+
+    if hint_key == "end_hint":
+        left = max(0, last_word - _CHILD_HINT_MIN_WORDS + 1)
+        right = last_word + 1
+        if right - left < _CHILD_HINT_MIN_WORDS:
+            right = min(len(source_words), left + _CHILD_HINT_MIN_WORDS)
+    else:
+        left = first_word
+        right = min(len(source_words), left + _CHILD_HINT_MIN_WORDS)
+        if right - left < _CHILD_HINT_MIN_WORDS:
+            left = max(0, right - _CHILD_HINT_MIN_WORDS)
+
+    candidate = " ".join(source_words[left:right]).strip()
+    if not (_CHILD_HINT_MIN_WORDS <= len(candidate.split()) <= _CHILD_HINT_MAX_WORDS):
+        return None, None
+    if re.search(r"\d", candidate) or re.search(
+        r"\[(INTRO|OUTRO|SECTION)", candidate, re.IGNORECASE,
+    ):
+        return None, None
+    return candidate, match_end
+
+
+def _find_token_sequence(
+    haystack: list[str], needle: list[str], start: int = 0,
+) -> int | None:
+    """Return the first exact normalized-token match at or after ``start``."""
+    if not needle:
+        return None
+    last = len(haystack) - len(needle)
+    for index in range(max(0, start), last + 1):
+        if haystack[index:index + len(needle)] == needle:
+            return index
+    return None
+
+
+def _collapse_duplicate_hint_runs(
+    beats: list[dict], *, language: str = "en",
+) -> list[dict]:
+    """Collapse consecutive beats that claim the identical narration span.
+
+    One narration span cannot supply distinct timestamp anchors for a montage.
+    The first beat remains authoritative, its suggested durations are summed
+    and capped by that beat's intensity tier, and the run's final transition is
+    retained so the collapsed beat still connects correctly to its successor.
+    """
+    if len(beats) < 2:
+        return beats
+
+    collapsed: list[dict] = []
+    index = 0
+    while index < len(beats):
+        pair = _normalized_hint_pair(beats[index], language)
+        run_end = index + 1
+        if pair is not None:
+            while (
+                run_end < len(beats)
+                and _normalized_hint_pair(beats[run_end], language) == pair
+            ):
+                run_end += 1
+
+        run = beats[index:run_end]
+        merged = dict(run[0])
+        if len(run) > 1:
+            intensity = str(merged.get("beat_intensity") or "medium")
+            total_suggested = 0.0
+            for beat in run:
+                try:
+                    suggested = float(beat.get("suggested_duration_sec"))
+                except (TypeError, ValueError):
+                    suggested = _normalize_suggested_duration_sec(None, intensity)
+                if not math.isfinite(suggested):
+                    suggested = _normalize_suggested_duration_sec(None, intensity)
+                total_suggested += max(0.0, suggested)
+            merged["suggested_duration_sec"] = _normalize_suggested_duration_sec(
+                total_suggested, intensity,
+            )
+            merged["transition_to_next"] = run[-1].get(
+                "transition_to_next", merged.get("transition_to_next"),
+            )
+            logger.info(
+                "STORYBOARD_DUPLICATE_HINT_RUN_COLLAPSED start_order=%s run_length=%d "
+                "removed_orders=%s start_hint=%r end_hint=%r suggested_sec=%.2f",
+                run[0].get("beat_order", index), len(run),
+                [
+                    beat.get("beat_order", index + offset)
+                    for offset, beat in enumerate(run[1:], 1)
+                ],
+                str(run[0].get("start_hint", ""))[:80],
+                str(run[0].get("end_hint", ""))[:80],
+                merged["suggested_duration_sec"],
+            )
+        collapsed.append(merged)
+        index = run_end
+
+    return [
+        {**beat, "beat_order": order}
+        for order, beat in enumerate(collapsed)
+    ]
+
+
+def _normalized_hint_pair(
+    beat: dict, language: str,
+) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
+    start = tuple(_normalize_phrase(str(beat.get("start_hint", "")), language))
+    end = tuple(_normalize_phrase(str(beat.get("end_hint", "")), language))
+    return (start, end) if start and end else None
 
 
 def _trim_beat_count_overshoot(
