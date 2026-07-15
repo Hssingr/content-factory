@@ -2481,6 +2481,12 @@ Rules:
   required configured language is missing or unvalidated.
 - Preserve the source script's narration POV — never convert first-person to
   third-person or vice versa during translation/adaptation.
+- A question stays a question (pre-next-test roadmap Tier 2 R6): an
+  interrogative source sentence must remain a complete, natural interrogative
+  sentence in the target language — all three native base prompts carry this
+  rule (a real FR adaptation shipped the final viewer-facing question with a
+  period instead of a question mark). Prompt-level only; no deterministic
+  question-parity check exists.
 
 `narration_pov` threading (roadmap 4a / audit P1-9): this function already
 loads its own `ChannelConfig` row (for `script_format`), so it reads
@@ -6110,8 +6116,15 @@ behavior — no caller is forced to change):
    Whisper's own raw text — never fabricated, never dropped. `insert`
    blocks (script-only words with no Whisper timing to anchor to) are
    skipped — never given a guessed timestamp.
-4. `_tokenize_script()` strips `[INTRO]`/`[SECTION N]`/`[OUTRO]` markers and
-   pre-merges French-style space-grouped numbers (`_merge_number_groups()`:
+4. `_tokenize_script()` strips `[INTRO]`/`[SECTION N]`/`[OUTRO]` markers AND
+   every other bracketed span (`_BRACKET_TAG_RE`, pre-next-test roadmap
+   Tier 2 R5 — ElevenLabs v3 audio tags like `[dramatic pause]` embedded in
+   `voice_script` by Agent 2's eleven_v3 TTS block; three confirmed
+   production leaks shipped a tag verbatim as caption display text via a
+   replace-block merge before this scrub existed; safe by construction
+   because no bracket content is ever spoken, so it can never legitimately
+   align to a Whisper word), and pre-merges French-style space-grouped
+   numbers (`_merge_number_groups()`:
    a leading all-digit token followed by one or more exact 3-digit groups,
    e.g. "30" + "000" → "30 000") into one atomic script token before
    alignment even runs — a script already using commas ("30,000") is

@@ -266,7 +266,9 @@ class ParagraphDensityPromptTest(unittest.TestCase):
 
     def test_prompt_version_bumped(self):
         from app.agents.agent2_discovery import system_prompt as sp
-        self.assertEqual(sp.PROMPT_VERSION, "5.1")
+        # ≥ 5.1 (the R2 bump) — later tiers may bump further; this test must
+        # not pin an exact version it does not own.
+        self.assertGreaterEqual(float(sp.PROMPT_VERSION), 5.1)
 
 
 if __name__ == "__main__":

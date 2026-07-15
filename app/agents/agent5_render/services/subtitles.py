@@ -58,6 +58,16 @@ _CLAUSE_END_RE   = re.compile(r"[,;:—–]$")
 _SECTION_MARKER_LINE_RE = re.compile(
     r"^\s*\[(?:INTRO|OUTRO|SECTION[^\]]*)\]\s*$", re.IGNORECASE | re.MULTILINE,
 )
+# Any other bracketed span — ElevenLabs v3 audio tags ([dramatic pause],
+# [whispers], …) embedded in voice_script by Agent 2's AUDIO_TAGS_INSTRUCTION
+# / eleven_v3 TTS block. Pre-next-test roadmap Tier 2 R5: three confirmed
+# production leaks (FR main caption @389.2s, FR Short 0 @77.6s, FR Short 2
+# @39.5s) where a tag left in the caption-restoration alignment reference
+# fell inside a replace-block merge and shipped verbatim as caption display
+# text. Scrubbing every bracket span is safe by construction: no bracket
+# content is ever spoken (the TTS provider consumes tags; markers are
+# stripped before TTS), so it can never legitimately align to a Whisper word.
+_BRACKET_TAG_RE = re.compile(r"\[[^\]]*\]")
 _NORMALIZE_STRIP_RE = re.compile(r"[^\w]+", re.UNICODE)
 _ALL_DIGITS_RE      = re.compile(r"^\d+$")
 _THREE_DIGITS_RE    = re.compile(r"^\d{3}$")
@@ -112,10 +122,13 @@ def _merge_number_groups(tokens: list[str]) -> list[str]:
 
 def _tokenize_script(voice_script: str) -> list[str]:
     """Split punctuated narration into display tokens: strips
-    [INTRO]/[SECTION N]/[OUTRO] marker lines, splits on whitespace
-    (preserving each word's own attached punctuation for display), and
-    merges French-style space-grouped numbers into one atomic token."""
+    [INTRO]/[SECTION N]/[OUTRO] marker lines AND every other bracketed span
+    (v3 audio tags — Tier 2 R5, see ``_BRACKET_TAG_RE``), splits on
+    whitespace (preserving each word's own attached punctuation for
+    display), and merges French-style space-grouped numbers into one
+    atomic token."""
     stripped = _SECTION_MARKER_LINE_RE.sub("", voice_script or "")
+    stripped = _BRACKET_TAG_RE.sub(" ", stripped)
     return _merge_number_groups(stripped.split())
 
 

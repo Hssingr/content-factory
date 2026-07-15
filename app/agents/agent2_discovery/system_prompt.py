@@ -7,7 +7,13 @@ from app.services.script_checks import split_sentences
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "5.1"  # v5.1: pre-next-test roadmap Tier 1 R2 — _TTS_SHARED_CORE's
+PROMPT_VERSION = "5.2"  # v5.2: pre-next-test roadmap Tier 2 R6 — all three native-
+                        # adaptation base prompts gained "a question stays a question":
+                        # an interrogative source sentence must stay interrogative in
+                        # the target language (a real FR adaptation shipped the final
+                        # viewer-facing question with a period instead of a question
+                        # mark, reading as a broken sentence).
+                        # v5.1: pre-next-test roadmap Tier 1 R2 — _TTS_SHARED_CORE's
                         # blank-line rule inverted: a blank line ONLY at a genuine
                         # scene/beat change (3-6 paragraphs per long-form section,
                         # at most 3-4 breaks in a Short). The old "one blank line
@@ -268,6 +274,10 @@ target language.
   describes it): if the source narrates in first person ("I"/"me"/"my"), the
   translation must too; if it narrates in third person, keep it in third person. Never
   convert one to the other during translation.
+- A question stays a question: any source sentence that ends with a question mark must
+  remain a complete, natural interrogative sentence in the target language, ending with
+  a question mark — never flattened into a declarative sentence. Check the final
+  sentence especially.
 - Target 1200–1600 words in voice_script (same order of magnitude as source).
 
 HOOK_CONTEXT (if provided below): the opening hook was optimised for retention.
@@ -307,6 +317,10 @@ target language.
   describes it): if the source narrates in first person ("I"/"me"/"my"), the adaptation
   must too; if it narrates in third person, keep it in third person. Never convert one
   to the other.
+- A question stays a question: any source sentence that ends with a question mark must
+  remain a complete, natural interrogative sentence in the target language, ending with
+  a question mark — never flattened into a declarative sentence. Check the final
+  sentence especially.
 
 HOOK_CONTEXT (if provided below): preserve the opening hook's concrete specificity and
 directness in your adapted version — the opening must hit with the same force in the
@@ -379,6 +393,11 @@ Standalone Short rules — apply strictly, this is NOT a long-form script:
   describes it): if the source narrates in first person ("I"/"me"/"my"), the adaptation
   must too; if it narrates in third person, keep it in third person. Never convert one
   to the other.
+- A question stays a question: any source sentence that ends with a question mark must
+  remain a complete, natural interrogative sentence in the target language, ending with
+  a question mark — never flattened into a declarative sentence. A real adaptation
+  shipped an interrogative clause ending in a period — check the final sentence
+  (usually the viewer-facing question) especially.
 
 HOOK_CONTEXT (if provided below): preserve the opening hook's concrete specificity and
 directness in your adapted version — the opening must hit with the same force in the
