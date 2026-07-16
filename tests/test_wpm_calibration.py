@@ -16,7 +16,7 @@ against the 1,200-1,600 spec). This proves:
      ceiling, and is really wired into Agent 2's quality-gate issue collector
      (_collect_quality_gate_issues), not just defined and unused.
   4. The recalibrated Short word band constants (_MIN_SHORT_WORDS=125,
-     _MAX_SHORT_WORDS=180) are in place.
+     _MAX_SHORT_WORDS=270) are in place.
   5. storyboard._estimate_beat_count() accepts a wpm override, and the real
      split_into_beats() chain picks up a calibrated per-language wpm for its
      diagnostic log when a db is supplied — with only the paid Claude
@@ -291,11 +291,14 @@ class TestQualityGateWiresMaxLengthCheck(unittest.TestCase):
 
 
 class TestShortWordBandRecalibrated(unittest.TestCase):
-    def test_min_and_max_match_120_wpm_67_to_90_second_band(self):
-        # Floor raised 125 → 135 (fresh full-system audit §2.4): 125 words at
-        # 120 wpm left only 1.5 s of margin over the hard 61 s audio floor.
-        self.assertEqual(_MIN_SHORT_WORDS, 135)
-        self.assertEqual(_MAX_SHORT_WORDS, 180)
+    def test_min_and_max_match_measured_compressed_rate_band(self):
+        # Recalibrated (2026-07-16) to the measured ~176 wpm POST-silence-
+        # compression Short rate (run 41f7eeb8: 246 words → 83.7 s). At that
+        # rate the old 135-word floor was ~46 s — far under the binding 61 s
+        # Short floor; 190 words ≈ 65 s keeps real margin. The 270 cap
+        # (~92 s) is telemetry-only: an over-cap Short ships, never fails.
+        self.assertEqual(_MIN_SHORT_WORDS, 190)
+        self.assertEqual(_MAX_SHORT_WORDS, 270)
 
 
 class TestEstimateBeatCountWpmOverride(unittest.TestCase):

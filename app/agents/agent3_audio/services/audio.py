@@ -250,7 +250,19 @@ def run_audio_generation(content_id: uuid.UUID, db: Session) -> bool:
 
     success_count = 0
 
-    for lang, script in scripts.items():
+    # Language second-chance (never-block policy): a TTS/storage transport
+    # failure re-queues that language for exactly one more full attempt at
+    # the END of the run (skip-on-disk makes any already-persisted parts
+    # cheap). Python list iteration picks up items appended mid-loop, so a
+    # re-queued language is processed by this same loop body unchanged. A
+    # language that fails both attempts is logged loudly below — it must
+    # never disappear silently (a real run shipped EN-only after one FR read
+    # timeout, with nothing louder than a single ERROR line).
+    _MAX_LANGUAGE_ATTEMPTS = 2
+    work: list[tuple[str, Script, int]] = [(lang, s, 1) for lang, s in scripts.items()]
+    missing_langs: set[str] = set()
+
+    for lang, script, attempt in work:
         voice = _select_channel_voice(voices_by_lang, lang, target_gender)
         if not voice or not voice.voice_id:
             logger.warning("No voice configured for lang=%s — skipping", lang)
@@ -312,8 +324,20 @@ def run_audio_generation(content_id: uuid.UUID, db: Session) -> bool:
                 continue
 
         except Exception as exc:
-            logger.error("TTS/storage failed lang=%s: %s", lang, exc)
+            logger.error(
+                "TTS/storage failed lang=%s (attempt %d/%d): %s",
+                lang, attempt, _MAX_LANGUAGE_ATTEMPTS, exc,
+            )
             db.rollback()
+            if attempt < _MAX_LANGUAGE_ATTEMPTS:
+                logger.warning(
+                    "AUDIO_LANGUAGE_RETRY content_id=%s language=%s — queueing one "
+                    "full second attempt at the end of this run",
+                    content_id, lang,
+                )
+                work.append((lang, script, attempt + 1))
+            else:
+                missing_langs.add(lang)
             continue
 
         # ── Step 3: Whisper transcription ─────────────────────────────────────
@@ -382,6 +406,19 @@ def run_audio_generation(content_id: uuid.UUID, db: Session) -> bool:
 
     if success_count > 0:
         content.status = "AUDIO_DONE"
+        # Loud, machine-greppable marker for every configured language that
+        # failed both attempts: the content proceeds (never-block), but a
+        # missing language is a real production gap — Agent 4/5 will simply
+        # skip it, so this line is the only trace. Re-running Agent 3 for
+        # this content backfills just the missing language (skip-on-disk
+        # reuses every language already generated).
+        for missing in sorted(missing_langs):
+            logger.error(
+                "AUDIO_LANGUAGE_MISSING content_id=%s language=%s — proceeding to "
+                "AUDIO_DONE without this language (never-block); re-run Agent 3 "
+                "for this content to backfill it",
+                content_id, missing,
+            )
     else:
         content.status = "FAILED"
         logger.error("All languages failed for content %s", content_id)

@@ -36,7 +36,7 @@ def _beat(order: int, prompt: str) -> dict:
     }
 
 
-def _write_solid(path: Path, *, luminance: int, seed: int = 0) -> None:
+def _write_solid(path: Path, *, luminance: int, seed: int = 0, size: tuple[int, int] = (64, 36)) -> None:
     """Write a real JPEG whose mean grayscale value is ~``luminance``.
 
     Deliberately NOT a perfectly uniform fill: a flat single-color image
@@ -51,10 +51,10 @@ def _write_solid(path: Path, *, luminance: int, seed: int = 0) -> None:
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     rng = random.Random(seed)
-    image = Image.new("RGB", (64, 64))
+    image = Image.new("RGB", size)
     pixels = image.load()
-    for y in range(64):
-        for x in range(64):
+    for y in range(size[1]):
+        for x in range(size[0]):
             value = max(0, min(255, luminance + rng.randint(-8, 8)))
             pixels[x, y] = (value, value, value)
     image.save(path, format="JPEG")
@@ -122,9 +122,10 @@ class LuminanceGateGenerationTest(unittest.TestCase):
                 result = flux_generator.generate_all_beat_images(beats, "content-1")
 
         # Beat 0: one call, bright, kept as-is.
-        # Beat 1: two calls (original + reroll), both dark → handed to
+        # Beat 1: three calls (original + heal attempt 1 corrective clause +
+        # heal attempt 2 deterministic prompt rewrite), all dark → handed to
         # neighbor-fill, which reuses beat 0's bright image.
-        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(calls), 4)
         self.assertEqual(result[0]["media_url"], "cache/content-1/fake-0.jpg")
         self.assertEqual(result[1]["media_url"], result[0]["media_url"])
 
@@ -168,7 +169,12 @@ class ChildShortLuminanceGateTest(unittest.TestCase):
             call_index = len(calls)
             calls.append(prompt)
             local_path = Path(cache_dir) / f"fake-{call_index}.jpg"
-            _write_solid(local_path, luminance=0 if call_index == 0 else 200, seed=call_index)
+            # Portrait fixture (9:16) — the child path's size gate would
+            # correctly flag a landscape/square image.
+            _write_solid(
+                local_path, luminance=0 if call_index == 0 else 200,
+                seed=call_index, size=(36, 64),
+            )
             return str(local_path.relative_to(media_path))
 
         with tempfile.TemporaryDirectory() as tmp:

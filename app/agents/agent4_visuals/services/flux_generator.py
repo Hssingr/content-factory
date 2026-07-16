@@ -18,13 +18,14 @@ card, no on-screen text of any kind; a repeated neighbouring image is strictly
 better. A content item where NO beat generated at all keeps empty media_urls and
 is stopped by Agent 5's missing-media blocker (fail loud, never render black).
 
-Every successfully generated image also passes a deterministic luminance gate
-(``_reroll_if_dark_once()``, roadmap Phase A / live-canary fix): a real
-production run shipped a beat whose Flux generation was a 100% black JPEG,
-since nothing previously inspected pixel content. A near-black frame (mean
-grayscale luminance below ``_LUMINANCE_MEAN_FLOOR``) gets exactly one reroll
-with a well-lit prompt clause; still-dark after that is treated the same as
-a hard generation failure and handed to neighbor-fill.
+Every successfully generated image also passes the unified image health gate
+(``_ensure_beat_image_healthy()``): near-black, baked-in letterbox, and
+off-aspect dimensions are detected via ``media_validation``'s own detectors,
+then healed with a bounded two-attempt ladder — a corrective-clause reroll,
+then a deterministic prompt rewrite (visual_intent + composition variation +
+both corrective clauses) — before neighbor-fill becomes the rare terminal
+fallback (explicit operator preference: regenerate with a changed prompt
+rather than duplicate a neighbor's image).
 """
 
 import hashlib
@@ -65,6 +66,15 @@ _LUMINANCE_MEAN_FLOOR = 24.0
 _WELL_LIT_REROLL_CLAUSE = (
     "bright well-lit scene, strong visible ambient light source, "
     "no underexposure, no near-black frame"
+)
+# Corrective clause for the letterbox reroll gate (fix-and-retry, never
+# block): a real run shipped Flux generations with black cinematic bars
+# baked into the pixels, which the render then displays inside the real
+# video frame — double letterboxing that reads as a broken export.
+_FULL_BLEED_REROLL_CLAUSE = (
+    "full-bleed composition filling the entire frame edge to edge, "
+    "no black bars, no letterboxing, no cinematic bars, no borders or "
+    "frame around the image"
 )
 
 # ── Safe fallback prompts by environment ───────────────────────────────────────
@@ -574,67 +584,149 @@ def _append_well_lit_clause(prompt: str) -> str:
     return f"{base}, {_WELL_LIT_REROLL_CLAUSE}." if base else f"{_WELL_LIT_REROLL_CLAUSE}."
 
 
-def _reroll_if_dark_once(
+def _detect_image_defect(
+    resolved: Path, *, width: int, height: int,
+) -> tuple[str, str] | None:
+    """Every repairable pixel-defect class behind one call: near-black,
+    baked-in letterbox, and off-aspect dimensions — reusing
+    ``media_validation``'s own detectors (single implementation, never
+    forked). Fail-open on unreadable files (the structural checks own those).
+    """
+    from app.agents.agent4_visuals.services.media_validation import (
+        detect_image_pixel_defect,
+        detect_image_wrong_aspect,
+    )
+
+    return (
+        detect_image_pixel_defect(resolved)
+        or detect_image_wrong_aspect(resolved, width / height)
+    )
+
+
+def _build_defect_rewrite_prompt(beat: dict, idx: int) -> str:
+    """Deterministic prompt REWRITE for the second healing attempt.
+
+    Per explicit operator preference (2026-07-16), a defective image gets a
+    genuinely DIFFERENT image request before any neighbor duplication: built
+    from the beat's ``visual_intent`` (or the environment-safe base when the
+    intent is too thin), a composition-slot variation drawn from the shared
+    24-slot rotation, and BOTH corrective clauses. Pure string construction —
+    no AI call.
+    """
+    intent = str(beat.get("visual_intent") or "").strip().rstrip(". ")
+    environment = str(beat.get("environment") or "other")
+    base = intent if len(intent.split()) >= 4 else _ENV_SAFE_PROMPTS.get(
+        environment, _ENV_SAFE_PROMPTS["other"],
+    )
+    return (
+        f"{base}, {composition_slot_variation(idx)}, "
+        f"{_WELL_LIT_REROLL_CLAUSE}, {_FULL_BLEED_REROLL_CLAUSE}."
+    )
+
+
+def _ensure_beat_image_healthy(
     beat: dict,
     path: str,
     content_id: str,
-    tier_counts: dict[str, int],
     *,
     width: int,
     height: int,
 ) -> str:
-    """Reroll one generated image if it is near-black, then hand off to
-    neighbor-fill if it is still too dark.
+    """Unified image health gate — detect → fix → retry, neighbor-fill last.
 
-    Disaster check + bounded transport-style retry — the same class of fix
-    as the pixel-duplicate reroll above (Elimination Mandate precedent), not
-    a quality-judging loop: exactly one reroll attempt with a deterministic
-    "well-lit" prompt clause. A beat still near-black after that reroll (or
-    whose reroll call fails outright) is handed to
-    ``fill_failed_beats_from_neighbors()`` — returning ``""`` so the caller
-    leaves ``beat["media_url"]`` unset — rather than ever shipping a known
-    black/near-black frame.
+    Replaces the former separate dark/letterbox/size gates (which each made
+    one attempt and fell straight to neighbor duplication — a fallback the
+    operator explicitly dislikes). Escalation ladder, bounded at TWO extra
+    generations per defective beat:
+
+      1. corrective-clause reroll — the beat's own prompt plus the clause
+         matched to the detected defect (well-lit / full-bleed; a size
+         defect keeps the prompt unchanged), with a fresh cache key — the
+         identical prompt+size would hash straight back to the cached bad
+         artifact;
+      2. deterministic prompt REWRITE (``_build_defect_rewrite_prompt``) —
+         a different image request, not the same prompt re-rolled.
+
+    Every regenerated image is re-checked against ALL defect classes, not
+    just the one that triggered healing (closes the former cross-check gap
+    where e.g. a dark-reroll's replacement was never letterbox-checked).
+    Only when both attempts fail does the beat hand off to neighbor-fill
+    (``""`` return) — the rare terminal fallback; something must still fill
+    the beat, or the render defers on missing media.
 
     Returns:
-        The (possibly rerolled) local path, or ``""`` to signal hand-off to
-        neighbor-fill.
+        A healthy local path, or ``""`` to signal neighbor-fill hand-off.
     """
     media_path = Path(settings.media_path)
     idx = beat.get("beat_order", beat.get("section_order", 0))
-    luminance = _mean_luminance(path, media_path)
-    if luminance is None or luminance >= _LUMINANCE_MEAN_FLOOR:
+
+    def _resolved(p: str) -> Path:
+        pp = Path(p)
+        return pp if pp.is_absolute() else media_path / pp
+
+    defect = _detect_image_defect(_resolved(path), width=width, height=height)
+    if defect is None:
         return path
-
-    reroll_prompt = _append_well_lit_clause(str(beat.get("flux_prompt", "") or ""))
-    reroll_beat = dict(beat)
-    reroll_beat["media_url"] = ""
-    reroll_beat["flux_prompt"] = reroll_prompt
+    code = defect[0]
     logger.warning(
-        "BEAT_IMAGE_DARK_REROLL content=%s beat=%s luminance=%.1f floor=%.0f",
-        content_id, idx, luminance, _LUMINANCE_MEAN_FLOOR,
+        "BEAT_IMAGE_DEFECT content=%s beat=%s code=%s media_url=%s — healing",
+        content_id, idx, code, path,
     )
 
-    reroll_path = generate_beat_image_with_routing(
-        reroll_beat, content_id, tier_counts, width=width, height=height,
-    )
-    if reroll_path:
-        beat["flux_prompt"] = reroll_prompt
-        reroll_luminance = _mean_luminance(reroll_path, media_path)
-        if reroll_luminance is not None and reroll_luminance < _LUMINANCE_MEAN_FLOOR:
-            logger.error(
-                "BEAT_IMAGE_DARK_REROLL_STILL_DARK content=%s beat=%s luminance=%.1f "
-                "floor=%.0f — handing off to neighbor-fill",
-                content_id, idx, reroll_luminance, _LUMINANCE_MEAN_FLOOR,
+    base_prompt = str(beat.get("flux_prompt", "") or "")
+    if code == "near_black_image":
+        attempt1_prompt = _append_well_lit_clause(base_prompt)
+    elif code == "letterboxed_image":
+        attempt1_prompt = _append_full_bleed_clause(base_prompt)
+    else:
+        attempt1_prompt = base_prompt
+
+    environment = beat.get("environment", "other")
+    for attempt, prompt in (
+        (1, attempt1_prompt),
+        (2, _build_defect_rewrite_prompt(beat, idx)),
+    ):
+        new_path = generate_beat_image(
+            prompt, idx, content_id,
+            environment=environment,
+            cache_key_extra=f"heal{attempt}:{code}:{idx}",
+            width=width, height=height,
+        )
+        if not new_path:
+            logger.warning(
+                "BEAT_IMAGE_HEAL_ATTEMPT_FAILED content=%s beat=%s attempt=%d "
+                "code=%s — generation returned nothing",
+                content_id, idx, attempt, code,
             )
-            return ""
-        return reroll_path
+            continue
+        remaining = _detect_image_defect(
+            _resolved(new_path), width=width, height=height,
+        )
+        if remaining is None:
+            beat["flux_prompt"] = prompt
+            logger.warning(
+                "BEAT_IMAGE_HEALED content=%s beat=%s attempt=%d code=%s new=%s",
+                content_id, idx, attempt, code, new_path,
+            )
+            return new_path
+        code = remaining[0]
+        logger.warning(
+            "BEAT_IMAGE_HEAL_ATTEMPT_STILL_DEFECTIVE content=%s beat=%s "
+            "attempt=%d remaining_code=%s",
+            content_id, idx, attempt, code,
+        )
 
     logger.error(
-        "BEAT_IMAGE_DARK_REROLL_FAILED content=%s beat=%s original_media_url=%s "
-        "— handing off to neighbor-fill",
-        content_id, idx, path,
+        "BEAT_IMAGE_HEAL_EXHAUSTED content=%s beat=%s code=%s "
+        "— handing off to neighbor-fill (terminal fallback)",
+        content_id, idx, code,
     )
     return ""
+
+
+def _append_full_bleed_clause(prompt: str) -> str:
+    base = str(prompt or "").rstrip(". ")
+    return f"{base}, {_FULL_BLEED_REROLL_CLAUSE}." if base else f"{_FULL_BLEED_REROLL_CLAUSE}."
 
 
 def fill_failed_beats_from_neighbors(beats: list[dict], content_id: str) -> int:
@@ -697,9 +789,10 @@ def generate_all_beat_images(beats: list[dict], content_id: str) -> list[dict]:
         then ``fill_failed_beats_from_neighbors()`` reuses the nearest
         neighbouring beat's image. Never a text card, never on-screen text
         (subtitles-only rendering, audit G-0/G-8).
-      - Near-black frame: ``_reroll_if_dark_once()`` rerolls once with a
-        well-lit prompt clause; still-dark after that also falls through to
-        neighbor-fill rather than shipping a black/near-black frame.
+      - Pixel defect (near-black / letterbox / off-aspect):
+        ``_ensure_beat_image_healthy()`` heals with up to two regeneration
+        attempts (corrective clause, then a deterministic prompt rewrite);
+        only after both fail does the beat fall through to neighbor-fill.
 
     Args:
         beats:      Storyboard beat dicts with a ``flux_prompt`` field.
@@ -746,8 +839,8 @@ def generate_all_beat_images(beats: list[dict], content_id: str) -> list[dict]:
                 beat, path, content_id, tier_counts, pixel_ledger,
                 width=_DEFAULT_WIDTH, height=_DEFAULT_HEIGHT,
             )
-            path = _reroll_if_dark_once(
-                beat, path, content_id, tier_counts,
+            path = _ensure_beat_image_healthy(
+                beat, path, content_id,
                 width=_DEFAULT_WIDTH, height=_DEFAULT_HEIGHT,
             )
             if path:

@@ -7,7 +7,15 @@ from app.services.script_checks import split_sentences
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "5.3"  # v5.3: pre-next-test roadmap Tier 4 R11/R13/R14 — first-person
+PROMPT_VERSION = "5.4"  # v5.4: Short word economy recalibrated to the measured
+                        # ~175 wpm POST-silence-compression narration rate (run
+                        # 41f7eeb8: 246 words → 83.7 s). Planner/writer/schema now
+                        # target 210-260 words with an explicit never-under-190
+                        # rule — at ~175 wpm the old 140-170 target produced
+                        # 48-58 s drafts, ALL under Agent 3's hard 61 s floor.
+                        # Operator rule codified: a Short must NEVER be under
+                        # 61 s; exceeding ~90 s is telemetry-only, never a failure.
+                        # v5.3: pre-next-test roadmap Tier 4 R11/R13/R14 — first-person
                         # cold-open identity stays first-person in both Shorts prompts;
                         # cliffhangers must name a concrete unresolved subject and sunk-cost
                         # logic is narrator rationalization; Short target tightened to 140-170
@@ -1465,9 +1473,11 @@ Rules:
 - total_parts must be between 3 and 5 (inclusive). Never fewer than 3 or more than 5.
 - Split at narrative boundaries: reveals, discoveries, reversals, or escalations.
   Never split primarily by time — narrative logic is paramount.
-- Each part targets 70–85 seconds of spoken narration (≈140–170 words at the measured
-  ~120 wpm real Short narration rate). Keep the plan scoped tightly enough for the writer
-  to stay within that range without omitting the main reveal.
+- Each part targets 72–88 seconds of spoken narration (≈210–260 words at the measured
+  ~175 wpm compressed Short narration rate). A Short must NEVER run under 61 seconds —
+  a part plan too thin to sustain at least 210 words of narration is a planning error.
+  Keep the plan scoped tightly enough for the writer to stay within that range without
+  omitting the main reveal.
 - Every part must be independently watchable: a viewer who starts on Part 3 must
   understand the situation from the first 5 seconds without having seen prior parts.
 - opening_hook: 1–2 sentences, each ≤15 words, starts at a high-tension story moment. No recap.
@@ -1611,11 +1621,14 @@ You are writing a TikTok episode script — one standalone part of a multi-part 
 This is NOT a cut of a longer video. It is purpose-built for TikTok.
 
 Rules:
-- Target 140–170 words. Count every word in voice_script before returning.
-  If voice_script exceeds 170 words, remove the least essential sentences until
-  the count is at or below 170. Do not pad a complete script merely to reach 140.
-  (170 words ≈ 85 seconds at the measured ~120 wpm real Short narration rate —
-  calibrated from production audio, not the raw "words per second" of the TTS voice.)
+- Target 210–260 words. Count every word in voice_script before returning.
+  NEVER return fewer than 190 words: the finished Short must run at least 61 seconds
+  of narration, and below ~190 words that is physically impossible. If voice_script
+  exceeds 260 words, remove the least essential sentences — but when in doubt, keep
+  them: a slightly long Short ships; a too-short one cannot.
+  (260 words ≈ 89 seconds at the measured ~175 wpm compressed Short narration rate —
+  calibrated from production audio after interior-silence compression, not the raw
+  "words per second" of the TTS voice.)
 - First sentence uses the opening_hook from the plan, ≤15 words, and starts at a
   high-tension story moment. It must also pass the cold-open deletion test: read it as
   the first thing a viewer ever hears, with no title, part number, previous part, or
@@ -1685,7 +1698,7 @@ _SHORT_EPISODE_SCHEMA: dict = {
     "type": "object",
     "properties": {
         "title":        {"type": "string", "description": "Part N title (≤60 chars, TikTok-optimized)."},
-        "voice_script": {"type": "string", "description": "Full flat narration text, target 140-170 words."},
+        "voice_script": {"type": "string", "description": "Full flat narration text, target 210-260 words (never under 190)."},
     },
     "required": ["title", "voice_script"],
     "additionalProperties": False,
@@ -1701,6 +1714,7 @@ def generate_short_episode_script(
     visual_style: str = "",
     image_style: str = "",
     narration_pov: str = "third_person",
+    word_floor_note: str = "",
 ) -> dict:
     """Generate a single TikTok episode script from a part plan.
 
@@ -1714,6 +1728,11 @@ def generate_short_episode_script(
         blueprint:          Blueprint dict from generate_story_blueprint().
         channel:            Channel ORM object (provides niche and tone).
         channel_voice:      ChannelVoice ORM object (provides tts_model for TTS_BLOCK).
+        word_floor_note:    Optional prepended constraint line — used ONLY by the
+                            single deterministic word-floor regeneration
+                            (operator-approved Elimination Mandate exception,
+                            2026-07-16): an objective word-count trigger, never
+                            an AI quality judgment.
 
     Returns:
         Dict with keys ``title`` (str) and ``voice_script`` (str).
@@ -1732,7 +1751,9 @@ def generate_short_episode_script(
     part_json  = json.dumps(part_plan, ensure_ascii=False)
     bp_json    = json.dumps(blueprint, ensure_ascii=False)
 
+    floor_line = f"{word_floor_note}\n\n" if word_floor_note else ""
     user_message = (
+        f"{floor_line}"
         f"Channel niche: {channel.niche}\n"
         f"Channel tone: {channel.tone}\n"
         f"Visual style: {visual_style or 'story_driven'}\n"

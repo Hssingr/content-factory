@@ -107,7 +107,7 @@ def test_real_child_short_adaptation_call_preserves_self_contained_cold_open():
 
 def test_word_cap_and_overlap_remain_prompt_and_telemetry_only():
     source = _flat(system_prompt._SHORT_EPISODE_SYSTEM_PROMPT)
-    assert "target 140–170 words" in source
-    assert "at or below 170" in source
+    assert "target 210–260 words" in source
+    assert "remove the least essential sentences" in source
     assert "originality" in source
     assert "never lift a run of 6 or more consecutive words" in source

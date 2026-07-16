@@ -207,11 +207,14 @@ class TestShortScriptGenerationNeverRetries(unittest.TestCase):
             "Sam Walker moved to Drisking Missouri as a kid and grew up hearing "
             "a grinding sound through the mountain every single night without fail. " * 3
         )
-        # Over the 180-word cap AND repeats a 6+ word run verbatim from the parent.
+        # Over the 270-word cap AND repeats a 6+ word run verbatim from the
+        # parent (and comfortably above the 190-word floor, so the one
+        # operator-approved word-floor regeneration never triggers here —
+        # over-cap remains strictly telemetry, never a retry).
         over_cap_overlapping = (
             "Sam Walker moved to Drisking Missouri as a kid and grew up hearing "
             "a grinding sound through the mountain every single night without fail. "
-            + ("More filler narration continues here. " * 30)
+            + ("More filler narration continues here. " * 52)
         )
         calls = {"n": 0}
 

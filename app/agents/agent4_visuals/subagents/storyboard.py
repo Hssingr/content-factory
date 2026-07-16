@@ -51,7 +51,7 @@ from app.models import VideoSection
 from app.services.claude_client import call_claude_structured_with_usage
 from app.agents.agent4_visuals.services.flux_generator import (
     _dedupe_generated_image_once,
-    _reroll_if_dark_once,
+    _ensure_beat_image_healthy,
     derive_text_prop_prompt,
     fill_failed_beats_from_neighbors,
     generate_beat_image_with_routing,
@@ -2602,8 +2602,9 @@ def generate_pending_beat_images(beats: list[dict], content_id: str) -> list[dic
     Mutates every beat in-place (mirrors `generate_all_beat_images()`'s
     contract):
       - Success: sets ``beat["media_url"]`` to a local cache path.
-      - Hard failure, or a near-black frame that is still dark after one
-        well-lit reroll (`_reroll_if_dark_once()`): left empty here, then
+      - Hard failure, or a pixel defect (near-black/letterbox/off-aspect)
+        that survives the unified health gate's two regeneration attempts
+        (`_ensure_beat_image_healthy()`): left empty here, then
         filled by ``fill_failed_beats_from_neighbors()`` (subtitles-only
         rendering — the ``__text_card__`` sentinel is never produced; a
         repeated neighbouring image is strictly better than a text card or a
@@ -2646,8 +2647,8 @@ def generate_pending_beat_images(beats: list[dict], content_id: str) -> list[dic
                 beat, new_url, content_id, tier_counts, pixel_ledger,
                 width=_SHORT_IMAGE_WIDTH, height=_SHORT_IMAGE_HEIGHT,
             )
-            new_url = _reroll_if_dark_once(
-                beat, new_url, content_id, tier_counts,
+            new_url = _ensure_beat_image_healthy(
+                beat, new_url, content_id,
                 width=_SHORT_IMAGE_WIDTH, height=_SHORT_IMAGE_HEIGHT,
             )
             if new_url:

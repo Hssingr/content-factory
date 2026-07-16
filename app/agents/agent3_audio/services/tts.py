@@ -2,6 +2,7 @@ import functools
 import inspect
 import logging
 import re
+import time
 
 from elevenlabs.types import VoiceSettings
 
@@ -1331,6 +1332,47 @@ def _wav_to_mp3(wav_bytes: bytes) -> bytes:
             return f.read()
 
 
+_TTS_TRANSPORT_ATTEMPTS = 3
+_TTS_TRANSPORT_BACKOFF_SEC = (2.0, 5.0)
+
+
+def _call_tts_with_transport_retry(request_fn, *, provider: str, unit_label: str):
+    """Bounded transport retry around ONE provider TTS request.
+
+    A real production run lost an entire language to a single read timeout
+    on section 6/6 — the 5 already-generated sections were discarded with
+    it. Transport failures (timeouts, connection resets, transient 5xx) get
+    up to ``_TTS_TRANSPORT_ATTEMPTS`` total attempts with a short backoff —
+    the same transport-not-quality retry class the Claude client uses
+    (Elimination Mandate-compatible: this never re-rolls a *successful*
+    generation, it only retries a request that returned no audio at all).
+
+    ``TypeError`` propagates immediately: it is the Cartesia SDK
+    request-shape incompatibility signal (`CARTESIA_REQUEST_FORMAT_UNSUPPORTED`)
+    and retrying an identical malformed call can never succeed.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, _TTS_TRANSPORT_ATTEMPTS + 1):
+        try:
+            return request_fn()
+        except TypeError:
+            raise
+        except Exception as exc:
+            last_exc = exc
+            if attempt == _TTS_TRANSPORT_ATTEMPTS:
+                raise
+            wait = _TTS_TRANSPORT_BACKOFF_SEC[
+                min(attempt - 1, len(_TTS_TRANSPORT_BACKOFF_SEC) - 1)
+            ]
+            logger.warning(
+                "TTS_TRANSPORT_RETRY provider=%s unit=%s attempt=%d/%d error=%s "
+                "— retrying in %.0fs",
+                provider, unit_label, attempt, _TTS_TRANSPORT_ATTEMPTS, exc, wait,
+            )
+            time.sleep(wait)
+    raise last_exc  # pragma: no cover — unreachable
+
+
 def _generate_cartesia_audio(
     voice_script: str, channel_voice, is_short_episode: bool = False,
 ) -> tuple[bytes, list[bytes], list[dict]]:
@@ -1414,7 +1456,11 @@ def _generate_cartesia_audio(
             speed_profile=unit["delivery"]["speed_profile"],
         )
         try:
-            wav_bytes = client.tts.bytes(**request_kwargs)
+            wav_bytes = _call_tts_with_transport_retry(
+                lambda: client.tts.bytes(**request_kwargs),
+                provider="cartesia",
+                unit_label=unit.get("section_label") or "unmarked",
+            )
         except TypeError:
             # _check_cartesia_sdk_compatibility() already validated the SDK
             # supports this model's request shape before this loop started —
@@ -1631,8 +1677,15 @@ def generate_audio(voice_script: str, channel_voice, is_short_episode: bool = Fa
             if next_prepared.strip():
                 kwargs["next_text"] = next_prepared[:300]
 
-        audio_iter = client.text_to_speech.convert(**kwargs)
-        all_bytes.append(b"".join(audio_iter))
+        # The convert() iterator is consumed inside the retry closure — read
+        # timeouts surface during iteration, not at call time, so joining
+        # inside is what makes the retry actually cover them.
+        blob = _call_tts_with_transport_retry(
+            lambda: b"".join(client.text_to_speech.convert(**kwargs)),
+            provider="elevenlabs",
+            unit_label=chunk.get("section_label") or "unmarked",
+        )
+        all_bytes.append(blob)
         if track_sections:
             section_meta.append({
                 "section_type": chunk.get("section_type"),

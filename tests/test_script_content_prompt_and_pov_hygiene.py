@@ -66,7 +66,7 @@ class ShortsPromptRuntimeTest(unittest.TestCase):
         self.assertIn("Never add a third-person naming sentence", prompt)
         self.assertIn("concrete unresolved threat, person, event, place, or object", prompt)
         self.assertIn("narrator's or character's rationalization", prompt)
-        self.assertIn("140–170 words", prompt)
+        self.assertIn("210–260 words", prompt)
 
     def test_short_writer_receives_first_person_and_content_rules(self) -> None:
         response = {"title": "The Frozen Route", "voice_script": "I led the army onward."}
@@ -89,7 +89,7 @@ class ShortsPromptRuntimeTest(unittest.TestCase):
         self.assertIn("Never insert a third-person naming sentence", prompt)
         self.assertIn("concrete unresolved threat, person, event, place, or object", prompt)
         self.assertIn("character's rationalization", prompt)
-        self.assertIn("Target 140–170 words", prompt)
+        self.assertIn("Target 210–260 words", prompt)
         self.assertGreaterEqual(tuple(map(int, system_prompt.PROMPT_VERSION.split("."))), (5, 3))
 
 

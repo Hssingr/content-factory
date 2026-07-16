@@ -30,6 +30,21 @@ _LETTERBOX_EDGE_LUMINANCE_CEILING = 12.0
 _LETTERBOX_CENTER_LUMINANCE_FLOOR = 48.0
 _LETTERBOX_EDGE_FRACTION = 0.03
 
+# Per-image, regeneration-fixable defect codes are repairable (fix-and-retry,
+# never block — operator policy): the orchestrator regenerates the flagged
+# image (falling back to a validated neighbor's image) instead of failing the
+# content. `local_image_aspect_mismatch` joined the set after a real run
+# FAILED an entire child Short because fal returned ONE 1072x1536 image for a
+# 1080x1920 portrait request (provider-side size anomaly — the same payload
+# produced 20+ correct portraits in the same run); a wrong-sized image is
+# fixed by a fresh correctly-sized generation, not a pipeline bug. Every
+# other blocking code is STRUCTURAL (missing/zero-byte/unreadable file,
+# remote URL, unsafe path, legacy sentinel) — those mean the render itself
+# would break or a real pipeline bug exists, and still fail the content.
+REPAIRABLE_MEDIA_CODES = frozenset(
+    {"near_black_image", "letterboxed_image", "local_image_aspect_mismatch"}
+)
+
 
 @dataclass(frozen=True)
 class MediaValidationIssue:
@@ -467,6 +482,46 @@ def _validate_image_letterbox(path: Path) -> tuple[str, str] | None:
             f"(center luminance {center:.1f}/255) baked into the pixels.",
         )
     return None
+
+
+def detect_image_pixel_defect(path: Path) -> tuple[str, str] | None:
+    """The two repairable pixel-quality defects, behind one public name.
+
+    Reused by ``flux_generator``'s generation-time letterbox reroll gate and
+    the orchestrator's validation-time media-repair pass, so exactly ONE
+    implementation of each pixel check exists (CLAUDE.md §11.4's
+    single-media-validator rule — reuse, never fork).
+
+    Returns:
+        ``(code, message)`` — code in ``REPAIRABLE_MEDIA_CODES`` — or ``None``
+        when the image is clean (or unreadable: the structural checks own
+        unreadable files, not this helper).
+    """
+    return _validate_image_luminance(path) or _validate_image_letterbox(path)
+
+
+def detect_image_letterbox(path: Path) -> tuple[str, str] | None:
+    """Public alias for the letterbox detector — see ``detect_image_pixel_defect``."""
+    return _validate_image_letterbox(path)
+
+
+def detect_image_wrong_aspect(
+    path: Path, expected_aspect_ratio: float,
+) -> tuple[str, str] | None:
+    """Public aspect check against an explicit expected ratio.
+
+    Reused by ``flux_generator``'s generation-time size gate (which knows the
+    exact requested width/height) and the orchestrator's repair-pass
+    verification — same ``_validate_image_dimensions()`` implementation and
+    tolerance the persisted-media validator itself uses, never a fork.
+    Returns ``None`` for an unreadable file (the structural checks own those).
+    """
+    try:
+        with Image.open(path) as image:
+            width, height = image.size
+    except (UnidentifiedImageError, OSError, ValueError):
+        return None
+    return _validate_image_dimensions(width, height, expected_aspect_ratio)
 
 
 def _issue(

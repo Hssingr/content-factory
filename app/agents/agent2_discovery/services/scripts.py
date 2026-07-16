@@ -1874,17 +1874,20 @@ def generate_script_sections(
 
 # ── Standalone short planning: Shorts Planner ──────────────────────────────────────────────────
 
-# Calibrated for a 61-90 s Short at the measured ~120 wpm child-Short rate
-# (roadmap 3.6/3.8, audit G-7 — real Shorts run at ~120 wpm, not the
-# previously-assumed 180 wpm / "3 words per second"; the old 250-word cap
-# produced measured 110 s Shorts, overshooting the 60-90 s plan band).
-# Floor raised 125 → 135 (fresh full-system audit §2.4): 125 words at 120 wpm
-# is 62.5 s — only 1.5 s of margin over Agent 3's hard 61 s monetization floor
-# (_MIN_SHORT_AUDIO_DURATION_MS); a marginally fast read failed the language
-# after paying for script + translation + TTS. 135 words ≈ 67.5 s keeps real
-# margin.
-_MIN_SHORT_WORDS = 135  # ~67 s at 120 wpm
-_MAX_SHORT_WORDS = 180  # ~90 s at 120 wpm
+# Calibrated for the operator's binding Short duration rule: a Short MUST
+# never be under 61 s (Agent 3's hard _MIN_SHORT_AUDIO_DURATION_MS gate);
+# it SHOULD stay at or under ~90 s, but exceeding 90 s is telemetry-only and
+# never fails anything.
+#
+# Recalibrated (implementation review, 2026-07-16): Tier 1's interior-silence
+# compression raised the real measured child-Short gross narration rate from
+# the ~120 wpm these constants were originally calibrated on to ~176 wpm
+# (run 41f7eeb8: 246 words → 83.7 s). At that rate the old 135-word floor was
+# ~46 s and the old 180-word cap ~61 s — i.e. every draft that OBEYED the old
+# targets would have failed the hard 61 s floor; the run only survived
+# because the model overshot. New calibration at ~175 wpm compressed:
+_MIN_SHORT_WORDS = 190  # ~65 s — the hard 61 s audio floor needs ≥ ~180 words
+_MAX_SHORT_WORDS = 270  # ~92 s — telemetry-only: an over-cap Short ships, never fails
 
 # Section markers must never appear in a child Short's narration — flat narration only
 # (CLAUDE.md §5.2). Catches [INTRO], [SECTION N], [OUTRO], or any other bracketed label
@@ -2274,7 +2277,10 @@ def _generate_short_script(
     image_style: str = "",
     narration_pov: str = "third_person",
 ) -> dict | None:
-    """Generate one child Short script with a single Claude call — no quality-judging retry.
+    """Generate one child Short script — no quality-judging retry; the sole
+    exception is the deterministic word-floor regeneration below (operator-
+    approved, 2026-07-16: an objective word-count trigger protecting the
+    binding never-under-61s Short rule, never an AI quality judgment).
 
     Per the Elimination Mandate (code_report/forensic_output_audit_borrasca_run.md,
     D1.3), the correction-round loop and the AI Short Quality Gate are deleted:
@@ -2300,6 +2306,58 @@ def _generate_short_script(
     except Exception as exc:
         logger.error("run_shorts_planner: script error for part %d: %s", part_n, exc)
         return None
+
+    # Word-floor regeneration — the ONE operator-approved Elimination Mandate
+    # exception (2026-07-16): the trigger is an objective word count, never an
+    # AI quality judgment. A draft under _MIN_SHORT_WORDS cannot physically
+    # reach the binding 61 s Short floor (at the measured ~175 wpm compressed
+    # rate), so it would die at Agent 3's hard audio gate AFTER paying for
+    # TTS. Exactly one regeneration with an explicit minimum-words constraint;
+    # the LONGER of the two drafts is kept (deterministic choice — never an AI
+    # judgment of which is "better"). Still-under-floor after that is
+    # telemetry (SHORT_SCRIPT_STILL_UNDER_FLOOR) — the 61 s audio gate remains
+    # the final enforcement.
+    first_wc = len(str(result.get("voice_script", "")).split())
+    if first_wc < _MIN_SHORT_WORDS:
+        logger.warning(
+            "SHORT_SCRIPT_WORD_FLOOR_REGEN part=%d words=%d floor=%d — one "
+            "deterministic regeneration (operator-approved mandate exception)",
+            part_n, first_wc, _MIN_SHORT_WORDS,
+        )
+        try:
+            second = generate_short_episode_script(
+                part_plan=part_plan,
+                long_voice_script=voice_script,
+                blueprint=blueprint,
+                channel=channel,
+                channel_voice=channel_voice,
+                visual_style=visual_style,
+                image_style=image_style,
+                narration_pov=narration_pov,
+                word_floor_note=(
+                    f"HARD CONSTRAINT — your previous draft was only {first_wc} words. "
+                    f"voice_script MUST contain at least {_MIN_SHORT_WORDS + 20} words "
+                    f"(target 210-260): below that the finished Short cannot reach the "
+                    f"mandatory 61 seconds of narration. Add concrete story detail from "
+                    f"the long-form script — never filler."
+                ),
+            )
+            second_wc = len(str(second.get("voice_script", "")).split())
+            if second_wc > first_wc:
+                result = second
+            if max(first_wc, second_wc) < _MIN_SHORT_WORDS:
+                logger.error(
+                    "SHORT_SCRIPT_STILL_UNDER_FLOOR part=%d words=%d floor=%d — "
+                    "proceeding with the longer draft; Agent 3's 61 s audio gate "
+                    "is the final enforcement",
+                    part_n, max(first_wc, second_wc), _MIN_SHORT_WORDS,
+                )
+        except Exception as exc:
+            logger.warning(
+                "SHORT_SCRIPT_WORD_FLOOR_REGEN_FAILED part=%d error=%s — keeping "
+                "the original draft",
+                part_n, exc,
+            )
 
     _collect_short_title_spoiler_issue(
         title=str(result.get("title", "")),

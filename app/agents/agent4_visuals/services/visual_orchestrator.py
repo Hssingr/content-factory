@@ -42,8 +42,19 @@ from app.agents.agent4_visuals.subagents.storyboard import (
 from app.agents.agent4_visuals.subagents.storyboard_validator import (
     validate_storyboard, repair_duplicate_flux_prompts,
 )
-from app.agents.agent4_visuals.services.flux_generator import generate_all_beat_images
-from app.agents.agent4_visuals.services.media_validation import validate_visual_media_assets
+from app.agents.agent4_visuals.services.flux_generator import (
+    _append_full_bleed_clause,
+    _append_well_lit_clause,
+    _build_defect_rewrite_prompt,
+    generate_all_beat_images,
+    generate_beat_image,
+)
+from app.agents.agent4_visuals.services.media_validation import (
+    REPAIRABLE_MEDIA_CODES,
+    detect_image_pixel_defect,
+    detect_image_wrong_aspect,
+    validate_visual_media_assets,
+)
 from app.agents.agent4_visuals.services.visual_review import (
     generate_visual_review_html, save_beat_review_metadata,
 )
@@ -210,22 +221,52 @@ def run_visual_generation_for_content(content_id: uuid.UUID, db: Session) -> boo
             warning.media_path, warning.message,
         )
     if not validation.passed:
-        logger.error(
-            "AGENT4_MEDIA_VALIDATION_BLOCKED content_id=%s blocking=%d checked=%d codes=%s",
-            content_id,
-            len(validation.blocking_issues),
-            validation.checked_count,
-            [issue.code for issue in validation.blocking_issues],
-        )
+        # Fix-and-retry, never block (operator policy): pixel-QUALITY findings
+        # (near-black, letterboxed — REPAIRABLE_MEDIA_CODES) are repaired in
+        # place and validation re-runs once. Only STRUCTURAL findings (missing/
+        # zero-byte/unreadable file, remote URL, unsafe path, aspect mismatch)
+        # still fail the content — those mean the render itself would break.
+        repairable = [
+            i for i in validation.blocking_issues if i.code in REPAIRABLE_MEDIA_CODES
+        ]
+        if repairable:
+            repaired = _repair_flagged_media(content_id, content, repairable, db)
+            logger.warning(
+                "AGENT4_MEDIA_REPAIR_DONE content_id=%s flagged=%d repaired_files=%d — revalidating",
+                content_id, len(repairable), repaired,
+            )
+            validation = validate_visual_media_assets(content_id, db)
+
+    if not validation.passed:
+        structural = [
+            i for i in validation.blocking_issues if i.code not in REPAIRABLE_MEDIA_CODES
+        ]
         for issue in validation.blocking_issues:
             logger.error(
                 "AGENT4_MEDIA_VALIDATION_BLOCKING_ISSUE content_id=%s language=%s section=%s code=%s media=%s message=%s",
                 content_id, issue.language, issue.section_order, issue.code,
                 issue.media_path, issue.message,
             )
-        content.status = "FAILED"
-        db.commit()
-        return False
+        if structural:
+            logger.error(
+                "AGENT4_MEDIA_VALIDATION_BLOCKED content_id=%s blocking=%d checked=%d codes=%s",
+                content_id,
+                len(validation.blocking_issues),
+                validation.checked_count,
+                [issue.code for issue in validation.blocking_issues],
+            )
+            content.status = "FAILED"
+            db.commit()
+            return False
+        # Only repairable codes remain after a repair attempt — proceed anyway
+        # (never block the flow on pixel quality); loud so it is visible.
+        logger.error(
+            "AGENT4_MEDIA_VALIDATION_UNREPAIRED content_id=%s remaining=%d codes=%s "
+            "— proceeding per never-block policy (pixel-quality findings never fail content)",
+            content_id,
+            len(validation.blocking_issues),
+            [issue.code for issue in validation.blocking_issues],
+        )
 
     # status is "PARENT_VISUALS_DONE" or "CHILD_SHORT_VISUALS_DONE" — Agent 4
     # is the sole writer of these statuses; pickup_visual_ready reads them.
@@ -246,6 +287,160 @@ def run_visual_generation_for_content(content_id: uuid.UUID, db: Session) -> boo
         content_id, status, len(result["beats_by_lang"]),
     )
     return True
+
+
+def _repair_flagged_media(
+    content_id: uuid.UUID,
+    content: Content,
+    issues: list,
+    db: Session,
+) -> int:
+    """Regenerate images flagged with repairable pixel-quality defects
+    (fix-and-retry, never block — operator policy).
+
+    For each unique flagged cache file: one regeneration with the defect's
+    corrective prompt clause (well-lit for ``near_black_image``, full-bleed
+    for ``letterboxed_image``), verified with the same detector that flagged
+    it; if the regeneration is still defective (or the call fails), falls
+    back to the nearest already-validated neighbor section's image — the
+    same terminal fallback the generation-time gates use. Every
+    ``VideoSection`` row in every language pointing at the old file is
+    updated (``media_url`` lives only in the ``generation_prompt`` JSON
+    extras — there is no column — and the shared loader merges extras over
+    columns, so the JSON is the single thing that must change).
+
+    Returns:
+        Number of flagged files actually re-pointed at a new image.
+    """
+    from pathlib import Path
+
+    from app.config import settings
+
+    media_root = Path(settings.media_path)
+    is_short = bool(getattr(content, "is_short_episode", False))
+    width, height = (1080, 1920) if is_short else (1920, 1080)
+
+    flagged: dict[str, str] = {}
+    for issue in issues:
+        if issue.media_path and issue.media_path not in flagged:
+            flagged[issue.media_path] = issue.code
+
+    rows = db.query(VideoSection).filter(VideoSection.content_id == content_id).all()
+    # Parse every row's extras once; group rows by their current media_url.
+    parsed: list[tuple[VideoSection, dict]] = []
+    for row in rows:
+        try:
+            extras = json.loads(row.generation_prompt) if row.generation_prompt else {}
+        except (TypeError, ValueError):
+            extras = {}
+        if isinstance(extras, dict):
+            parsed.append((row, extras))
+
+    # Known-good neighbor pool: one entry per section_order, deduplicated,
+    # excluding flagged files — used as the terminal fallback.
+    good_by_section: dict[int, str] = {}
+    for row, extras in parsed:
+        url = extras.get("media_url") or ""
+        if url.startswith("cache/") and url not in flagged:
+            good_by_section.setdefault(row.section_order, url)
+
+    expected_ratio = width / height
+    repaired = 0
+    for old_path, code in flagged.items():
+        group = [(row, extras) for row, extras in parsed if extras.get("media_url") == old_path]
+        if not group:
+            continue
+        anchor_row, anchor_extras = group[0]
+        base_prompt = anchor_row.flux_prompt or anchor_extras.get("visual_intent") or ""
+        # Corrective clause per defect; an aspect mismatch needs no prompt
+        # change — only a fresh, correctly-sized generation.
+        if code == "near_black_image":
+            corrected = _append_well_lit_clause(base_prompt)
+        elif code == "letterboxed_image":
+            corrected = _append_full_bleed_clause(base_prompt)
+        else:
+            corrected = base_prompt
+
+        # generate_beat_image (not the routing wrapper) with a cache_key_extra:
+        # the repair must always produce a FRESH artifact — for the
+        # unchanged-prompt aspect case especially, the identical prompt+size
+        # would hash straight back to the same cached wrong image. Two
+        # attempts before the neighbor fallback (explicit operator
+        # preference for regeneration over neighbor duplication): the
+        # corrective-clause prompt, then a deterministic prompt REWRITE —
+        # same ladder the generation-time health gate uses.
+        repair_beat = {
+            "visual_intent": anchor_extras.get("visual_intent", ""),
+            "environment": anchor_extras.get("environment", "other"),
+        }
+        new_path = ""
+        for label, prompt in (
+            ("media_repair", corrected),
+            (
+                "media_repair_rewrite",
+                _build_defect_rewrite_prompt(repair_beat, anchor_row.section_order),
+            ),
+        ):
+            candidate = ""
+            try:
+                candidate = generate_beat_image(
+                    prompt, anchor_row.section_order, str(content_id),
+                    environment=repair_beat["environment"],
+                    cache_key_extra=f"{label}:{code}:{anchor_row.section_order}",
+                    width=width, height=height,
+                ) or ""
+            except Exception as exc:
+                logger.warning(
+                    "MEDIA_REPAIR_REGENERATION_ERROR content_id=%s media=%s "
+                    "attempt=%s error=%s",
+                    content_id, old_path, label, exc,
+                )
+            if not candidate:
+                continue
+            resolved = (
+                Path(candidate) if Path(candidate).is_absolute() else media_root / candidate
+            )
+            if (
+                detect_image_pixel_defect(resolved) is None
+                and detect_image_wrong_aspect(resolved, expected_ratio) is None
+            ):
+                new_path = candidate
+                break
+
+        if new_path:
+            logger.warning(
+                "MEDIA_REPAIR_REGENERATED content_id=%s code=%s old=%s new=%s",
+                content_id, code, old_path, new_path,
+            )
+        else:
+            # Terminal fallback: nearest already-validated section's image.
+            if good_by_section:
+                nearest = min(
+                    good_by_section,
+                    key=lambda so: (abs(so - anchor_row.section_order), so > anchor_row.section_order),
+                )
+                new_path = good_by_section[nearest]
+                logger.warning(
+                    "MEDIA_REPAIR_NEIGHBOR_FALLBACK content_id=%s code=%s old=%s "
+                    "source_section=%s new=%s",
+                    content_id, code, old_path, nearest, new_path,
+                )
+            else:
+                logger.error(
+                    "MEDIA_REPAIR_IMPOSSIBLE content_id=%s code=%s old=%s "
+                    "— no regeneration and no validated neighbor to reuse",
+                    content_id, code, old_path,
+                )
+                continue
+
+        for row, extras in group:
+            extras["media_url"] = new_path
+            row.generation_prompt = json.dumps(extras)
+        repaired += 1
+
+    if repaired:
+        db.commit()
+    return repaired
 
 
 # ── Parent visual readiness ────────────────────────────────────────────────────

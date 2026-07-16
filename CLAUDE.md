@@ -2737,12 +2737,26 @@ telemetry only (Elimination Mandate, roadmap
   `_SHORT_QUALITY_SYSTEM_PROMPT` / `_SHORT_QUALITY_SCHEMA` /
   `task="short_quality_check"` were deleted from `system_prompt.py` and
   `model_routing.py` entirely — not disabled, not capped, removed.
+- **Word-floor regeneration (operator-approved Elimination Mandate
+  exception, 2026-07-16 — the binding Short duration rule):** a Short MUST
+  never run under 61 seconds (Agent 3's hard audio gate below); it SHOULD
+  stay at or under ~90 seconds, but exceeding 90 s is telemetry-only and
+  never fails anything. When the single draft's word count is under
+  `_MIN_SHORT_WORDS`, `_generate_short_script()` makes exactly ONE
+  regeneration call with an explicit minimum-words constraint
+  (`word_floor_note` parameter of `generate_short_episode_script()`) and
+  keeps the LONGER of the two drafts — a deterministic count-triggered
+  choice, never an AI quality judgment. Still-under-floor after that is
+  telemetry (`SHORT_SCRIPT_STILL_UNDER_FLOOR`); the 61 s audio gate remains
+  the final enforcement. Logs `SHORT_SCRIPT_WORD_FLOOR_REGEN`. Runtime
+  proof: `tests/test_short_word_floor_regen.py`.
 - **Structural checks** (`_collect_short_script_major_issues()`): calibrated
-  `_MIN_SHORT_WORDS` floor (135 words — see the calibrated band note below), word cap
-  (`_MAX_SHORT_WORDS` = 180), TTS compliance, hook opener, and section-marker
+  `_MIN_SHORT_WORDS` floor (190 words — see the calibrated band note below), word cap
+  (`_MAX_SHORT_WORDS` = 270), TTS compliance, hook opener, and section-marker
   presence (`_SHORT_TRANSLATION_MARKER_RE`, shared with the translated-Short
-  check below) still run on the single generated draft. Any MAJOR is logged
-  at WARNING (`"telemetry only, no retry"`) — it never triggers regeneration.
+  check below) still run on the generated draft. Any MAJOR is logged
+  at WARNING (`"telemetry only, no retry"`) — over-cap in particular never
+  triggers anything (a slightly-long Short ships, per the operator rule).
 - **Parent/child overlap** (`detect_parent_child_overlap()`, Phase 13.3):
   deterministic exact word-sequence reuse check between the child Short's
   narration and the parent long-form `voice_script`, unchanged in its own
@@ -2762,19 +2776,18 @@ telemetry only (Elimination Mandate, roadmap
   sentence followed by I/me/my); every cliffhanger names its concrete
   unresolved threat/person/event/place/object; sunk-cost logic is explicitly
   a pressured narrator/character rationalization, not objective advice.
-  Generation guidance is now 140–170 words in both prompts/schema
-  description. Python's existing 135–180 structural band remains
-  telemetry-only for tolerance — no trim, regeneration, or AI quality gate
-  was added.
-- Deterministic code still owns the hard duration band: `_MIN_SHORT_WORDS`
-  (135 — raised from 125 by the fresh full-system audit §2.4: 125 words at
-  120 wpm left only 1.5 s of margin over Agent 3's hard 61 s floor) through
-  `_MAX_SHORT_WORDS` (180 — recalibrated from 250 by roadmap
-  3.8 / audit G-7, since real Shorts measured ~120 wpm, not the
-  previously-assumed 180 wpm / "3 words per second") — both the
-  source-language and translated/adapted Short validators still emit MAJOR
-  findings below the minimum or above the cap; they are logged, not enforced
-  by regeneration.
+  Generation guidance was 140–170 words when Tier 4 shipped — superseded by
+  the 2026-07-16 recalibration below.
+- Deterministic code still owns the duration band, recalibrated
+  (`PROMPT_VERSION` 5.4, 2026-07-16) to the measured **~176 wpm
+  post-silence-compression** Short narration rate (run 41f7eeb8: 246 words
+  → 83.7 s — Tier 1's interior-silence compression obsoleted every ~120 wpm
+  calibration): `_MIN_SHORT_WORDS` (190 — ~65 s at the measured rate; at
+  the OLD 135 floor a compliant draft was ~46 s, far under the hard 61 s
+  gate) through `_MAX_SHORT_WORDS` (270 — ~92 s). Prompts/schema target
+  210–260 words with an explicit never-under-190 rule. The floor triggers
+  the single word-floor regeneration above; the cap is pure telemetry —
+  never enforced by regeneration or trim (operator rule: over ~90 s ships).
 - A hard exception from the single `generate_short_episode_script()` call
   (bad JSON, API error) returns `None` immediately — the caller
   (`run_shorts_planner()`) removes that child content row
@@ -3401,6 +3414,24 @@ a different result. If the existing row is missing a transcript or duration
 paragraph used to describe; see `generate_audio`/§10.4 below) — this is a
 reuse shortcut for the unchanged-audio case only, not a new
 skip-Whisper-always behavior.
+
+**Language second chance + loud missing-language marker (never-block
+follow-up, run 41f7eeb8):** a real run lost `fr_main` to ONE ElevenLabs read
+timeout on section 6/6 — the per-language `except` continued, the run logged
+`1/2 language(s) succeeded → AUDIO_DONE`, and FR silently never existed
+again. Now: a TTS/storage-failed language is re-queued for exactly one more
+full attempt at the END of the run (`AUDIO_LANGUAGE_RETRY`; skip-on-disk
+makes already-generated parts cheap), and a language that fails both
+attempts logs `AUDIO_LANGUAGE_MISSING` at ERROR while the content still
+proceeds to `AUDIO_DONE` — never block, never silent. Re-running Agent 3
+for the content backfills just the missing language. Upstream of this,
+`tts._call_tts_with_transport_retry()` gives every per-section provider
+request 3 total attempts with short backoff (`TTS_TRANSPORT_RETRY`;
+`TypeError` propagates immediately — the Cartesia SDK-shape signal), and
+`elevenlabs_client.get_client()` constructs the SDK with `timeout=300.0`
+(the ~60s default read timeout was the root cause). Transport retries, not
+quality re-rolls — Elimination Mandate-compatible. Runtime proof:
+`tests/test_transport_retry_and_language_second_chance.py`.
 
 Per-language hard assertions (roadmap 3.6/3.9, audit S-5/A-3, exec-8/exec-10)
 — both run immediately after the step they gate, both roll back and
@@ -4758,11 +4789,36 @@ Responsibilities:
   (outside the media root/run root), missing/zero-byte/unreadable/
   unsupported-extension local file, `PIL`-unreadable image, image aspect
   mismatches (parent expects 16:9; Shorts expect 9:16, with small fal rounding
-  tolerance), and `near_black_image` (roadmap Phase A1 — mean grayscale
+  tolerance), `near_black_image` (roadmap Phase A1 — mean grayscale
   luminance below `_NEAR_BLACK_LUMINANCE_FLOOR = 24.0`, the same floor
   `flux_generator.py`'s generation-time reroll uses, as a persistence-layer
-  backstop; see `generate_all_beat_images` above) — all `BLOCKING` (they fail
-  the content, setting `Content.status = "FAILED"`).
+  backstop; see `generate_all_beat_images` above), and `letterboxed_image`
+  (Tier 5 R19 — paired near-black edge bands with a clearly bright inset
+  center) — all `BLOCKING`-severity, **but blocking no longer always means
+  FAILED (post-Tier-5 live-canary fix, operator never-block policy):** the
+  orchestrator splits blocking findings by `REPAIRABLE_MEDIA_CODES`
+  (`near_black_image`, `letterboxed_image`, `local_image_aspect_mismatch` —
+  the last one joined after run 41f7eeb8's fal size anomaly).
+  Per-image, regeneration-fixable findings trigger
+  `_repair_flagged_media()` — the same two-attempt healing ladder the
+  generation-time gate uses (operator preference for regeneration over
+  neighbor duplication, 2026-07-16): the corrective-clause prompt, then a
+  deterministic prompt rewrite (`_build_defect_rewrite_prompt()`), each via
+  `generate_beat_image` with a `media_repair:`/`media_repair_rewrite:`
+  cache-key extra so even an unchanged-prompt aspect repair produces a
+  fresh artifact, each verified against pixel defects AND expected aspect;
+  nearest already-validated neighbor's image only as terminal fallback,
+  then every language's
+  `VideoSection` row re-pointed by rewriting the `generation_prompt` JSON
+  (the only place `media_url` lives — the shared loader merges extras over
+  columns) — then one re-validation; findings that somehow survive log
+  `AGENT4_MEDIA_VALIDATION_UNREPAIRED` at ERROR and the content **proceeds**.
+  Only STRUCTURAL findings (everything not in `REPAIRABLE_MEDIA_CODES`)
+  still set `Content.status = "FAILED"` — those mean the render itself
+  would break. Public detector aliases `detect_image_letterbox()` /
+  `detect_image_pixel_defect()` exist so the generation-time gates and the
+  repair pass reuse the validator's own pixel checks — one implementation,
+  never forked. Runtime proof: `tests/test_media_repair_never_block.py`.
 - Optional `beats_by_lang: dict[str, list[dict]] | None` parameter — when
   the caller (`run_visual_generation_for_content()`) passes
   `result["beats_by_lang"]` from `run_visual_generation()`, this also runs
@@ -4925,23 +4981,40 @@ languages.
   `LUMINANCE_CHECK_UNAVAILABLE`) if the file can't be read, exactly the
   same fail-open contract `_average_pixel_hash()` already uses for the
   pixel-duplicate check below it in the same file.
-- `_LUMINANCE_MEAN_FLOOR = 24.0` — a beat whose generated image measures
-  below this floor gets exactly **one** reroll
-  (`flux_generator._reroll_if_dark_once()`) with a `_WELL_LIT_REROLL_CLAUSE`
-  ("bright well-lit scene, strong visible ambient light source, no
-  underexposure, no near-black frame") appended to its `flux_prompt`. If the
-  reroll is still below the floor, or the reroll call itself fails, the beat
-  is handed to the existing `fill_failed_beats_from_neighbors()` mechanism
-  exactly like a hard generation failure — never shipped near-black.
-- This is a disaster check + bounded transport-style retry, not a
-  quality-judging loop (consistent with the Elimination Mandate's existing
-  precedent — the pixel-duplicate-hash reroll immediately above it in the
-  same function): it fires only on a near-total generation failure (a
-  near-uniform black frame), not on subjective darkness/mood, and retries
-  exactly once before falling back to a known-good neighbouring image.
-- Wired into both `generate_all_beat_images()` (parent path) and
-  `storyboard.generate_pending_beat_images()` (child Short path, portrait
-  images) — same call, same floor, same one-reroll contract on both paths.
+- **Unified image health gate (`flux_generator._ensure_beat_image_healthy()`
+  — supersedes the former separate dark/letterbox/size gates, explicit
+  operator preference 2026-07-16: regenerate with a changed prompt rather
+  than duplicate a neighbor's image):** every successfully generated image
+  is checked against ALL repairable pixel-defect classes at once —
+  near-black (`_LUMINANCE_MEAN_FLOOR = 24.0`), baked-in letterbox, and
+  off-aspect dimensions (the fal size anomaly: ONE 1072x1536 image returned
+  for a 1080x1920 portrait request while the identical payload produced 20+
+  correct portraits in the same run) — via `_detect_image_defect()`, which
+  reuses `media_validation`'s own public detectors
+  (`detect_image_pixel_defect()`, `detect_image_wrong_aspect()`; single
+  implementation, never forked). A defective image gets a bounded
+  TWO-attempt healing ladder: (1) corrective-clause reroll — the beat's own
+  prompt plus `_WELL_LIT_REROLL_CLAUSE` (near-black) or
+  `_FULL_BLEED_REROLL_CLAUSE` (letterbox); a size defect keeps the prompt
+  unchanged — always with a fresh cache key (`heal1:` — the identical
+  prompt+size would hash straight back to the cached bad artifact); (2) a
+  deterministic prompt REWRITE (`_build_defect_rewrite_prompt()` —
+  `visual_intent` base, or the environment-safe prompt when the intent is
+  too thin, plus a composition-slot variation from the shared 24-slot
+  rotation, plus BOTH corrective clauses; pure string construction, no AI
+  call, `heal2:` cache key). Every regenerated image is re-checked against
+  ALL defect classes, not just the triggering one. Only when both attempts
+  fail does the beat hand off to `fill_failed_beats_from_neighbors()` — the
+  rare terminal fallback (something must fill the beat or the render defers
+  on missing media). Wired into both `generate_all_beat_images()` (parent)
+  and `storyboard.generate_pending_beat_images()` (child Short, portrait).
+  Bounded, deterministic-triggered — an operator-approved never-block-policy
+  mechanism, not a quality-judging loop. Logs: `BEAT_IMAGE_DEFECT`,
+  `BEAT_IMAGE_HEALED`, `BEAT_IMAGE_HEAL_ATTEMPT_FAILED`/
+  `_ATTEMPT_STILL_DEFECTIVE`, `BEAT_IMAGE_HEAL_EXHAUSTED`. Runtime proof:
+  `tests/test_media_repair_never_block.py`,
+  `tests/test_transport_retry_and_language_second_chance.py`,
+  `tests/test_luminance_gate.py`.
 - Backstopped at persistence time: `media_validation._validate_image_luminance()`
   re-measures every referenced local image and adds a **blocking**
   `near_black_image` finding to `validate_visual_media_assets()` (§11.4
@@ -5603,10 +5676,15 @@ app/scheduler/tasks.py
 
 Responsibilities:
 
-- Tier 5 R19 blocks a baked-in horizontal or vertical letterbox when both
-  opposing edge bands are near-black while the inset center is bright. The
-  blocking finding code is letterboxed_image; uniformly dark frames remain
-  the responsibility of the existing near-black luminance gate.
+- Tier 5 R19 detects a baked-in horizontal or vertical letterbox when both
+  opposing edge bands are near-black while the inset center is bright
+  (finding code `letterboxed_image`); uniformly dark frames remain the
+  responsibility of the existing near-black luminance gate. Post-Tier-5
+  live-canary fix (operator never-block policy): this finding — like
+  `near_black_image` — is repaired via `_repair_flagged_media()` and never
+  sets `Content.status = "FAILED"`; see §11.4
+  `validate_visual_media_assets` and `generate_all_beat_images`'s
+  letterbox reroll gate.
 
 - Find `AUDIO_DONE` content with an `AudioFile`.
 - Skip content that already has the relevant `VideoRender` row.
@@ -7364,6 +7442,17 @@ STANDALONE_SHORT_RENDER_DONE
 PRE_RENDER_ASSET_AUDIT
 BEAT_IMAGE_HARD_RETRY
 BEAT_IMAGE_NEIGHBOR_REUSED
+BEAT_IMAGE_DEFECT
+BEAT_IMAGE_HEALED
+BEAT_IMAGE_HEAL_EXHAUSTED
+SHORT_SCRIPT_WORD_FLOOR_REGEN
+TTS_TRANSPORT_RETRY
+AUDIO_LANGUAGE_RETRY
+AUDIO_LANGUAGE_MISSING
+AGENT4_MEDIA_REPAIR_DONE
+MEDIA_REPAIR_REGENERATED
+MEDIA_REPAIR_NEIGHBOR_FALLBACK
+AGENT4_MEDIA_VALIDATION_UNREPAIRED
 DARK_CONTRAST_GRADE_DOWNGRADED
 DUPLICATE_PROMPT_REPAIRED
 PARENT_VISUALS_STALE_SCRIPT_HASH
@@ -7518,6 +7607,12 @@ This is the current shorts architecture.
 
 Rules:
 
+- **Binding duration rule (operator, 2026-07-16): a Short MUST never run
+  under 61 seconds** — enforced by Agent 3's hard
+  `_MIN_SHORT_AUDIO_DURATION_MS` gate, protected upstream by the 190-word
+  script floor + single word-floor regeneration (§9.4). A Short SHOULD stay
+  at or under ~90 seconds, but exceeding ~90 s is telemetry-only and never
+  fails, trims, or regenerates anything.
 - Shorts are child content rows.
 - Shorts are standalone episodes.
 - Shorts have their own scripts.
@@ -7729,7 +7824,7 @@ These are current engineering risks to monitor, not future feature promises.
 - Reuse stats logs: required
 - Character consistency controls: blueprint-derived locked descriptors plus Dev routing for qualifying person beats; reference-image identity lock remains design-only
 - Era-aware diversity: locked-era environment frequency is telemetry-only; vary motif/framing and use other when needed
-- Local image integrity: near-black and baked-in letterbox frames are blocking
+- Local image integrity: near-black and baked-in letterbox frames are detected, repaired (reroll → neighbor fallback), and never content-blocking; structural media findings still fail the content
 - Child remap phrase integrity: exact/resliced/non-verbatim telemetry; normalized matches are re-sliced from authoritative narration
 - Repetition diagnostics: should be monitored
 - Cache reuse diagnostics: should be monitored

@@ -32,9 +32,9 @@ def _beat(order: int, prompt: str) -> dict:
 
 def _write_pattern(path: Path, *, variant: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    image = Image.new("L", (64, 64))
+    image = Image.new("L", (64, 36))
     pixels = image.load()
-    for y in range(64):
+    for y in range(36):
         for x in range(64):
             if variant == 0:
                 value = 255 if x < 32 else 0

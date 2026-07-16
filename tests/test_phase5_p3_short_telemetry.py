@@ -55,7 +55,7 @@ class Phase5P3ShortTelemetryTest(unittest.TestCase):
         calls = []
         generated = {
             "title": "They Found Whitney Alive",
-            "voice_script": " ".join(["Whitney looks toward the mine."] + [f"detail{i}" for i in range(130)]),
+            "voice_script": " ".join(["Whitney looks toward the mine."] + [f"detail{i}" for i in range(200)]),
         }
 
         def fake_generate_short_episode_script(**kwargs):
