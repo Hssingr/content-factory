@@ -7,7 +7,11 @@ from app.services.script_checks import split_sentences
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "5.4"  # v5.4: Short word economy recalibrated to the measured
+PROMPT_VERSION = "5.6"  # v5.6: AI-premise scoring distinguishes the plain
+                        # operator pitch from the future video's opening.
+                        # v5.5: long-form budgets, native grammar agreement,
+                        # exclusive Short spans, and content-specific phrasing.
+                        # v5.4: Short word economy recalibrated to the measured
                         # ~175 wpm POST-silence-compression narration rate (run
                         # 41f7eeb8: 246 words → 83.7 s). Planner/writer/schema now
                         # target 210-260 words with an explicit never-under-190
@@ -476,7 +480,15 @@ def build_native_system_prompt(
 
     fallback = _TTS_FALLBACK.get(tts_provider, "sonic-2")
     tts = TTS_BLOCK.get(tts_model, TTS_BLOCK[fallback])
-    parts = [base, "\n\n" + tts]
+    grammar_rule = """
+
+GRAMMATICAL AGREEMENT AND NATURALNESS:
+- Use the narrator-gender value in the user message for narrator agreement.
+- Past participles and adjectives must match each person's actual gender, for the
+  narrator and every named character.
+- For French, prefer natural spoken French over literal calques, even when a
+  word-for-word rendering would remain understandable."""
+    parts = [base, grammar_rule, "\n\n" + tts]
     if audio_tags_enabled and tts_provider == "elevenlabs" and tts_model == "eleven_v3":
         parts.append(AUDIO_TAGS_INSTRUCTION)
     return "".join(parts)
@@ -736,6 +748,12 @@ do not re-establish the same point again later in the same section, even in diff
 words. Move forward, do not circle back.
 
 Content quality rules — driven by channel configuration, not hardcoded genre:
+  - When events jump by months or years, state the elapsed time and destination date
+    as a natural spoken bridge. Never make an unexplained temporal cut.
+  - Drop one-off atmospheric details unless their relevance is explained in the same
+    passage. Do not introduce a letter, object, sound, or image and abandon it.
+  - In third person, use a person's name or concrete role instead of an ambiguous
+    "she" for an invented public persona.
   - Every body section must contain at least one concrete moment: a named person doing
     something specific, a physical object, a number with context, a direct consequence,
     or an observable action. Abstract interpretation is not a substitute.
@@ -901,6 +919,8 @@ def generate_section(
     narration_pov: str = "third_person",
     midpoint_retention_trap: str | None = None,
     prior_full_text: str = "",
+    total_word_target: int | None = None,
+    planned_section_count: int | None = None,
 ) -> dict:
     """Generate a single narration section guided by the story blueprint.
 
@@ -955,6 +975,16 @@ def generate_section(
     prior_json = json.dumps(prior_sections_summary, ensure_ascii=False)
     avoid_json = json.dumps(visual_intent_accumulator.get("avoid_repeating", []), ensure_ascii=False)
     blueprint_json = json.dumps(blueprint, ensure_ascii=False)
+    budget_line = ""
+    if total_word_target and planned_section_count:
+        per_section_target = max(1, round(total_word_target / planned_section_count))
+        budget_line = (
+            f"Complete-script word budget: target {total_word_target} words across "
+            f"{planned_section_count} planned sections; target about "
+            f"{per_section_target} words for this section. Treat this as a writing "
+            f"target only: do not mention it in the narration and do not pad with "
+            f"repetition.\n\n"
+        )
 
     user_message = (
         f"Channel niche: {channel.niche}\n"
@@ -963,6 +993,7 @@ def generate_section(
         f"Image style: {image_style or 'photorealistic'}\n"
         f"Narration POV: {narration_pov or 'third_person'}\n"
         f"Script format: {script_format}\n\n"
+        f"{budget_line}"
         f"Blueprint:\n{blueprint_json}\n\n"
         f"Prior sections summary:\n{prior_json}\n\n"
         f"Prior sections (full text — established continuity; do not contradict any "
@@ -1243,6 +1274,7 @@ def generate_native_script(
     hook_context: str | None = None,
     content_kind: str = "parent_long_form",
     narration_pov: str = "third_person",
+    protagonist_gender: str = "unspecified",
 ) -> dict:
     """Adapt a source-language script for a target language and audience.
 
@@ -1289,6 +1321,8 @@ def generate_native_script(
         f"Channel niche: {niche}\n"
         f"Channel tone: {tone}\n"
         f"Narration POV: {narration_pov or 'third_person'}\n"
+        f"Narrator gender (for grammatical agreement): "
+        f"{protagonist_gender if protagonist_gender in {'feminine', 'masculine'} else 'unspecified'}\n"
     )
     if ctx:
         user_message += f"\nHOOK_CONTEXT:\n{ctx}\n"
@@ -1424,7 +1458,12 @@ def score_story_for_gate(
         metadata_line = (
             "Metadata: this is an AI-generated original premise — no real-world engagement "
             "signal exists for it. Do not penalize scroll_stopper_potential or "
-            "social_media_clickability for the natural absence of upvotes/comments/URL.\n"
+            "social_media_clickability for the natural absence of upvotes/comments/URL. "
+            "The body is an operator-facing plain-language pitch, not the finished script's "
+            "literal opening. For scroll_stopper_potential, judge whether the concrete "
+            "moments explicitly described in the pitch contain a high-stakes action, danger, "
+            "or contradiction that the script could open on; do not penalize the pitch for "
+            "stating its subject plainly, and do not invent an unmentioned moment.\n"
         )
     else:
         metadata_line = (
@@ -1480,6 +1519,9 @@ Rules:
   omitting the main reveal.
 - Every part must be independently watchable: a viewer who starts on Part 3 must
   understand the situation from the first 5 seconds without having seen prior parts.
+- Every part owns an exclusive narrative span. A part must never re-narrate another
+  part's main_reveal, and its ending must stop inside its own span instead of
+  continuing into a sibling part's events.
 - opening_hook: 1–2 sentences, each ≤15 words, starts at a high-tension story moment. No recap.
   Apply the cold-open deletion test: read it with the title, part number, previous part,
   and every earlier sentence removed. It must still identify the person, event, object,
@@ -1490,7 +1532,9 @@ Rules:
 - Narration POV is provided below. In "first_person_storytime" mode, satisfy the
   cold-open identity requirement IN the narrator's own first-person voice (for example,
   "I am Hannibal Barca" or "I led Carthage's army"). Never add a third-person naming
-  sentence and then switch to I/me/my. In "third_person" mode, name the subject normally.
+  sentence and then switch to I/me/my. Name the narrator within the first five seconds.
+  In "third_person" mode, name the subject normally; never use an ambiguous "she" for
+  an invented public persona when the person's name or role is available.
 - Part N's cliffhanger must be directly answered by Part N+1's main_reveal.
   Every cliffhanger must name the concrete unresolved threat, person, event, place, or
   object — never tease only "something", "what came next", or another unnamed abstraction.
@@ -1652,6 +1696,13 @@ Rules:
 - Provide only the minimum context needed for a first-time viewer to immediately understand the current situation.
   Do not summarize earlier events unless they are essential to understand the current reveal.
 - One clear main_reveal per part — this is the payoff for watching this part
+- The part plan includes other_parts_main_reveals. Treat every item there as forbidden
+  sibling territory: do not narrate, recap, or append those reveals. End within this
+  part's own span; do not continue into the next part's events.
+- When the story jumps by months or years, state the elapsed time and destination date
+  as a natural spoken bridge. Do not make an unexplained temporal cut.
+- Drop one-off atmospheric details unless their relevance is explained in the same
+  passage. Never introduce a letter, object, sound, or image and simply abandon it.
 - Do not state the same fact or implication twice in this script, even in different
   words. Once something is established, move forward — do not circle back to it.
 - End by delivering the planned cliffhanger while preserving its narrative intent — this is what drives the viewer to Part N+1
@@ -1675,7 +1726,12 @@ Rules:
   within this part's narration.
 - In "first_person_storytime" mode, satisfy the cold-open identity requirement in
   first person (for example, "I am Hannibal Barca" or "I led Carthage's army").
-  Never insert a third-person naming sentence and then switch to I/me/my.
+  Never insert a third-person naming sentence and then switch to I/me/my. Name the
+  narrator within the first five seconds.
+- In third person, never use an ambiguous "she" for an invented public persona when
+  the person's name or concrete role is available.
+- Prefer a precise final question anchored to this part's person, choice, object, or
+  consequence; never ask a scope-less question about "all of history".
 - Any sunk-cost reasoning must be framed as my/the character's rationalization
   under pressure, never as objective wisdom or advice endorsed by the narration.
 - ORIGINALITY — this is the most strictly enforced rule in this prompt: you will be

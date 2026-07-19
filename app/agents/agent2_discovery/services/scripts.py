@@ -38,6 +38,8 @@ logger = logging.getLogger(__name__)
 
 _MIN_BODY_SECTIONS    = 2
 _MAX_BODY_SECTIONS    = 7   # V2 hard cap — absolute maximum regardless of covered turns
+_SCRIPT_WORD_TARGETS: dict[str, int] = {"youtube_long": 1550}
+_SCRIPT_WORD_TARGET_DEFAULT = 600
 
 
 def _script_trace(label: str, voice_script: str) -> None:
@@ -285,6 +287,16 @@ def _log_quality_gate_review(issue_group: dict) -> None:
         )
 
 
+def _resolve_script_protagonist_gender(content: Content, db: Session) -> str:
+    """Read grammatical gender from this content's blueprint or its parent."""
+    blueprint = content.story_blueprint or {}
+    if not blueprint and content.is_short_episode and content.parent_content_id:
+        parent = db.get(Content, content.parent_content_id)
+        blueprint = (parent.story_blueprint or {}) if parent else {}
+    gender = blueprint.get("protagonist_gender", "unspecified")
+    return gender if gender in {"feminine", "masculine"} else "unspecified"
+
+
 def generate_multilingual_scripts(
     content: Content,
     channel: Channel,
@@ -353,6 +365,7 @@ def generate_multilingual_scripts(
     # per channel, not per content row, and historically defaulted every child
     # Short to the long-form/sectioned native base — see CLAUDE.md §9.3).
     content_kind = "child_short" if content.is_short_episode else "parent_long_form"
+    protagonist_gender = _resolve_script_protagonist_gender(content, db)
 
     # ── Build voice map: language → ChannelVoice (for tts_model + provider) ──
     voice_map: dict[str, ChannelVoice] = {
@@ -435,6 +448,7 @@ def generate_multilingual_scripts(
                     hook_context=hook_context,
                     content_id=content.id,
                     narration_pov=narration_pov,
+                    protagonist_gender=protagonist_gender,
                 )
                 if adapted is None:
                     raise ValueError("child Short translation failed after retries")
@@ -453,6 +467,7 @@ def generate_multilingual_scripts(
                     hook_context=hook_context,
                     content_id=content.id,
                     narration_pov=narration_pov,
+                    protagonist_gender=protagonist_gender,
                 )
                 if adapted is None:
                     raise ValueError("parent translation failed after retries")
@@ -645,6 +660,7 @@ def _generate_validated_translated_parent_script(
     hook_context: str | None,
     content_id: uuid.UUID,
     narration_pov: str = "third_person",
+    protagonist_gender: str = "unspecified",
 ) -> dict | None:
     """Generate one translated/adapted parent long-form script — single Claude call.
 
@@ -675,6 +691,7 @@ def _generate_validated_translated_parent_script(
             hook_context=hook_context,
             content_kind="parent_long_form",
             narration_pov=narration_pov,
+            protagonist_gender=protagonist_gender,
         )
     except Exception as exc:
         logger.error(
@@ -891,6 +908,8 @@ def _call_section_generation(
     narration_pov: str = "third_person",
     midpoint_retention_trap: str | None = None,
     prior_full_text: str = "",
+    total_word_target: int | None = None,
+    planned_section_count: int | None = None,
 ) -> dict | None:
     try:
         return generate_section(
@@ -911,6 +930,8 @@ def _call_section_generation(
             narration_pov=narration_pov,
             midpoint_retention_trap=midpoint_retention_trap,
             prior_full_text=prior_full_text,
+            total_word_target=total_word_target,
+            planned_section_count=planned_section_count,
         )
     except Exception as exc:
         logger.error("Section %s generation error (attempt %d): %s", label, attempt, exc)
@@ -1111,6 +1132,8 @@ def _generate_section_once(
     narration_pov: str = "third_person",
     midpoint_retention_trap: str | None = None,
     prior_full_text: str = "",
+    total_word_target: int | None = None,
+    planned_section_count: int | None = None,
 ) -> dict | None:
     """Generate a single section with exactly one Claude call — no quality-judging retry.
 
@@ -1145,6 +1168,8 @@ def _generate_section_once(
         narration_pov=narration_pov,
         midpoint_retention_trap=midpoint_retention_trap,
         prior_full_text=prior_full_text,
+        total_word_target=total_word_target,
+        planned_section_count=planned_section_count,
     )
     if result is None:
         return None
@@ -1319,6 +1344,7 @@ def _build_section_generation_context(
     visual_style: str = "",
     image_style: str = "",
     narration_pov: str = "third_person",
+    script_format: str = "youtube_long",
 ) -> dict:
     major_turns = blueprint.get("major_turns") or []
     max_body = max(
@@ -1346,6 +1372,10 @@ def _build_section_generation_context(
         "visual_style": visual_style,
         "image_style": image_style,
         "narration_pov": narration_pov,
+        "total_word_target": _SCRIPT_WORD_TARGETS.get(
+            script_format, _SCRIPT_WORD_TARGET_DEFAULT,
+        ),
+        "planned_section_count": max_body + 2,
     }
 
 
@@ -1452,6 +1482,8 @@ def _generate_intro_section(
         visual_style=context.get("visual_style", ""),
         image_style=context.get("image_style", ""),
         narration_pov=context.get("narration_pov", "third_person"),
+        total_word_target=context["total_word_target"],
+        planned_section_count=context["planned_section_count"],
     )
     if intro is None:
         raise RuntimeError("generate_script_sections: INTRO generation failed (single-call, no retry)")
@@ -1600,6 +1632,8 @@ def _run_body_section_loop(
             midpoint_retention_trap=(
                 blueprint.get("midpoint_retention_trap") if is_midpoint_section else None
             ),
+            total_word_target=context["total_word_target"],
+            planned_section_count=context["planned_section_count"],
         )
         if section is None:
             logger.warning(
@@ -1663,6 +1697,8 @@ def _generate_outro_section(
         visual_style=context.get("visual_style", ""),
         image_style=context.get("image_style", ""),
         narration_pov=context.get("narration_pov", "third_person"),
+        total_word_target=context["total_word_target"],
+        planned_section_count=context["planned_section_count"],
     )
     if outro is None:
         raise RuntimeError("generate_script_sections: OUTRO generation failed (single-call, no retry)")
@@ -1842,7 +1878,7 @@ def generate_script_sections(
     """
     context = _build_section_generation_context(
         channel_voice, blueprint, visual_style=visual_style, image_style=image_style,
-        narration_pov=narration_pov,
+        narration_pov=narration_pov, script_format=script_format,
     )
     state = _create_section_loop_state()
     _log_blueprint_summary(blueprint, context["major_turns"], context["max_body"])
@@ -2088,7 +2124,16 @@ def run_shorts_planner(
 
     for part_plan in parts:
         part_n = part_plan.get("part", 0)
-        part_plan_with_total = {**part_plan, "_total_parts": total_parts}
+        other_parts_main_reveals = [
+            str(other.get("main_reveal") or "")
+            for other in parts
+            if other.get("part") != part_n and other.get("main_reveal")
+        ]
+        part_plan_with_total = {
+            **part_plan,
+            "_total_parts": total_parts,
+            "other_parts_main_reveals": other_parts_main_reveals,
+        }
         short_content = _create_child_short_content(
             long_content=long_content,
             long_content_id=long_content_id,
@@ -2615,6 +2660,7 @@ def _generate_validated_translated_short_script(
     hook_context: str | None,
     content_id: uuid.UUID,
     narration_pov: str = "third_person",
+    protagonist_gender: str = "unspecified",
 ) -> dict | None:
     """Generate one translated/adapted child Short script — single Claude call.
 
@@ -2645,6 +2691,7 @@ def _generate_validated_translated_short_script(
             hook_context=hook_context,
             content_kind="child_short",
             narration_pov=narration_pov,
+            protagonist_gender=protagonist_gender,
         )
     except Exception as exc:
         logger.error(

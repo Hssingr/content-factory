@@ -137,9 +137,10 @@ class HistoricalAccuracyPromptRuntimeTest(unittest.TestCase):
         self.assertEqual(result, generated)
         paid_boundary.assert_called_once()
         self.assertIn(
-            "Target length: 1200 words", paid_boundary.call_args.kwargs["user_message"],
+            "Target length: 2200 words", paid_boundary.call_args.kwargs["user_message"],
         )
         self.assertIn("do not exceed it", paid_boundary.call_args.kwargs["user_message"])
+        self.assertEqual(paid_boundary.call_args.kwargs["max_tokens"], 8192)
 
 
 class NarrationPovNormalizationTest(unittest.TestCase):

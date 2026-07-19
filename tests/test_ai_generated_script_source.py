@@ -277,7 +277,7 @@ class TestExpandStoryPremise(unittest.TestCase):
             story_generator_mod.expand_story_premise(
                 premise="p", channel=channel, script_format="youtube_long", language="en",
             )
-        self.assertIn("1200 words", captured["user_message"])
+        self.assertIn("2200 words", captured["user_message"])
 
         captured.clear()
         with patch.object(story_generator_mod, "call_claude_structured", side_effect=fake_call):

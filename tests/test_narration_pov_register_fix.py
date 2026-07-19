@@ -315,6 +315,7 @@ class TestGenerateMultilingualScriptsThreadsNarrationPov(unittest.TestCase):
         content = Content(
             id=content_id, channel_id=channel_id, is_short_episode=False,
             source_language="en", status="GENERATING_SCRIPTS",
+            story_blueprint={"protagonist_gender": "feminine"},
         )
         channel = Channel(id=channel_id, niche="horror", tone="tense")
         config = ChannelConfig(
@@ -367,6 +368,10 @@ class TestGenerateMultilingualScriptsThreadsNarrationPov(unittest.TestCase):
         # proves config.narration_pov actually reached the real adapter call,
         # not just that some kwarg by that name exists.
         self.assertIn("Narration POV: first_person_storytime", captured.get("user_message", ""))
+        self.assertIn(
+            "Narrator gender (for grammatical agreement): feminine",
+            captured.get("user_message", ""),
+        )
 
 
 if __name__ == "__main__":

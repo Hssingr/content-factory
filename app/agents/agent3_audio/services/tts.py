@@ -1052,6 +1052,8 @@ def _normalize_loudness(mp3_bytes: bytes) -> bytes:
 
 
 _SILENCE_COMPRESS_THRESHOLD_DB = -40
+_DRAMATIC_SILENCE_KEEP_COUNT = 2
+_DRAMATIC_SILENCE_MAX_MS = 900
 # TTS inter-utterance silence is near-digital (well below -60 dB); -40 dB
 # detects it reliably while never clipping quiet speech or breath tails.
 
@@ -1072,11 +1074,9 @@ def _compress_interior_silence(mp3_bytes: bytes) -> bytes:
        long as the cap. When none exist the input bytes are returned
        **unchanged** — no re-encode, no quality-generation loss, which is
        the common case for short chunks.
-    2. ``silenceremove`` with ``stop_periods=-1`` (interior mode) and
-       ``stop_duration=<cap>`` trims every qualifying silence run down to
-       ~the cap itself (verified empirically on this ffmpeg build: silence
-       shorter than ``stop_duration`` is copied verbatim; a longer run is
-       copied up to ``stop_duration`` and the remainder dropped).
+    2. A deterministic ``atrim``/``concat`` splice preserves the two longest
+       non-leading gaps at up to 900 ms and caps every other qualifying gap
+       at the configured limit. Only excess silence is removed.
 
     Applied per TTS chunk in ``generate_audio()``'s provider paths — BEFORE
     ``_concat_mp3_chunks()`` and BEFORE ``_compute_section_boundaries()`` —
@@ -1086,8 +1086,8 @@ def _compress_interior_silence(mp3_bytes: bytes) -> bytes:
     skip-on-disk resume path (same contract as ``_normalize_loudness()``):
     an on-disk file was compressed once, at generation time.
 
-    Leading silence of a chunk is never trimmed (``start_periods`` is left
-    at 0); a chunk's trailing silence is treated as one more interior run
+    Leading silence of a chunk is never trimmed; a chunk's trailing silence
+    is treated as one more interior run
     and capped — after concatenation it sits between sections anyway.
 
     Args:
@@ -1140,38 +1140,90 @@ def _compress_interior_silence(mp3_bytes: bytes) -> bytes:
                 f"ffmpeg silencedetect failed (rc={detect_proc.returncode}): "
                 f"{detect_proc.stderr[-300:].decode(errors='replace')}"
             )
-        qualifying = len(
-            _re.findall(rb"silence_duration:", detect_proc.stderr)
-        )
+        interval_matches = list(_re.finditer(
+            rb"silence_start:\s*([0-9.]+).*?"
+            rb"silence_end:\s*([0-9.]+)\s*\|\s*silence_duration:\s*([0-9.]+)",
+            detect_proc.stderr,
+            _re.DOTALL,
+        ))
+        qualifying = len(interval_matches)
         if qualifying == 0:
             return mp3_bytes
 
-        # Pass 2 — cap every qualifying silence run.
+        in_ms = measure_audio_duration_ms(Path(in_path))
+        intervals = [
+            (float(match.group(1)), float(match.group(2)), float(match.group(3)))
+            for match in interval_matches
+        ]
+        # Preserve leading silence exactly. Of the remaining runs, the two
+        # longest get a deliberate 900 ms ceiling; every other run keeps the
+        # configured continuity cap.
+        eligible = [i for i, (start, _end, _duration) in enumerate(intervals) if start > 0.001]
+        dramatic = set(sorted(
+            eligible, key=lambda i: intervals[i][2], reverse=True,
+        )[:_DRAMATIC_SILENCE_KEEP_COUNT])
+
+        removals: list[tuple[float, float]] = []
+        for i in eligible:
+            start, end, duration = intervals[i]
+            keep_s = min(
+                duration,
+                (_DRAMATIC_SILENCE_MAX_MS / 1000.0) if i in dramatic else cap_s,
+            )
+            remove_start = start + keep_s
+            if end - remove_start > 0.001:
+                removals.append((remove_start, end))
+        if not removals:
+            return mp3_bytes
+
+        total_s = in_ms / 1000.0
+        keep_ranges: list[tuple[float, float]] = []
+        cursor = 0.0
+        for remove_start, remove_end in removals:
+            if remove_start > cursor:
+                keep_ranges.append((cursor, min(remove_start, total_s)))
+            cursor = max(cursor, remove_end)
+        if cursor < total_s:
+            keep_ranges.append((cursor, total_s))
+
+        filters = [
+            f"[0:a]atrim=start={start:.6f}:end={end:.6f},asetpts=PTS-STARTPTS[a{i}]"
+            for i, (start, end) in enumerate(keep_ranges)
+            if end > start
+        ]
+        if not filters:
+            return mp3_bytes
+        labels = "".join(f"[a{i}]" for i in range(len(filters)))
+        filter_graph = ";".join(filters)
+        if len(filters) == 1:
+            filter_graph += ";[a0]anull[out]"
+        else:
+            filter_graph += f";{labels}concat=n={len(filters)}:v=0:a=1[out]"
+
+        # Pass 2 — splice out only the excess tail of each qualifying run.
         compress_cmd = [
             "ffmpeg", "-y", "-i", in_path,
-            "-af", (
-                f"silenceremove=stop_periods=-1:"
-                f"stop_duration={cap_s:.3f}:"
-                f"stop_threshold={_SILENCE_COMPRESS_THRESHOLD_DB}dB"
-            ),
+            "-filter_complex", filter_graph,
+            "-map", "[out]",
             "-c:a", "libmp3lame", "-b:a", "192k",
             out_path,
         ]
         proc = subprocess.run(compress_cmd, capture_output=True)
         if proc.returncode != 0:
             raise RuntimeError(
-                f"ffmpeg silenceremove failed (rc={proc.returncode}): "
+                f"ffmpeg silence splice failed (rc={proc.returncode}): "
                 f"{proc.stderr[-300:].decode(errors='replace')}"
             )
 
-        in_ms = measure_audio_duration_ms(Path(in_path))
         out_ms = measure_audio_duration_ms(Path(out_path))
         with open(out_path, "rb") as f:
             result = f.read()
 
     logger.info(
-        "AUDIO_SILENCE_COMPRESSED n=%d cap_ms=%d in_ms=%d out_ms=%d removed_ms=%d",
-        qualifying, cap_ms, in_ms, out_ms, in_ms - out_ms,
+        "AUDIO_SILENCE_COMPRESSED n=%d normal_cap_ms=%d dramatic_n=%d "
+        "dramatic_cap_ms=%d in_ms=%d out_ms=%d removed_ms=%d",
+        qualifying, cap_ms, len(dramatic), _DRAMATIC_SILENCE_MAX_MS,
+        in_ms, out_ms, in_ms - out_ms,
     )
     return result
 
@@ -1293,11 +1345,88 @@ def _finalize_audio_with_boundaries(
     final_duration_ms = _measure_mp3_bytes_duration_ms(normalized)
     boundaries = _compute_section_boundaries(section_meta, chunk_bytes_list, final_duration_ms)
     if boundaries:
+        normalized = _apply_section_loudness_arc(normalized, boundaries, section_meta)
+        final_duration_ms = _measure_mp3_bytes_duration_ms(normalized)
+        boundaries = _compute_section_boundaries(
+            section_meta, chunk_bytes_list, final_duration_ms,
+        )
+    if boundaries:
         logger.info(
             "AUDIO_SECTION_BOUNDARIES_COMPUTED sections=%d final_duration_ms=%d",
             len(boundaries), final_duration_ms,
         )
     return normalized, boundaries
+
+
+_SECTION_LOUDNESS_GAIN_DB: dict[str, float] = {
+    "intro": -1.0,
+    "early_buildup": 0.0,
+    "late_buildup": 1.0,
+    "climax_title": 1.5,
+    "outro": -1.5,
+}
+
+
+def _apply_section_loudness_arc(
+    mp3_bytes: bytes,
+    boundaries: list[dict],
+    section_meta: list[dict],
+) -> bytes:
+    """Apply a conservative deterministic hush-build-peak-settle level arc."""
+    windows: list[tuple[float, float, float]] = []
+    for boundary, meta in zip(boundaries, section_meta):
+        gain_db = _SECTION_LOUDNESS_GAIN_DB.get(meta.get("delivery_reason"), 0.0)
+        if gain_db:
+            windows.append((
+                boundary["start_ms"] / 1000.0,
+                boundary["end_ms"] / 1000.0,
+                gain_db,
+            ))
+    if not mp3_bytes or not windows:
+        return mp3_bytes
+
+    import math
+    import os
+    import subprocess
+    import tempfile
+
+    filters: list[str] = []
+    input_label = "0:a"
+    for i, (start_s, end_s, gain_db) in enumerate(windows):
+        output_label = f"arc{i}"
+        multiplier = math.pow(10.0, gain_db / 20.0)
+        filters.append(
+            f"[{input_label}]volume={multiplier:.8f}:"
+            f"enable='between(t\\,{start_s:.6f}\\,{end_s:.6f})'"
+            f"[{output_label}]"
+        )
+        input_label = output_label
+
+    with tempfile.TemporaryDirectory() as tmp:
+        in_path = os.path.join(tmp, "in.mp3")
+        out_path = os.path.join(tmp, "out.mp3")
+        with open(in_path, "wb") as f:
+            f.write(mp3_bytes)
+        proc = subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", in_path,
+                "-filter_complex", ";".join(filters),
+                "-map", f"[{input_label}]",
+                "-c:a", "libmp3lame", "-b:a", "192k",
+                out_path,
+            ],
+            capture_output=True,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"ffmpeg section loudness arc failed (rc={proc.returncode}): "
+                f"{proc.stderr[-300:].decode(errors='replace')}"
+            )
+        with open(out_path, "rb") as f:
+            result = f.read()
+
+    logger.info("AUDIO_SECTION_LOUDNESS_ARC_APPLIED windows=%s", windows)
+    return result
 
 
 def _wav_to_mp3(wav_bytes: bytes) -> bytes:
@@ -1477,6 +1606,7 @@ def _generate_cartesia_audio(
         section_meta.append({
             "section_type": unit.get("section_type"),
             "section_index": unit.get("section_index"),
+            "delivery_reason": unit["delivery"]["reason"],
         })
 
     # Tier 1 R1: cap interior silences per chunk BEFORE concat — the same
@@ -1690,6 +1820,7 @@ def generate_audio(voice_script: str, channel_voice, is_short_episode: bool = Fa
             section_meta.append({
                 "section_type": chunk.get("section_type"),
                 "section_index": chunk.get("section_index"),
+                "delivery_reason": delivery["reason"],
             })
 
     # Tier 1 R1: cap interior silences per chunk BEFORE concat and BEFORE

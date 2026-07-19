@@ -123,8 +123,8 @@ class TestPropsEmitNoTextFields(unittest.TestCase):
         self._assert_clean(props)
         self.assertEqual(props["part_label"], "")
 
-    def test_part_label_config_defaults_off(self):
-        self.assertFalse(settings.short_part_label_enabled)
+    def test_part_label_config_defaults_on(self):
+        self.assertTrue(settings.short_part_label_enabled)
 
 
 class TestBeatBuildNormalization(unittest.TestCase):

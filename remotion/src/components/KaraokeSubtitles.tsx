@@ -38,7 +38,7 @@ export const KaraokeSubtitles: React.FC<Props> = ({
                 color:     isActive ? chunkActiveColor : "#ffffff",
                 transform: isActive ? "scale(1.1)" : "scale(1)",
                 display:   "inline-block",
-                marginRight: "0.25em",
+                marginRight: "0.45em",
               }}
             >
               {word.w}

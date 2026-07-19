@@ -2144,10 +2144,12 @@ untouched — normalization (`"unspecified"`/missing → `"feminine"`) is
 `_resolve_target_gender()`'s job in Agent 3 (§10.3), not this function's;
 inspecting the raw blueprint always shows exactly what Claude returned. See
 §10.3 for the full consumer chain and §8.1/§8.4 for the `ChannelVoice`
-gender configuration this drives. D2 (threading `protagonist_gender` into
-`generate_native_script()` so a translated script's grammar agrees with the
-protagonist's gender — e.g. French "tenue"/"restée" vs "tenu"/"resté") is
-explicitly out of scope for Phase D1 and not implemented.
+gender configuration this drives. Native adaptation resolves the same value
+for parent and child content (children inherit the parent blueprint when
+needed), passes it as `Narrator gender (for grammatical agreement)`, and
+requires participle/adjective agreement for both narrator and named
+characters. French adaptation additionally prefers natural spoken French
+over literal calques.
 
 #### `generate_script_sections`
 
@@ -2442,10 +2444,12 @@ Maximum-length check (roadmap 3.8 / audit G-7) still runs, as telemetry:
   or 800 words (700 target + 100 tolerance) for any other format — real
   production evidence showed a script reaching 1,799 words against the
   documented 1,200-1,600 word spec, producing a 13.3-minute video instead of
-  the intended ~9-10 minutes. The finding is now logged
+  the intended ~9-10 minutes. Source generation now also receives a
+  deterministic prompt target: 1,550 words for `youtube_long`, divided by the
+  planned INTRO + body + OUTRO count and stated on every section call. This
+  is target-only construction — no trim or quality retry. The finding is logged
   (`QUALITY_GATE_BREAKDOWN`'s `det_length_maj` field) but no longer triggers
-  a rewrite — see Phase C (§6 of the audit roadmap) for the planned
-  deterministic-trim replacement.
+  a rewrite.
 - Applies to the source-language parent script only — translated parent
   scripts have their own separate `length_parity` ratio check
   (`_generate_validated_translated_parent_script()`, Phase 13.4), and child
@@ -2778,6 +2782,15 @@ telemetry only (Elimination Mandate, roadmap
   a pressured narrator/character rationalization, not objective advice.
   Generation guidance was 140–170 words when Tier 4 shipped — superseded by
   the 2026-07-16 recalibration below.
+- **Current Short content rules (`PROMPT_VERSION` 5.5):** every planned part
+  owns an exclusive narrative span. The writer receives every sibling
+  `main_reveal` as `other_parts_main_reveals` (forbidden territory) and
+  must stop inside its own span. First-person Shorts name their narrator in
+  the first five seconds; third-person persona references are unambiguous;
+  month/year jumps use spoken bridges; one-off atmospheric details are
+  explained or dropped; closing questions are precise and story-anchored.
+  These are construction rules only. Parent/child overlap remains telemetry
+  only, and no child-vs-child blocker/retry was introduced.
 - Deterministic code still owns the duration band, recalibrated
   (`PROMPT_VERSION` 5.4, 2026-07-16) to the measured **~176 wpm
   post-silence-compression** Short narration rate (run 41f7eeb8: 246 words
@@ -2903,6 +2916,17 @@ Mediterranean and the Alps to fight Rome." The eventual resolution may
 still be left open (that's normal story structure); the *subject* must
 never be hidden to manufacture suspense.
 
+**Performance assets are explicit without turning the approval pitch into a
+teaser (`PROMPT_VERSION` 5.6):** premise construction chooses a specific
+episode rather than a cradle-to-grave survey and names a factual
+high-stakes/counterintuitive hook-source moment, a personal consequence,
+real conflict/contradiction, distinct visual settings/actions, and a
+nameable thumbnail image/object. The description remains a plain operator
+pitch. For `ai_generated` scoring, `scroll_stopper_potential` judges
+whether those explicitly described facts contain a moment the future script
+could open on; it does not demand that the approval description itself use
+viewer-hook rhetoric and may not invent an unmentioned moment.
+
 **Historical-accuracy framing (pre-next-test roadmap Tier 4 R12):** all
 three `story_generator.py` system prompts — premise, expansion, and
 conversational revision — apply the same conditional rule when the channel
@@ -2939,17 +2963,23 @@ too-short-but-real result is not re-rolled here; it is left for the
 exactly like it already does for a too-thin Reddit candidate.
 
 Word-count target scales with `script_format`
-(`_EXPANSION_WORD_TARGETS = {"youtube_long": 1200}`, default `600` for any
-other format) — the same 900/420-word floor `check_source_material_floor()`
-uses, plus a buffer, so a real expansion clears the floor with margin rather
-than skating the exact line. The target is explicitly both goal and ceiling
-(`1200` for `youtube_long`): plan the arc, stay close, do not exceed, and stop
-rather than pad when complete. Python returns the single model result unchanged
+(`_EXPANSION_WORD_TARGETS = {"youtube_long": 2200}`, default `600` for any
+other format). The richer 2,200-word source is intentionally larger than the
+1,550-word assembled-script target, so section generation compresses grounded
+material instead of inflating a thin source. The expansion target is explicitly
+both goal and ceiling: plan the arc, stay close, do not exceed, and stop rather
+than pad when complete. Python returns the single model result unchanged
 — there is no trim/retry mechanism. The system prompt requires the expansion to
 preserve the approved premise's situation/tension/tone faithfully (never
 invent a different plot), write a complete narrative with a real resolution
 (not an outline), and keep the same conditional fiction/history and rights-
 safety rules as the premise prompt.
+
+The structured-output ceiling is 8,192 tokens. The first production attempt
+after raising the source target to 2,200 words hit the former 4,096-token
+ceiling exactly (usage reported 4,096 output tokens) and returned no usable
+`body`. Raising headroom fixes truncation without changing the word target,
+adding a retry, or accepting a partial story.
 
 #### `run_discovery()` branching (`discovery.py`)
 
@@ -2988,7 +3018,11 @@ once, near the top, and branches on it:
   upvotes/comments/`published_at` metadata line for an honest "no
   real-world engagement signal exists for this story" note, so
   `scroll_stopper_potential`/`social_media_clickability` are not penalized
-  for an absence that isn't real.
+  for an absence that isn't real. A score rejection remains terminal for
+  that discovery call: the logged `attempt=N/3` budget covers duplicate or
+  thin-source replacement, not AI-quality re-rolls. Generating another
+  premise because an AI judge scored the first one poorly would violate the
+  Agent 2 no-quality-retry rule.
 - **Manual fallback wording:** `_create_manual_fallback()` takes a new
   `is_ai_generated: bool = False` parameter and sends a different Telegram
   message on exhaustion ("send a story premise or full story text
@@ -3379,10 +3413,9 @@ only) to `dict[str, dict[str, ChannelVoice]]` (language → gender):
   set comprehension over `channel.voices`, so it needed no code change when
   the DB started allowing a second row per language — verified directly,
   not assumed.
-- D2 (threading `protagonist_gender` into `generate_native_script()` so a
-  translated script's own grammar agrees with the protagonist's gender) is
-  explicitly out of scope for Phase D1 — voice selection and script
-  translation grammar are independent fixes; only the former is implemented.
+- `protagonist_gender` is also threaded into
+  `generate_native_script()` for translated-script grammatical agreement;
+  voice choice and wording consume the same persisted blueprint fact.
 
 Runtime proof: `tests/test_gender_aware_voices.py` — real
 `generate_story_blueprint()` call (only `call_claude_structured` stubbed)
@@ -3616,13 +3649,14 @@ Rules:
   production run measured 31% of a 12:40 video as near-digital silence (219
   gaps ≥0.5s, median 1.1s) — paragraph-per-sentence scripts × ElevenLabs v3
   per-utterance pauses, with no pause bound anywhere.
-  `tts._compress_interior_silence(mp3_bytes)` caps every interior silence at
+  `tts._compress_interior_silence(mp3_bytes)` uses
   `settings.audio_max_interior_silence_ms` (default 650; ≤0 disables) via a
   deterministic two-pass ffmpeg: a read-only `silencedetect` pre-pass returns
   the input **unchanged** when no qualifying silence exists (no re-encode
-  generation loss), otherwise `silenceremove` (interior mode, `-40dB`
-  threshold, semantics verified empirically against the installed ffmpeg
-  build) trims each run to ~the cap. **Applied per TTS chunk, in both
+  generation loss); otherwise an `atrim`/`concat` segment splice keeps the
+  two longest non-leading gaps per chunk at up to 900 ms and caps every
+  other qualifying gap at 650 ms. Leading silence is never removed.
+  **Applied per TTS chunk, in both
   provider paths, BEFORE `_concat_mp3_chunks()` and BEFORE
   `_compute_section_boundaries()`** — the chunk list handed to boundary
   computation is the compressed one, so `section_boundaries`, Whisper,
@@ -3632,11 +3666,19 @@ Rules:
   never trimmed; a chunk's trailing silence is capped (it sits between
   sections after concat). Fails loud (`RuntimeError`) on ffmpeg failure,
   same contract as loudnorm/concat. Never runs on the skip-on-disk resume
-  path. Logs `AUDIO_SILENCE_COMPRESSED n=… cap_ms=… in_ms=… out_ms=…
-  removed_ms=…`. Runtime proof: `tests/test_tier1_audio_continuity.py`
+  path. Logs `AUDIO_SILENCE_COMPRESSED` with the normal cap, dramatic
+  count/cap, input/output duration, and removed duration. Runtime proof:
+  `tests/test_tier1_audio_continuity.py`
   (real ffmpeg synthesizes known speech/silence layouts and independently
   re-measures results, including the compression-before-boundaries ordering
   proof through the real `generate_audio()` chain).
+- **Post-normalization section loudness arc:** long-form section metadata now
+  carries the existing delivery-selector reason into finalization. After
+  loudnorm, one deterministic ffmpeg pass applies intro −1.0 dB, early
+  buildup 0 dB, late buildup +1.0 dB, climax +1.5 dB, and outro −1.5 dB.
+  The arced file is re-measured and `section_boundaries` are recomputed
+  against its actual duration, so no timing consumer can drift. Flat Shorts
+  and paths without trustworthy section metadata are unchanged.
 - **`generate_audio()` returns `tuple[bytes, section_boundaries]`, not bare
   bytes (roadmap Phase B1):** the second element is a list of
   `{"section_type", "section_index", "start_ms", "end_ms"}` dicts describing
@@ -3848,6 +3890,13 @@ Text-conditioning
 (`previous_text`/`next_text`) remains non-v3 only when the SDK supports it, and
 all multi-chunk/multi-section output still passes through `_concat_mp3_chunks()`
 (Phase 11.6) for final concatenation.
+
+French ElevenLabs v3 voices use the existing per-voice stability path.
+Migration 015 sets matching French v3 rows without an explicit numeric
+`stability_override` to `v3_stability_preset="robust"` (0.85), addressing
+measured French prosody fragmentation without a new provider call or a
+language-specific runtime branch. The next operator run must measure the
+voice-level effect; code cannot predict provider prosody magnitude offline.
 
 #### Phase 11 Deliverables
 
@@ -5395,6 +5444,13 @@ Rules:
 - Dev routing is operator-enabled by default. Do not enable Pro by default or raise
   `image_routing_max_pro_per_content` above `0` without an explicit
   operator decision.
+- The current deployment intentionally overrides both Dev routing switches to
+  false. Keep Flux Dev off until the operator changes that decision; code
+  defaults do not override environment configuration.
+- Reference-image identity locking remains design-only. The repository has no
+  verified reference-capable provider endpoint/payload contract yet. Do not
+  invent one: endpoint selection, retention/cost policy, and a live operator
+  canary are prerequisites before implementation.
 
 ### 11.6 AI Text Rendering Ban + Subtitles-Only Rendering (supersedes Phases 14.4/14.7/14.10b)
 
@@ -5404,8 +5460,9 @@ subtitle track is the video's only text layer. Text cards
 text (`overlay_text`/`overlay_position`, `TextOverlay`), and the
 subtitle-suppression machinery that coordinated them (Phase 14.10b's
 `suppressWindows`/`computeOverlaySuppressWindows`) are all removed. The
-Shorts "Part N of M" corner label is the single operator-opt-in exception
-(`settings.short_part_label_enabled`, default off).
+Shorts "Part N of M" corner label is the single operator-approved exception
+(`settings.short_part_label_enabled`, default on). `Short.tsx` mounts it
+outside any time-limited sequence, so it remains visible for the full Short.
 
 Why: image models cannot render legible text (generated documents/posters/
 signs always carry gibberish), and the run-9500c231 audit (G-3) showed the
@@ -6334,6 +6391,11 @@ like/share rail, progress bar) that occupies the bottom of the frame.
 `StandardSubtitles.tsx` (main 16:9 video) is unaffected — no platform UI
 chrome overlaps a horizontal video the same way.
 
+Karaoke word tokens use `marginRight: "0.45em"`. The prior 0.25em
+gap was narrower than Arial Black's natural space at the 82px Short caption
+size and repeatedly made clean adjacent tokens look fused. Caption data and
+standard main-video subtitles are unchanged.
+
 ### 11A.5 Subtitle/Overlay Collision Prevention (Phase 14.10b — RETIRED)
 
 Retired by subtitles-only rendering (§11.6 / Golden Rule 11). The mechanism
@@ -6716,8 +6778,8 @@ Rules:
 11. **Remotion renders subtitles ONLY.** The subtitle track is the video's only
     text layer — no text cards, no overlay text, no placeholder labels. Every
     beat is a Flux-generated image. (The Shorts "Part N of M" corner label is
-    the single operator-opt-in exception, behind `short_part_label_enabled`,
-    default off.)
+    the single operator-approved exception, behind
+    `short_part_label_enabled`, default on.)
 
 ---
 
@@ -7473,6 +7535,7 @@ PROPS_STALE_REBUILDING
 PROPS_STALENESS_CHECK_FAILED
 LUMINANCE_CHECK_UNAVAILABLE
 AUDIO_LOUDNESS_NORMALIZED
+AUDIO_SECTION_LOUDNESS_ARC_APPLIED
 AUDIO_SECTION_BOUNDARIES_COMPUTED
 VISUAL_TIMING_SECTION_ANCHORED
 VISUAL_TIMING_WHOLE_VIDEO_STRETCH_FALLBACK

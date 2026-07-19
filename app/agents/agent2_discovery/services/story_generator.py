@@ -54,13 +54,16 @@ logger = logging.getLogger(__name__)
 _PREMISE_SOFT_WORD_CEILING = 150
 
 _PREMISE_MAX_TOKENS = 512
-_EXPANSION_MAX_TOKENS = 4096
+# A 2,200-word body plus structured-tool JSON can exceed 4,096 output tokens.
+# A production response hit that ceiling exactly and arrived without a usable
+# body. This is generation headroom, not a retry or a larger word target.
+_EXPANSION_MAX_TOKENS = 8192
 
 # Mirrors check_source_material_floor()'s own 900/420-word floor
 # (app/services/script_checks.py) with a buffer, so a real expansion clears
 # the floor with margin instead of skating the exact line.
 _EXPANSION_WORD_TARGETS: dict[str, int] = {
-    "youtube_long": 1200,
+    "youtube_long": 2200,
 }
 _EXPANSION_WORD_TARGET_DEFAULT = 600
 
@@ -112,6 +115,15 @@ Rules:
   usernames, no "OP", no fake upvote/comment counts, no "as told by u/...".
 - Title: state the specific subject/situation plainly — name who or what the story is about
   and the core situation, not a cryptic or clickbait phrase.
+- Choose a performance-ready STORY, not a cradle-to-grave survey or a broad topic summary.
+  The premise must explicitly identify: one concrete high-stakes or counterintuitive moment
+  that a finished script could open on; a personal consequence for a named person; a real
+  conflict or contradiction; several visually distinct settings/actions; and one powerful,
+  nameable thumbnail image or object. For history, all of these must be factual — never
+  invent jeopardy or conflict to satisfy this rule.
+- Keep the operator-facing wording plain while exposing those performance assets. Do not
+  write the premise itself as a viewer hook or vague teaser; describe the concrete moment
+  that could become the hook.
 - Description (body): write 2-4 sentences that plainly state the situation, the setting, and
   the people/characters and conflict involved — clearly enough that the operator could
   describe the story to someone else after reading it once. Do NOT hide or withhold the

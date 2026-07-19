@@ -9,9 +9,8 @@ blueprint time, zero extra AI calls) drives which gender Agent 3 selects at
 audio-generation time, with a logged fallback when only one gender is
 configured for a language.
 
-D2 (threading protagonist_gender into generate_native_script() for
-translated-script grammar agreement) is explicitly out of scope for this
-phase per operator instruction — not tested here.
+Native-script grammatical agreement now consumes the same
+protagonist_gender value and is covered by the multilingual runtime path.
 
 Only the paid `call_claude_structured` boundary is stubbed. Everything else
 (schema, real `generate_story_blueprint()`/`run_audio_generation()`

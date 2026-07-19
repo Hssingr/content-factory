@@ -65,9 +65,10 @@ class Settings(BaseSettings):
     short_visual_max_hold_ms: int = 6000
 
     # Shorts "Part N of M" corner label. Remotion renders subtitles ONLY
-    # (audit G-0) — this label is the single allowed, operator-opt-in
-    # exception. Default off: no non-subtitle text is drawn.
-    short_part_label_enabled: bool = False
+    # (audit G-0) — this label is the single allowed, operator-approved
+    # exception. The operator requires this series-position label throughout
+    # every standalone Short, so it is enabled by default.
+    short_part_label_enabled: bool = True
 
     # Agent 4 parent long-form: last-line hold cap after timestamp mapping. Even
     # if every upstream guard (hint proximity window, anchor span sanity) is

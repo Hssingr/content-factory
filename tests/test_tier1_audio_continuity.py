@@ -91,7 +91,7 @@ class CompressInteriorSilenceTest(unittest.TestCase):
             f"expected AUDIO_SILENCE_COMPRESSED log marker, got: {logs.output}",
         )
 
-    def test_multiple_long_silences_all_capped(self):
+    def test_two_longest_silences_preserve_dramatic_headroom(self):
         blob = _make_pattern_mp3(
             [("tone", 1.0), ("silence", 1.5), ("tone", 1.0), ("silence", 2.0), ("tone", 1.0)]
         )
@@ -99,9 +99,20 @@ class CompressInteriorSilenceTest(unittest.TestCase):
         self.assertAlmostEqual(in_s, 6.5, delta=0.25)
         out = tts._compress_interior_silence(blob)
         out_s = _duration_s(out)
-        # 3.0 speech + 2 × ~0.65 kept silence ≈ 4.3s; ≥1.8s removed.
-        self.assertGreater(in_s - out_s, 1.8)
-        self.assertGreater(out_s, 3.9)   # speech content is never eaten
+        # Both are the chunk's two longest gaps, so each keeps ~0.90s.
+        self.assertAlmostEqual(out_s, 4.8, delta=0.25)
+        self.assertGreater(out_s, 4.4)   # speech content is never eaten
+
+    def test_third_longest_silence_keeps_normal_cap(self):
+        blob = _make_pattern_mp3([
+            ("tone", 1.0), ("silence", 1.5),
+            ("tone", 1.0), ("silence", 2.0),
+            ("tone", 1.0), ("silence", 1.2),
+            ("tone", 1.0),
+        ])
+        out_s = _duration_s(tts._compress_interior_silence(blob))
+        # Four seconds of speech + 0.90 + 0.90 + normal 0.65 second cap.
+        self.assertAlmostEqual(out_s, 6.45, delta=0.30)
 
     def test_short_silence_untouched_and_skips_reencode(self):
         """A sub-cap pause is normal sentence rhythm — the pre-pass must

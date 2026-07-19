@@ -23,7 +23,7 @@ if str(ROOT) not in sys.path:
 if str(ROOT / "test_pipeline") not in sys.path:
     sys.path.insert(0, str(ROOT / "test_pipeline"))
 
-from test_full_pipeline import _format_gate_score
+from test_full_pipeline import DISCOVERY_NONE_MESSAGE, _format_gate_score
 from app.agents.agent2_discovery.services.scoring import score_story_assessment
 
 
@@ -43,6 +43,10 @@ def _real_assessment(**overrides) -> dict:
 
 
 class FormatGateScoreTest(unittest.TestCase):
+    def test_discovery_none_message_mentions_score_gate(self) -> None:
+        self.assertIn("failed score gates", DISCOVERY_NONE_MESSAGE)
+        self.assertNotIn("Are sources configured?", DISCOVERY_NONE_MESSAGE)
+
     def test_none_assessment_returns_question_mark(self) -> None:
         self.assertEqual(_format_gate_score(None), "?")
 
