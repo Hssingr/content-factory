@@ -159,6 +159,12 @@ _TEXT_PROP_KEYWORDS: tuple[str, ...] = (
     "letter", "newspaper", "article", "phone screen", "text message",
     "phone message", "name tag", "identification card", "id card",
     "license", "headline",
+    # Added after an independent review of real output found these exact
+    # words in beats that slipped past sanitization (7 of 15 book/ledger/
+    # parchment-mentioning beats in one run were uncaught — code_report/
+    # 8abd7fea_independent_video_output_review.md, finding 2).
+    "book", "ledger", "parchment", "scroll", "manuscript", "notice",
+    "notice board", "seal", "wax seal",
 )
 _TEXT_PROP_FIELDS: tuple[str, ...] = ("flux_prompt", "visual_intent", "motif")
 
@@ -183,6 +189,17 @@ _TEXT_PROP_KEYWORD_PATTERNS: tuple[tuple[str, "re.Pattern[str]"], ...] = tuple(
 # directly causing duplicate images. Claude's own flux_prompt is never
 # rewritten now; exactly one short clause is appended.
 _TEXT_PROP_NO_TEXT_CLAUSE = "no readable text or legible words in the frame"
+
+# Applied to EVERY generated beat, not just text-prop beats (independent
+# review of real output found a stray "2024." watermark-style mark baked
+# into an ordinary portrait/window beat with no document/sign/poster subject
+# — code_report/8abd7fea_independent_video_output_review.md, finding 3).
+# Flux models occasionally bake in stock-photo-style watermarks, signatures,
+# or date stamps regardless of subject; this is the same one-clause-append
+# pattern already proven safe for text props, just applied unconditionally.
+UNIVERSAL_NO_ARTIFACT_CLAUSE = (
+    "no watermark, no signature, no visible date or timestamp, no logos"
+)
 
 
 def is_text_prop_beat(beat: dict) -> bool:

@@ -50,6 +50,7 @@ from app.agents.agent4_visuals.system_prompt import (
 from app.models import VideoSection
 from app.services.claude_client import call_claude_structured_with_usage
 from app.agents.agent4_visuals.services.flux_generator import (
+    UNIVERSAL_NO_ARTIFACT_CLAUSE,
     _dedupe_generated_image_once,
     _ensure_beat_image_healthy,
     derive_text_prop_prompt,
@@ -1908,6 +1909,14 @@ def _build_beat_section(beat: dict, index: int, start_ms: int, end_ms: int, scri
             beat_order, flux_prompt_value[:160], sanitized_prompt,
         )
         flux_prompt_value = sanitized_prompt
+
+    # ── Universal artifact guard (independent review finding 3) ─────────────
+    # Applied to every beat, not just text-prop beats — a stray watermark/
+    # signature/date artifact can appear on any generated image regardless
+    # of subject. Appended once here so it survives into every downstream
+    # consumer of flux_prompt (Flux call, media validation re-check).
+    if flux_prompt_value and UNIVERSAL_NO_ARTIFACT_CLAUSE not in flux_prompt_value:
+        flux_prompt_value = f"{flux_prompt_value}, {UNIVERSAL_NO_ARTIFACT_CLAUSE}"
 
     # ── Dark-frame guard (audit G-6) ─────────────────────────────────────────
     # dark_contrast renders `contrast(140%) brightness(65%)` — on a source

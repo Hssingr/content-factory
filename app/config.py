@@ -61,8 +61,12 @@ class Settings(BaseSettings):
     remotion_pre_bundle: bool = False
 
     # Agent 4 child Shorts: cap individual visual holds so sparse remaps do not
-    # leave one image on screen for long short-form spans.
-    short_visual_max_hold_ms: int = 6000
+    # leave one image on screen for long short-form spans. Lowered from 6000
+    # (independent review of real output, code_report/
+    # 8abd7fea_independent_video_output_review.md, finding 9) — a free lever:
+    # this only redistributes hold time across already-generated images, no
+    # new Flux calls, forcing more frequent visual change for short-form pacing.
+    short_visual_max_hold_ms: int = 5000
 
     # Shorts "Part N of M" corner label. Remotion renders subtitles ONLY
     # (audit G-0) — this label is the single allowed, operator-approved
@@ -74,8 +78,11 @@ class Settings(BaseSettings):
     # if every upstream guard (hint proximity window, anchor span sanity) is
     # defeated, no non-terminal parent beat may hold a single image longer than
     # this. Applied in split_into_beats() by advancing the next beat — never by
-    # creating beats or touching audio/subtitle timing.
-    parent_visual_max_hold_ms: int = 9000
+    # creating beats or touching audio/subtitle timing. Lowered from 9000
+    # (independent review of real output, code_report/
+    # 8abd7fea_independent_video_output_review.md, finding 9) — same free
+    # lever as short_visual_max_hold_ms above.
+    parent_visual_max_hold_ms: int = 7000
 
     # Post-render verification: run ffprobe/blackdetect/silencedetect after every render.
     # Set VERIFY_RENDERS=false to skip (e.g. in CI or when ffmpeg is unavailable).

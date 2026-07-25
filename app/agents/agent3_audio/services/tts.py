@@ -228,11 +228,15 @@ _CHUNK_BOUNDARY_SILENCE_SECONDS = 0.08
 # audit): a real production run measured a parent's EN narration at -22.4
 # LUFS against the SAME content's FR narration at -18.3 LUFS — no
 # normalization existed anywhere in this pipeline, so loudness varied by
-# provider/voice/language with nothing correcting it. -17 LUFS is the
-# midpoint of a -16..-18 LUFS online-narration target band; -1.5 dBTP
-# leaves headroom against inter-sample peaks after mp3 re-encoding.
-_LOUDNORM_TARGET_I_LUFS  = -17.0
-_LOUDNORM_TARGET_TP_DBTP = -1.5
+# provider/voice/language with nothing correcting it. -15 LUFS matches
+# short-form platform norms (TikTok/Reels/Shorts loudness-normalize close
+# to this) — independent review measurement of real output at the prior
+# -17.0 target (code_report/8abd7fea_independent_video_output_review.md,
+# finding 8) confirmed the target was hit accurately but felt quiet for
+# short-form delivery; -1.0 dBTP still leaves real headroom against
+# inter-sample peaks after mp3 re-encoding.
+_LOUDNORM_TARGET_I_LUFS  = -15.0
+_LOUDNORM_TARGET_TP_DBTP = -1.0
 _LOUDNORM_TARGET_LRA_LU  = 11.0  # ffmpeg loudnorm's own default LRA target
 
 _REVEAL_SENTENCE_RE = re.compile(
@@ -1057,6 +1061,17 @@ _DRAMATIC_SILENCE_MAX_MS = 900
 # TTS inter-utterance silence is near-digital (well below -60 dB); -40 dB
 # detects it reliably while never clipping quiet speech or breath tails.
 
+# Fraction of a non-dramatic gap's excess (above the cap) retained instead of
+# trimmed away. Flattening every ordinary gap to exactly `cap_s` (the prior
+# behavior) makes every capped pause bit-for-bit identical — an independent
+# review of real output measured this as a mechanical, "assembled from
+# chunks" rhythm (code_report/8abd7fea_independent_video_output_review.md,
+# finding 1). Retaining a fraction of each gap's own original excess
+# preserves natural variation between pauses while still bounding worst-case
+# length; result is still clamped to the dramatic-tier ceiling so ordinary
+# gaps never out-last the two deliberately-longer "dramatic" pauses.
+_ORDINARY_SILENCE_EXCESS_RETENTION = 0.3
+
 
 def _compress_interior_silence(mp3_bytes: bytes) -> bytes:
     """Cap interior narration silences at ``settings.audio_max_interior_silence_ms``
@@ -1075,8 +1090,11 @@ def _compress_interior_silence(mp3_bytes: bytes) -> bytes:
        **unchanged** — no re-encode, no quality-generation loss, which is
        the common case for short chunks.
     2. A deterministic ``atrim``/``concat`` splice preserves the two longest
-       non-leading gaps at up to 900 ms and caps every other qualifying gap
-       at the configured limit. Only excess silence is removed.
+       non-leading gaps at up to 900 ms; every other qualifying gap retains
+       the configured limit plus ``_ORDINARY_SILENCE_EXCESS_RETENTION`` of
+       its own excess above that limit (bounded by the 900 ms dramatic
+       ceiling) rather than being flattened to one identical duration — only
+       the excess beyond that retained amount is removed.
 
     Applied per TTS chunk in ``generate_audio()``'s provider paths — BEFORE
     ``_concat_mp3_chunks()`` and BEFORE ``_compute_section_boundaries()`` —
@@ -1166,10 +1184,15 @@ def _compress_interior_silence(mp3_bytes: bytes) -> bytes:
         removals: list[tuple[float, float]] = []
         for i in eligible:
             start, end, duration = intervals[i]
-            keep_s = min(
-                duration,
-                (_DRAMATIC_SILENCE_MAX_MS / 1000.0) if i in dramatic else cap_s,
-            )
+            if i in dramatic:
+                keep_s = min(duration, _DRAMATIC_SILENCE_MAX_MS / 1000.0)
+            else:
+                excess = max(0.0, duration - cap_s)
+                keep_s = min(
+                    duration,
+                    cap_s + excess * _ORDINARY_SILENCE_EXCESS_RETENTION,
+                    _DRAMATIC_SILENCE_MAX_MS / 1000.0,
+                )
             remove_start = start + keep_s
             if end - remove_start > 0.001:
                 removals.append((remove_start, end))

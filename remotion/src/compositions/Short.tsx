@@ -152,8 +152,12 @@ const PartLabel: React.FC<PartLabelProps> = ({ label }) => {
       <div
         style={{
           position:        "absolute",
-          top:             96,
-          left:            48,
+          // Independent review of real output (code_report/
+          // 8abd7fea_independent_video_output_review.md, finding 7) found the
+          // prior top:96/left:48 position sitting inside the zone TikTok/
+          // Reels/IG Stories reserve for their own profile/follow-button UI.
+          top:             170,
+          left:            56,
           backgroundColor: "rgba(0,0,0,0.65)",
           borderRadius:    8,
           padding:         "8px 18px",

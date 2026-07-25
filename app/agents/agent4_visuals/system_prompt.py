@@ -11,7 +11,14 @@ from app.services.claude_client import (
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "5.0"  # v5.0: Tier 5 R18 era-aware diversity — locked-era stories use
+PROMPT_VERSION = "5.1"  # v5.1: independent review of real output (code_report/
+                        #        8abd7fea_independent_video_output_review.md) — two
+                        #        additive prompt-only rules, no schema change: (1) prefer
+                        #        depicting a named, identity-locked character physically
+                        #        over a symbolic object standing in for them; (2) avoid
+                        #        extreme close-ups isolating a single facial feature
+                        #        (mouth/lips/eyes), a reliable image-model distortion mode.
+                        # v5.0: Tier 5 R18 era-aware diversity — locked-era stories use
                         #        motif/camera-framing diversity and never invent an anachronistic
                         #        environment merely to evade an environment-frequency cap.
                         # v4.9: Tier 3 alignment rules — never split one narration span into
@@ -348,6 +355,18 @@ character looking like the same person across 100+ beats — a real production
 run showed a story's protagonist rendered as 6+ visually different women with
 nothing enforcing consistency.
 
+When a beat's narration centers on a NAMED character who has a locked
+"Character identities:" description, prefer depicting that person physically
+(using their locked description) over a purely symbolic object standing in
+for them. An independent review of real output found this failure mode
+repeatedly — a musician represented only by his lute, a child represented
+only by an empty bonnet or a toy, a brother represented only by an empty
+coat, speech represented only by an extreme mouth close-up. Reserve an
+object-only beat for when the OBJECT ITSELF, not the person, is the actual
+subject of this exact sentence (e.g. the narration is specifically about the
+lute being found, not about the musician). When in doubt and the person is
+available to draw, draw the person.
+
 When an "Era/setting lock:" line appears, it names this story's historical period
 and physical setting. Every beat's props, clothing, architecture, technology, and
 background details must be authentic to that period and place — no modern flags,
@@ -552,7 +571,12 @@ FORBIDDEN words — using any of these in a flux_prompt is an automatic failure:
 Build every flux_prompt in this exact order (50–80 words total):
   1. SUBJECT — the single most specific concrete element from the narration text:
      a named object, a specific place, a visible action, something the narration mentions.
-  2. COMPOSITION — where is the camera? (close-up, wide shot, overhead, eye-level)
+  2. COMPOSITION — where is the camera? (close-up, wide shot, overhead, eye-level).
+     Avoid an extreme close-up isolating a single facial feature (mouth, lips,
+     or eyes only, filling the frame) — image models reliably distort anatomy
+     at that framing (an independent review of real output flagged exactly
+     this as the single worst image in a series). For speech or emotion,
+     prefer a medium facial close-up that shows the whole face.
   3. SETTING — specific location detail ("a 1980s hospital waiting room with plastic chairs
      and wall-mounted TV" not "a room", "a cobblestone alley in an old European city" not "street")
   4. LIGHTING — exact quality and source (morning side light through venetian blinds,

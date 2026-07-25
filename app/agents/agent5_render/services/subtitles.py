@@ -40,7 +40,11 @@ logger = logging.getLogger(__name__)
 # fire mid-phrase and produce broken-fragment captions.
 _MIN_WORDS_STANDARD      = 3
 _TARGET_WORDS_STANDARD   = 7
-_MAX_WORDS_STANDARD      = 10     # hard cap; was 12 — tighter for readability
+_MAX_WORDS_STANDARD      = 13     # hard cap; was 10 — independent review of real output
+                                  # (code_report/8abd7fea_independent_video_output_review.md,
+                                  # finding 6) reproduced mid-clause splits firing at exactly
+                                  # 10 words with no natural boundary reached yet, even though
+                                  # the co-equal duration ceiling below had headroom to spare.
 _MAX_DURATION_MS         = 4500   # split chunk if it would exceed 4.5 s
 
 _MIN_WORDS_KARAOKE       = 2

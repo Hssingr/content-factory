@@ -3623,7 +3623,12 @@ Rules:
   normalization existed anywhere in the pipeline, so perceived volume varied
   by provider/voice/language with nothing correcting it.
   `tts._normalize_loudness(mp3_bytes)` applies a single-pass ffmpeg
-  `loudnorm` filter (`I=-17.0:TP=-1.5:LRA=11.0`, output re-encoded at
+  `loudnorm` filter (`I=-15.0:TP=-1.0:LRA=11.0` — raised from the original
+  `-17.0`/`-1.5` per an independent review of real output,
+  `code_report/8abd7fea_independent_video_output_review.md` finding 8, which
+  measured accurate but short-form-platform-quiet output at the prior
+  target; -15 LUFS matches TikTok/Reels/Shorts norms while -1.0 dBTP still
+  leaves real headroom under clipping — output re-encoded at
   192kbps) — a deliberate simplicity tradeoff (one pass, not the more
   precise two-pass measure-then-apply variant): the goal is consistent,
   reasonable loudness across languages/providers, not broadcast-spec-exact
@@ -3654,8 +3659,14 @@ Rules:
   deterministic two-pass ffmpeg: a read-only `silencedetect` pre-pass returns
   the input **unchanged** when no qualifying silence exists (no re-encode
   generation loss); otherwise an `atrim`/`concat` segment splice keeps the
-  two longest non-leading gaps per chunk at up to 900 ms and caps every
-  other qualifying gap at 650 ms. Leading silence is never removed.
+  two longest non-leading gaps per chunk at up to 900 ms; every other
+  qualifying gap retains 650 ms plus `_ORDINARY_SILENCE_EXCESS_RETENTION`
+  (30%) of its own excess above that (bounded by the 900 ms ceiling) rather
+  than being flattened to one identical duration — an independent review of
+  real output (`code_report/8abd7fea_independent_video_output_review.md`
+  finding 1) measured this flattening as an audible, metronomic "assembled
+  from chunks" rhythm, since every capped pause came out bit-for-bit
+  identical. Leading silence is never removed.
   **Applied per TTS chunk, in both
   provider paths, BEFORE `_concat_mp3_chunks()` and BEFORE
   `_compute_section_boundaries()`** — the chunk list handed to boundary
@@ -4494,9 +4505,14 @@ Visual hold cap (third frozen-frame guard — the last-line guarantee):
 
 - Even if a bad anchor slips past BOTH guards above, no non-terminal parent
   beat may hold one image longer than `settings.parent_visual_max_hold_ms`
-  (default 9000 ms). Applied in `split_into_beats()` after timestamp mapping
+  (default 7000 ms — lowered from 9000 per an independent review of real
+  output, `code_report/8abd7fea_independent_video_output_review.md` finding
+  9, requesting more frequent visual change; this is a free lever since it
+  only redistributes already-generated images' hold time, no new Flux
+  calls). Applied in `split_into_beats()` after timestamp mapping
   via `_apply_visual_hold_cap()` — the same shared core the child Short path
-  uses at its tighter `settings.short_visual_max_hold_ms` (6000 ms) ceiling —
+  uses at its tighter `settings.short_visual_max_hold_ms` (5000 ms, same
+  rationale) ceiling —
   by shortening the over-cap beat and advancing the next existing beat. It
   never creates synthetic beats and never touches audio/subtitle timing; a
   terminal beat with no later beat to absorb the remainder is exempt.
@@ -5134,7 +5150,8 @@ Rules:
 - Child remap MAJOR handling is telemetry only (Elimination Mandate D1.5, `code_report/forensic_output_audit_borrasca_run.md` — supersedes the former roadmap 3.5 / audit G-4.3 deterministic remediation primitive): after `validate_storyboard()` finds child MAJORs, `_run_child_short_visuals()` logs them and proceeds with the beats unchanged. The deleted primitive (`remediate_child_major_storyboard_issues()`) used to strip forbidden/readable-text language and regenerate `flux_prompt` from `visual_intent`/environment/motif for `forbidden_flux_word`/`ai_text_rendering_requested` MAJORs — removed because MAJOR findings never blocked the pipeline either way, so the repair pass added complexity without a provable quality gain. No Claude, Flux, or internal remap retry is invoked (unchanged).
 - Log reuse stats.
 - Child Short visual sections use `settings.short_visual_max_hold_ms` (default
-  6000 ms) as a maximum non-terminal image hold target after timestamp mapping
+  5000 ms — lowered from 6000, see the "Visual hold cap" rules above) as a
+  maximum non-terminal image hold target after timestamp mapping
   and micro-beat cleanup.
   If a non-terminal beat exceeds the cap, Agent 4 shortens that beat and
   advances the next existing visual beat earlier to cover the remaining
@@ -5142,7 +5159,8 @@ Rules:
   and never changes Whisper/subtitle timing. A terminal beat with no later
   visual beat may remain above the cap, and the cap application is logged as
   `SHORT_VISUAL_HOLD_CAP_APPLIED`. Parent long-form beats have their own,
-  looser hold cap (`settings.parent_visual_max_hold_ms`, default 9000 ms)
+  looser hold cap (`settings.parent_visual_max_hold_ms`, default 7000 ms —
+  lowered from 9000)
   applied in `split_into_beats()` — see the "Visual hold cap" rules under
   `map_storyboard_beats_to_timestamps` above; both paths share one
   implementation (`_apply_visual_hold_cap`), differing only in ceiling and
@@ -7683,7 +7701,7 @@ Rules:
 - Shorts have their own Whisper.
 - Shorts use remapped parent visual beats.
 - Shorts cap non-terminal visual holds with `settings.short_visual_max_hold_ms`
-  (default 6000 ms) by advancing the next existing visual beat, without
+  (default 5000 ms) by advancing the next existing visual beat, without
   changing narration audio or subtitle timing and without creating fake beats.
 - Every Short beat's Flux image is generated fresh at portrait size
   (1080×1920), cached under the child's own content ID — never the parent's
