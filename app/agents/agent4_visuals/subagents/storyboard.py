@@ -2023,6 +2023,13 @@ def _apply_short_visual_hold_cap(
     )
 
 
+# Minimum span (ms) a later beat must retain when an earlier over-cap beat's
+# shortening pushes that later beat's start forward. Prevents the cascading
+# chain-shortening bug documented in _apply_visual_hold_cap() below from ever
+# reaching or passing that beat's own fixed end.
+_HOLD_CAP_MIN_REMAINING_SPAN_MS = 500
+
+
 def _apply_visual_hold_cap(
     sections: list[dict],
     *,
@@ -2043,6 +2050,15 @@ def _apply_visual_hold_cap(
     timeline. When a non-terminal beat exceeds the cap, its end is shortened and
     the next existing visual beat starts earlier. The terminal beat is left alone
     when no later beat exists to take over the remaining narration span.
+
+    A chain of consecutive over-cap beats near the end of the sequence can
+    otherwise push a later beat's forced start all the way up to (or past)
+    that beat's own fixed end — a real production run hit this exactly on
+    the actual terminal beat, producing a zero-width last section that
+    failed Agent 5's props sanity check. Each shortening is clamped so the
+    receiving beat always keeps at least ``_HOLD_CAP_MIN_REMAINING_SPAN_MS``
+    of its own span; a clamp engaging is logged (``*_CASCADE_CLAMPED``), not
+    silent.
     """
     if not sections:
         return []
@@ -2070,6 +2086,22 @@ def _apply_visual_hold_cap(
             continue
 
         new_end_ms = start_ms + cap_ms
+        # Defensive floor (real production bug: a real run's terminal beat
+        # collapsed to zero width — "Section 115: end <= start" — because a
+        # chain of consecutive over-cap beats near the end of the video kept
+        # pushing the next beat's forced start later with nothing stopping
+        # it from reaching or passing that beat's own fixed end). Never push
+        # the next beat's start past its own end minus a minimum span.
+        next_end_ms = int(capped[idx + 1].get("audio_end_ms", new_end_ms))
+        max_allowed_new_end = next_end_ms - _HOLD_CAP_MIN_REMAINING_SPAN_MS
+        if new_end_ms > max_allowed_new_end:
+            logger.warning(
+                "%s_CASCADE_CLAMPED content_id=%s language=%s beat_idx=%d "
+                "requested_end_ms=%d clamped_to_ms=%d next_beat_end_ms=%d",
+                log_prefix, content_id or "unknown", language or "unknown",
+                idx, new_end_ms, max_allowed_new_end, next_end_ms,
+            )
+            new_end_ms = max(start_ms, max_allowed_new_end)
         capped[idx]["audio_end_ms"] = new_end_ms
         capped[idx + 1]["audio_start_ms"] = new_end_ms
         capped_count += 1

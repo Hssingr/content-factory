@@ -1137,11 +1137,14 @@ directly (the per-section state and save handlers that used to live in
 
 **Most leaf section components kept their pre-existing logic** —
 `LanguagesSection.jsx`, `VoicesSection.jsx`,
-`ScheduleSection.jsx`, `SourcesSection.jsx`, `PlatformsSection.jsx`,
+`ScheduleSection.jsx`, `PlatformsSection.jsx`,
 `CredentialRow.jsx`, `AISuggestionField.jsx`, and `ChannelList.jsx` remain
 ordinary editable form components. `BasicInfoSection.jsx` is the exception:
-it now owns the Agent 1 Research Ideas UX (§8.5). No new dependency was
-added — no Tailwind, no icon library, no animation library; the visual
+it now owns the Agent 1 Research Ideas UX (§8.5) and, since the frontend/
+backend audit of 2026-07-30, also owns the inline Reddit-sources UI
+directly (the standalone `SourcesSection.jsx` component was unused dead
+code — never imported after this redesign — and was deleted). No new
+dependency was added — no Tailwind, no icon library, no animation library; the visual
 design is plain hand-written CSS.
 
 **`BasicInfoSection.jsx` — two-path UX with progressive reveal (supersedes
@@ -4505,17 +4508,26 @@ Visual hold cap (third frozen-frame guard — the last-line guarantee):
 
 - Even if a bad anchor slips past BOTH guards above, no non-terminal parent
   beat may hold one image longer than `settings.parent_visual_max_hold_ms`
-  (default 7000 ms — lowered from 9000 per an independent review of real
+  (default 9000 ms). A lowered value of 7000 ms (independent review of real
   output, `code_report/8abd7fea_independent_video_output_review.md` finding
-  9, requesting more frequent visual change; this is a free lever since it
-  only redistributes already-generated images' hold time, no new Flux
-  calls). Applied in `split_into_beats()` after timestamp mapping
+  9) was tried and reverted: a real run
+  (`code_report/36e0ec63-3ce1-467e-aaba-251a9a85844c_logs.txt`) showed the
+  tighter cap forced a chain of consecutive over-cap beats near the end of a
+  116-beat parent video, which pushed the terminal beat's forced start past
+  its own fixed end — a zero-width last section that failed Agent 5's props
+  sanity check and failed the render for both languages. Applied in
+  `split_into_beats()` after timestamp mapping
   via `_apply_visual_hold_cap()` — the same shared core the child Short path
-  uses at its tighter `settings.short_visual_max_hold_ms` (5000 ms, same
-  rationale) ceiling —
+  uses at its tighter `settings.short_visual_max_hold_ms` (6000 ms, same
+  revert history) ceiling —
   by shortening the over-cap beat and advancing the next existing beat. It
   never creates synthetic beats and never touches audio/subtitle timing; a
-  terminal beat with no later beat to absorb the remainder is exempt.
+  terminal beat with no later beat to absorb the remainder is exempt. Each
+  shortening is now clamped so the receiving beat always keeps at least
+  `_HOLD_CAP_MIN_REMAINING_SPAN_MS` (500 ms) of its own span — a defensive
+  floor added alongside the revert so this cascading-collapse class of bug
+  can't recur even if either cap is tuned again in the future; a clamp
+  engaging is logged (`*_CASCADE_CLAMPED`), never silent.
 - The cap is deliberately applied in `split_into_beats()` (parent path) and
   `remap_beats_for_short()` (child path), after the shared
   `map_storyboard_beats_to_timestamps()` cleanup/micro-merge step — the two
@@ -5150,17 +5162,16 @@ Rules:
 - Child remap MAJOR handling is telemetry only (Elimination Mandate D1.5, `code_report/forensic_output_audit_borrasca_run.md` — supersedes the former roadmap 3.5 / audit G-4.3 deterministic remediation primitive): after `validate_storyboard()` finds child MAJORs, `_run_child_short_visuals()` logs them and proceeds with the beats unchanged. The deleted primitive (`remediate_child_major_storyboard_issues()`) used to strip forbidden/readable-text language and regenerate `flux_prompt` from `visual_intent`/environment/motif for `forbidden_flux_word`/`ai_text_rendering_requested` MAJORs — removed because MAJOR findings never blocked the pipeline either way, so the repair pass added complexity without a provable quality gain. No Claude, Flux, or internal remap retry is invoked (unchanged).
 - Log reuse stats.
 - Child Short visual sections use `settings.short_visual_max_hold_ms` (default
-  5000 ms — lowered from 6000, see the "Visual hold cap" rules above) as a
-  maximum non-terminal image hold target after timestamp mapping
-  and micro-beat cleanup.
+  6000 ms — see the "Visual hold cap" rules above for the reverted 5000 ms
+  attempt and why) as a maximum non-terminal image hold target after
+  timestamp mapping and micro-beat cleanup.
   If a non-terminal beat exceeds the cap, Agent 4 shortens that beat and
   advances the next existing visual beat earlier to cover the remaining
   narration span. It never creates fake beats, never changes child audio,
   and never changes Whisper/subtitle timing. A terminal beat with no later
   visual beat may remain above the cap, and the cap application is logged as
   `SHORT_VISUAL_HOLD_CAP_APPLIED`. Parent long-form beats have their own,
-  looser hold cap (`settings.parent_visual_max_hold_ms`, default 7000 ms —
-  lowered from 9000)
+  looser hold cap (`settings.parent_visual_max_hold_ms`, default 9000 ms)
   applied in `split_into_beats()` — see the "Visual hold cap" rules under
   `map_storyboard_beats_to_timestamps` above; both paths share one
   implementation (`_apply_visual_hold_cap`), differing only in ceiling and
@@ -7701,7 +7712,7 @@ Rules:
 - Shorts have their own Whisper.
 - Shorts use remapped parent visual beats.
 - Shorts cap non-terminal visual holds with `settings.short_visual_max_hold_ms`
-  (default 5000 ms) by advancing the next existing visual beat, without
+  (default 6000 ms) by advancing the next existing visual beat, without
   changing narration audio or subtitle timing and without creating fake beats.
 - Every Short beat's Flux image is generated fresh at portrait size
   (1080×1920), cached under the child's own content ID — never the parent's

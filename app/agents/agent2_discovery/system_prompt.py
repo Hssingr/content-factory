@@ -1025,6 +1025,22 @@ def generate_section(
         input_schema=_SECTION_GENERATION_SCHEMA,
         max_tokens=3072,
     )
+    # Forced tool-use's schema `required` list is advisory to the API, not a
+    # Python-side guarantee — a real production run returned a tool_use input
+    # missing `script_text` entirely (a required field), which crashed
+    # _append_generated_section()'s direct `section["script_text"]` index
+    # several call frames later with an unhelpful KeyError. This is the
+    # validation this function's own docstring already documented
+    # ("Raises: ValueError: If Claude returns... missing required keys") but
+    # never actually implemented. Caught by _call_section_generation()'s
+    # existing try/except (returns None, logged) — a transport/malformed-
+    # response failure, not a quality judgment, so no retry is added here,
+    # consistent with the Elimination Mandate.
+    if not str(result.get("script_text") or "").strip():
+        raise ValueError(
+            f"generate_section: {label} response missing required 'script_text' "
+            f"field (returned keys: {sorted(result.keys())})"
+        )
     _coerce_section_array_fields(result, label)
     return result
 

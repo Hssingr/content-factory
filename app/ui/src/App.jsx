@@ -259,12 +259,14 @@ export default function App() {
       channel_name: lang === userLanguage ? name : (langNames[lang] ?? ''),
     }))
     await api.replaceLanguages(channelId, entries)
+    // Ensure every selected language has an (empty) entry so VoicesSection
+    // renders a card for it; voices are nested by gender ({ feminine, masculine }),
+    // so a newly-added language simply gets no pre-seeded gender sub-object —
+    // VoicesSection/normalizeVoice already render sane defaults for that case.
     setVoices(prev => {
       const next = { ...prev }
       languages.forEach(l => {
-        if (!next[l]) {
-          next[l] = { provider: 'cartesia', tts_model: 'sonic-3.5', voice_id: '', voice_validated: false }
-        }
+        if (!next[l]) next[l] = {}
       })
       return next
     })
@@ -337,6 +339,15 @@ export default function App() {
     markDone('platforms')
     setCurrentStep('credentials')
   }
+
+  // A language is voice-ready once at least one of its two gender cards has
+  // a saved (non-empty) Voice ID — either gender satisfies the backend's own
+  // activation-readiness check, which is already gender-agnostic.
+  const hasAnyVoiceForLang = (lang) => {
+    const v = voices[lang] || {}
+    return Boolean(v.feminine?.voice_id?.trim() || v.masculine?.voice_id?.trim())
+  }
+  const voicesIncomplete = languages.some(l => !hasAnyVoiceForLang(l))
 
   const toggleLang = code => setLanguages(p => p.includes(code) ? p.filter(c => c !== code) : [...p, code])
   const togglePlatform = id => setPlatforms(p => p.includes(id) ? p.filter(x => x !== id) : [...p, id])
@@ -490,11 +501,17 @@ export default function App() {
               onBack={() => setCurrentStep('languages')}
               onNext={handleVoices}
               nextLoading={saving}
+              nextDisabled={voicesIncomplete}
               error={error}
             >
               <VoicesSection
                 languages={languages} voices={voices} setVoices={setVoices}
               />
+              {voicesIncomplete && (
+                <p className="voice-description" style={{ marginTop: 8 }}>
+                  Save at least one voice (feminine or masculine) for every selected language before continuing.
+                </p>
+              )}
             </StepShell>
           )}
 

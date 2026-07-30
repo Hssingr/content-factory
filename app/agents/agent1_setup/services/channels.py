@@ -88,7 +88,13 @@ def upsert_config(db: Session, channel_id: uuid.UUID, data: ChannelConfigUpsert)
     if config is None:
         config = ChannelConfig(channel_id=channel_id)
         db.add(config)
-    for field, value in data.model_dump().items():
+    # exclude_unset=True: this endpoint is called repeatedly with partial
+    # payloads across the setup wizard's steps (e.g. the Schedule step sends
+    # only videos_per_week). Using the plain model_dump() would resolve every
+    # omitted field to its Pydantic default, silently resetting
+    # script_source/visual_style/image_style/etc. back to defaults on every
+    # unrelated partial save (see code_report/agent1_frontend_backend_audit_2026_07_30.md).
+    for field, value in data.model_dump(exclude_unset=True).items():
         setattr(config, field, value)
     db.commit()
     return _load(db, channel_id)

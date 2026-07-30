@@ -21,7 +21,10 @@ class ChannelVoice(Base):
     # "feminine" | "masculine". Every pre-existing row backfills to "feminine"
     # via the migration's server_default — identical to today's single-voice
     # behavior; the operator adds masculine rows through the Agent 1 UI.
-    gender: Mapped[str] = mapped_column(String(16), nullable=False, server_default="masculine")
+    # (Migration 012 originally set server_default="masculine" here, the
+    # inverse of its own stated intent — fixed going forward by migration
+    # 016; see code_report/agent1_frontend_backend_audit_2026_07_30.md.)
+    gender: Mapped[str] = mapped_column(String(16), nullable=False, server_default="feminine")
     # TTS provider for this language's voice ("cartesia" | "elevenlabs").
     # The column-level default ("elevenlabs") is a legacy value never exercised
     # in practice — Agent 1 (replace_voices()) always sets this explicitly per

@@ -61,12 +61,20 @@ class Settings(BaseSettings):
     remotion_pre_bundle: bool = False
 
     # Agent 4 child Shorts: cap individual visual holds so sparse remaps do not
-    # leave one image on screen for long short-form spans. Lowered from 6000
-    # (independent review of real output, code_report/
-    # 8abd7fea_independent_video_output_review.md, finding 9) — a free lever:
-    # this only redistributes hold time across already-generated images, no
-    # new Flux calls, forcing more frequent visual change for short-form pacing.
-    short_visual_max_hold_ms: int = 5000
+    # leave one image on screen for long short-form spans.
+    #
+    # A 5000 ms value (independent review of real output, code_report/
+    # 8abd7fea_independent_video_output_review.md, finding 9) was tried and
+    # reverted: a real run (code_report/36e0ec63-3ce1-467e-aaba-251a9a85844c_logs.txt)
+    # showed real Shorts consistently come back with ~19-25 beats over
+    # ~100-120s of audio — averaging almost exactly 5000 ms/beat with zero
+    # headroom — so the hard beats*max_hold>=duration invariant in
+    # map_storyboard_beats_to_timestamps() (VISUAL_DENSITY_INVARIANT_FAILED)
+    # failed for nearly every child Short language, in both cases where it
+    # would have passed at 6000. 6000 restores real headroom; do not lower
+    # this again without confirming actual beat-count/duration ratios from a
+    # real run first.
+    short_visual_max_hold_ms: int = 6000
 
     # Shorts "Part N of M" corner label. Remotion renders subtitles ONLY
     # (audit G-0) — this label is the single allowed, operator-approved
@@ -78,11 +86,21 @@ class Settings(BaseSettings):
     # if every upstream guard (hint proximity window, anchor span sanity) is
     # defeated, no non-terminal parent beat may hold a single image longer than
     # this. Applied in split_into_beats() by advancing the next beat — never by
-    # creating beats or touching audio/subtitle timing. Lowered from 9000
-    # (independent review of real output, code_report/
-    # 8abd7fea_independent_video_output_review.md, finding 9) — same free
-    # lever as short_visual_max_hold_ms above.
-    parent_visual_max_hold_ms: int = 7000
+    # creating beats or touching audio/subtitle timing.
+    #
+    # A 7000 ms value (independent review of real output, finding 9 above)
+    # was tried and reverted: a real run made this cap tight enough to force
+    # a cascading chain of consecutive over-cap shortenings near the end of a
+    # 116-beat parent video, which pushed the terminal beat's forced start
+    # past its own fixed end (duration_ms) — a zero-width last beat that
+    # failed Agent 5's props sanity check ("Section 115: end <= start") and
+    # failed the render entirely for both languages. See
+    # `_apply_visual_hold_cap()` in `agent4_visuals/subagents/storyboard.py`
+    # for the defensive floor added alongside this revert. 9000 restores the
+    # original, proven-safe margin; do not lower this again without a
+    # real-run proof that no beat sequence can chain-collapse the terminal
+    # beat at the new value.
+    parent_visual_max_hold_ms: int = 9000
 
     # Post-render verification: run ffprobe/blackdetect/silencedetect after every render.
     # Set VERIFY_RENDERS=false to skip (e.g. in CI or when ffmpeg is unavailable).
