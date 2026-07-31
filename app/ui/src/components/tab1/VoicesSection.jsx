@@ -1,4 +1,5 @@
 import { LANGUAGES, VOICE_PROVIDERS, VOICE_MODELS_BY_PROVIDER, DEFAULT_VOICE_MODEL_BY_PROVIDER } from '../../constants'
+import VoicePicker from './VoicePicker'
 
 const languageLabel = (code) => LANGUAGES.find(l => l.code === code)?.label ?? code.toUpperCase()
 
@@ -128,15 +129,16 @@ export default function VoicesSection({ languages, voices, setVoices }) {
                   </label>
                 </div>
 
-                <label className="field">
+                <div className="field">
                   <span className="field-label">Voice ID</span>
-                  <input
-                    className="field-input"
+                  <VoicePicker
+                    provider={voice.provider}
+                    language={lang}
+                    gender={gender}
                     value={voice.voice_id}
-                    onChange={e => changeVoiceId(lang, gender, e.target.value)}
-                    placeholder="Paste provider voice ID"
+                    onSelect={id => changeVoiceId(lang, gender, id)}
                   />
-                </label>
+                </div>
 
                 <div className="voice-card-footer">
                   <span className="voice-description">

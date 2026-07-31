@@ -565,6 +565,35 @@ JSON string values without otherwise loosening validation — a genuinely
 malformed JSON document still raises `ValueError` exactly as before. Runtime
 proof: `tests/test_claude_call_empty_block_retry.py`.
 
+**`call_claude_structured()`/`call_claude_structured_with_usage()` reject a
+truncated tool_use response instead of silently returning it (live-canary
+fix):** a real Agent 1 run (`research_channel_ideas()`, task=`channel_research`)
+returned a 200 whose `primary_recommendation` was missing 15 of its 18
+required fields, only surfacing downstream as a wall of unrelated-looking
+FastAPI `ResponseValidationError` "Field required" errors. Root cause:
+Anthropic still returns a syntactically-valid `tool_use` `input` dict when
+generation is cut off by `max_tokens` mid-object — it is just missing
+whatever properties weren't generated yet — and the block-scanning loop
+returned that partial dict unconditionally, the same way it already returns
+a real, complete one. `stop_reason == "max_tokens"` is an unambiguous
+truncation signal (never set on a genuinely completed `tool_use` block), so
+the loop now raises `ValueError` (task/schema/max_tokens/output_tokens in
+the message) the moment it detects that condition, instead of a caller's
+Pydantic response model discovering the corruption several layers away with
+a confusing error. Every other `stop_reason` (`tool_use`, `end_turn`, etc.)
+is completely unaffected — this only changes behavior for responses that
+were already truncated and silently wrong. `research_channel_ideas()`'s own
+`max_tokens` was also doubled 4096 → 8192 at the time (that schema's real
+shape — 18 required top-level fields, several long-form text fields, a
+`platform_suitability` array with per-platform reasoning, a nested
+`editable_config` object — was genuinely too rich for the old budget, not
+just occasionally unlucky) — **superseded by the two-call split below**:
+`research_channel_ideas()` no longer makes one call against that combined
+schema at all, see §8.5. This truncation guard itself remains exactly as
+described — it is generic client-layer protection, unrelated to how any one
+caller's schema is shaped. Runtime proof:
+`tests/test_claude_structured_truncation.py`.
+
 Rules:
 
 - Agents must never instantiate Anthropic clients directly.
@@ -616,13 +645,18 @@ Current model tier (roadmap 4.2 / audit S-2, exec-6):
   `PRIMARY_MODEL`-tier creative tasks (`script_generation`,
   `native_adaptation`, `storyboard`, `story_blueprint`, `section_generation`,
   `short_script`, plus `story_research`/`channel_suggestion`/
-  `channel_research`/`publish_timing_suggestion`/`story_gate_scoring`)
-  resolve to the configured primary model. `publish_timing_suggestion`
-  (prompt engineering audit §2.7) is `suggest_publish_timing()`'s own task
-  key, split out of the shared `channel_suggestion` key it previously reused
-  — same `PRIMARY_MODEL` slot, purely so its cost/latency logs no longer
-  blur with `suggest_field()`'s free-text single-value calls (which keep
-  `channel_suggestion`).
+  `channel_research`/`channel_concept_validation`/`publish_timing_suggestion`/
+  `story_gate_scoring`) resolve to the configured primary model.
+  `publish_timing_suggestion` (prompt engineering audit §2.7) is
+  `suggest_publish_timing()`'s own task key, split out of the shared
+  `channel_suggestion` key it previously reused — same `PRIMARY_MODEL` slot,
+  purely so its cost/latency logs no longer blur with `suggest_field()`'s
+  free-text single-value calls (which keep `channel_suggestion`).
+  `channel_concept_validation` (two-call research-ideas redesign, §8.5) is
+  `research_channel_ideas()`'s step-1 task key, split out the same way and
+  for the same reason — same `PRIMARY_MODEL` slot as `channel_research`
+  (step 2), purely so a large forced-tool-use schema never again has to be
+  satisfied in one call.
 - `model_routing.DEFAULT_PRIMARY_MODEL`/`DEFAULT_SECONDARY_MODEL` are kept in
   sync with `config.py`'s defaults as a documentation reference, but are not
   themselves read by `resolve_model()`/`_configured_model()` — those always
@@ -1330,13 +1364,16 @@ Post-roadmap deep audit changes to this wizard (all implemented):
   `subtitle_karaoke_active_color`, `script_format`, `allow_legacy_fallback`
   (repurposed: proportional-fallback tolerance), `audio_tags_enabled`, and
   the six V3 fields. Operator must run `alembic upgrade head`.
-- **The ElevenLabs voice-browser chain is removed**: `VoicePicker.jsx` had
-  zero importers, so the whole dead chain went with it —
-  `api.getVoices`, the `GET /api/agent1/voices` router
-  (`routers/voices.py`), and `services/elevenlabs.py`
-  (`get_shared_voices()`). Voice IDs remain operator-provided hard inputs
-  (§8). The `ChannelVoice.music_style`/`use_case` columns remain as legacy
-  nullable columns (no migration); nothing reads them.
+- **The ElevenLabs voice-browser chain was removed** (as of this phase, then
+  reintroduced — see §8.8): `VoicePicker.jsx` had zero importers at the time,
+  so the whole dead chain went with it — `api.getVoices`, the
+  `GET /api/agent1/voices` router (`routers/voices.py`), and
+  `services/elevenlabs.py` (`get_shared_voices()`). Voice IDs remain
+  operator-provided hard inputs (§8) — §8.8's reintroduction does not change
+  that; it only helps the operator find a real ID to paste, it still never
+  auto-validates or auto-fills without an explicit operator click. The
+  `ChannelVoice.music_style`/`use_case` columns remain as legacy nullable
+  columns (no migration); nothing reads them.
 
 ### 8.5 Research Ideas UX (Agent 1 V3.5c)
 
@@ -1350,9 +1387,9 @@ Backend ownership:
 
 ```text
 app/agents/agent1_setup/routers/suggest.py      — `/api/agent1/research-ideas`
-app/agents/agent1_setup/system_prompt.py        — `research_channel_ideas()` structured Claude prompt
+app/agents/agent1_setup/system_prompt.py        — `research_channel_ideas()` — two sequential structured Claude calls, merged in Python
 app/schemas/research_ideas.py                   — request/response models
-app/services/model_routing.py                   — `channel_research` Claude task key
+app/services/model_routing.py                   — `channel_concept_validation` (step 1) and `channel_research` (step 2) Claude task keys
 ```
 
 The endpoint accepts `channel_description` (optional when `mode="explore"`),
@@ -1367,25 +1404,84 @@ so Claude proposes the best available niche opportunity from scratch.
 The frontend sends `mode="explore"` for the **"✨ Research Ideas"** button and
 `mode="validate"` for the **"✨ Validate Description"** button.
 
-The endpoint calls Claude only through the shared `call_claude_structured()`
-client pattern with task `channel_research`. It does **not** call YouTube,
-TikTok, Instagram, Facebook, Reddit, credential-verification services, or any
-scraping/tooling. If web-enabled Claude research tooling is unavailable, the
-feature remains a structured AI estimate based only on the operator's
-description (or the pipeline-constraint brief in explore mode) and the current
-pipeline constraints.
+**Two-call design (supersedes the original single-call implementation):**
+`research_channel_ideas()` makes two sequential `call_claude_structured()`
+calls instead of one, then deterministically merges them in Python:
 
-Required response shape includes: recommended channel concept, why Claude
-selected it, qualitative RPM potential, qualitative follower/subscriber
-growth potential, platform suitability for YouTube/TikTok/Instagram/
-Facebook, best script source (`reddit` or Claude Generated), recommended
-output mode, visual style, image style, tone, target languages, target
-platforms, suggested channel names, example video ideas, risks/difficulty,
-a final recommendation summary, an `editable_config` object that maps
-into the wizard's existing editable state, and a `references_used` array
-of well-known subreddits, publications, or public resources Claude knows
-from training data (empty when none apply — real web search is a future
-phase, not wired yet).
+- **Step 1 — `channel_concept_validation`** (`_CONCEPT_VALIDATION_SYSTEM_PROMPT`/
+  `_CONCEPT_VALIDATION_SCHEMA`): turns the description (real or, in explore
+  mode, the synthetic open-ended brief) into a fully-populated, directly
+  executable `editable_config` — channel_name, description, niche, tone,
+  script_source, output_mode, visual_style, image_style, languages,
+  platforms, videos_per_week, subreddits/story_generation_prompt — plus a
+  `description_issues` array (gaps/assumptions the description required
+  filling; empty when clear) and a nullable `assumption_note`. 13 required
+  leaf fields, `max_tokens=2048`.
+- **Step 2 — `channel_research`** (`_RESEARCH_NARRATIVE_SYSTEM_PROMPT`/
+  `_RESEARCH_NARRATIVE_SCHEMA`): receives step 1's finalized
+  `editable_config` (as `finalized_editable_config`) plus
+  `description_issues`/`assumption_note` as context, and analyzes/explains
+  that already-decided configuration — `recommended_channel_concept`,
+  `why_selected`, `rpm_potential`, `follower_growth_potential`,
+  `platform_suitability`, `suggested_channel_names`, `example_video_ideas`,
+  `risks_difficulty`, `final_recommendation_summary`, `references_used`. It
+  is never given `best_script_source` or any `recommended_output_mode`/
+  `recommended_visual_style`/`recommended_image_style`/`recommended_tone`/
+  `recommended_target_languages`/`recommended_platforms` field to fill in —
+  those don't exist in its schema at all. 10 required top-level fields,
+  `max_tokens=8192` (unchanged from the old combined schema — this is where
+  all the genuinely long-form prose lives).
+- **`_merge_research_steps(concept, narrative)`** combines both into the
+  response shape below: `best_script_source` and the six `recommended_*`
+  fields are always copied directly from step 1's `editable_config`
+  (`output_mode`→`recommended_output_mode`, `visual_style`→
+  `recommended_visual_style`, etc.) — Claude is never asked to produce the
+  same decision twice. `research_label` is a hardcoded Python constant
+  (`_RESEARCH_LABEL`) — it was always the same fixed string, so nothing
+  asks Claude to generate it anymore.
+
+**Why this exists (two real production incidents, one root cause class):**
+the original single-call schema required ~30 leaf fields (18 under
+`primary_recommendation`, 12 more nested inside its own `editable_config`)
+in one forced-tool-use response and failed twice with FastAPI
+`ResponseValidationError` — Anthropic's forced tool-use does not strictly
+enforce a JSON Schema's `required` list. Both times, `editable_config`
+itself was always complete and correct; what got dropped was either most of
+the narrative fields (a genuine `max_tokens` truncation — see §7.1's
+`call_claude_structured()` truncation-guard note) or exactly the six
+`recommended_*` fields, each a literal semantic duplicate of one of
+`editable_config`'s own fields — Claude appears to treat a top-level value
+as redundant once an identical decision already exists elsewhere in the
+same response, and simply omits it. The original fix for the second
+incident (`_backfill_recommendation_from_editable_config()`, since removed)
+patched around this by copying from `editable_config` when the top-level
+copy was missing. This two-call split removes the duplication at the
+schema level instead: step 2 structurally cannot omit `best_script_source`
+or any `recommended_*` field, because it is never asked for them.
+
+The endpoint calls Claude only through the shared `call_claude_structured()`
+client pattern. It does **not** call YouTube, TikTok, Instagram, Facebook,
+Reddit, credential-verification services, or any scraping/tooling. If
+web-enabled Claude research tooling is unavailable, the feature remains a
+structured AI estimate based only on the operator's description (or the
+pipeline-constraint brief in explore mode) and the current pipeline
+constraints.
+
+Required response shape (unchanged from before this redesign — the merge
+guarantees byte-compatibility, so the frontend needed no changes) includes:
+recommended channel concept, why Claude selected it, qualitative RPM
+potential, qualitative follower/subscriber growth potential, platform
+suitability for YouTube/TikTok/Instagram/Facebook, best script source
+(`reddit` or `ai_generated`), recommended output mode, visual style, image
+style, tone, target languages, target platforms, suggested channel names,
+example video ideas, risks/difficulty, a final recommendation summary, an
+`editable_config` object that maps into the wizard's existing editable
+state, and a `references_used` array of well-known subreddits,
+publications, or public resources Claude knows from training data (empty
+when none apply — real web search is a future phase, not wired yet).
+`alternative_ideas` was removed from the schema entirely (confirmed unused
+by the frontend — no reader anywhere in `app/ui/src`); re-add only if a real
+consumer needs it.
 
 The result is explicitly labeled **"AI market research estimate — not
 verified platform analytics"**. Claude must not invent exact verified
@@ -1447,17 +1543,24 @@ Rules:
   this section.
 - Do not make `channel_description` required when `mode="explore"` — the
   entire point of explore mode is that the operator has nothing to describe yet.
-- `recommended_visual_style`/`recommended_image_style` and
-  `editable_config.visual_style`/`.image_style` are **enum-constrained** in
-  `_RESEARCH_IDEAS_SCHEMA` to the canonical preset values
-  (`_VISUAL_STYLE_VALUES`/`_IMAGE_STYLE_VALUES` in
+- `editable_config.visual_style`/`.image_style` (step 1,
+  `_CONCEPT_VALIDATION_SCHEMA`) are **enum-constrained** to the canonical
+  preset values (`_VISUAL_STYLE_VALUES`/`_IMAGE_STYLE_VALUES` in
   `agent1_setup/system_prompt.py`, mirroring `constants.js`'s
   `VISUAL_STYLE_OPTIONS`/`IMAGE_STYLE_OPTIONS`) — post-roadmap deep audit:
   a free-string recommendation could previously set a value the setup
   dropdowns could not display. Keep the Python lists and the JS lists in
-  sync when adding a preset. `recommended_output_mode`/
-  `editable_config.output_mode` accept `youtube_long_only` now that it is
-  executable (§8.2).
+  sync when adding a preset. `editable_config.output_mode` accepts
+  `youtube_long_only` now that it is executable (§8.2);
+  `recommended_output_mode`/`recommended_visual_style`/`recommended_image_style`
+  are always derived from `editable_config`'s own values (see the two-call
+  design above) so they can never disagree with it.
+- Do not ask Claude for `best_script_source` or any `recommended_*` field a
+  second time — these are always derived deterministically in Python from
+  `editable_config`'s own fields (`research_channel_ideas()`'s merge step,
+  `_merge_research_steps()`). If a new duplicate-prone field is ever added
+  to `editable_config`, add its Python-side derivation there rather than
+  asking Claude for two independent copies of the same decision.
 
 ### 8.6 Channel Configuration Snapshot Foundation (Phase Agent1-V3.6)
 
@@ -1596,6 +1699,121 @@ Rules:
   deterministic, no-tokens-spent flag at setup time.
 - Do not call this module from Agent 2/3/4/5 — like `check_activation_readiness()`
   itself, it is Agent 1 setup-time tooling only.
+
+### 8.8 Provider Voice-Catalog Browsing (reintroduces, redesigns §8.4's removed ElevenLabs voice-browser chain)
+
+Voice IDs remain operator-provided hard inputs (§8): this feature never
+auto-validates or auto-fills a Voice ID without an explicit operator click —
+it only lets the operator search the TTS provider's own voice catalog,
+paginated and filtered the way that provider's own platform lets you browse
+it, instead of needing to already know a raw Voice ID to paste in.
+
+Files:
+
+```text
+app/agents/agent1_setup/services/cartesia_voices.py     — Cartesia GET /voices
+app/agents/agent1_setup/services/elevenlabs_voices.py   — ElevenLabs Voice Library (voices.get_shared())
+app/agents/agent1_setup/routers/voices.py               — GET /api/agent1/voices
+app/schemas/voice_browse.py                             — VoiceSummary / VoiceBrowseResponse
+app/ui/src/components/tab1/VoicePicker.jsx              — search/filter/paginate/preview UI
+```
+
+Backend:
+
+- `GET /api/agent1/voices?provider=cartesia|elevenlabs&search=&gender=&language=&accent=&age=&use_case=&cursor=&page_size=`
+  dispatches to `cartesia_voices.list_voices()` or
+  `elevenlabs_voices.list_shared_voices()` based on `provider`. `accent`/`age`/
+  `use_case` are ElevenLabs-only and silently ignored for Cartesia (that
+  provider's catalog has no such filters).
+- **Cartesia** (`cartesia_voices.list_voices()`): the installed `cartesia` SDK's
+  `Voices.list()` takes no query parameters at all (see
+  `cartesia/voices.py` in site-packages) — real pagination/filtering
+  requires calling Cartesia's REST `GET https://api.cartesia.ai/voices`
+  directly via `httpx`, reusing the SDK's own `X-API-Key`/`Cartesia-Version`
+  header convention (`cartesia/resource.py`), with `DEFAULT_CARTESIA_VERSION`
+  imported from the SDK rather than a hardcoded duplicate string so it can
+  never drift from whatever API version the pinned SDK targets. Params sent:
+  `limit`, `starting_after` (cursor), `q` (search), `gender`
+  (`masculine`|`feminine`|`gender_neutral`), `language`,
+  `expand[]=preview_file_url`.
+  **Dual response-shape handling (live-canary fix):** a real first call
+  crashed with `AttributeError: 'list' object has no attribute 'get'` —
+  Cartesia's current public docs describe a paginated envelope
+  (`{"data": [...], "has_more": bool, "next_page": str}`), but the pinned
+  `DEFAULT_CARTESIA_VERSION` ("2024-06-10", the same version Agent 3's TTS
+  generation already uses successfully) returns a **bare JSON array**
+  instead, with none of the sent query params applied server-side.
+  `list_voices()` now branches on `isinstance(body, dict)` vs a bare list: a
+  dict uses the documented envelope fields directly (forward-compatible with
+  a future SDK/version bump); a bare list is treated as the full unfiltered
+  catalog, with `search`/`gender`/`language` filtering
+  (`_matches_filters()`) and offset-based pagination applied client-side in
+  Python so the feature still delivers real pagination/filtering regardless
+  of which shape the account's pinned API version returns. `next_cursor` is
+  opaque either way — a Cartesia voice ID in the envelope case, a
+  stringified offset in the client-side case — and a cursor that doesn't
+  parse as either falls back to the first page rather than raising.
+- **ElevenLabs** (`elevenlabs_voices.list_shared_voices()`): calls the
+  installed SDK's `client.voices.get_shared()` (backed by
+  `GET /v1/shared-voices`, the real Voice Library search endpoint — distinct
+  from `GET /v2/voices`, which only lists voices already in the operator's
+  own account) through the existing shared `elevenlabs_client.get_client()`
+  singleton (§7/CLAUDE.md's "no second provider integration point" rule) —
+  no new ElevenLabs client construction. Real params used: `page_size`,
+  `page` (offset-based, not cursor-based — `next_cursor` is a stringified
+  page number), `search`, `gender`, `age`, `accent`, `language`, `use_cases`.
+- Both service functions normalize their provider's response into the same
+  `VoiceSummary` shape (`voice_id, name, description, gender, language,
+  accent, age, preview_url, provider`) and the same pagination envelope
+  (`voices, has_more, next_cursor`) so the frontend picker is fully
+  provider-agnostic and never needs to interpret what `next_cursor` means.
+- Both fail open (empty list, `has_more=False`, logged at WARNING/ERROR) on
+  a missing API key or any request failure — same convention as every other
+  Agent 1 suggestion call; browsing failing never blocks manually pasting a
+  Voice ID.
+
+Frontend:
+
+- `VoicePicker.jsx` **is** each voice card's "Voice ID" field in
+  `VoicesSection.jsx` — there is no separate plain text input anymore. The
+  field renders as a select-styled trigger (`.voice-picker-trigger`) showing
+  the current value (resolved to a friendly name when that voice happens to
+  already be in the fetched result set this session, otherwise the raw ID
+  string) or a placeholder when empty, scoped to that card's
+  `(provider, language, gender)`. Opening it fetches the first page
+  immediately; a debounced search box and a "show all genders" checkbox
+  (default: filtered to the card's own gender) re-fetch from page one; a
+  "Load more" button appends using the previous response's `next_cursor`.
+  Each result shows gender/age/accent/language metadata and, when the
+  provider supplied one, a play/stop preview button for `preview_url`. A
+  "paste a voice ID directly" row inside the open panel preserves manual
+  entry for an operator who already knows their ID — pressing Enter or
+  clicking "Use ID" there calls the exact same `onSelect()`/`changeVoiceId()`
+  path a picked search result does, so there is still only one write path
+  regardless of how the ID was obtained.
+- Reuses `.voice-picker`/`.voice-picker-trigger`/`.voice-picker-dropdown`/
+  `.voice-list`/`.voice-row`/`.voice-preview-btn` CSS classes already present
+  in `form.css` (left over, unused, from the original deleted
+  `VoicePicker.jsx`); `.voice-picker-manual` (the paste-directly row) is the
+  only new CSS this phase added.
+
+Rules:
+
+- Do not add a third provider integration point for this — `cartesia_voices.py`
+  calls Cartesia's REST API directly (the SDK has no listing params to
+  reuse); `elevenlabs_voices.py` must keep going through
+  `elevenlabs_client.get_client()`, never construct its own `ElevenLabs(...)`
+  instance.
+- Do not make voice browsing a prerequisite for saving a Voice ID — an
+  operator who already knows their ID must still be able to paste it
+  directly (the "paste a voice ID directly" row inside the open panel) and
+  never be forced to search/select from fetched results first.
+- Do not persist anything from a browse call — `GET /api/agent1/voices` is
+  read-only; the only write path remains `PUT /channels/{id}/voices`.
+- Keep both providers' normalized output in the same `VoiceSummary` shape —
+  do not let `VoicePicker.jsx` grow provider-specific branches for basic
+  rendering; provider differences belong in the two backend service
+  modules, not the shared picker component.
 
 ---
 

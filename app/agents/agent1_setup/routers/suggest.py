@@ -2,6 +2,7 @@ import logging
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -61,4 +62,20 @@ def research_ideas(
         logger.error("Claude research ideas failed: %s", exc)
         raise HTTPException(status_code=503, detail="AI market research service unavailable")
 
-    return result
+    # Explicit validation here, before returning (CLAUDE.md Golden Rule 7 —
+    # "No unvalidated AI output"): without this, an incomplete Claude
+    # response only ever surfaced as FastAPI's own automatic response_model
+    # serialization crashing with a raw, uncaught ResponseValidationError —
+    # an opaque 500 with no HTTPException/detail the frontend could show.
+    # research_channel_ideas() no longer has known-duplicate fields to
+    # backfill — the two-call split removes the duplication at the schema
+    # level instead (CLAUDE.md §8.5); this is the last-resort net for
+    # anything else that still doesn't validate.
+    try:
+        return ResearchIdeasResponse.model_validate(result)
+    except ValidationError as exc:
+        logger.error("Research ideas response failed validation: %s", exc)
+        raise HTTPException(
+            status_code=502,
+            detail="AI market research returned an incomplete response — please try again",
+        )

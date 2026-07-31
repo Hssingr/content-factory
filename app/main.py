@@ -30,7 +30,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
-from app.agents.agent1_setup.routers import users_router, channels_router, suggest_router
+from app.agents.agent1_setup.routers import users_router, channels_router, suggest_router, voices_router
 from app.agents.agent2_discovery.routers import discovery_router, telegram_router
 
 logger = logging.getLogger(__name__)
@@ -92,6 +92,7 @@ app.add_middleware(
 app.include_router(users_router)
 app.include_router(channels_router)
 app.include_router(suggest_router)
+app.include_router(voices_router)
 
 # Agent 2 — Content Discovery
 app.include_router(discovery_router)

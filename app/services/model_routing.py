@@ -43,6 +43,15 @@ MODEL_ROUTING: dict[str, str] = {
     "story_gate_scoring":      PRIMARY_MODEL,  # single-story gate structured call
     "story_research":          PRIMARY_MODEL,  # uses web_search tool — secondary model does not support it by default
     "channel_suggestion":      PRIMARY_MODEL,  # Agent 1 UX — poor suggestions harm onboarding quality
+    "channel_concept_validation": PRIMARY_MODEL,  # Agent 1 research-ideas step 1 of 2 — split from
+                                                   # channel_research (two-call reliability redesign) so
+                                                   # the schema Claude must fully satisfy in one forced
+                                                   # tool-use call never again exceeds the
+                                                   # editable_config-only shape that survived both real
+                                                   # production incidents unscathed; channel_research
+                                                   # keeps the narrative/analysis half. Same PRIMARY_MODEL
+                                                   # slot — split is about schema-size reliability, not
+                                                   # cost/quality tier.
     "channel_research":        PRIMARY_MODEL,  # Agent 1 market-research estimate; nuanced strategy output
     "publish_timing_suggestion": PRIMARY_MODEL,  # Agent 1 UX — split from channel_suggestion (prompt
                                                   # engineering audit §2.7) so cost/latency telemetry for

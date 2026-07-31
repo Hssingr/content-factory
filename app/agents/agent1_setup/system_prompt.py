@@ -6,7 +6,17 @@ from app.services.claude_client import call_claude, call_claude_structured
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "1.5"  # v1.5: added "cinematic_cartoon" image_style preset (operator request — historical
+PROMPT_VERSION = "1.6"  # v1.6: research_channel_ideas() split into two sequential structured calls
+                        #        (channel_concept_validation -> channel_research) — the single
+                        #        ~30-required-leaf-field call was unreliable under Anthropic's
+                        #        forced tool-use (the "required" list is not strictly enforced);
+                        #        step 1 now owns editable_config exclusively (the part that was
+                        #        always reliably filled in both real production incidents), step 2
+                        #        owns narrative analysis only and is never asked for the same
+                        #        decision twice. _backfill_recommendation_from_editable_config()
+                        #        (patched around one symptom) is removed — the redesign removes the
+                        #        duplication that caused it at the schema level instead.
+                        # v1.5: added "cinematic_cartoon" image_style preset (operator request — historical
                         #        channel wanted a cinematic_cartoon-like look distinct from anime/digital_art).
                         #        _IMAGE_STYLE_VALUES gains "cinematic_cartoon", mirrored in
                         #        app/ui/src/constants.js IMAGE_STYLE_OPTIONS and Agent 4's
@@ -247,146 +257,180 @@ _TONE_VALUES = [
     "educational", "entertaining", "investigative", "humorous", "inspirational",
 ]
 
-_RESEARCH_IDEAS_SYSTEM_PROMPT = """\
-You are a combined YouTube strategist, short-form content strategist,
-monetization analyst, and content production advisor for Content Factory.
+# `research_channel_ideas()` is split into two sequential structured Claude
+# calls (roadmap: two-call reliability redesign) instead of one combined
+# call. The combined call's schema required ~30 leaf fields in one
+# forced-tool-use response (18 under primary_recommendation, 12 more nested
+# inside its own editable_config) and failed twice in real production runs
+# with FastAPI ResponseValidationError — Anthropic's forced tool-use does
+# not strictly enforce a JSON Schema's "required" list. Critically, in BOTH
+# real failures `editable_config` itself was always complete and correct;
+# what got dropped was either most of the narrative fields (a genuine
+# max_tokens truncation) or exactly six fields that are literal semantic
+# duplicates of editable_config's own fields (recommended_output_mode/
+# recommended_visual_style/recommended_image_style/recommended_tone/
+# recommended_target_languages/recommended_platforms all mirror
+# editable_config's output_mode/visual_style/image_style/tone/languages/
+# platforms) — Claude appears to treat the top-level copy as redundant once
+# the same decision exists elsewhere in the response, and simply omits it.
+#
+# Step 1 (_CONCEPT_VALIDATION_SCHEMA, task="channel_concept_validation")
+# owns exactly the editable_config shape that survived both incidents
+# unscathed, plus a cheap validation-issues list — 13 required leaf fields.
+# Step 2 (_RESEARCH_NARRATIVE_SCHEMA, task="channel_research") owns only the
+# narrative/analysis half and is structurally never given best_script_source
+# or any recommended_* field to fill in — they don't exist in its schema at
+# all, so it cannot omit them. research_channel_ideas() calls step 1, then
+# step 2 (grounded in step 1's finalized editable_config), then merges both
+# into today's unchanged ResearchIdeasResponse shape in _merge_research_steps()
+# — every recommended_* field and best_script_source are derived once, in
+# Python, directly from editable_config; Claude is never asked for the same
+# decision twice. See CLAUDE.md §8.5 for the full design writeup.
 
-Your task: analyze the operator's rough channel idea and return ONE primary
-channel concept recommendation plus optional alternatives.
+_CONCEPT_VALIDATION_SYSTEM_PROMPT = """\
+You are a channel-setup configuration advisor for Content Factory. Your task:
+read the operator's rough channel idea and produce ONE fully-populated,
+directly-executable editable configuration for a new channel. Return direct,
+concrete values for every field — never a placeholder, never a list of
+options, never "TBD".
 
-Important limits:
-1. This is AI-assisted market research, not verified platform analytics.
-2. Do not claim you checked live YouTube, TikTok, Instagram, Facebook, Reddit,
-   RPM dashboards, or competitor analytics.
-3. Do not invent exact verified numbers, exact RPM dollar values, audience sizes,
-   or platform statistics. Use qualitative estimates only: low, medium, high,
-   very_high.
-4. Distinguish platform suitability, monetization potential, audience growth
-   potential, production feasibility, sourcing feasibility, and risk level.
-5. Optimize for sustainable repeatable content, strong retention, high
-   monetization potential, cross-platform adaptation, feasible production with
-   this pipeline, and compatibility with single_story mode.
-6. If the operator's description is vague, still produce a useful recommendation
-   and include an assumption_note explaining what you assumed.
-7. Return direct editable config values. For script_source use "reddit" or
-   "ai_generated" only. If explaining the source to the user, "ai_generated"
-   means Claude Generated.
-8. Prefer executable values when practical: content_mode single_story,
-   script_source reddit, output_mode youtube_and_shorts (or youtube_long_only
-   when Shorts genuinely do not fit the concept). Recommend shorts_only only
-   when the concept is short-form-first and note that it is not executable yet.
-9. If script_source is reddit, include concrete subreddit names like r/name.
-   If script_source is ai_generated, include a story_generation_prompt instead.
-10. Recommended languages must be BCP-47-style short codes from this set when
-    possible: en, fr, es, de, it, pt.
-11. Recommended platforms must use: youtube, tiktok, instagram, facebook.
-12. Explain WHY the subject was selected. The why_selected field is mandatory
-    and should mention opportunity, retention, monetization, sourcing, and
-    production feasibility where relevant.
-13. In references_used, include any well-known subreddits, YouTube channels,
-    RSS feeds, publications, or public reports you are confident exist and are
-    directly relevant to this niche (e.g. "r/personalfinance", "Nature News RSS",
-    "JSTOR Daily"). Only include sources you are confident are real. Do not invent
-    URLs or fabricate source names. Leave the array empty when no well-known
-    relevant source comes to mind. This is NOT a web search — these are known
-    sources from training data.
+Do not write marketing copy, growth analysis, or platform strategy here —
+that is a separate pass. Focus entirely on turning the description into
+concrete, valid configuration values.
 
-Return ONLY valid JSON matching the provided schema. No markdown. No code fence.
+Rules:
+1. If the operator's description is vague, incomplete, or contradictory,
+   still produce a complete, usable configuration — never ask a follow-up
+   question. List every material gap or assumption in description_issues
+   (e.g. "no target platform given — defaulted to YouTube + TikTok"). Leave
+   description_issues empty when the description is already clear.
+2. Set assumption_note to one short operator-facing sentence naming the
+   single most important assumption behind your configuration choices. Set
+   it to null when nothing meaningful was assumed.
+3. Choose configuration values (script_source, output_mode, platforms,
+   videos_per_week) that support strong retention and monetization potential
+   where relevant, while staying feasible to produce with this pipeline and
+   compatible with single_story mode. Deeper reasoning about WHY belongs to a
+   later pass — here, make the concrete decision.
+4. Prefer executable values when practical: script_source reddit, output_mode
+   youtube_and_shorts (or youtube_long_only when Shorts genuinely do not fit
+   the concept). Recommend shorts_only only when the concept is genuinely
+   short-form-first; it is not executable yet.
+5. For script_source use "reddit" or "ai_generated" only. If script_source is
+   reddit, include concrete subreddit names like r/name in subreddits. If
+   script_source is ai_generated, include a story_generation_prompt instead
+   and leave subreddits empty.
+6. Languages must be BCP-47-style short codes from this set when possible:
+   en, fr, es, de, it, pt.
+7. Platforms must use only: youtube, tiktok, instagram, facebook.
+
+Return ONLY valid JSON matching the provided schema. No markdown. No code
+fence.
 """
 
-_RESEARCH_IDEAS_SCHEMA = {
+_CONCEPT_VALIDATION_SCHEMA = {
     "type": "object",
     "properties": {
-        "research_label": {
-            "type": "string",
-            "description": "Must say this is an AI market research estimate, not verified platform analytics.",
+        "description_issues": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Gaps/assumptions the description required filling. Empty when already clear.",
         },
-        "primary_recommendation": {
+        "assumption_note": {"type": ["string", "null"]},
+        "editable_config": {
             "type": "object",
             "properties": {
-                "recommended_channel_concept": {"type": "string"},
-                "why_selected": {"type": "string"},
-                "rpm_potential": {"type": "string", "enum": ["low", "medium", "high", "very_high"]},
-                "follower_growth_potential": {"type": "string", "enum": ["low", "medium", "high", "very_high"]},
-                "platform_suitability": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "platform": {"type": "string", "enum": ["youtube", "tiktok", "instagram", "facebook"]},
-                            "fit": {"type": "string", "enum": ["low", "medium", "high", "very_high"]},
-                            "reasoning": {"type": "string"},
-                        },
-                        "required": ["platform", "fit", "reasoning"],
-                        "additionalProperties": False,
-                    },
-                },
-                "best_script_source": {"type": "string", "enum": ["reddit", "claude_generated"]},
-                "recommended_output_mode": {"type": "string", "enum": ["youtube_and_shorts", "youtube_long_only", "shorts_only"]},
-                "recommended_visual_style": {"type": "string", "enum": _VISUAL_STYLE_VALUES},
-                "recommended_image_style": {"type": "string", "enum": _IMAGE_STYLE_VALUES},
-                "recommended_tone": {"type": "string", "enum": _TONE_VALUES},
-                "recommended_target_languages": {"type": "array", "items": {"type": "string"}},
-                "recommended_platforms": {
+                "channel_name": {"type": "string"},
+                "description": {"type": "string"},
+                "niche": {"type": "string"},
+                "tone": {"type": "string", "enum": _TONE_VALUES},
+                "script_source": {"type": "string", "enum": ["reddit", "ai_generated"]},
+                "output_mode": {"type": "string", "enum": ["youtube_and_shorts", "youtube_long_only", "shorts_only"]},
+                "visual_style": {"type": "string", "enum": _VISUAL_STYLE_VALUES},
+                "image_style": {"type": "string", "enum": _IMAGE_STYLE_VALUES},
+                "languages": {"type": "array", "items": {"type": "string"}},
+                "platforms": {
                     "type": "array",
                     "items": {"type": "string", "enum": ["youtube", "tiktok", "instagram", "facebook"]},
                 },
-                "suggested_channel_names": {"type": "array", "items": {"type": "string"}},
-                "example_video_ideas": {"type": "array", "items": {"type": "string"}},
-                "risks_difficulty": {"type": "array", "items": {"type": "string"}},
-                "final_recommendation_summary": {"type": "string"},
-                "assumption_note": {"type": ["string", "null"]},
-                "editable_config": {
-                    "type": "object",
-                    "properties": {
-                        "channel_name": {"type": "string"},
-                        "description": {"type": "string"},
-                        "niche": {"type": "string"},
-                        "tone": {"type": "string", "enum": _TONE_VALUES},
-                        "script_source": {"type": "string", "enum": ["reddit", "ai_generated"]},
-                        "output_mode": {"type": "string", "enum": ["youtube_and_shorts", "youtube_long_only", "shorts_only"]},
-                        "visual_style": {"type": "string", "enum": _VISUAL_STYLE_VALUES},
-                        "image_style": {"type": "string", "enum": _IMAGE_STYLE_VALUES},
-                        "languages": {"type": "array", "items": {"type": "string"}},
-                        "platforms": {
-                            "type": "array",
-                            "items": {"type": "string", "enum": ["youtube", "tiktok", "instagram", "facebook"]},
-                        },
-                        "videos_per_week": {"type": "integer", "minimum": 1, "maximum": 21},
-                        "subreddits": {"type": "array", "items": {"type": "string"}},
-                        "story_generation_prompt": {"type": ["string", "null"]},
-                    },
-                    "required": [
-                        "channel_name", "description", "niche", "tone", "script_source",
-                        "output_mode", "visual_style", "image_style", "languages",
-                        "platforms", "videos_per_week", "subreddits",
-                    ],
-                    "additionalProperties": False,
-                },
+                "videos_per_week": {"type": "integer", "minimum": 1, "maximum": 21},
+                "subreddits": {"type": "array", "items": {"type": "string"}},
+                "story_generation_prompt": {"type": ["string", "null"]},
             },
             "required": [
-                "recommended_channel_concept", "why_selected", "rpm_potential",
-                "follower_growth_potential", "platform_suitability", "best_script_source",
-                "recommended_output_mode", "recommended_visual_style",
-                "recommended_image_style", "recommended_tone", "recommended_target_languages",
-                "recommended_platforms", "suggested_channel_names", "example_video_ideas",
-                "risks_difficulty", "final_recommendation_summary", "editable_config",
+                "channel_name", "description", "niche", "tone", "script_source",
+                "output_mode", "visual_style", "image_style", "languages",
+                "platforms", "videos_per_week", "subreddits",
             ],
             "additionalProperties": False,
         },
-        "alternative_ideas": {
+    },
+    "required": ["description_issues", "editable_config"],
+    "additionalProperties": False,
+}
+
+_RESEARCH_NARRATIVE_SYSTEM_PROMPT = """\
+You are a combined YouTube strategist, short-form content strategist, and
+monetization analyst for Content Factory. A channel configuration has
+already been finalized (finalized_editable_config in the context) — your
+job is to analyze and explain that already-decided concept, not to change or
+re-derive any configuration value.
+
+Important limits:
+1. This is AI-assisted market research, not verified platform analytics.
+2. Do not claim you checked live YouTube, TikTok, Instagram, Facebook,
+   Reddit, RPM dashboards, or competitor analytics.
+3. Do not invent exact verified numbers, exact RPM dollar values, audience
+   sizes, or platform statistics. Use qualitative estimates only: low,
+   medium, high, very_high.
+4. Distinguish platform suitability, monetization potential, audience growth
+   potential, and risk level; ground each judgment in why THIS configuration
+   specifically is or isn't well suited, not generic platform advice.
+5. Explain how this configuration supports sustainable, repeatable content,
+   strong retention, cross-platform adaptation, and monetization — this is
+   analysis for the operator to decide whether to proceed, not a request to
+   change any configuration value.
+6. Explain WHY the subject was selected. why_selected is mandatory and
+   should mention opportunity, retention, monetization, sourcing, and
+   production feasibility where relevant.
+7. In references_used, include any well-known subreddits, YouTube channels,
+   RSS feeds, publications, or public reports you are confident exist and
+   are directly relevant to this niche. Only include sources you are
+   confident are real — do not invent URLs or fabricate source names. Leave
+   the array empty when none come to mind. This is NOT a web search — these
+   are known sources from training data.
+8. If description_issues/assumption_note in the context describe a gap or
+   assumption, stay consistent with it — do not contradict an assumption
+   already made about platforms, languages, tone, or sourcing.
+
+Return ONLY valid JSON matching the provided schema. No markdown. No code
+fence.
+"""
+
+_RESEARCH_NARRATIVE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "recommended_channel_concept": {"type": "string"},
+        "why_selected": {"type": "string"},
+        "rpm_potential": {"type": "string", "enum": ["low", "medium", "high", "very_high"]},
+        "follower_growth_potential": {"type": "string", "enum": ["low", "medium", "high", "very_high"]},
+        "platform_suitability": {
             "type": "array",
             "items": {
                 "type": "object",
                 "properties": {
-                    "concept": {"type": "string"},
-                    "why_it_could_work": {"type": "string"},
-                    "main_tradeoff": {"type": "string"},
+                    "platform": {"type": "string", "enum": ["youtube", "tiktok", "instagram", "facebook"]},
+                    "fit": {"type": "string", "enum": ["low", "medium", "high", "very_high"]},
+                    "reasoning": {"type": "string"},
                 },
-                "required": ["concept", "why_it_could_work", "main_tradeoff"],
+                "required": ["platform", "fit", "reasoning"],
                 "additionalProperties": False,
             },
         },
+        "suggested_channel_names": {"type": "array", "items": {"type": "string"}},
+        "example_video_ideas": {"type": "array", "items": {"type": "string"}},
+        "risks_difficulty": {"type": "array", "items": {"type": "string"}},
+        "final_recommendation_summary": {"type": "string"},
         "references_used": {
             "type": "array",
             "items": {"type": "string"},
@@ -398,9 +442,50 @@ _RESEARCH_IDEAS_SCHEMA = {
             ),
         },
     },
-    "required": ["research_label", "primary_recommendation", "alternative_ideas", "references_used"],
+    "required": [
+        "recommended_channel_concept", "why_selected", "rpm_potential",
+        "follower_growth_potential", "platform_suitability",
+        "suggested_channel_names", "example_video_ideas", "risks_difficulty",
+        "final_recommendation_summary", "references_used",
+    ],
     "additionalProperties": False,
 }
+
+_RESEARCH_LABEL = "AI market research estimate — not verified platform analytics"
+
+
+def _merge_research_steps(concept: dict, narrative: dict) -> dict:
+    """Deterministically merge step 1 (channel_concept_validation) and step 2
+    (channel_research) outputs into the exact ResearchIdeasResponse shape the
+    frontend already expects. The six recommended_* fields and
+    best_script_source are never asked of Claude twice — they are always
+    copied from step 1's editable_config here, in Python (CLAUDE.md §8.5)."""
+    editable_config = concept["editable_config"]
+    primary_recommendation = {
+        "recommended_channel_concept": narrative["recommended_channel_concept"],
+        "why_selected": narrative["why_selected"],
+        "rpm_potential": narrative["rpm_potential"],
+        "follower_growth_potential": narrative["follower_growth_potential"],
+        "platform_suitability": narrative["platform_suitability"],
+        "best_script_source": editable_config["script_source"],
+        "recommended_output_mode": editable_config["output_mode"],
+        "recommended_visual_style": editable_config["visual_style"],
+        "recommended_image_style": editable_config["image_style"],
+        "recommended_tone": editable_config["tone"],
+        "recommended_target_languages": editable_config["languages"],
+        "recommended_platforms": editable_config["platforms"],
+        "suggested_channel_names": narrative["suggested_channel_names"],
+        "example_video_ideas": narrative["example_video_ideas"],
+        "risks_difficulty": narrative["risks_difficulty"],
+        "final_recommendation_summary": narrative["final_recommendation_summary"],
+        "assumption_note": concept.get("assumption_note"),
+        "editable_config": editable_config,
+    }
+    return {
+        "research_label": _RESEARCH_LABEL,
+        "primary_recommendation": primary_recommendation,
+        "references_used": narrative.get("references_used", []),
+    }
 
 
 def research_channel_ideas(
@@ -417,6 +502,12 @@ def research_channel_ideas(
     mode="validate" — operator has an idea; description is required and Claude
                       analyses/refines it.
 
+    Two sequential Claude calls (see the module comment above): step 1
+    (task="channel_concept_validation") turns the description into a fully
+    -populated editable_config; step 2 (task="channel_research") analyzes
+    and explains that already-decided configuration. Neither call is asked
+    for the same decision twice.
+
     This uses Claude only through the shared structured client. It does not call
     platform APIs, scrape platforms, or verify analytics; the returned label must
     keep that limitation visible to the operator.
@@ -427,8 +518,8 @@ def research_channel_ideas(
         raise ValueError("channel_description is required for validate mode")
 
     # For explore mode with no description, give Claude an explicit open-ended brief
-    # so rule 6 of the system prompt ("if description is vague, still produce a
-    # useful recommendation") works as intended — Claude knows to freely propose.
+    # so step 1's rule 1 ("if description is vague, still produce a useful
+    # configuration") works as intended — Claude knows to freely propose.
     if mode == "explore" and not description:
         description = (
             "The operator has not provided a channel idea yet — propose the best "
@@ -438,27 +529,50 @@ def research_channel_ideas(
             "Factory pipeline."
         )
 
-    context = {
+    pipeline_constraints = {
+        "currently_executable_content_mode": "single_story",
+        "currently_executable_script_source": "reddit",
+        "currently_executable_output_modes": ["youtube_and_shorts", "youtube_long_only"],
+        "no_platform_api_access": True,
+        "no_verified_analytics": True,
+        "operator_review_required": True,
+    }
+
+    # ── Step 1: turn the description into a concrete, valid configuration ──
+    concept_user_message = json.dumps({
         "mode": mode,
         "channel_description": description,
         "content_mode": content_mode,
         "target_languages": target_languages or [],
         "target_platforms": target_platforms or [],
-        "pipeline_constraints": {
-            "currently_executable_content_mode": "single_story",
-            "currently_executable_script_source": "reddit",
-            "currently_executable_output_modes": ["youtube_and_shorts", "youtube_long_only"],
-            "no_platform_api_access": True,
-            "no_verified_analytics": True,
-            "operator_review_required": True,
-        },
-    }
-    user_message = json.dumps(context, ensure_ascii=False, indent=2)
-    return call_claude_structured(
-        task="channel_research",
-        system_prompt=_RESEARCH_IDEAS_SYSTEM_PROMPT,
-        user_message=user_message,
-        schema_name="channel_research_ideas",
-        input_schema=_RESEARCH_IDEAS_SCHEMA,
-        max_tokens=4096,
+        "pipeline_constraints": pipeline_constraints,
+    }, ensure_ascii=False, indent=2)
+    concept = call_claude_structured(
+        task="channel_concept_validation",
+        system_prompt=_CONCEPT_VALIDATION_SYSTEM_PROMPT,
+        user_message=concept_user_message,
+        schema_name="channel_concept_validation",
+        input_schema=_CONCEPT_VALIDATION_SCHEMA,
+        max_tokens=2048,
     )
+
+    # ── Step 2: analyze and explain that already-decided configuration ──
+    narrative_user_message = json.dumps({
+        "mode": mode,
+        "channel_description": description,
+        "content_mode": content_mode,
+        "pipeline_constraints": pipeline_constraints,
+        "finalized_editable_config": concept["editable_config"],
+        "description_issues": concept.get("description_issues", []),
+        "assumption_note": concept.get("assumption_note"),
+    }, ensure_ascii=False, indent=2)
+    narrative = call_claude_structured(
+        task="channel_research",
+        system_prompt=_RESEARCH_NARRATIVE_SYSTEM_PROMPT,
+        user_message=narrative_user_message,
+        schema_name="channel_research_narrative",
+        input_schema=_RESEARCH_NARRATIVE_SCHEMA,
+        max_tokens=8192,
+    )
+
+    return _merge_research_steps(concept, narrative)

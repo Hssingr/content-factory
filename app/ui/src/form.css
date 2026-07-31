@@ -463,6 +463,15 @@
 .voice-preview-btn.playing { background: rgba(168,85,247,0.25); color: #d8b4fe; }
 .voice-preview-btn:hover   { background: rgba(255,255,255,0.12); }
 
+.voice-picker-manual {
+  display: flex;
+  gap: 8px;
+  padding: 10px 14px;
+  border-top: 1px solid var(--border);
+  background: var(--panel-alt);
+}
+.voice-picker-manual .field-input { flex: 1; }
+
 /* ── Source collection builder ────────────────────────────────── */
 .source-builder-controls { display: flex; align-items: flex-end; gap: 10px; }
 .source-added-list { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }

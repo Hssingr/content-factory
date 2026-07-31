@@ -293,8 +293,10 @@ def call_claude_structured(
         The parsed ``input`` dict from Claude's ``tool_use`` response block.
 
     Raises:
-        ValueError: If no ``tool_use`` block is present, task is unknown, or
-                    the response is otherwise malformed.
+        ValueError: If no ``tool_use`` block is present, the response was
+                    truncated at ``max_tokens`` (``stop_reason == "max_tokens"``
+                    — the tool_use input is likely missing required fields),
+                    task is unknown, or the response is otherwise malformed.
         anthropic.RateLimitError: If all retry attempts are exhausted.
         anthropic.APIConnectionError: On network or config errors (not retried).
         anthropic.APIError: On any other non-retryable API error.
@@ -348,8 +350,10 @@ def call_claude_structured_with_usage(
         from the last successful attempt.
 
     Raises:
-        ValueError: If no ``tool_use`` block is present, task is unknown, or
-                    the response is otherwise malformed.
+        ValueError: If no ``tool_use`` block is present, the response was
+                    truncated at ``max_tokens`` (``stop_reason == "max_tokens"``
+                    — the tool_use input is likely missing required fields),
+                    task is unknown, or the response is otherwise malformed.
         anthropic.RateLimitError: If all retry attempts are exhausted.
         anthropic.APIConnectionError: On network or config errors (not retried).
         anthropic.APIError: On any other non-retryable API error.
@@ -415,6 +419,26 @@ def call_claude_structured_with_usage(
             )
             for block in response.content:
                 if getattr(block, "type", None) == "tool_use" and block.name == schema_name:
+                    if response.stop_reason == "max_tokens":
+                        # A live incident (Agent 1 research-ideas) hit this exactly:
+                        # Anthropic still returns a syntactically-valid tool_use
+                        # `input` dict when generation is cut off mid-object — it is
+                        # just missing whatever properties weren't generated yet.
+                        # That partial dict silently passed as a "successful" call
+                        # here, only to fail much later at response-model
+                        # validation with a wall of unrelated-looking "Field
+                        # required" errors. `stop_reason == "max_tokens"` is an
+                        # unambiguous truncation signal (never set on a real
+                        # completed tool_use), so fail loud immediately instead of
+                        # returning data the caller's schema almost certainly
+                        # cannot satisfy (CLAUDE.md Golden Rules 3/7).
+                        raise ValueError(
+                            f"call_claude_structured: response truncated at max_tokens "
+                            f"for task={task!r} schema={schema_name!r} "
+                            f"max_tokens={max_tokens} output_tokens={usage['output_tokens']} — "
+                            f"the tool_use input is likely missing required fields. "
+                            f"Raise max_tokens for this call site."
+                        )
                     return block.input, usage  # type: ignore[return-value]
             raise ValueError(
                 f"call_claude_structured: no tool_use block for '{schema_name}' in response. "

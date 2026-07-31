@@ -6,8 +6,11 @@ from app.schemas.channel import ContentMode, OutputMode, ScriptSource
 
 Potential = Literal["low", "medium", "high", "very_high"]
 Platform = Literal["youtube", "tiktok", "instagram", "facebook"]
-ScriptSourceRecommendation = Literal["reddit", "claude_generated"]
-OutputModeRecommendation = Literal["youtube_and_shorts", "shorts_only"]
+# Matches ResearchEditableConfig.script_source's own spelling ("ai_generated",
+# not the legacy "claude_generated") so best_script_source can always be a
+# pure identity copy of editable_config.script_source (see
+# _merge_research_steps() in system_prompt.py) with zero translation.
+ScriptSourceRecommendation = Literal["reddit", "ai_generated"]
 
 
 class PlatformSuitability(BaseModel):
@@ -39,7 +42,13 @@ class ResearchRecommendation(BaseModel):
     follower_growth_potential: Potential
     platform_suitability: list[PlatformSuitability]
     best_script_source: ScriptSourceRecommendation
-    recommended_output_mode: OutputModeRecommendation
+    # Reuses ResearchEditableConfig.output_mode's own OutputMode type (was a
+    # separate, narrower OutputModeRecommendation Literal missing
+    # "youtube_long_only" — a latent bug: since this field is now always
+    # derived directly from editable_config.output_mode, a channel where
+    # step 1 legitimately picks youtube_long_only would otherwise fail
+    # validation every time).
+    recommended_output_mode: OutputMode
     recommended_visual_style: str
     recommended_image_style: str
     recommended_tone: str
@@ -53,12 +62,6 @@ class ResearchRecommendation(BaseModel):
     editable_config: ResearchEditableConfig
 
 
-class ResearchAlternativeIdea(BaseModel):
-    concept: str
-    why_it_could_work: str
-    main_tradeoff: str
-
-
 class ResearchIdeasRequest(BaseModel):
     channel_description: str = ""
     mode: Literal["explore", "validate"] = "validate"
@@ -70,7 +73,10 @@ class ResearchIdeasRequest(BaseModel):
 class ResearchIdeasResponse(BaseModel):
     research_label: str = "AI market research estimate — not verified platform analytics"
     primary_recommendation: ResearchRecommendation
-    alternative_ideas: list[ResearchAlternativeIdea] = Field(default_factory=list)
+    # Confirmed unused by the frontend (no reader anywhere in app/ui/src) —
+    # dropped from the schema entirely rather than kept as an always-empty
+    # placeholder Claude is never even asked to fill (two-call redesign,
+    # CLAUDE.md §8.5). Re-add only if a real consumer needs it.
     references_used: list[str] = Field(
         default_factory=list,
         description="URLs or source references Claude used to inform this estimate. "

@@ -42,7 +42,14 @@ export const api = {
   activateChannel:     (id)         => req('POST',   `/channels/${id}/activate`),
   suggestTiming:       (id)         => req('POST',   `/channels/${id}/suggest-timing`),
 
-  // Voices
+  // Voices — browse a TTS provider's real voice catalog (paginated, filtered
+  // the same way the provider's own platform lets an operator browse it).
+  getVoices: (params) => {
+    const query = new URLSearchParams(
+      Object.fromEntries(Object.entries(params).filter(([, v]) => v !== undefined && v !== null && v !== ''))
+    )
+    return req('GET', `/voices?${query.toString()}`)
+  },
 
   // AI suggestions
   suggest:             (field, ctx) => req('POST',   '/suggest', { field, context: ctx }),
