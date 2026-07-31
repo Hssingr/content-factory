@@ -1772,6 +1772,49 @@ Backend:
   Agent 1 suggestion call; browsing failing never blocks manually pasting a
   Voice ID.
 
+**Live preview for voices with no static sample (`GET
+/api/agent1/voices/preview?provider=cartesia&voice_id=`,
+`cartesia_voices.synthesize_preview()`):** ElevenLabs' Voice Library entries
+each carry a real, static `preview_url` — the frontend plays it directly,
+instantly, for free. Cartesia's account/API version returns **no preview
+audio field of any kind** for any voice (confirmed directly against the
+installed SDK's own `VoiceMetadata` TypedDict — `id, name, description,
+embedding, is_public, user_id, created_at, language, base_voice_id`; no
+`preview_url`/`preview_file_url` exists in this API version's voice objects
+at all, so the `expand[]=preview_file_url` param above is requested but
+never actually returned). Cartesia's own web app previews a voice the same
+way its dashboard does — by synthesizing a short fixed phrase on demand with
+the real TTS endpoint — so this does the same thing:
+
+- `synthesize_preview(voice_id)` always uses `model_id="sonic-2"` (the
+  legacy `_experimental_voice_controls` request shape) regardless of what
+  `tts_model` the operator's channel is actually configured with — the
+  installed `cartesia` SDK version does not implement the `voice=`/
+  `generation_config=` kwargs Sonic 3/3.5 need at all (see
+  `agent3_audio/services/tts.py`'s `_cartesia_sdk_supports_generation_config()`,
+  §10.3), so passing them here would raise a raw `TypeError`. A Voice ID is
+  portable across Cartesia model versions — `sonic-2` is enough to hear what
+  the *voice* sounds like, which is all a setup-time preview needs; the
+  channel's real generation still uses whatever `tts_model` is actually
+  configured.
+- Synthesizes one fixed phrase ("Hello, this is a quick preview of this
+  voice for your channel's narration.") and caches the resulting WAV to
+  `{media_path}/cache/voice_previews/cartesia/{voice_id}.wav` — the phrase
+  and model are both fixed, so the same `voice_id` always produces the same
+  bytes, safe to reuse across operators/sessions (same reuse philosophy as
+  this codebase's Flux image cache, §11.4/§13). A cache hit skips Cartesia
+  entirely.
+- `voice_id` is validated against `^[A-Za-z0-9_-]+$` before it ever reaches
+  a filesystem path or an API call — fails closed on anything else (defense
+  against path traversal via the cache filename).
+- Fails open (`None` → the router returns `503`) on a missing API key, a
+  malformed `voice_id`, or any synthesis failure. The frontend
+  (`VoicePicker.jsx`'s `preview()`) only calls this endpoint for
+  `provider === "cartesia"` voices that have no `preview_url`; ElevenLabs
+  voices always use their real static URL and never reach this endpoint —
+  requesting it for a non-Cartesia provider is a `400`, since it would
+  indicate a frontend bug, not a runtime condition to tolerate.
+
 Frontend:
 
 - `VoicePicker.jsx` **is** each voice card's "Voice ID" field in
@@ -1784,9 +1827,13 @@ Frontend:
   immediately; a debounced search box and a "show all genders" checkbox
   (default: filtered to the card's own gender) re-fetch from page one; a
   "Load more" button appends using the previous response's `next_cursor`.
-  Each result shows gender/age/accent/language metadata and, when the
-  provider supplied one, a play/stop preview button for `preview_url`. A
-  "paste a voice ID directly" row inside the open panel preserves manual
+  Each result shows gender/age/accent/language metadata and a play/stop
+  preview button — for a static `preview_url` it plays instantly; for a
+  Cartesia voice with none, clicking it calls the live-synthesis endpoint
+  above, showing a distinct loading state (`…`) on the button until the
+  browser can play the fetched clip, and a dismissible error line in the
+  panel if synthesis fails. A "paste a voice ID directly" row inside the
+  open panel preserves manual
   entry for an operator who already knows their ID — pressing Enter or
   clicking "Use ID" there calls the exact same `onSelect()`/`changeVoiceId()`
   path a picked search result does, so there is still only one write path

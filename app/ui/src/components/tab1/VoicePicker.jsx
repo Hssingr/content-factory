@@ -21,6 +21,8 @@ export default function VoicePicker({ provider, language, gender, value, onSelec
   const [loading,      setLoading]     = useState(false)
   const [error,        setError]       = useState('')
   const [playing,      setPlaying]     = useState(null)
+  const [previewLoading, setPreviewLoading] = useState(null)
+  const [previewError, setPreviewError] = useState('')
   const [dropdownPos,  setDropdownPos] = useState({ top: 0, left: 0, width: 320 })
   const [manualId,     setManualId]    = useState('')
 
@@ -94,15 +96,35 @@ export default function VoicePicker({ provider, language, gender, value, onSelec
     setOpen(o => !o)
   }
 
+  // ElevenLabs voices carry a real, static preview_url — play it directly,
+  // instantly, for free. Cartesia's account/API version returns no preview
+  // sample at all, so its "preview" is a genuinely live synthesis call
+  // (api.previewVoiceUrl) that takes a moment — the button shows a loading
+  // state while the browser fetches/decodes it.
   const preview = (voice) => {
-    if (!voice.preview_url) return
+    const canLiveSynthesize = voice.provider === 'cartesia'
+    const src = voice.preview_url || (canLiveSynthesize ? api.previewVoiceUrl(voice.provider, voice.voice_id) : null)
+    if (!src) return
+
     if (audioRef.current) { audioRef.current.pause(); audioRef.current = null }
-    if (playing === voice.voice_id) { setPlaying(null); return }
-    const audio = new Audio(voice.preview_url)
+    if (playing === voice.voice_id) { setPlaying(null); setPreviewLoading(null); return }
+
+    setPreviewError('')
+    const audio = new Audio(src)
     audioRef.current = audio
     setPlaying(voice.voice_id)
-    audio.play()
+    if (!voice.preview_url) setPreviewLoading(voice.voice_id)
+    audio.oncanplay = () => setPreviewLoading(null)
     audio.onended = () => setPlaying(null)
+    audio.onerror = () => {
+      setPreviewLoading(null)
+      setPlaying(null)
+      setPreviewError('Preview unavailable for this voice — please try again.')
+    }
+    audio.play().catch(() => {
+      setPreviewLoading(null)
+      setPlaying(null)
+    })
   }
 
   const select = (voice) => {
@@ -161,6 +183,7 @@ export default function VoicePicker({ provider, language, gender, value, onSelec
           </label>
 
           {error && <p className="field-error" style={{ padding: '0 14px' }}>{error}</p>}
+          {previewError && <p className="field-error" style={{ padding: '0 14px' }}>{previewError}</p>}
 
           <div className="voice-list">
             {voices.map(v => (
@@ -174,14 +197,15 @@ export default function VoicePicker({ provider, language, gender, value, onSelec
                   <span className="voice-desc">{metaLine(v)}</span>
                   {v.description && <span className="voice-description">{v.description}</span>}
                 </div>
-                {v.preview_url && (
+                {(v.preview_url || v.provider === 'cartesia') && (
                   <button
                     type="button"
                     className={`voice-preview-btn${playing === v.voice_id ? ' playing' : ''}`}
                     onClick={e => { e.stopPropagation(); preview(v) }}
-                    title="Preview"
+                    title={v.preview_url ? 'Preview' : 'Generate a live preview of this voice'}
+                    disabled={previewLoading === v.voice_id}
                   >
-                    {playing === v.voice_id ? '■' : '▶'}
+                    {previewLoading === v.voice_id ? '…' : playing === v.voice_id ? '■' : '▶'}
                   </button>
                 )}
               </div>

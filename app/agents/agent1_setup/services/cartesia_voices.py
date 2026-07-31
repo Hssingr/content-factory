@@ -36,6 +36,8 @@ regardless of which shape this account's pinned API version returns.
 from __future__ import annotations
 
 import logging
+import re
+from pathlib import Path
 
 import httpx
 from cartesia._constants import DEFAULT_CARTESIA_VERSION
@@ -46,6 +48,78 @@ logger = logging.getLogger(__name__)
 
 _LIST_URL = "https://api.cartesia.ai/voices"
 _MAX_PAGE_SIZE = 100
+
+# ── On-demand voice preview (live synthesis) ────────────────────────────────
+# Unlike ElevenLabs' Voice Library, this account's Cartesia API version
+# returns no preview/sample audio field at all for any voice (confirmed by
+# reading the installed SDK's own VoiceMetadata TypedDict — id, name,
+# description, embedding, is_public, user_id, created_at, language,
+# base_voice_id; no preview_url/preview_file_url of any kind). Cartesia's
+# own web app previews a voice the same way: synthesizing a short fixed
+# phrase on demand with the real TTS endpoint. This does the same thing —
+# a genuinely "live" preview, not a pre-recorded static sample.
+#
+# Deliberately always uses model_id="sonic-2" (the legacy request shape)
+# regardless of what tts_model the operator's channel is actually configured
+# with: the installed `cartesia` SDK version (1.3.1, see
+# agent3_audio/services/tts.py's `_cartesia_sdk_supports_generation_config()`)
+# does not implement the voice=/generation_config= kwargs Sonic 3/3.5 need at
+# all, so calling client.tts.bytes() with those kwargs would raise a raw
+# TypeError. A Voice ID is portable across Cartesia model versions — sonic-2
+# is enough to hear what the VOICE sounds like, which is all a setup-time
+# preview needs; the channel's real generation still uses whatever
+# tts_model is actually configured.
+_PREVIEW_PHRASE = "Hello, this is a quick preview of this voice for your channel's narration."
+_PREVIEW_OUTPUT_FORMAT: dict = {"container": "wav", "encoding": "pcm_s16le", "sample_rate": 44100}
+_VOICE_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _preview_cache_path(voice_id: str) -> Path:
+    cache_dir = Path(settings.media_path) / "cache" / "voice_previews" / "cartesia"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / f"{voice_id}.wav"
+
+
+def synthesize_preview(voice_id: str) -> bytes | None:
+    """Synthesize (or reuse a cached) short preview clip for a Cartesia voice.
+
+    Returns raw WAV bytes, or `None` on a missing API key, an invalid
+    `voice_id`, or any synthesis failure — fails open, same convention as
+    `list_voices()`. Cached to disk keyed by voice_id (the phrase and model
+    are both fixed, so the same voice_id always produces the same preview —
+    safe to reuse across operators/sessions, same reuse philosophy as this
+    codebase's Flux image cache).
+    """
+    if not _VOICE_ID_RE.match(voice_id or ""):
+        logger.warning("Rejected malformed Cartesia voice_id for preview: %r", voice_id)
+        return None
+
+    cache_path = _preview_cache_path(voice_id)
+    if cache_path.exists():
+        logger.info("CARTESIA_VOICE_PREVIEW_CACHE_HIT voice_id=%s", voice_id)
+        return cache_path.read_bytes()
+
+    if not settings.cartesia_api_key:
+        logger.warning("CARTESIA_API_KEY not set — cannot synthesize voice preview")
+        return None
+
+    try:
+        from cartesia import Cartesia
+        client = Cartesia(api_key=settings.cartesia_api_key)
+        audio_bytes = client.tts.bytes(
+            model_id="sonic-2",
+            transcript=_PREVIEW_PHRASE,
+            voice_id=voice_id,
+            output_format=_PREVIEW_OUTPUT_FORMAT,
+            _experimental_voice_controls={"speed": "normal", "emotion": []},
+        )
+    except Exception as exc:
+        logger.error("Failed to synthesize Cartesia voice preview for voice_id=%s: %s", voice_id, exc)
+        return None
+
+    cache_path.write_bytes(audio_bytes)
+    logger.info("CARTESIA_VOICE_PREVIEW_SYNTHESIZED voice_id=%s bytes=%d", voice_id, len(audio_bytes))
+    return audio_bytes
 
 
 def _normalize_voice(v: dict) -> dict:

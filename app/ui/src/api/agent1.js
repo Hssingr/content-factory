@@ -50,6 +50,11 @@ export const api = {
     )
     return req('GET', `/voices?${query.toString()}`)
   },
+  // Some providers (Cartesia) return no static preview sample at all — this
+  // is a plain URL (not a fetch helper) meant to be used directly as an
+  // <audio>/Audio() src, which live-synthesizes a short preview clip on GET.
+  previewVoiceUrl: (provider, voiceId) =>
+    `${BASE}/voices/preview?provider=${encodeURIComponent(provider)}&voice_id=${encodeURIComponent(voiceId)}`,
 
   // AI suggestions
   suggest:             (field, ctx) => req('POST',   '/suggest', { field, context: ctx }),

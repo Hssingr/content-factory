@@ -10,14 +10,21 @@ attribute; the ElevenLabs SDK boundary is stubbed by patching
 `elevenlabs_voices.elevenlabs_client.get_client` to return a fake client
 object exposing the same `.voices.get_shared(...)` call shape the real SDK
 uses (verified directly against the installed `elevenlabs==2.51.0` package's
-`elevenlabs/voices/client.py`).
+`elevenlabs/voices/client.py`). The Cartesia live-preview synthesis path
+(`synthesize_preview()`) stubs `cartesia.Cartesia` itself (the real package's
+top-level attribute `synthesize_preview()`'s local `from cartesia import
+Cartesia` resolves at call time) with a fake exposing `.tts.bytes(...)`,
+matching the real `cartesia.tts.TTS.bytes()` signature verified directly
+against the installed `cartesia` package's source.
 """
 
 from __future__ import annotations
 
+import tempfile
 import types
 import unittest
-from unittest.mock import patch
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 from app.agents.agent1_setup.services import cartesia_voices, elevenlabs_voices
 
@@ -304,6 +311,83 @@ class ElevenLabsVoiceBrowsingTest(unittest.TestCase):
             result = elevenlabs_voices.list_shared_voices()
 
         self.assertEqual(result, {"voices": [], "has_more": False, "next_cursor": None})
+
+
+class CartesiaVoicePreviewTest(unittest.TestCase):
+    """synthesize_preview() — Cartesia's account/API version returns no
+    static preview sample field at all (confirmed by reading the installed
+    SDK's own VoiceMetadata TypedDict), so this live-synthesizes a short
+    fixed phrase on demand instead, cached to disk by voice_id."""
+
+    def test_rejects_malformed_voice_id_without_any_call_or_disk_access(self) -> None:
+        def fail_if_called(*args, **kwargs):
+            raise AssertionError("Cartesia must not be called for a malformed voice_id")
+
+        with patch("cartesia.Cartesia", fail_if_called):
+            result = cartesia_voices.synthesize_preview("../../etc/passwd")
+
+        self.assertIsNone(result)
+
+    def test_missing_api_key_fails_open(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(cartesia_voices.settings, "media_path", tmp), \
+                 patch.object(cartesia_voices.settings, "cartesia_api_key", ""):
+                result = cartesia_voices.synthesize_preview("voice-123")
+
+        self.assertIsNone(result)
+
+    def test_successful_synthesis_uses_sonic2_legacy_shape_and_is_cached(self) -> None:
+        fake_client = MagicMock()
+        fake_client.tts.bytes.return_value = b"FAKE_WAV_BYTES"
+        fake_cartesia_class = MagicMock(return_value=fake_client)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(cartesia_voices.settings, "media_path", tmp), \
+                 patch.object(cartesia_voices.settings, "cartesia_api_key", "test-key"), \
+                 patch("cartesia.Cartesia", fake_cartesia_class):
+                result = cartesia_voices.synthesize_preview("voice-123")
+
+            self.assertEqual(result, b"FAKE_WAV_BYTES")
+            fake_cartesia_class.assert_called_once_with(api_key="test-key")
+            call_kwargs = fake_client.tts.bytes.call_args.kwargs
+            self.assertEqual(call_kwargs["model_id"], "sonic-2")
+            self.assertEqual(call_kwargs["voice_id"], "voice-123")
+            self.assertEqual(call_kwargs["transcript"], cartesia_voices._PREVIEW_PHRASE)
+
+            cache_path = Path(tmp) / "cache" / "voice_previews" / "cartesia" / "voice-123.wav"
+            self.assertTrue(cache_path.exists())
+            self.assertEqual(cache_path.read_bytes(), b"FAKE_WAV_BYTES")
+
+    def test_cache_hit_skips_synthesis_entirely(self) -> None:
+        def fail_if_called(*args, **kwargs):
+            raise AssertionError("Cartesia should not be called on a cache hit")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_path = Path(tmp) / "cache" / "voice_previews" / "cartesia" / "voice-123.wav"
+            cache_path.parent.mkdir(parents=True)
+            cache_path.write_bytes(b"CACHED_BYTES")
+
+            with patch.object(cartesia_voices.settings, "media_path", tmp), \
+                 patch.object(cartesia_voices.settings, "cartesia_api_key", "test-key"), \
+                 patch("cartesia.Cartesia", fail_if_called):
+                result = cartesia_voices.synthesize_preview("voice-123")
+
+        self.assertEqual(result, b"CACHED_BYTES")
+
+    def test_synthesis_failure_fails_open_and_does_not_cache(self) -> None:
+        fake_client = MagicMock()
+        fake_client.tts.bytes.side_effect = RuntimeError("simulated failure")
+        fake_cartesia_class = MagicMock(return_value=fake_client)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(cartesia_voices.settings, "media_path", tmp), \
+                 patch.object(cartesia_voices.settings, "cartesia_api_key", "test-key"), \
+                 patch("cartesia.Cartesia", fake_cartesia_class):
+                result = cartesia_voices.synthesize_preview("voice-123")
+
+            self.assertIsNone(result)
+            cache_path = Path(tmp) / "cache" / "voice_previews" / "cartesia" / "voice-123.wav"
+            self.assertFalse(cache_path.exists())
 
 
 if __name__ == "__main__":
