@@ -312,14 +312,23 @@ Rules:
    where relevant, while staying feasible to produce with this pipeline and
    compatible with single_story mode. Deeper reasoning about WHY belongs to a
    later pass — here, make the concrete decision.
-4. Prefer executable values when practical: script_source reddit, output_mode
-   youtube_and_shorts (or youtube_long_only when Shorts genuinely do not fit
-   the concept). Recommend shorts_only only when the concept is genuinely
-   short-form-first; it is not executable yet.
-5. For script_source use "reddit" or "ai_generated" only. If script_source is
-   reddit, include concrete subreddit names like r/name in subreddits. If
-   script_source is ai_generated, include a story_generation_prompt instead
-   and leave subreddits empty.
+4. Prefer executable values when practical: output_mode youtube_and_shorts
+   (or youtube_long_only when Shorts genuinely do not fit the concept).
+   Recommend shorts_only only when the concept is genuinely short-form-first;
+   it is not executable yet.
+5. script_source is "reddit" or "ai_generated" only — both are fully
+   executable and equally legitimate; choose whichever genuinely fits this
+   specific concept better, never a default. Use "reddit" when the niche has
+   an active, ongoing subreddit community that reliably produces real,
+   engaging posts matching the concept — name the actual subreddits you have
+   in mind. Use "ai_generated" when the niche is more specialized, historical,
+   or otherwise not the kind of thing a subreddit regularly posts, or when
+   original written narrative fits the concept better than sourcing real
+   posts. If script_source is reddit, include concrete subreddit names like
+   r/name in subreddits. If script_source is ai_generated, include a
+   story_generation_prompt instead and leave subreddits empty. Do not pick
+   reddit merely because it is the more common choice elsewhere — justify
+   the choice against this concept specifically.
 6. Languages must be BCP-47-style short codes from this set when possible:
    en, fr, es, de, it, pt.
 7. Platforms must use only: youtube, tiktok, instagram, facebook.
@@ -519,19 +528,34 @@ def research_channel_ideas(
 
     # For explore mode with no description, give Claude an explicit open-ended brief
     # so step 1's rule 1 ("if description is vague, still produce a useful
-    # configuration") works as intended — Claude knows to freely propose.
+    # configuration") works as intended — Claude knows to freely propose. Must
+    # not steer toward one script_source (see the pipeline_constraints fix
+    # below for the same bug in a different spot) — a real operator report
+    # traced a systematic reddit bias partly to this brief's old wording
+    # ("work well with Reddit-sourced stories"), which pre-committed every
+    # explore-mode proposal to reddit-shaped niches before step 1 even got a
+    # chance to judge fit.
     if mode == "explore" and not description:
         description = (
             "The operator has not provided a channel idea yet — propose the best "
             "channel opportunity for a new content creator starting from scratch. "
-            "Focus on niches that have strong repeatable content potential, work "
-            "well with Reddit-sourced stories, and are feasible with the Content "
-            "Factory pipeline."
+            "Focus on niches that have strong repeatable content potential and are "
+            "feasible with the Content Factory pipeline, using whichever "
+            "script_source (reddit-sourced or ai_generated original stories) "
+            "genuinely fits the proposed niche best."
         )
 
+    # currently_executable_script_source used to be the single string
+    # "reddit" — a real, direct bug (not just prompt-wording bias): both
+    # "reddit" and "ai_generated" have been fully executable since the
+    # AI-Generated Story Discovery feature shipped (CLAUDE.md §8.2/§9.5).
+    # Telling Claude only reddit was executable manufactured a hard
+    # constraint out of stale data, on top of step 1's own prompt wording
+    # bias fixed alongside this. Both together produced the "always reddit"
+    # pattern a real operator observed across multiple concepts.
     pipeline_constraints = {
         "currently_executable_content_mode": "single_story",
-        "currently_executable_script_source": "reddit",
+        "currently_executable_script_sources": ["reddit", "ai_generated"],
         "currently_executable_output_modes": ["youtube_and_shorts", "youtube_long_only"],
         "no_platform_api_access": True,
         "no_verified_analytics": True,

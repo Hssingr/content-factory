@@ -216,6 +216,41 @@ class ResearchChannelIdeasOrchestrationTest(unittest.TestCase):
         self.assertEqual(step1_context["mode"], "explore")
         self.assertIn("starting from scratch", step1_context["channel_description"])
 
+    def test_pipeline_constraints_do_not_falsely_claim_only_reddit_is_executable(self) -> None:
+        """Regression test for a real reddit-bias bug: pipeline_constraints
+        used to send the single string "reddit" as
+        currently_executable_script_source, a false claim (ai_generated has
+        been fully executable since CLAUDE.md §9.5's AI-Generated Story
+        Discovery shipped) that manufactured a hard constraint pushing every
+        recommendation toward reddit regardless of concept fit."""
+        calls, fake = self._stub(_concept(), _narrative())
+        with patch.object(system_prompt, "call_claude_structured", fake):
+            system_prompt.research_channel_ideas("A channel idea", mode="validate")
+
+        step1_context = json.loads(calls[0]["user_message"])
+        constraints = step1_context["pipeline_constraints"]
+        self.assertNotIn("currently_executable_script_source", constraints)
+        self.assertEqual(
+            set(constraints["currently_executable_script_sources"]),
+            {"reddit", "ai_generated"},
+        )
+
+    def test_explore_synthetic_brief_does_not_steer_toward_reddit(self) -> None:
+        """The old synthetic brief said "work well with Reddit-sourced
+        stories", pre-committing every explore-mode proposal to
+        reddit-shaped niches before step 1 could judge genuine fit."""
+        calls, fake = self._stub(_concept(), _narrative())
+        with patch.object(system_prompt, "call_claude_structured", fake):
+            system_prompt.research_channel_ideas("", mode="explore")
+
+        step1_context = json.loads(calls[0]["user_message"])
+        self.assertNotIn("Reddit-sourced", step1_context["channel_description"])
+
+    def test_concept_validation_prompt_frames_both_sources_as_equally_executable(self) -> None:
+        prompt = system_prompt._CONCEPT_VALIDATION_SYSTEM_PROMPT
+        self.assertIn("both are fully", prompt.lower())
+        self.assertNotIn("script_source reddit,", prompt)
+
     def test_validate_mode_empty_description_raises_before_any_claude_call(self) -> None:
         def fail_if_called(**kwargs):
             raise AssertionError("Claude must not be called for an empty validate-mode description")

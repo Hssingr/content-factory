@@ -111,13 +111,26 @@ async def start_polling(on_message: MessageHandlerFunc) -> Application | None:
     # Remove any existing webhook so polling can receive updates
     await delete_webhook()
 
-    _app = ApplicationBuilder().token(settings.telegram_bot_token).build()
-    _app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    app_instance = ApplicationBuilder().token(settings.telegram_bot_token).build()
+    app_instance.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
-    await _app.initialize()
-    await _app.start()
-    await _app.updater.start_polling()
+    try:
+        await app_instance.initialize()
+        await app_instance.start()
+        await app_instance.updater.start_polling()
+    except Exception as exc:
+        logger.error(
+            "Telegram polling failed to start (Telegram API unreachable?) — "
+            "continuing without Telegram integration: %s", exc,
+        )
+        try:
+            await app_instance.shutdown()
+        except Exception:
+            pass
+        _app = None
+        return None
 
+    _app = app_instance
     logger.info("Telegram polling started")
     return _app
 
