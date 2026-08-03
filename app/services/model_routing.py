@@ -61,6 +61,12 @@ MODEL_ROUTING: dict[str, str] = {
     "story_blueprint":         PRIMARY_MODEL,  # Narrative skeleton — foundation for all sections
     "section_generation":      PRIMARY_MODEL,  # Creative writing per section
     "short_script":            PRIMARY_MODEL,  # Standalone short planning: TikTok-optimised episode script
+    "solo_short_script":       PRIMARY_MODEL,  # Solo Short (output_mode="shorts_only"): standalone short
+                                                # episode written directly from source material, no parent,
+                                                # no plan — split from short_script purely so its cost/
+                                                # latency logs don't blur with the child-of-parent path,
+                                                # same PRIMARY_MODEL slot (same convention as
+                                                # publish_timing_suggestion's split from channel_suggestion)
     "story_synthesis":         PRIMARY_MODEL,  # AI-generated story discovery (script_source="ai_generated"):
                                                 # premise pitch + post-approval expansion — original creative
                                                 # fiction grounded only in channel niche/tone/description

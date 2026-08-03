@@ -14,7 +14,7 @@ from app.agents.agent2_discovery.services.scoring import (
     decide_story_acceptance,
 )
 from app.agents.agent2_discovery.system_prompt import score_story_for_gate
-from app.services.script_checks import check_source_material_floor
+from app.services.script_checks import check_source_material_floor, SOLO_SHORT_SCRIPT_FORMAT
 from app.services.script_source import normalize_script_source
 
 logger = logging.getLogger(__name__)
@@ -88,6 +88,17 @@ def run_discovery(
     script_format = config.script_format if config else "youtube_long"
     script_source = normalize_script_source(config.script_source if config else "reddit")
     is_ai_generated = script_source == "ai_generated"
+    # A Solo Short — output_mode="shorts_only" — is a content row that is
+    # ITSELF a standalone short episode with no parent (see code_report/
+    # output_mode_shorts_only_and_youtube_long_only_roadmap.md). It needs the
+    # short-appropriate (420-word) source-material floor, not the long-form
+    # (900-word) one its channel's own `script_format` would otherwise imply
+    # — `script_format` and `output_mode` are deliberately independent
+    # settings (CLAUDE.md §9.3), so this is a separate variable, not a
+    # reassignment of `script_format` itself.
+    output_mode = getattr(config, "output_mode", "youtube_and_shorts") or "youtube_and_shorts"
+    is_solo_short_channel = output_mode == "shorts_only"
+    floor_script_format = SOLO_SHORT_SCRIPT_FORMAT if is_solo_short_channel else script_format
 
     sources_list: list[tuple[str, str, float]] = []
     if is_ai_generated:
@@ -154,7 +165,7 @@ def run_discovery(
             accumulated_rejected.append({"title": candidate.title, "url": candidate.url})
             continue
 
-        floor_reason = None if is_ai_generated else _fails_source_material_floor(candidate, script_format)
+        floor_reason = None if is_ai_generated else _fails_source_material_floor(candidate, floor_script_format)
         if floor_reason:
             logger.warning(
                 "Discovery: candidate too thin on attempt %d (title=%r) — %s — "
@@ -184,7 +195,7 @@ def run_discovery(
             _MAX_DEDUP_RETRIES + 1, channel_id,
         )
         story = _nuclear_retry(
-            channel, sources_list, accumulated_rejected, db, script_format
+            channel, sources_list, accumulated_rejected, db, floor_script_format
         )
     elif story is None and is_ai_generated:
         logger.warning(
@@ -252,6 +263,13 @@ def run_discovery(
         title=story.title,
         status="PENDING_APPROVAL",
         source_excerpt=story.body[:MAX_SOURCE_EXCERPT_CHARS] if story.body else None,
+        # A Solo Short is itself the primary content unit — no parent, one
+        # part (output_mode="shorts_only"; see code_report/
+        # output_mode_shorts_only_and_youtube_long_only_roadmap.md). Explicit
+        # rather than relying on downstream `or 1` fallbacks (Finding D).
+        is_short_episode=is_solo_short_channel,
+        short_part_number=1 if is_solo_short_channel else None,
+        short_total_parts=1 if is_solo_short_channel else None,
     )
     db.add(content)
     db.flush()
@@ -461,6 +479,9 @@ def _create_manual_fallback(
     placeholder_hash = hashlib.sha256(
         f"manual_{channel.id}_{unique_suffix}".encode()
     ).hexdigest()
+    is_solo_short_channel = (
+        getattr(config, "output_mode", "youtube_and_shorts") or "youtube_and_shorts"
+    ) == "shorts_only"
 
     content = Content(
         channel_id=channel.id,
@@ -471,6 +492,9 @@ def _create_manual_fallback(
         status="AWAITING_MANUAL_STORY",
         source_excerpt=None,
         story_blueprint={"rejected_stories": rejected_stories},
+        is_short_episode=is_solo_short_channel,
+        short_part_number=1 if is_solo_short_channel else None,
+        short_total_parts=1 if is_solo_short_channel else None,
     )
     db.add(content)
     db.flush()

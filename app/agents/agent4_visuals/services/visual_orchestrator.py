@@ -59,6 +59,7 @@ from app.agents.agent4_visuals.services.visual_review import (
     generate_visual_review_html, save_beat_review_metadata,
 )
 from app.services.local_run_paths import ensure_run_dirs
+from app.services.script_checks import SOLO_SHORT_SCRIPT_FORMAT
 from app.services.video_sections import load_video_sections
 from app.agents.agent4_visuals.system_prompt import (
     STORYBOARD_SCHEMA_VERSION as _STORYBOARD_SCHEMA_VERSION,
@@ -99,9 +100,26 @@ def run_visual_generation(
     """
     content_id = content.id
     is_short_episode = bool(getattr(content, "is_short_episode", False))
+    parent_content_id = getattr(content, "parent_content_id", None)
 
-    if is_short_episode:
+    # Three content shapes reach this dispatch (output_mode shorts_only
+    # roadmap, Finding C): a parent (is_short_episode=False); a child-of-a-
+    # parent short, which remaps an existing parent's beats and therefore
+    # requires parent_content_id; and a Solo Short — is_short_episode=True
+    # with NO parent — which needs its own original storyboard generation,
+    # never a remap. Before this fix, is_short_episode=True alone routed
+    # unconditionally into _run_child_short_visuals(), which hard-fails
+    # (VISUALS_FAILED) the instant it finds no parent_content_id — a Solo
+    # Short reaching this dispatch is therefore a NEW, distinct branch, not a
+    # variant of the existing child-short path.
+    if is_short_episode and parent_content_id:
         return _run_child_short_visuals(
+            content, channel, scripts_by_lang, audio_by_lang, db,
+            visual_style=visual_style, image_style=image_style,
+        )
+
+    if is_short_episode and not parent_content_id:
+        return _run_solo_short_visuals(
             content, channel, scripts_by_lang, audio_by_lang, db,
             visual_style=visual_style, image_style=image_style,
         )
@@ -573,12 +591,22 @@ def _run_visual_pass(
     image_style: str = "",
     script_hash: str | None = None,
     blueprint: dict | None = None,
+    is_short_episode: bool = False,
+    width: int = 1920,
+    height: int = 1080,
 ) -> tuple[list[dict] | None, int]:
     """Generate storyboard + Flux images once for this content item.
 
     Uses the source language script/audio for storyboard generation (so hints
     are in the same language as the Whisper transcript). All language renders
     share the resulting beat images; timing is re-scaled per language.
+
+    Shared by the parent path (``_run_parent_visuals()``, default landscape
+    args, unchanged behavior) and the Solo Short path
+    (``_run_solo_short_visuals()``, ``is_short_episode=True,
+    width=1080, height=1920`` — output_mode="shorts_only", see code_report/
+    output_mode_shorts_only_and_youtube_long_only_roadmap.md). Neither caller
+    is a remap — both generate an original storyboard from their own script.
 
     Args:
         script_hash: When provided (the source-language script's SHA-256,
@@ -589,6 +617,11 @@ def _run_visual_pass(
             continuity line (see ``build_continuity_line_from_blueprint()``)
             — no AI call, replaces the deleted visual-bible layer (Elimination
             Mandate, code_report/forensic_output_audit_borrasca_run.md, D2.1).
+        is_short_episode: Forwarded to ``split_into_beats()``'s wpm-
+            calibration scoping (Finding A) and selects which milestone log
+            names are emitted below.
+        width, height: Forwarded to ``generate_all_beat_images()`` — landscape
+            1920x1080 (parent, default) or portrait 1080x1920 (Solo Short).
 
     Returns:
         ``(beats, source_duration_ms)`` on success, ``(None, 0)`` on failure.
@@ -615,7 +648,8 @@ def _run_visual_pass(
 
     source_duration_ms = source_audio.duration_ms
     logger.info(
-        "PARENT_VISUALS_START content_id=%s source_lang=%s source_duration_ms=%d",
+        "%s content_id=%s source_lang=%s source_duration_ms=%d",
+        "SOLO_SHORT_VISUALS_START" if is_short_episode else "PARENT_VISUALS_START",
         content_id, source_lang, source_duration_ms,
     )
     logger.info(
@@ -640,6 +674,7 @@ def _run_visual_pass(
         continuity_line=continuity_line,
         content_id=str(content_id),
         db=db,
+        is_short_episode=is_short_episode,
     )
 
     if beats is None:
@@ -700,7 +735,7 @@ def _run_visual_pass(
     db.commit()
 
     # ── 3. Flux generation ────────────────────────────────────────────────────
-    beats = generate_all_beat_images(beats, cid_str)
+    beats = generate_all_beat_images(beats, cid_str, width=width, height=height)
 
     succeeded = sum(1 for b in beats if (b.get("media_url") or "").startswith("cache/"))
     missing_media = len(beats) - succeeded
@@ -712,7 +747,11 @@ def _run_visual_pass(
     # ── 4. Update saved beats with Flux media_url ─────────────────────────────
     _save_shared_beats(content_id, beats, db)
     db.commit()
-    logger.info("PARENT_VISUALS_DONE content_id=%s beats=%d", content_id, len(beats))
+    logger.info(
+        "%s content_id=%s beats=%d",
+        "SOLO_SHORT_VISUALS_DONE" if is_short_episode else "PARENT_VISUALS_DONE",
+        content_id, len(beats),
+    )
 
     return beats, source_duration_ms
 
@@ -1412,6 +1451,97 @@ def _run_child_short_visuals(
 
     status = "CHILD_SHORT_VISUALS_DONE" if beats_by_lang else "VISUALS_FAILED"
     return {"status": status, "beats_by_lang": beats_by_lang}
+
+
+def _run_solo_short_visuals(
+    content: Content,
+    channel: Channel,
+    scripts_by_lang: dict[str, Script],
+    audio_by_lang: dict[str, AudioFile],
+    db: Session,
+    visual_style: str = "",
+    image_style: str = "",
+) -> dict:
+    """Generate an original storyboard for a Solo Short — a short episode
+    with no parent at all (``is_short_episode=True``, ``parent_content_id``
+    ``None``; ``output_mode="shorts_only"``, see code_report/output_mode_
+    shorts_only_and_youtube_long_only_roadmap.md).
+
+    NOT ``_run_child_short_visuals()``'s remap path — a Solo Short has no
+    parent beats to remap from. It gets an original storyboard exactly like
+    a parent does (reusing ``_run_visual_pass()``, the same generation
+    sequence ``_run_parent_visuals()`` uses: ``split_into_beats()``,
+    storyboard validation, duplicate-prompt repair, save-before-Flux, Flux
+    generation, save-after-Flux), parameterized for this content shape:
+    ``SOLO_SHORT_SCRIPT_FORMAT`` (Check 5's shared short-appropriate format
+    constant) and portrait 1080x1920 images.
+
+    Idempotency: reuses already-persisted ``__visual__`` beats when every
+    one already has a local image (a basic completeness check only — unlike
+    ``_run_parent_visuals()``, this does not yet carry the full script-hash/
+    audio-duration staleness-fingerprint guard). This is a deliberate,
+    documented scope boundary for this phase, not an oversight: a Solo
+    Short whose script is regenerated after this ran once would need its
+    stale beats cleared manually until a future phase extends the same
+    staleness guard `_run_parent_visuals()` already has to this path too.
+    """
+    content_id = content.id
+
+    existing_beats = _load_shared_beats(content_id, db)
+    beats_complete = bool(existing_beats) and all(
+        (b.get("media_url") or "").startswith("cache/") for b in existing_beats
+    )
+
+    if beats_complete:
+        logger.info(
+            "SOLO_SHORT_VISUALS_REUSED content_id=%s beats=%d — persisted beats "
+            "already complete, skipping regeneration",
+            content_id, len(existing_beats),
+        )
+        beats = existing_beats
+        source_duration_ms = max(
+            (b.get("audio_end_ms", 0) for b in beats), default=0
+        )
+    else:
+        beats, source_duration_ms = _run_visual_pass(
+            content_id=content_id,
+            scripts_by_lang=scripts_by_lang,
+            audio_by_lang=audio_by_lang,
+            channel=channel,
+            script_format=SOLO_SHORT_SCRIPT_FORMAT,
+            allow_legacy_fallback=False,
+            db=db,
+            visual_style=visual_style,
+            image_style=image_style,
+            blueprint=content.story_blueprint,
+            is_short_episode=True,
+            width=1080,
+            height=1920,
+        )
+        if beats is None:
+            return {"status": "VISUALS_FAILED", "beats_by_lang": {}}
+
+    src_audio = audio_by_lang.get(content.source_language)
+    if source_duration_ms == 0:
+        source_duration_ms = src_audio.duration_ms if src_audio else 0
+    source_sections = src_audio.section_boundaries if src_audio else None
+
+    beats_by_lang: dict[str, list[dict]] = {}
+    for language, _script in scripts_by_lang.items():
+        audio = audio_by_lang.get(language)
+        if not audio:
+            continue
+        beats_for_lang = _remap_beats_timing(
+            beats, audio.duration_ms, source_duration_ms,
+            source_sections=source_sections,
+            target_sections=audio.section_boundaries,
+        )
+        _save_video_sections(content_id, language, beats_for_lang, db)
+        db.commit()
+        save_beat_review_metadata(content_id, language, beats_for_lang)
+        beats_by_lang[language] = beats_for_lang
+
+    return {"status": "CHILD_SHORT_VISUALS_DONE", "beats_by_lang": beats_by_lang}
 
 
 # ── DB helpers ─────────────────────────────────────────────────────────────────

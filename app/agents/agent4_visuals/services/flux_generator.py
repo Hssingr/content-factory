@@ -797,7 +797,10 @@ def fill_failed_beats_from_neighbors(beats: list[dict], content_id: str) -> int:
     return filled
 
 
-def generate_all_beat_images(beats: list[dict], content_id: str) -> list[dict]:
+def generate_all_beat_images(
+    beats: list[dict], content_id: str,
+    width: int = _DEFAULT_WIDTH, height: int = _DEFAULT_HEIGHT,
+) -> list[dict]:
     """Generate Flux images for all beats sequentially (1 worker, 0.5s inter-beat sleep).
 
     Mutates each beat in-place:
@@ -814,6 +817,14 @@ def generate_all_beat_images(beats: list[dict], content_id: str) -> list[dict]:
     Args:
         beats:      Storyboard beat dicts with a ``flux_prompt`` field.
         content_id: Content UUID string for logging.
+        width:      Image width — landscape 1920 (default) for the parent
+                    path; the Solo Short visual pass (output_mode
+                    "shorts_only", see code_report/output_mode_shorts_only_
+                    and_youtube_long_only_roadmap.md) passes 1080 for
+                    portrait, mirroring generate_pending_beat_images()'s
+                    existing child-remap portrait generation.
+        height:     Image height — landscape 1080 (default) or 1920 (Solo
+                    Short portrait).
 
     Returns:
         The same list with each beat's ``media_url`` set.
@@ -835,7 +846,9 @@ def generate_all_beat_images(beats: list[dict], content_id: str) -> list[dict]:
 
     def _generate_one(beat: dict) -> dict:
         idx = beat.get("beat_order", beat.get("section_order", 0))
-        path = generate_beat_image_with_routing(beat, content_id, tier_counts)
+        path = generate_beat_image_with_routing(
+            beat, content_id, tier_counts, width=width, height=height,
+        )
         if not path:
             # Safe-prompt retry with a fresh cache key: an empty flux_prompt
             # makes every cascade tier resolve to the environment-safe prompt,
@@ -850,15 +863,16 @@ def generate_all_beat_images(beats: list[dict], content_id: str) -> list[dict]:
                 "", idx, content_id,
                 environment=beat.get("environment", "other"),
                 cache_key_extra=f"hard_retry:{idx}",
+                width=width, height=height,
             )
         if path:
             path = _dedupe_generated_image_once(
                 beat, path, content_id, tier_counts, pixel_ledger,
-                width=_DEFAULT_WIDTH, height=_DEFAULT_HEIGHT,
+                width=width, height=height,
             )
             path = _ensure_beat_image_healthy(
                 beat, path, content_id,
-                width=_DEFAULT_WIDTH, height=_DEFAULT_HEIGHT,
+                width=width, height=height,
             )
             if path:
                 beat["media_url"]  = path

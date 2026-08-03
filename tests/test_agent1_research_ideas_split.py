@@ -251,6 +251,27 @@ class ResearchChannelIdeasOrchestrationTest(unittest.TestCase):
         self.assertIn("both are fully", prompt.lower())
         self.assertNotIn("script_source reddit,", prompt)
 
+    def test_pipeline_constraints_include_shorts_only_as_executable(self) -> None:
+        """Regression test mirroring the script_source-bias fix above, for
+        output_mode: shorts_only (the Solo Short path, code_report/
+        output_mode_shorts_only_and_youtube_long_only_roadmap.md) is now
+        fully executable and must not be excluded from the constraints
+        context or framed as "not executable yet" in the prompt — the same
+        false-constraint bug class, just on a different field."""
+        calls, fake = self._stub(_concept(), _narrative())
+        with patch.object(system_prompt, "call_claude_structured", fake):
+            system_prompt.research_channel_ideas("A channel idea", mode="validate")
+
+        step1_context = json.loads(calls[0]["user_message"])
+        constraints = step1_context["pipeline_constraints"]
+        self.assertEqual(
+            set(constraints["currently_executable_output_modes"]),
+            {"youtube_and_shorts", "youtube_long_only", "shorts_only"},
+        )
+        prompt = system_prompt._CONCEPT_VALIDATION_SYSTEM_PROMPT
+        self.assertNotIn("it is not executable yet", prompt.lower())
+        self.assertIn("all three are fully executable", prompt.lower())
+
     def test_validate_mode_empty_description_raises_before_any_claude_call(self) -> None:
         def fail_if_called(**kwargs):
             raise AssertionError("Claude must not be called for an empty validate-mode description")

@@ -427,6 +427,19 @@ def check_minimum_length(voice_script: str, language: str, script_format: str = 
 # floor mirrors check_minimum_length()'s own per-format word targets just
 # above: a script cannot be responsibly grounded in a source with fewer words
 # than the shortest acceptable script itself.
+
+# The Solo Short's own script_format value (output_mode="shorts_only" — see
+# code_report/output_mode_shorts_only_and_youtube_long_only_roadmap.md).
+# check_source_material_floor()'s and agent4's _BEAT_SECONDS_BY_FORMAT's
+# branching both key on "== 'youtube_long'" — any other string already
+# satisfies "not youtube_long" — so this constant exists purely so every
+# caller that needs a short-appropriate value shares one name instead of
+# three ad-hoc string literals (discovery.py's floor check, Agent 2's
+# _run_solo_short_script_workflow() floor check, Agent 4's split_into_beats()
+# call in _run_solo_short_visuals()).
+SOLO_SHORT_SCRIPT_FORMAT = "solo_short"
+
+
 def check_source_material_floor(
     source_excerpt: str, language: str, script_format: str = "youtube_long"
 ) -> list[dict]:

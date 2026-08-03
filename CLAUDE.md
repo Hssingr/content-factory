@@ -252,6 +252,36 @@ shim was needed for the retired video statuses: nothing outside the render
 pipeline itself ever filtered on `VIDEO_DONE`/`GENERATING_VIDEO` (no Agent
 6/publishing consumer existed yet).
 
+### 4.4 Solo Short (`output_mode="shorts_only"`)
+
+A Solo Short — a standalone short episode with no parent at all (§5.3,
+§9.6, §11.4) — is itself the primary content unit for its channel and
+follows the **same string-for-string status flow as a parent** (§4.1), not
+the child-of-a-parent flow's defer-back-to-`AUDIO_DONE` behavior (§4.2):
+
+```text
+PENDING_APPROVAL
+→ APPROVED
+→ GENERATING_SCRIPTS
+→ SCRIPTS_VALIDATED
+→ GENERATING_AUDIO
+→ AUDIO_DONE
+→ GENERATING_VISUALS
+→ CHILD_SHORT_VISUALS_DONE
+→ RENDERING
+→ RENDERED
+```
+
+The one deliberate difference from §4.1's parent flow: the visuals-done
+status is `CHILD_SHORT_VISUALS_DONE`, not `PARENT_VISUALS_DONE` — reused
+verbatim from §4.2 rather than a new status, since Agent 5's render-format
+decision and `pickup_visual_ready`'s status filter are already
+`is_short_episode`-driven, not keyed to which Agent 4 code path produced
+the visuals (§11.4). A Solo Short never reverts to `AUDIO_DONE` the way a
+child-of-a-parent Short can — that revert exists only inside
+`_run_child_short_visuals()`'s parent-readiness gate (§11.4), which a
+Solo Short's dispatch never reaches, since it has no parent to wait on.
+
 ---
 
 ## 5. Core Database Tables
@@ -297,13 +327,29 @@ short_part_number = NULL
 short_total_parts = NULL
 ```
 
-Child short content:
+Child short content (a Short cut from — and remapped against — a parent's own beats):
 
 ```text
 is_short_episode = True
 parent_content_id = parent Content.id
 short_part_number = 1-based part index
 short_total_parts = total number of parts
+```
+
+Solo Short — a standalone short episode with no parent at all
+(`output_mode="shorts_only"`, §8.1/§9.6/§11.4): itself the primary content
+unit for its channel, discovered and approved exactly like a parent, but
+short-form throughout. Exactly one per discovery cycle — never a multi-part
+series. Do not confuse this with "standalone short architecture"
+elsewhere in this document, which refers to a child-of-a-parent Short being
+its own independently-rendered `Content` row (§16.2) — a Solo Short has no
+parent to be "standalone" from in that sense; it never had one:
+
+```text
+is_short_episode = True
+parent_content_id = NULL
+short_part_number = 1
+short_total_parts = 1
 ```
 
 #### `scripts`
@@ -684,6 +730,16 @@ Responsibilities:
 - Length checks.
 - Source-material floor check (roadmap 4b / audit P1-5 —
   `check_source_material_floor()`; see §9.3's `fetch_batch` entry).
+- `SOLO_SHORT_SCRIPT_FORMAT` (output_mode `shorts_only` roadmap, §9.6) — the
+  single shared `script_format` value ("solo_short") every Solo Short call
+  site uses in place of the channel's own `ChannelConfig.script_format`:
+  `check_source_material_floor()`'s and Agent 4's `_BEAT_SECONDS_BY_FORMAT`'s
+  branching both key on `== "youtube_long"`, so any non-`"youtube_long"`
+  string already satisfies "not long-form" — this constant exists purely so
+  the three Solo Short call sites (`discovery.py`'s floor check,
+  `_run_solo_short_script_workflow()`'s floor check, Agent 4's
+  `split_into_beats()` call inside `_run_solo_short_visuals()`) share one
+  name instead of three ad-hoc string literals.
 - Deterministic cleanup utilities.
 - `split_sentences()` — the single public sentence splitter (fresh
   full-system audit §3.5): every sentence-level rule in Agent 2/script-checks
@@ -934,7 +990,7 @@ acts on it.
 |---|---|---|---|---|
 | `content_mode` | `str` (Pydantic `Literal`) | `"single_story"` | `"single_story"` — matches today's only real behavior (one discovery → one parent + standalone shorts per cycle) | `"limited_series"`, `"ongoing_series"` — reserved; no Agent 2 execution logic exists for either |
 | `script_source` | `str` (Pydantic `Literal`) | `"reddit"` | **Read by Agent 2** — `"reddit"` (existing discovery default; `fetch_batch()`, web_search-grounded) and `"ai_generated"` (alias `"claude_generated"`; AI-Generated Story Discovery — `generate_story_premise()`/`expand_story_premise()`, no `ChannelSource` required; see §9.5) | `"user_provided"`, `"hybrid"` — reserved; no execution logic exists for either |
-| `output_mode` | `str` (Pydantic `Literal`) | `"youtube_and_shorts"` | `"youtube_and_shorts"` (parent render + standalone shorts via `run_shorts_planner`, per §9.4) and `"youtube_long_only"` (same parent pipeline; `run_script_workflow()` skips the shorts planner, logged `SHORTS_PLANNER_SKIPPED` — post-roadmap deep audit, the first runtime consumer of this column) | `"shorts_only"` — reserved; Agent 5 always renders the parent main video, no switch exists to skip the long-form half |
+| `output_mode` | `str` (Pydantic `Literal`) | `"youtube_and_shorts"` | **Fully executable for all three values** — `"youtube_and_shorts"` (parent render + standalone shorts via `run_shorts_planner`, per §9.4), `"youtube_long_only"` (same parent pipeline; `run_script_workflow()` skips the shorts planner, logged `SHORTS_PLANNER_SKIPPED` — post-roadmap deep audit, the first runtime consumer of this column), and `"shorts_only"` (a Solo Short — one standalone short episode per discovery cycle with no parent Content row at all, written directly from source material; see §9.6/§11.4 and code_report/output_mode_shorts_only_and_youtube_long_only_roadmap.md) | none — this field has no remaining coming-soon values |
 | `visual_style` | `str` (free-form, no DB enum) | `"story_driven"` (roadmap 4a / audit P1-9 — was `"documentary"`) | **Read by Agent 2 and Agent 4** — Agent 2 injects it into `generate_story_blueprint()`, `generate_section()`, and `generate_short_episode_script()` user messages as "Visual style:" so narration and hook framing align with the channel's visual aesthetic; Agent 4 injects it into every `generate_storyboard_batch()` call as "Global visual direction:" applying a consistent mood/color/lighting constraint across all beats. See §11 (Agent 4) for the Agent 4 injection contract. | **Reconciled (migration 009):** the former duplicate `video_style_type` column is dropped — its only consumer chain (Agent 5 `channel_style` → props `config.style`) ended in a Remotion prop no component ever read. `visual_style` is the single channel-level style column |
 | `image_style` | `str` (free-form, no DB enum) | `"photorealistic"` | **Read by Agent 2 and Agent 4** — Agent 2 injects it into the same three prompt functions as `visual_style` as "Image style:"; Agent 4 injects it into every `generate_storyboard_batch()` call as "Global image style:" applying a consistent Flux rendering approach across all beats. See §11 (Agent 4) for the Agent 4 injection contract. | No per-beat `image_style` override exists; the channel-level setting applies uniformly to every `flux_generated` beat |
 | `narration_pov` | `str` (Pydantic `Literal`, roadmap 4a / audit P1-9) | `"third_person"` | **Read by Agent 2 only** — `"third_person"` (standard narrator voice) or `"first_person_storytime"` (narrate as the protagonist, "I"/"me"/"my" — the r/nosleep storytime format). Threaded via `ScriptWorkflowContext` into `generate_story_blueprint()`, `generate_section()`, `generate_shorts_plan()`, `generate_short_episode_script()`, and `generate_native_script()` (native adaptation is instructed to preserve the source's POV, never convert it) as "Narration POV:". Real behavioral rules exist in `_STORY_BLUEPRINT_SYSTEM_PROMPT`, `_SECTION_GENERATION_SYSTEM_PROMPT`, `_SHORTS_PLANNER_SYSTEM_PROMPT`, and `_SHORT_EPISODE_SYSTEM_PROMPT` — this is not a passthrough label. | Not read by Agent 4 — visual storyboard direction does not depend on narration person |
@@ -951,11 +1007,16 @@ Rules:
   receives `visual_style`/`image_style` in `generate_storyboard_batch()` via
   `split_into_beats()` (see §11.4). `script_source` is now also read by
   Agent 2 — see §9.5 for the `"ai_generated"` branch in
-  `run_discovery()`/`generate_parent_source_script()`. `content_mode` and
-  `output_mode` (except `output_mode`'s existing `youtube_long_only`
-  branch, §9.3) remain schema-only; do not make any other agent read them
-  until a dedicated phase explicitly wires them in, documents the new
-  behavior here, and proves it with a runtime test (§19.4).
+  `run_discovery()`/`generate_parent_source_script()`. `output_mode` is now
+  read by Agent 1 (`run_discovery()`/`_create_manual_fallback()`, to set
+  `is_short_episode` at Content-row creation time for `shorts_only`
+  channels — §9.6), Agent 2 (`run_script_workflow()`'s top-level branch,
+  and the existing `youtube_long_only` skip, §9.3), and Agent 4
+  (`run_visual_generation()`'s 3-way dispatch, §11.4) — all three
+  executable values are now wired in, not just `youtube_long_only`.
+  `content_mode` remains schema-only; do not make any agent read it until a
+  dedicated phase explicitly wires it in, documents the new behavior here,
+  and proves it with a runtime test (§19.4).
 - `content_mode`/`script_source`/`output_mode`/`narration_pov` are Pydantic
   `Literal` types in `app/schemas/channel.py` (`ContentMode`/`ScriptSource`/
   `OutputMode`/`NarrationPov`) — the API rejects any value outside the table
@@ -997,17 +1058,19 @@ all, for this value, today?). No database access, no network call, no
 mutation of a `ChannelConfig` row.
 
 **Two combinations are executable today (AI-Generated Story Discovery —
-see `code_report/ai_generated_story_discovery_design.md` and §9.5):**
+see `code_report/ai_generated_story_discovery_design.md` and §9.5 — and the
+Solo Short build, see `code_report/output_mode_shorts_only_and_youtube_
+long_only_roadmap.md` and §9.6/§11.4):**
 `content_mode="single_story"` + `script_source` in `{"reddit", "ai_generated"}`
-+ `output_mode` in `{"youtube_and_shorts", "youtube_long_only"}`. Everything
-else is schema-supported (an operator can already save it) but not yet
-executable:
++ `output_mode` in `{"youtube_and_shorts", "youtube_long_only", "shorts_only"}`.
+Everything else is schema-supported (an operator can already save it) but
+not yet executable:
 
 | Field | Executable today | Supported, not executable | Reason |
 |---|---|---|---|
 | `content_mode` | `single_story` | `limited_series`, `ongoing_series` | Agent 2 has no multi-episode or open-ended series planning/execution logic |
 | `script_source` | `reddit`, `ai_generated` (alias: `claude_generated`) — both only when `content_mode="single_story"` | `user_provided`, `hybrid` | `reddit` fetches a real source story via web_search; `ai_generated` synthesizes an original premise from channel niche/tone/description (`generate_story_premise()`/`expand_story_premise()`, no `ChannelSource` needed) — no operator-supplied or mixed script-origin path exists yet |
-| `output_mode` | `youtube_and_shorts`, `youtube_long_only` | `shorts_only` | `youtube_long_only` skips `run_shorts_planner()` in `run_script_workflow()` (`SHORTS_PLANNER_SKIPPED`); `shorts_only` is not executable — Agent 5 always renders the parent main video, no switch exists to skip the long-form half |
+| `output_mode` | `youtube_and_shorts`, `youtube_long_only`, `shorts_only` | none | `youtube_long_only` skips `run_shorts_planner()` in `run_script_workflow()` (`SHORTS_PLANNER_SKIPPED`); `shorts_only` produces a Solo Short — a standalone short episode with no parent, discovered as `is_short_episode=True` from the start (§9.6) and visually generated via its own original storyboard pass (§11.4), never `run_shorts_planner()` |
 
 `normalize_script_source()` (`app/services/script_source.py` — shared with
 Agent 2, see §7.6) maps `"claude_generated"` → `"ai_generated"` — a pure
@@ -3517,6 +3580,141 @@ guard. `tests/test_telegram_chatbot_and_story_freshness.py` covers the
 conversational-revision CHANGE path specifically — see "Conversational
 premise revision" above for the full runtime-proof description.
 
+### 9.6 Solo Short Script Generation (`output_mode="shorts_only"`)
+
+Design record: `code_report/output_mode_shorts_only_and_youtube_long_only_roadmap.md`.
+
+A Solo Short is a standalone short episode with **no parent Content row at
+all** — `is_short_episode=True`, `parent_content_id=NULL` (§5.3, §4.4).
+Unlike the child-of-a-parent Shorts §9.4 covers (which are always cut from
+an already-validated long-form script), a Solo Short's own script IS the
+final output — written directly from the discovered/generated source
+material, never derived from a long-form script or a multi-part plan.
+
+**Discovery (`discovery.py`) — reuses `run_discovery()` unchanged, no new
+discovery mechanism.** `config.output_mode` is already loaded near the top
+of `run_discovery()`; when it is `"shorts_only"`, both `run_discovery()`'s
+own `Content(...)` construction and `_create_manual_fallback()`'s
+placeholder-row construction set `is_short_episode=True,
+short_part_number=1, short_total_parts=1` (`parent_content_id` stays
+`NULL`, the column's own default) — the row is a Solo Short from the
+moment it is discovered, all the way through Telegram approval. The
+discovery-time source-material floor check
+(`_fails_source_material_floor()`/`_nuclear_retry()`) and
+`generate_parent_source_script()`'s post-approval floor check both use
+`SOLO_SHORT_SCRIPT_FORMAT` (§7.3 — the 420-word floor) instead of the
+channel's own `script_format` for a `shorts_only` channel, since a
+~200-260 word Short needs far less source material than a 1,550-word
+long-form script.
+
+**Script generation — `run_script_workflow()`'s top-level dispatch:**
+```python
+def run_script_workflow(content, db):
+    if content.is_short_episode:
+        return _run_solo_short_script_workflow(content, db)
+    # existing parent logic, unchanged — including the run_shorts_planner()
+    # call at the end, which a Solo Short structurally never reaches
+```
+`_run_solo_short_script_workflow(content, db)` (`script_workflow.py`) is
+modeled on `generate_parent_source_script()` but swaps the long-form
+blueprint→sections→quality-gate middle for a single script-generation call:
+
+1. `_load_script_workflow_context()`, then `dataclasses.replace(context,
+   script_format=SOLO_SHORT_SCRIPT_FORMAT)` — one substitution point that
+   threads the short-appropriate format through every reused helper
+   (`_ensure_ai_story_expanded()`, `_passes_source_material_floor()`,
+   `generate_story_blueprint()`) with no per-function parameter changes.
+2. `ai_generated` expansion (`_ensure_ai_story_expanded()`, reused verbatim
+   — channel-level, not content-shape-specific) and the source-material
+   floor check (`_passes_source_material_floor()`, reused verbatim).
+3. `generate_story_blueprint(story, context.channel, ...)` — confirmed
+   fully reusable (takes only `story.body` = `content.source_excerpt` +
+   channel/style config, nothing long-form-specific). Persisted to
+   `content.story_blueprint` exactly like the parent path — this is what
+   gives a Solo Short its own `character_descriptors`/`era_setting`/
+   `protagonist_gender`/`hook` for Agent 3 voice-gender selection (§10.3)
+   and Agent 4 visual continuity (§11.4), with zero parent involvement.
+4. **New** `generate_solo_short_script(story, blueprint, channel,
+   channel_voice, visual_style, image_style, narration_pov,
+   word_floor_note="")` (`system_prompt.py`, new `_SOLO_SHORT_SYSTEM_PROMPT`
+   / `_SOLO_SHORT_SCHEMA`, task key `solo_short_script` — same
+   `PRIMARY_MODEL` tier as `short_script`, split out purely so cost/latency
+   logs don't blur, same convention as `publish_timing_suggestion`).
+   Framed as writing THE complete, self-contained short directly from
+   `story.body` — not "one part of a plan." Cannot reuse
+   `generate_short_episode_script()` (§9.4): that function hard-requires
+   `main_reveal`/`cliffhanger`/`other_parts_main_reveals`, which only exist
+   because `generate_shorts_plan()` produced a multi-part plan first.
+   Reuses the same calibrated word band (`_MIN_SHORT_WORDS`–
+   `_MAX_SHORT_WORDS`, ~190-270 words) and the same §21.6 short-episode
+   prompt rules (standalone/cold-open test, spoken-video delivery, no
+   clickbait filler, an ORIGINALITY rule against copying the source
+   material's own phrasing).
+5. Word-floor regeneration — the same single-retry pattern
+   `_generate_short_script()` uses (scripts.py): one extra
+   `generate_solo_short_script()` call with a `word_floor_note` if the
+   first draft is under `_MIN_SHORT_WORDS`, keeping the longer draft.
+   Logged `SOLO_SHORT_WORD_FLOOR_REGEN`.
+6. Structural checks — `_collect_short_script_major_issues()` (scripts.py,
+   the same function the per-part planner path already uses). Telemetry
+   only (Elimination Mandate). `detect_parent_child_overlap()` is skipped
+   entirely — no parent script exists to compare against.
+7. Persisted via `_persist_source_script()` — already threaded to pass
+   `content.is_short_episode` (not a hardcoded `False`) into
+   `estimate_duration_sec()`'s wpm calibration, so a Solo Short's own
+   duration estimate correctly uses the short-form (~120 wpm) calibration
+   window, not the long-form (~135 wpm) one.
+8. `generate_multilingual_scripts()` — called exactly as the parent path
+   calls it, **zero code changes needed**: its `content_kind` branch
+   (`"child_short" if content.is_short_episode else "parent_long_form"`,
+   scripts.py) is driven purely by `is_short_episode`, never
+   `parent_content_id`, so it already selects the flat, unsectioned
+   native-adaptation prompt correctly for a Solo Short.
+9. `content.status = "SCRIPTS_VALIDATED"` — the existing status string,
+   unchanged meaning.
+10. Returns without ever calling `run_shorts_planner()` — structurally
+    unreachable from this branch (the dispatch above returns before
+    `run_script_workflow()`'s own `run_shorts_planner()` call is reached),
+    **plus** `run_shorts_planner()` itself refuses to act on
+    already-short content as a second, independent line of defense: its
+    very first check after loading the target content is
+    `if long_content.is_short_episode: log SHORTS_PLANNER_SKIPPED
+    reason=content_is_already_a_short; return`. This protects any future
+    caller of `run_shorts_planner()` (a direct script, an admin tool, a
+    retry path), not just the one call path that exists today.
+
+Log names: `SOLO_SHORT_SCRIPT_START`, `SOLO_SHORT_SCRIPT_DONE`,
+`SOLO_SHORT_WORD_FLOOR_REGEN`, `SOLO_SHORT_SCRIPT_STILL_UNDER_FLOOR`,
+`SOLO_SHORT_SCRIPT_ISSUES` (mirroring the equivalent `SHORT_SCRIPT_*`/
+`CHILD_SHORT_TRANSLATION_ISSUES` names §9.4 already uses).
+
+Rules:
+
+- Do not thread `output_mode` any deeper than this dispatch — every reused
+  helper below it (`_ensure_ai_story_expanded()`,
+  `_passes_source_material_floor()`, `generate_story_blueprint()`,
+  `generate_multilingual_scripts()`) reads only `is_short_episode` or the
+  already-substituted `context.script_format`, never `output_mode` itself.
+- Never call `generate_parent_source_script()`, `generate_script_sections()`,
+  or `run_script_quality_gate()` from the Solo Short path — those are the
+  long-form blueprint→sections→quality-gate pipeline and do not apply here.
+- `run_shorts_planner()`'s own-content guard must never be loosened back to
+  "only checked by the caller" — see the two-line-of-defense reasoning above.
+
+Runtime proof: `tests/test_solo_short_pipeline.py` — real
+`run_script_workflow()`/`_run_solo_short_script_workflow()` chain against a
+fake DB (only `generate_story_blueprint()`/`generate_solo_short_script()`/
+`generate_native_script()` stubbed at the paid-Claude boundary), proving:
+`SCRIPTS_VALIDATED` reached without `run_shorts_planner()` or
+`generate_parent_source_script()` ever being called (both poisoned to
+raise); the 450-word source excerpt (clears the 420-word Solo Short floor,
+would have failed the 900-word long-form floor) reaches script generation;
+real `Script` rows persisted and validated for every configured language;
+the word-floor regeneration path fires and keeps the longer draft; and no
+child `Content` row is ever created. `tests/test_solo_short_prerequisite_
+fixes.py` covers `run_shorts_planner()`'s own guard directly (both the
+refusal on a short row and the unaffected real-parent case).
+
 ---
 
 ## 10. Agent 3 — Audio and Whisper
@@ -5368,6 +5566,103 @@ languages.
   succeeding, the reroll still failing and handing off to neighbor-fill, a
   bright image never triggering a reroll, the child Short path, and both
   `_mean_luminance()`/`_validate_image_luminance()` directly.
+- `generate_all_beat_images(beats, content_id, width=1920, height=1080)`
+  gained optional `width`/`height` parameters (output_mode `shorts_only`
+  roadmap, see `_run_solo_short_visuals` below) — threaded into all four
+  internal calls (`generate_beat_image_with_routing`, the hard-retry
+  `generate_beat_image`, `_dedupe_generated_image_once`,
+  `_ensure_beat_image_healthy`), all of which already accepted width/height
+  end-to-end. Defaults match the pre-existing landscape call exactly, so
+  every existing caller (the parent path) is unaffected.
+
+#### `_run_solo_short_visuals` — original storyboard generation for a Solo Short (output_mode `shorts_only` roadmap)
+
+File:
+
+```text
+app/agents/agent4_visuals/services/visual_orchestrator.py
+```
+
+A Solo Short (§4.4/§5.3/§9.6 — `is_short_episode=True`,
+`parent_content_id=NULL`) needs an **original** storyboard generated
+directly from its own script, exactly like a parent does — **not**
+`remap_beats_for_short()`'s remap-from-parent path (below), which has no
+parent beats to remap from and would hard-fail it. `run_visual_generation()`'s
+dispatch (§11.1) is a 3-way branch, not the 2-way branch it used to be:
+
+```python
+is_short_episode = bool(getattr(content, "is_short_episode", False))
+parent_content_id = getattr(content, "parent_content_id", None)
+
+if is_short_episode and parent_content_id:
+    return _run_child_short_visuals(...)          # remap path, unchanged
+if is_short_episode and not parent_content_id:
+    return _run_solo_short_visuals(...)            # NEW
+return _run_parent_visuals(...)                    # unchanged
+```
+Before this, `is_short_episode=True` alone routed unconditionally into
+`_run_child_short_visuals()`, which immediately returns `VISUALS_FAILED`
+the instant it finds no `parent_content_id` — a Solo Short reaching this
+dispatch was a reachable-but-guaranteed-failure case, not merely
+unreachable.
+
+`_run_solo_short_visuals(content, channel, scripts_by_lang, audio_by_lang,
+db, visual_style="", image_style="")` reuses `_run_visual_pass()` — the
+same generation sequence `_run_parent_visuals()` uses (`split_into_beats()`,
+storyboard validation, duplicate-prompt repair, save-before-Flux, Flux
+generation, save-after-Flux) — which gained `is_short_episode`/`width`/
+`height` parameters (defaults preserve the parent path exactly) so both
+callers share one implementation instead of forking it:
+
+- `script_format=SOLO_SHORT_SCRIPT_FORMAT` (§7.3), `is_short_episode=True`
+  — threaded into `split_into_beats()`'s wpm-calibration scoping (the same
+  Finding-A fix `_persist_source_script()`/`_set_multilingual_durations()`
+  got — see §9.6).
+- `width=1080, height=1920` — portrait, threaded into
+  `generate_all_beat_images()`.
+- `allow_legacy_fallback=False` — hardcoded; this dead toggle is never set
+  by the UI for any content shape (§11.4's `split_into_beats` entry).
+- Milestone logs are `SOLO_SHORT_VISUALS_START`/`SOLO_SHORT_VISUALS_DONE`
+  when `is_short_episode=True` (distinct from `PARENT_VISUALS_START`/
+  `_DONE` — `_run_visual_pass()` itself selects the log name).
+
+Idempotency: reuses already-persisted `__visual__` beats when every one
+already has a local image (a basic completeness check, mirroring the
+`existing_complete` check `_run_child_short_visuals()` already uses).
+**Deliberately does not yet carry `_run_parent_visuals()`'s full
+script-hash/audio-duration staleness-fingerprint guard** (the stale-visuals
+guard documented under `_run_parent_visuals` above) — a documented scope
+boundary, not an oversight: a Solo Short whose script is regenerated after
+this ran once would need its stale beats cleared manually until a future
+phase extends that same guard to this path too.
+
+Terminal status: `content.status = "CHILD_SHORT_VISUALS_DONE"` — the
+existing string, not a new one. Agent 5's render-format decision
+(`render_fmt = "short" if is_short_episode else "main"`) and
+`pickup_visual_ready`'s status filter are already `is_short_episode`-driven,
+not keyed to which Agent 4 code path produced the visuals — reusing this
+string means **zero changes were needed anywhere in
+`app/scheduler/tasks.py`**.
+
+Rules:
+
+- Do not route a Solo Short into `_run_child_short_visuals()` — that
+  function's parent-readiness gate (`if not parent_content_id: ...
+  VISUALS_FAILED`) and its `CHILD_SHORT_VISUALS_DEFERRED`-to-`AUDIO_DONE`
+  revert both assume a parent exists; neither applies to a Solo Short.
+- Do not give `_run_solo_short_visuals()` its own copy of the storyboard
+  generation sequence — extend `_run_visual_pass()` (shared with the parent
+  path) instead, the same way this phase did.
+
+Runtime proof: `tests/test_solo_short_pipeline.py` — proves the dispatch
+routes a parentless short to `_run_solo_short_visuals()` (not the old
+remap path), that it calls the real `_run_visual_pass()` with
+`is_short_episode=True, width=1080, height=1920,
+script_format=SOLO_SHORT_SCRIPT_FORMAT`, that the idempotency reuse path
+never regenerates when beats are already complete, and — independently —
+that `_run_visual_pass()` itself correctly threads width/height into
+`generate_all_beat_images()` for both the Solo Short case and the
+unmodified parent-default case.
 
 #### `remap_beats_for_short`
 
@@ -5755,8 +6050,12 @@ text (`overlay_text`/`overlay_position`, `TextOverlay`), and the
 subtitle-suppression machinery that coordinated them (Phase 14.10b's
 `suppressWindows`/`computeOverlaySuppressWindows`) are all removed. The
 Shorts "Part N of M" corner label is the single operator-approved exception
-(`settings.short_part_label_enabled`, default on). `Short.tsx` mounts it
-outside any time-limited sequence, so it remains visible for the full Short.
+(`settings.short_part_label_enabled`, default on) — suppressed when
+`short_total_parts <= 1` (Finding E, §11A.4's `build_short_props` entry): a
+single-part Short (every Solo Short, §4.4/§9.6, always has exactly one
+part) must never render a misleading "Part 1 of 1". `Short.tsx` mounts the
+label outside any time-limited sequence, so when it IS shown it remains
+visible for the full Short.
 
 Why: image models cannot render legible text (generated documents/posters/
 signs always carry gibberish), and the run-9500c231 audit (G-3) showed the
@@ -6245,6 +6544,37 @@ Rules:
 - Fail fast (`ValueError`) if the last section end or last filtered caption
   end drifts from `duration_ms` (= `end_ms − start_ms`) by more than 2% —
   see `_assert_timeline_alignment` below (roadmap 2b / audit P0-2).
+
+**Part-label suppression for single-part Shorts (Finding E, output_mode
+`shorts_only` roadmap):** `build_short_props()` itself just passes
+`short.get("part_label", "")` straight through to the props file — the
+actual decision of *what* label string to pass lives one layer up, in
+`video.py`'s `_process_language()`, at the `short_dict` construction:
+```python
+"part_label": (
+    _build_part_label(language, part_number, short_total_parts or 1)
+    if settings.short_part_label_enabled and (short_total_parts or 1) > 1
+    else ""
+),
+```
+Before this fix, the condition was only `settings.short_part_label_enabled`
+— a Solo Short (`short_total_parts=1`, always) would render a literal
+"Part 1 of 1" label under the default (enabled) setting, since nothing
+checked whether there was more than one part to number. The
+`short_total_parts` value itself comes straight from the `Content` row
+(`run_video_generation()`, not a caller override) — see §4.4/§5.3/§9.6 for
+why a Solo Short always has `short_total_parts=1`. No `Short.tsx` change
+was needed: it already renders the `PartLabel` overlay purely on a truthy
+string check, so passing `""` correctly suppresses it.
+
+Runtime proof: `tests/test_subtitles_only_rendering.py`
+(`TestPartLabelSuppressedForSingleParts` — real `_process_language()` call,
+proving suppression at `total_parts=1`, the label still showing at
+`total_parts=3`, and that the enabled-flag check is additive, not
+replaced) and `tests/test_solo_short_pipeline.py`
+(`TestSoloShortRenderEndToEnd` — the same proof end-to-end through the real
+`run_video_generation()` entrypoint, not just `_process_language()` in
+isolation).
 
 #### `_assert_timeline_alignment`
 
@@ -6815,24 +7145,26 @@ Rules:
 
 ---
 
-## 12. Parent vs Child Short Comparison
+## 12. Parent vs Child Short vs Solo Short Comparison
 
-| Dimension | Parent long content | Child short episode |
-|---|---|---|
-| `content.is_short_episode` | `False` | `True` |
-| Parent link | none | `parent_content_id` |
-| Script | long structured script | standalone flat short narration |
-| Audio | own full audio | own short audio |
-| Whisper | parent transcript | child transcript |
-| Breakpoints | empty | empty |
-| Bookends/rehooks/bridges | disabled | disabled |
-| Visual pass | full storyboard + Flux | remap parent visual beats, then cap non-terminal visual holds |
-| Images | parent Flux cache, landscape 1920×1080 | every beat regenerated portrait 1080×1920 in child cache, reusing the parent's prompt where match score qualifies |
-| Remotion composition | `MainVideo.tsx` | `Short.tsx` |
-| Resolution | 1920×1080 | 1080×1920 |
-| `VideoRender.format` | `"main"` | `"short"` |
-| Render content ID | parent ID | child ID |
-| Status flow | parent flow | child flow |
+| Dimension | Parent long content | Child short episode | Solo Short (`output_mode="shorts_only"`) |
+|---|---|---|---|
+| `content.is_short_episode` | `False` | `True` | `True` |
+| Parent link | none | `parent_content_id` | none (`parent_content_id=NULL`) — this is the field that distinguishes it from a child short episode, not `is_short_episode` alone |
+| `short_part_number`/`short_total_parts` | `NULL`/`NULL` | 1-based index / total parts | `1`/`1` — always exactly one part |
+| Script | long structured script | standalone flat short narration, derived from/grounded in the parent's finished script | standalone flat short narration, written directly from raw source material — no parent script exists to derive from |
+| Audio | own full audio | own short audio | own short audio |
+| Whisper | parent transcript | child transcript | own transcript |
+| Breakpoints | empty | empty | empty |
+| Bookends/rehooks/bridges | disabled | disabled | disabled |
+| Visual pass | full original storyboard + Flux | **remap** parent visual beats, then cap non-terminal visual holds | full **original** storyboard + Flux (§11.4's `_run_solo_short_visuals`) — same mechanism as the parent, not a remap; no parent beats exist to remap from |
+| Images | parent Flux cache, landscape 1920×1080 | every beat regenerated portrait 1080×1920 in child cache, reusing the parent's prompt where match score qualifies | every beat generated fresh, portrait 1080×1920, from its own original storyboard prompts (no parent prompt to inherit) |
+| Remotion composition | `MainVideo.tsx` | `Short.tsx` | `Short.tsx` |
+| Resolution | 1920×1080 | 1080×1920 | 1080×1920 |
+| `VideoRender.format` | `"main"` | `"short"` | `"short"` |
+| Render content ID | parent ID | child ID | its own ID |
+| Status flow | parent flow (§4.1) | child flow (§4.2, may defer `GENERATING_VISUALS`→`AUDIO_DONE` waiting on its parent) | parent-shaped flow (§4.4) — never defers waiting on a parent, since it has none |
+| Part label (`Short.tsx`) | n/a | shown (`settings.short_part_label_enabled`, real `total_parts>1`) | always suppressed (`total_parts=1`, Finding E, §11A.4) |
 
 ---
 
@@ -7117,6 +7449,23 @@ Use product/domain terms instead:
 | `phase4_only_shorts` | `standalone_shorts_only` |
 
 Historical migration filenames may keep old names if already applied. Do not edit applied migrations just for naming.
+
+**"Solo Short" vs. "standalone short architecture" — two distinct terms, do
+not conflate them.** This document already uses "standalone short
+architecture" (and derived names like `standalone_shorts_only`,
+`STANDALONE_SHORTS_ONLY`, `render_standalone_short`) to mean *"each
+child-of-a-parent Short is its own independently-rendered `Content` row"*
+— see §9.4/§28. **"Solo Short"** (§4.4/§5.3/§9.6/§11.4) is a different,
+newer concept: *"a short episode with no parent at all"*
+(`output_mode="shorts_only"`, `is_short_episode=True,
+parent_content_id=NULL`). A child-of-a-parent Short is always
+"standalone-rendered" in the first sense; a Solo Short never had a parent
+to be standalone *from* in that sense — it was never a cut of anything.
+Keep new function/log/doc names for the parentless-short concept using
+"Solo Short"/`solo_short_*` (e.g. `_run_solo_short_visuals()`,
+`generate_solo_short_script()`, `SOLO_SHORT_SCRIPT_START`) — never reuse
+"standalone" for it, and never assume an existing `standalone_*`/
+`STANDALONE_*` symbol refers to a Solo Short.
 
 ### 16.2 Function Naming
 

@@ -82,6 +82,9 @@ class _FakeDb:
     def add(self, row):
         self.tables.setdefault(type(row), []).append(row)
 
+    def flush(self):
+        pass
+
     def commit(self):
         self.commits += 1
 
@@ -387,7 +390,11 @@ class TestV3OutputModeExecutability(unittest.TestCase):
         )
         self.assertTrue(is_executable_output_mode("youtube_and_shorts"))
         self.assertTrue(is_executable_output_mode("youtube_long_only"))
-        self.assertFalse(is_executable_output_mode("shorts_only"))
+        # shorts_only became executable in the Solo Short build (roadmap:
+        # code_report/output_mode_shorts_only_and_youtube_long_only_
+        # roadmap.md, Phase D) — see test_solo_short_pipeline.py for the
+        # real end-to-end proof.
+        self.assertTrue(is_executable_output_mode("shorts_only"))
 
         result = validate_v3_channel_config({
             "content_mode": "single_story",

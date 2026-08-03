@@ -88,7 +88,7 @@ export const SCRIPT_SOURCES = [
 export const OUTPUT_MODES = [
   { value: 'youtube_and_shorts', label: 'YouTube long-form + Shorts',  executable: true },
   { value: 'youtube_long_only',  label: 'YouTube long-form only',      executable: true },
-  { value: 'shorts_only',        label: 'Shorts only (Coming soon)',   executable: false },
+  { value: 'shorts_only',        label: 'Shorts only',                 executable: true },
 ]
 
 // Structured preset options for visual/image style dropdowns (Item 17).
@@ -156,5 +156,5 @@ export const NARRATION_POV_OPTIONS = [
 export const OUTPUT_MODE_DESCRIPTIONS = {
   youtube_and_shorts: 'Generates a full-length YouTube video plus vertical Short episodes from the same story. Both are rendered and ready to publish.',
   youtube_long_only:  'Generates only the long-form YouTube video — the standalone Shorts planner is skipped entirely.',
-  shorts_only:        'Generates only vertical Short episodes, with no long-form video. (Coming soon)',
+  shorts_only:        'Generates one standalone vertical Short per discovery cycle, written directly from the discovered/generated story — no parent video and no long-form script are ever produced for this channel.',
 }

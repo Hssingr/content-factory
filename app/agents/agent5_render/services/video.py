@@ -441,10 +441,16 @@ def _process_language(
             "end_ms":       audio.duration_ms,
             "sections":     beats,
             # Subtitles-only rendering: the part label is Remotion-drawn text,
-            # so it ships only when the operator explicitly opts in.
+            # so it ships only when the operator explicitly opts in. Also
+            # suppressed when there is only one part (roadmap: output_mode
+            # shorts_only/Solo Short Finding E) — a real multi-part series
+            # earns a "Part N of M" label; a single-part short does not, and
+            # showing "Part 1 of 1" is a misleading artifact of this dict's
+            # own `or 1` default, not a real series indicator.
             "part_label":   (
                 _build_part_label(language, part_number, short_total_parts or 1)
-                if settings.short_part_label_enabled else ""
+                if settings.short_part_label_enabled and (short_total_parts or 1) > 1
+                else ""
             ),
             "total_parts":  short_total_parts or 1,
         }

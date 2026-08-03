@@ -471,6 +471,7 @@ def split_into_beats(
     continuity_line: str = "",
     content_id: str | None = None,
     db: Session | None = None,
+    is_short_episode: bool = False,
 ) -> list[dict] | None:
     """Generate a storyboard with Claude (batched per segment) and map it onto real audio timestamps.
 
@@ -503,6 +504,11 @@ def split_into_beats(
             of the static fallback. Never affects the real per-segment
             ``target_beat_count`` sent to Claude, which is always derived
             from the segment's share of the real measured ``duration_ms``.
+        is_short_episode: Scopes the diagnostic wpm calibration window
+            (``get_calibrated_wpm()``) to parent long-form rows (``False``,
+            the default) or short-episode rows (``True``) — the two run at
+            measurably different rates. Callers must pass the real content
+            shape rather than relying on this default.
 
     Returns:
         List of renderable beat-section dicts, or ``None`` if storyboard generation
@@ -526,11 +532,12 @@ def split_into_beats(
     # is always derived from measured duration_ms) — prefers the real
     # per-language calibrated rate when db is available and enough samples
     # exist, falling back to the static _WORDS_PER_MINUTE otherwise
-    # (roadmap 3.8 / audit G-7).
-    # split_into_beats() only ever runs on the parent path (child Shorts use
-    # remap_beats_for_short), so scope the calibration window to parent rows.
+    # (roadmap 3.8 / audit G-7). Scoped by the caller-supplied
+    # is_short_episode — this function is called from both the parent visual
+    # pass and, once wired, the Solo Short visual pass (output_mode
+    # shorts_only roadmap), so it must not assume which one is calling it.
     diagnostic_wpm = (
-        get_calibrated_wpm(db, language, is_short_episode=False)
+        get_calibrated_wpm(db, language, is_short_episode=is_short_episode)
         if db is not None else _WORDS_PER_MINUTE
     )
     estimated_beats = _estimate_beat_count(voice_script, script_format, wpm=diagnostic_wpm)

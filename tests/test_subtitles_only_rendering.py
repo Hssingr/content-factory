@@ -13,8 +13,10 @@ the paid fal.ai wrapper stubbed, the real `_build_beat_section` normalization
 import json
 import logging
 import unittest
+import uuid
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.config import settings
@@ -35,6 +37,7 @@ from app.agents.agent4_visuals.system_prompt import (
     _BEAT_SCHEMA,
     _STORYBOARD_SYSTEM_PROMPT,
 )
+from app.agents.agent5_render.services import video
 from app.agents.agent5_render.services.remotion_builder import (
     build_main_props,
     build_short_props,
@@ -127,6 +130,104 @@ class TestPropsEmitNoTextFields(unittest.TestCase):
         self.assertTrue(settings.short_part_label_enabled)
 
 
+class _FakeVideoRenderQuery:
+    """Minimal stand-in for `_is_rendered()`'s `db.query(VideoRender)...first()`
+    lookup — always empty, so the fresh-build path is always taken."""
+
+    def filter(self, *a, **k):
+        return self
+
+    def first(self):
+        return None
+
+
+class _FakeVideoDb:
+    def query(self, model):
+        return _FakeVideoRenderQuery()
+
+    def get(self, model, key):
+        return None
+
+    def commit(self):
+        pass
+
+
+class TestPartLabelSuppressedForSingleParts(unittest.TestCase):
+    """Runtime proof for Finding E (code_report/output_mode_shorts_only_and_
+    youtube_long_only_roadmap.md, Phase B): a Short with only one part
+    (``short_total_parts=1``, the shape a Solo Short always has) must never
+    render a "Part 1 of 1" label, even though
+    ``settings.short_part_label_enabled`` defaults to True. A real
+    multi-part child-of-a-parent Short must still show its label,
+    unaffected — the new condition is an AND on top of the existing
+    enabled check, not a replacement for it.
+
+    Exercises the REAL `video._process_language()` — not a reimplementation
+    of its ternary — with only the deep render call (`_run_short_render`, a
+    local Remotion subprocess — never invoked live, per CLAUDE.md §19.1) and
+    the technical-blocker/props-sanity/subtitle-building steps (independent
+    concerns with their own coverage elsewhere) stubbed. `build_short_props()`
+    itself is real and writes a real JSON file, which is read back for the
+    assertions — the same "real internal chain, only the paid/expensive
+    boundary stubbed" pattern as `TestPropsEmitNoTextFields` above.
+    """
+
+    def _run(self, short_total_parts: int, part_label_enabled: bool = True) -> dict:
+        content_id = uuid.uuid4()
+        cid_str = str(content_id)
+        script = SimpleNamespace(voice_script="Hello world, this is a short.")
+        audio = SimpleNamespace(
+            whisper_transcript=[], duration_ms=9000,
+            file_path="audio/x/en.mp3",
+        )
+        # audio_end_ms must match audio.duration_ms exactly — build_short_props()
+        # runs its own real _assert_timeline_alignment() check (unstubbed,
+        # unrelated to this fix) and raises ValueError on drift >2%.
+        beats = [_beat(0, media_url="cache/abc/one.jpg", audio_end_ms=9000)]
+
+        with TemporaryDirectory() as tmp:
+            with (
+                patch.object(settings, "media_path", tmp),
+                patch.object(settings, "short_part_label_enabled", part_label_enabled),
+                patch.object(video, "build_standard_subtitles", return_value=[]),
+                patch.object(video, "build_karaoke_subtitles", return_value=[]),
+                patch.object(video, "_collect_technical_blockers", return_value=[]),
+                patch.object(video, "_check_props_sanity", return_value=(True, "")),
+                patch.object(video, "_run_short_render", return_value={
+                    "file_path": f"{tmp}/video/{cid_str}/en_short_0.mp4",
+                    "duration_seconds": 9.0, "render_time_seconds": 1.0,
+                }),
+            ):
+                ok = video._process_language(
+                    content_id=content_id, language="en", script=script,
+                    audio=audio, beats=beats, channel=None,
+                    karaoke_color="#FFD700", db=_FakeVideoDb(),
+                    is_short_episode=True, short_order=0,
+                    short_total_parts=short_total_parts, proper_nouns=[],
+                )
+            self.assertTrue(ok)
+            props_path = Path(tmp) / "remotion_props" / f"{cid_str}_en_short_0.json"
+            return json.loads(props_path.read_text())
+
+    def test_single_part_suppresses_part_label(self):
+        props = self._run(short_total_parts=1)
+        self.assertEqual(props["part_label"], "")
+        self.assertEqual(props["total_parts"], 1)
+
+    def test_multi_part_still_shows_label(self):
+        props = self._run(short_total_parts=3)
+        self.assertNotEqual(props["part_label"], "")
+        self.assertIn("3", props["part_label"])  # e.g. "Part 1 of 3"
+        self.assertEqual(props["total_parts"], 3)
+
+    def test_single_part_suppressed_regardless_of_enabled_flag(self):
+        # part_label_enabled=False already produced "" before this fix —
+        # confirms the new total_parts>1 condition is additive (an AND),
+        # not a replacement of the pre-existing enabled check.
+        props = self._run(short_total_parts=1, part_label_enabled=False)
+        self.assertEqual(props["part_label"], "")
+
+
 class TestBeatBuildNormalization(unittest.TestCase):
     """_build_beat_section: every beat is flux_generated, no overlays derived."""
 
@@ -174,7 +275,7 @@ class TestNeighborReuseFallback(unittest.TestCase):
     def test_generate_all_fills_failed_beat_from_neighbor(self):
         beats = [_beat(0), _beat(1), _beat(2)]
 
-        def fake_routing(beat, content_id, tier_counts):
+        def fake_routing(beat, content_id, tier_counts, **kwargs):
             # Beat 1's generation hard-fails; the others succeed.
             return None if beat["beat_order"] == 1 else f"cache/cid/{beat['beat_order']}.jpg"
 

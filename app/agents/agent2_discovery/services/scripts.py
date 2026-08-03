@@ -2093,6 +2093,23 @@ def run_shorts_planner(
         return
 
     long_content, source_script = planner_source
+
+    # Finding B (output_mode shorts_only roadmap): a content row that is
+    # ITSELF already a short (a Solo Short, is_short_episode=True with no
+    # parent — see code_report/output_mode_shorts_only_and_youtube_long_only_
+    # roadmap.md) must never spawn its own child Shorts. run_script_workflow()
+    # already never reaches this call for such a row (its top-level branch
+    # dispatches Solo Shorts to their own script-generation path instead), so
+    # this guard is a second, independent line of defense — it protects any
+    # future caller of run_shorts_planner() (a direct script, an admin tool,
+    # a retry path), not just the one call path that exists today.
+    if long_content.is_short_episode:
+        logger.info(
+            "SHORTS_PLANNER_SKIPPED content=%s reason=content_is_already_a_short",
+            long_content_id,
+        )
+        return
+
     blueprint: dict = long_content.story_blueprint or {}
     voice_script = source_script.voice_script or ""
     channel_voice = _load_short_source_voice(long_content, channel, db)

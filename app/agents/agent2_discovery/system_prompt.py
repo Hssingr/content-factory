@@ -1857,6 +1857,184 @@ def generate_short_episode_script(
         max_tokens=1024,
     )
 
+
+# ── Solo Short — a standalone short episode with no parent ─────────────────────
+# output_mode="shorts_only" (code_report/output_mode_shorts_only_and_youtube_long_
+# only_roadmap.md). Distinct from generate_short_episode_script() above: that
+# function requires a part_plan (opening_hook/main_reveal/cliffhanger/
+# other_parts_main_reveals) that only exists because generate_shorts_plan()
+# split an already-written long-form script into parts first. A Solo Short has
+# no long-form script, no plan, and no siblings to avoid stepping on — it is
+# written directly from the discovered/generated source material as one
+# complete, self-contained short.
+
+_SOLO_SHORT_SYSTEM_PROMPT = """\
+You are writing a complete, standalone short-form video script — the ONLY \
+video that will ever be made from this story. There is no long-form version, \
+no other parts, and nothing else the viewer will see.
+
+This is NOT a summary or a trailer for a longer piece. It is the entire story, \
+purpose-built for TikTok/Reels/Shorts.
+
+Rules:
+- Target 210–260 words. Count every word in voice_script before returning.
+  NEVER return fewer than 190 words: the finished video must run at least 61 seconds
+  of narration, and below ~190 words that is physically impossible. If voice_script
+  exceeds 260 words, remove the least essential sentences — but when in doubt, keep
+  them: a slightly long video ships; a too-short one cannot.
+  (260 words ≈ 89 seconds at the measured ~175 wpm compressed narration rate —
+  calibrated from production audio after interior-silence compression, not the raw
+  "words per second" of the TTS voice.)
+- First sentence is the hook: ≤15 words, starts at the highest-tension moment you can
+  find in the source material. It must also pass the cold-open deletion test: read it
+  as the first thing a viewer ever hears, with no title, no context, nothing before it.
+  It must name the person, event, object, or situation needed to understand it; never
+  begin with backward-dependent wording such as "they weren't hypothetical", "that
+  changed everything", "but then", or an unexplained he/she/they/this/that. Do not
+  state the story's final answer or mechanism in this opening sentence — open on the
+  situation or the unresolved question instead, and let the reveal land later.
+- Re-hook every 7–10 seconds of narration: a new curiosity gap, question, or micro-reveal
+  that prevents the viewer from scrolling away. These are not summaries — they are new angles.
+- Spoken-video delivery — this is heard, not read silently as prose: default to present
+  tense for story events wherever the story allows it ("She opens the door" not "She
+  opened"); speak directly to the viewer at least once as "you" or with a rhetorical
+  question aimed at them; use contractions wherever natural speech would ("doesn't",
+  "can't", "it's") — formal, contraction-free prose reads as robotic when spoken by TTS;
+  read-aloud test — if a sentence wouldn't be said out loud telling this story to a
+  friend, rewrite it in spoken language.
+- Provide only the minimum context needed for a first-time viewer to immediately
+  understand the situation — you are not recapping anything, this is the whole story.
+- Select ONE clear central reveal or turning point from the source material and build
+  the whole script toward it — this is the payoff for watching.
+- When the story spans months or years, state the elapsed time and destination date
+  as a natural spoken bridge. Do not make an unexplained temporal cut.
+- Drop one-off atmospheric details unless their relevance is explained in the same
+  passage. Never introduce a letter, object, sound, or image and simply abandon it.
+- Do not state the same fact or implication twice in this script, even in different
+  words. Once something is established, move forward — do not circle back to it.
+- End on a complete, satisfying close for the story you chose to tell OR, if the
+  source material's own ending is genuinely unresolved, a cliffhanger that names the
+  concrete unresolved threat, person, event, place, or object. Never end only on an
+  unnamed "something" or a similarly abstract tease.
+- The final question/CTA must be specific to THIS story's exact person, object, place,
+  or consequence. Do not reuse generic channel endings such as "what would you do?",
+  "would you go back?", or "what do you think happened?" unless the sentence is
+  anchored in this story's own specifics.
+- Sentence rhythm: short sentences (3–7 words) for tension, longer (8–15 words) for buildup.
+  Never 3+ consecutive sentences of the same length.
+- No filler, no recap, no meta-references to "this video" or "this story".
+- No [SECTION N] markers — this is flat narration only.
+- Narration POV — driven by the "Narration POV" value in the user message, not
+  hardcoded: "third_person" (default) narrates about the story's people using
+  third-person pronouns and names; "first_person_storytime" narrates AS the
+  protagonist retelling their own experience directly to the viewer, using
+  "I"/"me"/"my" throughout (the r/nosleep-style storytime format). Never mix POV
+  within this script.
+- In "first_person_storytime" mode, satisfy the cold-open identity requirement in
+  first person (for example, "I am Hannibal Barca" or "I led Carthage's army").
+  Never insert a third-person naming sentence and then switch to I/me/my. Name the
+  narrator within the first five seconds.
+- In third person, never use an ambiguous "she" for an invented public persona when
+  the person's name or concrete role is available.
+- Any sunk-cost reasoning must be framed as my/the character's rationalization
+  under pressure, never as objective wisdom or advice endorsed by the narration.
+- ORIGINALITY — this is the most strictly enforced rule in this prompt: you are given
+  the raw source material for FACT GROUNDING ONLY. You must NEVER lift a run of 6 or
+  more consecutive words directly from it, even when the source phrasing is already
+  tight and factual. If a passage in the source is hard to paraphrase, that is a
+  signal to find a different angle into the same fact — not a reason to copy it.
+  Write this script as if you had never read the source word-for-word, only learned
+  the underlying facts from it.
+- Avoid generic clickbait filler and canned suspense phrases.
+  Do not use stock lines such as "you won't believe", "but here's the thing",
+  "little did they know", or similar formulaic hooks.
+
+Return ONLY valid JSON. No markdown. No code fence. No extra keys.
+{"title": "Video title (≤60 chars, TikTok-optimized)", "voice_script": "Full flat narration text"}\
+"""
+
+_SOLO_SHORT_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "title":        {"type": "string", "description": "Video title (≤60 chars, TikTok-optimized)."},
+        "voice_script": {"type": "string", "description": "Full flat narration text, target 210-260 words (never under 190)."},
+    },
+    "required": ["title", "voice_script"],
+    "additionalProperties": False,
+}
+
+
+def generate_solo_short_script(
+    story,
+    blueprint: dict,
+    channel,
+    channel_voice,
+    visual_style: str = "",
+    image_style: str = "",
+    narration_pov: str = "third_person",
+    word_floor_note: str = "",
+) -> dict:
+    """Generate a complete, standalone short episode script directly from
+    discovered/generated source material — no parent, no plan, no siblings.
+
+    Unlike ``generate_short_episode_script()``, this takes a ``Story`` (the
+    same shape ``generate_story_blueprint()``/``generate_script_sections()``
+    consume — ``story.body`` is ``content.source_excerpt``) instead of a
+    ``part_plan``: there is no multi-part plan to derive a hook/reveal/
+    cliffhanger from, so Claude selects them directly from the source.
+
+    Args:
+        story:            ``Story`` object — ``story.body`` is the fact source.
+        blueprint:         Blueprint dict from ``generate_story_blueprint()``.
+        channel:           Channel ORM object (provides niche and tone).
+        channel_voice:     ChannelVoice ORM object (provides tts_model for TTS_BLOCK).
+        word_floor_note:   Optional prepended constraint line — used ONLY by the
+                            single deterministic word-floor regeneration
+                            (operator-approved Elimination Mandate exception,
+                            2026-07-16): an objective word-count trigger, never
+                            an AI quality judgment.
+
+    Returns:
+        Dict with keys ``title`` (str) and ``voice_script`` (str).
+
+    Raises:
+        ValueError: If Claude returns malformed JSON or missing required keys.
+        anthropic.APIError: On non-retryable Claude API errors.
+    """
+    tts_model    = channel_voice.tts_model if channel_voice else "sonic-2"
+    tts_provider = channel_voice.provider  if channel_voice else "cartesia"
+    system_prompt = with_tts_block(_SOLO_SHORT_SYSTEM_PROMPT, tts_provider, tts_model)
+
+    import json
+    bp_json = json.dumps(blueprint, ensure_ascii=False)
+
+    floor_line = f"{word_floor_note}\n\n" if word_floor_note else ""
+    user_message = (
+        f"{floor_line}"
+        f"Channel niche: {channel.niche}\n"
+        f"Channel tone: {channel.tone}\n"
+        f"Visual style: {visual_style or 'story_driven'}\n"
+        f"Image style: {image_style or 'photorealistic'}\n"
+        f"Narration POV: {narration_pov or 'third_person'}\n\n"
+        f"Story title: {story.title}\n\n"
+        f"Blueprint (hook/turns/payoff already identified from this source — use "
+        f"these to ground your central reveal choice, do not contradict them):\n"
+        f"{bp_json}\n\n"
+        f"Source material (for FACT GROUNDING ONLY — see ORIGINALITY rule above. "
+        f"Do not reuse its exact phrasing):\n"
+        f"{story.body[:MAX_SOURCE_EXCERPT_CHARS]}"
+    )
+
+    return call_claude_structured(
+        task="solo_short_script",
+        system_prompt=system_prompt,
+        user_message=user_message,
+        schema_name="solo_short_script_output",
+        input_schema=_SOLO_SHORT_SCHEMA,
+        max_tokens=1024,
+    )
+
+
 # ── Short Quality Gate — REMOVED (Elimination Mandate, D1.3) ────────────────────
 # The AI Short Quality Gate (assess_short_script_quality(), _SHORT_QUALITY_SYSTEM_PROMPT,
 # _SHORT_QUALITY_SCHEMA, task="short_quality_check") was deleted per

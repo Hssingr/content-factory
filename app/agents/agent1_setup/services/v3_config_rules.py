@@ -9,17 +9,18 @@ classify the V3.2 groundwork fields (`content_mode`, `script_source`,
                  (app/schemas/channel.py's `ContentMode`/`ScriptSource`/
                  `OutputMode` Literal types)?
   "executable" — does ANY agent in this codebase today actually run
-                 differently, or run at all, for this value? As of this
-                 phase the answer is "no" for everything except the single
-                 combination that already matches current real behavior
-                 (`single_story` + `reddit` + `youtube_and_shorts`) — see
-                 CLAUDE.md §8.1 and §9-§11A for what Agent 2-5 actually do.
+                 differently, or run at all, for this value? `content_mode`
+                 is executable only for `single_story`; `script_source` is
+                 executable for `reddit`/`ai_generated`, both only in
+                 combination with `single_story`; `output_mode` is
+                 executable for all three of `youtube_and_shorts`,
+                 `youtube_long_only`, and `shorts_only` — see CLAUDE.md
+                 §8.1 and §9-§11A for what Agent 2-5 actually do with each.
 
-This module is NOT wired into any route, activation check, or agent yet
-(per Phase Agent1-V3.3's brief: "do not enforce it globally yet unless
-safe"). It exists so a future phase has a single, already-tested place to
-ask "is this config combination real yet?" before deciding whether to wire
-enforcement into the activation route, the frontend, or an agent itself.
+This module's own helpers perform no database access or enforcement
+themselves — `validate_v3_channel_config()` is used by
+`activation_readiness.check_activation_readiness()` (§8.3) to gate channel
+activation, but this module still has no callers anywhere in Agent 2/3/4/5.
 """
 
 from __future__ import annotations
@@ -46,7 +47,14 @@ _EXECUTABLE_SCRIPT_SOURCES = frozenset({"reddit", "ai_generated"})
 # youtube_long_only: same parent pipeline with the Shorts planner skipped —
 # run_script_workflow() branches on ChannelConfig.output_mode (post-roadmap
 # deep audit; the first real runtime consumer of output_mode).
-_EXECUTABLE_OUTPUT_MODES = frozenset({"youtube_and_shorts", "youtube_long_only"})
+# shorts_only: a Solo Short — a standalone short episode with no parent at
+# all, written directly from source material and rendered through the
+# existing Short path (code_report/output_mode_shorts_only_and_youtube_long_
+# only_roadmap.md). run_discovery()/_create_manual_fallback() create the
+# content row as is_short_episode=True; run_script_workflow() and
+# run_visual_generation() both branch on that flag before any output_mode
+# check is needed downstream.
+_EXECUTABLE_OUTPUT_MODES = frozenset({"youtube_and_shorts", "youtube_long_only", "shorts_only"})
 
 
 class V3ConfigIssue(TypedDict):
@@ -115,14 +123,13 @@ def is_supported_output_mode(output_mode: str) -> bool:
 
 def is_executable_output_mode(output_mode: str) -> bool:
     """True for 'youtube_and_shorts' (the default parent + standalone Shorts
-    architecture, CLAUDE.md §3/§28) and 'youtube_long_only' (same parent
+    architecture, CLAUDE.md §3/§28), 'youtube_long_only' (same parent
     pipeline; run_script_workflow() skips run_shorts_planner() when
     ChannelConfig.output_mode is 'youtube_long_only' — logged as
-    SHORTS_PLANNER_SKIPPED).
-
-    'shorts_only' is schema-supported but NOT executable: Agent 5 always
-    renders the parent's main video; there is no config-driven switch to
-    skip the long-form half.
+    SHORTS_PLANNER_SKIPPED), and 'shorts_only' (a Solo Short — one
+    standalone short episode with no parent per discovery cycle, written
+    directly from source material; see code_report/output_mode_shorts_only_
+    and_youtube_long_only_roadmap.md).
     """
     return output_mode in _EXECUTABLE_OUTPUT_MODES
 
@@ -163,12 +170,6 @@ def coming_soon_reason(field: str, value: str) -> str | None:
             return None
         return None
     if field == "output_mode":
-        if value == "shorts_only":
-            return (
-                "shorts_only is accepted by the V3 schema but the pipeline cannot yet run "
-                "standalone-Shorts-only generation without a rendered parent video — "
-                "run_shorts_planner() always requires a validated parent source script today."
-            )
         return None
     return None
 

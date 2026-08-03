@@ -312,10 +312,16 @@ Rules:
    where relevant, while staying feasible to produce with this pipeline and
    compatible with single_story mode. Deeper reasoning about WHY belongs to a
    later pass — here, make the concrete decision.
-4. Prefer executable values when practical: output_mode youtube_and_shorts
-   (or youtube_long_only when Shorts genuinely do not fit the concept).
-   Recommend shorts_only only when the concept is genuinely short-form-first;
-   it is not executable yet.
+4. output_mode is "youtube_and_shorts", "youtube_long_only", or "shorts_only" —
+   all three are fully executable; choose whichever genuinely fits this
+   specific concept, never a default. Use "youtube_and_shorts" (the common
+   case) when the concept supports both a full long-form video and
+   standalone short episodes from the same story. Use "youtube_long_only"
+   when the concept is long-form-only and Shorts genuinely do not fit it.
+   Use "shorts_only" when the concept is short-form-first — the channel
+   should produce one standalone short episode per discovery cycle with no
+   companion long-form video at all (e.g. quick facts, rapid-fire stories,
+   a niche where a full long-form treatment would pad thin material).
 5. script_source is "reddit" or "ai_generated" only — both are fully
    executable and equally legitimate; choose whichever genuinely fits this
    specific concept better, never a default. Use "reddit" when the niche has
@@ -556,7 +562,9 @@ def research_channel_ideas(
     pipeline_constraints = {
         "currently_executable_content_mode": "single_story",
         "currently_executable_script_sources": ["reddit", "ai_generated"],
-        "currently_executable_output_modes": ["youtube_and_shorts", "youtube_long_only"],
+        "currently_executable_output_modes": [
+            "youtube_and_shorts", "youtube_long_only", "shorts_only",
+        ],
         "no_platform_api_access": True,
         "no_verified_analytics": True,
         "operator_review_required": True,
