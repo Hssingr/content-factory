@@ -12,7 +12,14 @@ Covers, with only paid Claude boundaries stubbed:
 2. output_mode wiring: `run_script_workflow()` skips `run_shorts_planner()`
    entirely for `ChannelConfig.output_mode="youtube_long_only"` (logged
    SHORTS_PLANNER_SKIPPED) and still runs it for "youtube_and_shorts" —
-   the first real runtime consumer of `output_mode`.
+   the first real runtime consumer of `output_mode`. Extended end-to-end
+   (code_report/output_mode_shorts_only_and_youtube_long_only_roadmap.md
+   Phase A): the real `run_script_workflow()` -> `generate_multilingual_scripts()`
+   chain for a `youtube_long_only` channel, with only the paid
+   `generate_native_script()` boundary stubbed (not the whole multilingual
+   function), proves the translation call actually runs and that zero
+   child `Content` rows exist afterward — not just that a mocked
+   `run_shorts_planner()` was never invoked.
 3. V3 rules + activation: `youtube_long_only` is now executable and a
    channel configured with it (plus a verified YouTube platform) activates.
 4. Eliminated surfaces stay eliminated: Celery compat shims, the
@@ -30,7 +37,7 @@ from unittest.mock import patch
 
 from app.agents.agent2_discovery.services import script_workflow
 from app.agents.agent2_discovery.services import scripts as agent2_scripts
-from app.models import Channel, ChannelConfig, ChannelVoice, Content
+from app.models import Channel, ChannelConfig, ChannelLanguage, ChannelVoice, Content, Script
 
 
 # ── Shared fake DB (same shape as test_roadmap_closeout_fixes.py) ────────────
@@ -40,6 +47,9 @@ class _FakeQuery:
         self.rows = rows
 
     def filter(self, *a, **k):
+        return self
+
+    def join(self, *a, **k):
         return self
 
     def order_by(self, *a, **k):
@@ -250,6 +260,124 @@ class TestOutputModeLongOnlySkipsShortsPlanner(unittest.TestCase):
         content, planner_calls = self._run("youtube_and_shorts")
         self.assertEqual(len(planner_calls), 1)
         self.assertEqual(content.status, "SCRIPTS_VALIDATED")
+
+
+class TestOutputModeLongOnlyFullChainNoChildRows(unittest.TestCase):
+    """Extended end-to-end proof for Phase A of
+    code_report/output_mode_shorts_only_and_youtube_long_only_roadmap.md.
+
+    Unlike ``TestOutputModeLongOnlySkipsShortsPlanner`` above (which stubs
+    ``generate_multilingual_scripts()`` itself with a canned return value),
+    this lets the REAL ``generate_multilingual_scripts()`` run — only its
+    own paid boundary (``generate_native_script()``) is stubbed — so a
+    real translation call is proven to happen, real ``Script`` rows are
+    proven to be persisted, and the fake DB's ``Content`` table is queried
+    directly afterward to prove no child row was ever created — a stronger
+    proof than "the shorts planner mock was never called" alone.
+    """
+
+    def _fixtures(self):
+        channel_id = uuid.uuid4()
+        content_id = uuid.uuid4()
+        db = _FakeDb()
+        db.add(Channel(id=channel_id, niche="horror", tone="suspenseful"))
+        db.add(ChannelConfig(
+            channel_id=channel_id, script_format="youtube_long",
+            output_mode="youtube_long_only", audio_tags_enabled=False,
+            visual_style="story_driven", image_style="photorealistic",
+        ))
+        db.add(ChannelVoice(
+            id=uuid.uuid4(), channel_id=channel_id, language="en",
+            provider="cartesia", voice_id="v1", tts_model="sonic-3.5",
+        ))
+        # A second configured language so generate_multilingual_scripts()
+        # takes the real per-language generation branch instead of the
+        # "no target languages configured" shortcut.
+        db.add(ChannelLanguage(
+            id=uuid.uuid4(), channel_id=channel_id, language="fr", channel_name="Le Show",
+        ))
+        db.add(ChannelVoice(
+            id=uuid.uuid4(), channel_id=channel_id, language="fr",
+            provider="cartesia", voice_id="v2", tts_model="sonic-3.5",
+        ))
+        content = Content(
+            id=content_id, channel_id=channel_id, is_short_episode=False,
+            source_language="en", status="APPROVED", title="T",
+            source_url="https://example.com/x",
+            source_excerpt=" ".join(["word"] * 950),
+        )
+        db.add(content)
+        # generate_parent_source_script() is stubbed below (its own
+        # blueprint->sections->quality-gate chain is out of scope for this
+        # output_mode proof and is covered elsewhere) — so the validated
+        # source-language Script row it would normally persist via
+        # _persist_source_script() must be seeded directly here, since
+        # generate_multilingual_scripts() independently re-queries the DB
+        # for it rather than trusting the stub's return value.
+        db.add(Script(
+            id=uuid.uuid4(), content_id=content_id, language="en",
+            voice_script=_SOURCE_SCRIPT, version=1, validated=True,
+            estimated_duration_sec=30.0,
+        ))
+        return db, content
+
+    def test_real_multilingual_chain_runs_and_no_child_content_created(self):
+        db, content = self._fixtures()
+        channel_id = content.channel_id
+        native_calls: list = []
+
+        def fake_native(**kwargs):
+            native_calls.append(kwargs)
+            return {"voice_script": _SOURCE_SCRIPT.replace("Sam", "Samuel")}
+
+        with (
+            patch.object(script_workflow, "ensure_run_dirs", return_value={}),
+            patch.object(script_workflow, "generate_parent_source_script",
+                         return_value="[INTRO]\nHook line.\n[OUTRO]\nDone.\n"),
+            patch.object(agent2_scripts, "generate_native_script", side_effect=fake_native),
+            patch.object(script_workflow, "run_shorts_planner",
+                         side_effect=AssertionError(
+                             "run_shorts_planner must never be called for "
+                             "output_mode=youtube_long_only"
+                         )),
+            self.assertLogs(
+                "app.agents.agent2_discovery.services.script_workflow", level="INFO"
+            ) as log_ctx,
+        ):
+            script_workflow.run_script_workflow(content, db)
+
+        # 1. Reached SCRIPTS_VALIDATED and logged the youtube_long_only skip
+        #    (the shorts planner is never even called — poisoned above — so
+        #    reaching this line already proves that branch fired first).
+        self.assertEqual(content.status, "SCRIPTS_VALIDATED")
+        self.assertIn("SHORTS_PLANNER_SKIPPED", " ".join(log_ctx.output))
+
+        # 2. The real translation call happened exactly once — for "fr" only
+        #    ("en" reused the pre-seeded validated source script, no
+        #    generation needed for it).
+        self.assertEqual(len(native_calls), 1)
+        self.assertEqual(native_calls[0]["target_language"], "fr")
+
+        # 3. Real Script rows persisted for both languages, both validated.
+        scripts = db.tables.get(Script, [])
+        by_lang = {s.language: s for s in scripts if s.content_id == content.id}
+        self.assertEqual(set(by_lang), {"en", "fr"})
+        self.assertTrue(by_lang["en"].validated)
+        self.assertTrue(by_lang["fr"].validated)
+        self.assertIn("Samuel", by_lang["fr"].voice_script)
+
+        # 4. The direct DB-level proof: no child Content row was ever
+        #    created — only the original parent row exists in the fake DB's
+        #    Content table, for this channel or any other.
+        all_content = db.tables.get(Content, [])
+        self.assertEqual(len(all_content), 1)
+        self.assertIs(all_content[0], content)
+        self.assertIsNone(getattr(all_content[0], "parent_content_id", None))
+
+        # Sanity: fixture channel_id is still the one every row above
+        # belongs to (guards against a copy/paste fixture bug silently
+        # scoping assertions to the wrong channel).
+        self.assertEqual(content.channel_id, channel_id)
 
 
 class TestV3OutputModeExecutability(unittest.TestCase):

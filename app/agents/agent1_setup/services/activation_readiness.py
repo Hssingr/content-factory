@@ -76,8 +76,9 @@ def check_activation_readiness(channel: Channel) -> dict:
          not-yet-executable V3 value block activation.
       3. At least one ChannelLanguage row exists.
       4. Every configured language has at least one ChannelVoice row.
-      5. script_source="reddit" (the only executable script source today)
-         requires at least one ChannelSource row.
+      5. script_source="reddit" requires at least one ChannelSource row
+         ("ai_generated" is equally executable and has its own grounding
+         requirement instead — see item 10).
       6. At least one ChannelPublishTiming row exists.
       7. At least one ChannelPlatform row exists (something was selected
          and credentials were saved for it).
@@ -142,7 +143,8 @@ def check_activation_readiness(channel: Channel) -> dict:
                         f"save Section 3 (Voices) for this language.",
             ))
 
-    # 5 — sources required for script_source="reddit" (the only executable source today)
+    # 5 — sources required for script_source="reddit" only ("ai_generated" is
+    # equally executable and is checked separately in item 10 below)
     script_source = normalize_script_source(
         getattr(channel.config, "script_source", "reddit") if channel.config else "reddit"
     )
