@@ -17,7 +17,7 @@ const STEP_CONTEXT = {
   activation: 'Activation is gated entirely by the backend’s readiness check — every requirement below must be satisfied for every selected platform before the pipeline can go live.',
 }
 
-export default function StepIndicator({ steps, currentStep, completedSteps, onNavigate }) {
+export default function StepIndicator({ steps, currentStep, completedSteps, onNavigate, onExit }) {
   const context = STEP_CONTEXT[currentStep]
 
   return (
@@ -32,6 +32,16 @@ export default function StepIndicator({ steps, currentStep, completedSteps, onNa
               <span className="app-subtitle">Channel Setup</span>
             </div>
           </div>
+          {onExit && (
+            <button
+              type="button"
+              className="btn-secondary step-nav-exit"
+              onClick={onExit}
+              style={{ marginLeft: 16 }}
+            >
+              ← All channels
+            </button>
+          )}
         </div>
 
         <div className="step-nav-badges">

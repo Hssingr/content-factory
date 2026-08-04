@@ -315,6 +315,7 @@ export default function BasicInfoSection({
               onChange={e => setOutputMode(e.target.value)}
               style={{ maxWidth: 340 }}
             >
+              {!outputMode && <option value="">— Select —</option>}
               {OUTPUT_MODES.map(o => (
                 <option key={o.value} value={o.value} disabled={!o.executable}>{o.label}</option>
               ))}
@@ -334,6 +335,7 @@ export default function BasicInfoSection({
                 value={visualStyle}
                 onChange={e => setVisualStyle(e.target.value)}
               >
+                {!visualStyle && <option value="">— Select —</option>}
                 {VISUAL_STYLE_OPTIONS.map(o => (
                   <option key={o.value} value={o.value}>{o.label}</option>
                 ))}
@@ -351,6 +353,7 @@ export default function BasicInfoSection({
                 value={imageStyle}
                 onChange={e => setImageStyle(e.target.value)}
               >
+                {!imageStyle && <option value="">— Select —</option>}
                 {IMAGE_STYLE_OPTIONS.map(o => (
                   <option key={o.value} value={o.value}>{o.label}</option>
                 ))}
@@ -371,6 +374,7 @@ export default function BasicInfoSection({
               onChange={e => setNarrationPov(e.target.value)}
               style={{ maxWidth: 340 }}
             >
+              {!narrationPov && <option value="">— Select —</option>}
               {NARRATION_POV_OPTIONS.map(o => (
                 <option key={o.value} value={o.value}>{o.label}</option>
               ))}
@@ -391,6 +395,7 @@ export default function BasicInfoSection({
               onChange={e => setScriptSource(e.target.value)}
               style={{ maxWidth: 320 }}
             >
+              {!scriptSource && <option value="">— Select —</option>}
               {SCRIPT_SOURCES.map(s => (
                 <option key={s.value} value={s.value} disabled={!s.executable}>{s.label}</option>
               ))}

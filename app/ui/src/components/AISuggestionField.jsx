@@ -38,6 +38,10 @@ export default function AISuggestionField({
           onChange={e => onChange(e.target.value)}
           disabled={disabled}
         >
+          {/* Manual-fill mode must show a genuinely blank/unselected state,
+              not silently fall back to whichever option the browser renders
+              first — see App.jsx's blank initial state for tone/etc. */}
+          {!value && <option value="">— Select —</option>}
           {!hasValue && <option value={value}>{value} (custom)</option>}
           {options.map(o => (
             <option key={o.value} value={o.value}>{o.label}</option>

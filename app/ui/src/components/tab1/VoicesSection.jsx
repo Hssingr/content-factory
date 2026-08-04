@@ -3,20 +3,21 @@ import VoicePicker from './VoicePicker'
 
 const languageLabel = (code) => LANGUAGES.find(l => l.code === code)?.label ?? code.toUpperCase()
 
-// Roadmap Phase D1 — one voice per (language, gender). Feminine is the
-// recommended default (used whenever a story has no clear masculine
-// protagonist); masculine is optional, used automatically when the story
-// blueprint identifies a masculine protagonist.
+// Roadmap Phase D1 — one voice per (language, gender). Neither gender is
+// mandatory on its own; the backend only requires at least one of the two
+// per language (see `voicesIncomplete` in App.jsx), and the pipeline
+// selects whichever voice matches the story's protagonist at generation
+// time — configure one, the other, or both.
 const GENDERS = [
   {
     value: 'feminine',
     label: 'Feminine Voice',
-    description: 'Used by default, and for any story with no single clear masculine protagonist.',
+    description: 'Used for narration whenever a story’s protagonist is identified as feminine — or has no single clear protagonist.',
   },
   {
     value: 'masculine',
-    label: 'Masculine Voice (optional)',
-    description: "Used automatically when a story's protagonist is identified as masculine. Leave blank to always use the feminine voice.",
+    label: 'Masculine Voice',
+    description: "Used for narration whenever a story's protagonist is identified as masculine.",
   },
 ]
 

@@ -41,7 +41,10 @@ export default function App() {
   const [description, setDescription] = useState('')
   const [name, setName] = useState('')
   const [niche, setNiche] = useState('')
-  const [tone, setTone] = useState('documentary')
+  // No preset value — manual mode (Skip / close-without-applying) must start
+  // with every dropdown genuinely unselected, not silently defaulted. See
+  // BasicInfoSection.jsx's blank-option rendering for the matching UI side.
+  const [tone, setTone] = useState('')
 
   // ── Languages ────────────────────────────────────────────────
   const [languages, setLanguages] = useState([])
@@ -54,17 +57,24 @@ export default function App() {
   const [videosPerWeek, setVideosPerWeek] = useState(3)
   const [timings, setTimings] = useState([])
   const [suggestingTime, setSuggestingTime] = useState(false)
-  const [scriptSource, setScriptSource] = useState('reddit')
-  const [outputMode, setOutputMode] = useState('youtube_and_shorts')
-  const [visualStyle, setVisualStyle] = useState('story_driven')
-  const [imageStyle, setImageStyle] = useState('photorealistic')
-  const [narrationPov, setNarrationPov] = useState('third_person')
+  // These four, like tone above, deliberately start blank rather than
+  // preset — see the comment on `tone`.
+  const [scriptSource, setScriptSource] = useState('')
+  const [outputMode, setOutputMode] = useState('')
+  const [visualStyle, setVisualStyle] = useState('')
+  const [imageStyle, setImageStyle] = useState('')
+  const [narrationPov, setNarrationPov] = useState('')
 
   // ── Sources ──────────────────────────────────────────────────
   const [sources, setSources] = useState([])
 
   // ── Platforms ────────────────────────────────────────────────
   const [platforms, setPlatforms] = useState([])
+  // Snapshot of `platforms` taken when the Concept step is saved (bug fix:
+  // Platform Synchronization) — if the operator picked platform(s) during
+  // Concept (via an applied Research/Validate recommendation), Step 6 is
+  // restricted to that set instead of offering every platform freely.
+  const [conceptPlatforms, setConceptPlatforms] = useState([])
 
   // ── Basics step action gating ────────────────────────────────
   // basicsReady: true once the operator has seen a result (or is editing an existing channel)
@@ -148,7 +158,15 @@ export default function App() {
         next.add('basics')
         if (langs.length > 0) next.add('languages')
         if (ch.voices.length > 0) next.add('voices')
-        if (ch.config) next.add('schedule')
+        // Bug fix: `ch.config` exists as soon as the Concept step is first
+        // saved (handleBasics() creates it), long before the operator has
+        // actually visited the Schedule step — using its mere existence as
+        // the "schedule done" signal marked Schedule complete immediately
+        // after Concept. Reaching Platforms (or having saved real publish
+        // timings) is the earliest reliable signal that Schedule was
+        // actually completed, since it's the step that follows it.
+        const hasTimings = Array.isArray(ch.publish_timings) && ch.publish_timings.length > 0
+        if (uniquePlatforms.length > 0 || hasTimings) next.add('schedule')
         if (uniquePlatforms.length > 0) next.add('platforms')
         return [...next]
       })
@@ -249,6 +267,10 @@ export default function App() {
         trust_score: s.trust_score,
       }))
     if (sourceEntries.length > 0) await api.replaceSources(id, sourceEntries)
+    // Platform Synchronization: snapshot whatever platforms were selected
+    // at Concept-step save time — Step 6 restricts itself to this set
+    // instead of offering every platform freely (see PlatformsSection).
+    setConceptPlatforms(platforms)
     markDone('basics')
     setCurrentStep('languages')
   })
@@ -340,6 +362,23 @@ export default function App() {
     setCurrentStep('credentials')
   }
 
+  // Concept step: once the editable fields are showing (basicsReady), every
+  // field — including the dropdowns that now start genuinely blank — must
+  // be explicitly chosen before the operator can continue. Prevents an
+  // empty-string value ever reaching api.upsertConfig(), which the backend
+  // would reject (these are Literal-typed enum columns).
+  const basicsIncomplete = basicsReady && (
+    !name.trim() || !niche.trim() || !tone || !outputMode ||
+    !visualStyle || !imageStyle || !narrationPov || !scriptSource
+  )
+
+  // A language is name-ready once it has a non-empty Channel Name — the
+  // primary language's name comes from the Concept-step `name` field
+  // (mirrored, not independently editable, in LanguagesSection).
+  const hasNameForLang = (lang) =>
+    Boolean((lang === userLanguage ? name : langNames[lang])?.trim())
+  const languagesIncomplete = languages.some(l => !hasNameForLang(l))
+
   // A language is voice-ready once at least one of its two gender cards has
   // a saved (non-empty) Voice ID — either gender satisfies the backend's own
   // activation-readiness check, which is already gender-agnostic.
@@ -363,7 +402,9 @@ export default function App() {
     setSources([])
     setTimings([])
     setContentMode('single_story')
-    setName(''); setDescription(''); setNiche(''); setTone('documentary')
+    setName(''); setDescription(''); setNiche(''); setTone('')
+    setScriptSource(''); setOutputMode(''); setVisualStyle(''); setImageStyle(''); setNarrationPov('')
+    setConceptPlatforms([])
     setBasicsReady(false)
     setBasicsLoading(false)
     setCurrentStep('mode')
@@ -421,6 +462,7 @@ export default function App() {
         currentStep={currentStep}
         completedSteps={completedSteps}
         onNavigate={setCurrentStep}
+        onExit={backToList}
       />
 
       <div className={showSidebar ? 'wizard-body' : ''}>
@@ -448,6 +490,7 @@ export default function App() {
                 : (description.trim() ? 'Validate →' : 'Research Ideas →')}
               nextLoading={basicsReady ? saving : basicsLoading}
               nextLoadingLabel={basicsReady ? 'Saving…' : (description.trim() ? 'Validating…' : 'Researching…')}
+              nextDisabled={basicsIncomplete}
               error={error}
             >
               <BasicInfoSection
@@ -483,13 +526,18 @@ export default function App() {
               onBack={() => setCurrentStep('basics')}
               onNext={handleLanguages}
               nextLoading={saving}
-              nextDisabled={languages.length === 0}
+              nextDisabled={languages.length === 0 || languagesIncomplete}
               error={error}
             >
               <LanguagesSection
                 selected={languages} onToggle={toggleLang} langNames={langNames} setLangNames={setLangNames}
                 ctx={ctx()} primaryLanguage={userLanguage} primaryName={name}
               />
+              {languagesIncomplete && (
+                <p className="voice-description" style={{ marginTop: 8 }}>
+                  Enter a Channel Name for every selected language before continuing.
+                </p>
+              )}
             </StepShell>
           )}
 
@@ -531,6 +579,7 @@ export default function App() {
                 onSuggestTiming={suggestTiming} suggestingTiming={suggestingTime}
                 languagesSaved={completedSteps.includes('languages')}
                 channelId={channelId}
+                languages={languages}
               />
             </StepShell>
           )}
@@ -544,7 +593,7 @@ export default function App() {
               onNext={handlePlatforms}
               nextDisabled={platforms.length === 0}
             >
-              <PlatformsSection selected={platforms} onToggle={togglePlatform} />
+              <PlatformsSection selected={platforms} onToggle={togglePlatform} allowedPlatforms={conceptPlatforms} />
             </StepShell>
           )}
 

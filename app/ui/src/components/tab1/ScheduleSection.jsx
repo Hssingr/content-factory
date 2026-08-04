@@ -1,6 +1,16 @@
+import { useEffect } from 'react'
 import { LANGUAGES } from '../../constants'
 
 const ALL_DAYS = ['monday','tuesday','wednesday','thursday','friday','saturday','sunday']
+
+const defaultTiming = (lang) => ({
+  language: lang,
+  timezone: 'UTC',
+  optimal_days: [],
+  optimal_hour_start: 18,
+  optimal_hour_end: 20,
+  shorts_spread_hours: 6,
+})
 
 function DayPicker({ selected, onChange }) {
   const toggle = day => {
@@ -30,11 +40,30 @@ export default function ScheduleSection({
   onSuggestTiming, suggestingTiming,
   languagesSaved,
   channelId,
+  languages,
 }) {
   const langLabel = code => LANGUAGES.find(l => l.code === code)?.label ?? code
 
   const updateTiming = (lang, field, value) =>
     setTimings(prev => prev.map(t => t.language === lang ? { ...t, [field]: value } : t))
+
+  // Bug fix (Scheduler Visibility): the schedule grid used to stay hidden
+  // until "Suggest timing" was clicked, forcing that AI call before a manual
+  // schedule could even be entered. Seed one default (manually-editable) row
+  // per selected language as soon as this step is reached — Suggest timing
+  // remains available as an optional enhancement that overwrites these
+  // defaults, but Save & Continue never requires it. Only fills in rows for
+  // languages that don't already have one — never overwrites an existing or
+  // AI-suggested entry.
+  useEffect(() => {
+    if (!languages || languages.length === 0) return
+    setTimings(prev => {
+      const existing = new Set(prev.map(t => t.language))
+      const missing = languages.filter(l => !existing.has(l))
+      if (missing.length === 0) return prev
+      return [...prev, ...missing.map(defaultTiming)]
+    })
+  }, [languages, setTimings])
 
   return (
     <>
@@ -65,11 +94,11 @@ export default function ScheduleSection({
           >
             {suggestingTiming ? '…' : '✨ Suggest timing'}
           </button>
-          {!languagesSaved && (
-            <p className="placeholder" style={{ fontSize: '0.78rem', marginTop: 4 }}>
-              Save languages first to get timing suggestions.
-            </p>
-          )}
+          <p className="placeholder" style={{ fontSize: '0.78rem', marginTop: 4 }}>
+            {languagesSaved
+              ? 'Optional — edit the schedule below manually, or ask Claude to suggest optimal times.'
+              : 'Save languages first to get timing suggestions. You can still set the schedule manually below.'}
+          </p>
         </div>
       )}
 
