@@ -43,6 +43,12 @@ class Content(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False,
     )
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Set once Agent 6 finishes generating metadata (Content.status moves to
+    # METADATA_PENDING_APPROVAL) — check_metadata_auto_approve() (roadmap
+    # Phase E, code_report/agent6_metadata_roadmap.md) compares this against
+    # settings.metadata_auto_approve_seconds. NULL until that stage, and for
+    # every row that predates this column (migration 017).
+    metadata_generated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # Short episode fields — null on long-form content rows
     is_short_episode: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     parent_content_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("content.id", ondelete="SET NULL"), nullable=True)

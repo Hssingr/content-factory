@@ -62,4 +62,14 @@ celery_app.conf.beat_schedule = {
         "task": "app.scheduler.tasks.pickup_visual_ready",
         "schedule": crontab(minute="*/15"),            # every 15 minutes
     },
+    # Agent 6: generate titles/descriptions/thumbnails for RENDERED content
+    "pickup-rendered-content": {
+        "task": "app.scheduler.tasks.pickup_rendered_content",
+        "schedule": crontab(minute="*/15"),            # every 15 minutes
+    },
+    # Auto-approve metadata whose review window has elapsed
+    "check-metadata-auto-approve": {
+        "task": "app.scheduler.tasks.check_metadata_auto_approve",
+        "schedule": crontab(minute="*/15"),            # every 15 minutes
+    },
 }

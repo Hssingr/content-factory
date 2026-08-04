@@ -70,6 +70,18 @@ MODEL_ROUTING: dict[str, str] = {
     "story_synthesis":         PRIMARY_MODEL,  # AI-generated story discovery (script_source="ai_generated"):
                                                 # premise pitch + post-approval expansion — original creative
                                                 # fiction grounded only in channel niche/tone/description
+    "thumbnail_prompt_generation": PRIMARY_MODEL,  # Agent 6 (roadmap: code_report/agent6_metadata_roadmap.md):
+                                                # writes the Flux image prompt for a content's YouTube
+                                                # thumbnail, grounded in story_blueprint + channel visual/image
+                                                # style. Primary tier — a weak prompt directly costs
+                                                # click-through, the same "quality matters" bar as
+                                                # storyboard/story_blueprint.
+    "platform_metadata_generation": PRIMARY_MODEL,  # Agent 6: writes titles/descriptions/hashtags (and,
+                                                # for platform="youtube", thumbnail_text — Check 1 v2
+                                                # decision) for one platform from the content's own script +
+                                                # blueprint. Primary tier — directly affects audience
+                                                # acquisition/SEO, the same bar channel_suggestion already
+                                                # uses ("poor suggestions harm onboarding quality").
     # ── Fast / cheap (secondary) ─────────────────────────────────────────────
     "content_reformat":        SECONDARY_MODEL,   # reformatting prose discovery output to JSON
     "shorts_planner":          SECONDARY_MODEL,   # Standalone short planning: structural planning for Short episodes

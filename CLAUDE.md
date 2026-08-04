@@ -158,7 +158,21 @@ PENDING_APPROVAL
 → PARENT_VISUALS_DONE
 → RENDERING
 → RENDERED
+→ GENERATING_METADATA
+→ METADATA_PENDING_APPROVAL
+→ METADATA_APPROVED
 ```
+
+The four statuses past `RENDERED` (Agent 6 — §11B) are identical, string-for-
+string, across all three content shapes (parent, child-of-parent Short, Solo
+Short) — unlike the visuals stage, there is no shape-specific defer behavior
+here, since neither thumbnail-only-on-youtube-row gating (§5.2) nor
+title/description generation depend on which Agent 4 code path produced the
+render. `RENDERED` remains the sole readiness signal Agent 6 polls on
+(`Content.status == "RENDERED"`, never `VideoRender` row existence) — a
+`NEEDS_REVIEW` content item, which can carry real `VideoRender` rows from
+whichever language did pass render verification, is deliberately excluded
+from Agent 6 pickup and does not auto-progress past it.
 
 Optional/problem statuses:
 
@@ -179,7 +193,14 @@ GENERATING_SCRIPTS
 → CHILD_SHORT_VISUALS_DONE
 → RENDERING
 → RENDERED
+→ GENERATING_METADATA
+→ METADATA_PENDING_APPROVAL
+→ METADATA_APPROVED
 ```
+
+Past `RENDERED`, a child-of-a-parent Short follows the exact same Agent 6
+sequence as a parent (§4.1) — only the thumbnail sub-step is skipped for it
+(text metadata is generated regardless of render format, §5.2/§11B).
 
 A child may revert from `GENERATING_VISUALS` back to `AUDIO_DONE` if its
 parent has not yet reached `PARENT_VISUALS_DONE` — this is a normal wait, not
@@ -220,11 +241,28 @@ Child short audio rule:
 | `SCRIPTS_VALIDATED` → `GENERATING_AUDIO` → `AUDIO_DONE` | Agent 3 |
 | `AUDIO_DONE` → `GENERATING_VISUALS` → `PARENT_VISUALS_DONE` / `CHILD_SHORT_VISUALS_DONE` (or back to `AUDIO_DONE` on child defer) | Agent 4 |
 | `PARENT_VISUALS_DONE` / `CHILD_SHORT_VISUALS_DONE` → `RENDERING` → `RENDERED` | Agent 5 |
+| `RENDERED` → `GENERATING_METADATA` → `METADATA_PENDING_APPROVAL` / `METADATA_APPROVED` | Agent 6 |
 | any stage → `FAILED` | the agent active at that stage |
 
 No agent writes a status outside its own row in this table. Agent 4 never
 writes `RENDERING`/`RENDERED`; Agent 5 never writes
-`GENERATING_VISUALS`/`PARENT_VISUALS_DONE`/`CHILD_SHORT_VISUALS_DONE`.
+`GENERATING_VISUALS`/`PARENT_VISUALS_DONE`/`CHILD_SHORT_VISUALS_DONE`; Agent 6
+never writes `RENDERING`/`RENDERED` and never reads/writes
+`PublishSchedule.content_id` (Agent 7's future job, not built yet).
+
+`METADATA_PENDING_APPROVAL` → `METADATA_APPROVED` has two independent
+triggers, mirroring the Telegram `PENDING_APPROVAL` → `APPROVED` precedent
+(§9.3's `send_for_validation`): a human `POST /api/agent6/content/{id}/approve`
+call (bypasses the timer early, §11B), or `check_metadata_auto_approve()`'s
+periodic sweep once `Content.metadata_generated_at` is older than
+`settings.metadata_auto_approve_seconds` (default 3600). `FAILED` for Agent 6
+means **zero `VideoMetadata` rows produced for the content item** — mirroring
+`run_video_generation()`'s `successful > 0` convention exactly; a content item
+with some, but not all, `(language, platform)` pairs succeeding is *not* a
+total failure and still reaches `METADATA_PENDING_APPROVAL` (every per-pair
+failure — a transport error, an unknown platform, a missing thumbnail — is
+independently non-fatal, logged, and simply leaves that pair's row absent or
+partial).
 
 Stuck-state recovery (fresh full-system audit §1.2): `Content.updated_at`
 (migration `010_add_content_updated_at.py`, touched by every ORM UPDATE) is
@@ -232,8 +270,13 @@ the staleness signal for in-progress statuses. Each Beat pickup also
 re-dispatches rows stuck in its stage's in-progress status past a
 per-stage threshold (`_STALE_RECOVERY_MINUTES` in `app/scheduler/tasks.py`:
 GENERATING_SCRIPTS/GENERATING_AUDIO 60 min, GENERATING_VISUALS 120 min,
-RENDERING 180 min — deliberately above worst-case legitimate runtimes so a
-live worker is never raced; logged `STUCK_STATE_RECOVERY`). Stale RENDERING
+RENDERING 180 min, GENERATING_METADATA 90 min — deliberately above
+worst-case legitimate runtimes so a live worker is never raced; logged
+`STUCK_STATE_RECOVERY`). `GENERATING_METADATA`'s 90 min is derived, not
+guessed: up to ~24 sequential `platform_metadata_generation` Claude calls
+(6 languages x 4 platforms) plus one thumbnail Flux generation puts
+worst-case legitimate runtime around ~40 min, so 90 min leaves genuine
+margin (§11B). Stale RENDERING
 rows dispatch directly, bypassing the has-render skip (a partial render must
 not strand the row). To make both this sweep and Celery's own task retries
 actually re-enter the service, the Agent 2/3 task guards accept their own
@@ -270,7 +313,17 @@ PENDING_APPROVAL
 → CHILD_SHORT_VISUALS_DONE
 → RENDERING
 → RENDERED
+→ GENERATING_METADATA
+→ METADATA_PENDING_APPROVAL
+→ METADATA_APPROVED
 ```
+
+Past `RENDERED`, a Solo Short follows the exact same Agent 6 sequence as a
+parent. Agent 6's thumbnail gate is `is_short_episode == False`
+(§11B) — a Solo Short is `is_short_episode=True`, so like a child-of-a-parent
+Short it gets text metadata (title/description/hashtags) for every
+configured, verified platform but no thumbnail, driven purely by
+`is_short_episode`, never by `parent_content_id`.
 
 The one deliberate difference from §4.1's parent flow: the visuals-done
 status is `CHILD_SHORT_VISUALS_DONE`, not `PARENT_VISUALS_DONE` — reused
@@ -309,10 +362,22 @@ content_validations
 audio_files
 video_sections
 video_renders
+video_metadata
 publish_schedule
 video_analytics
 analytics_anomalies
 ```
+
+`video_metadata` (Agent 6, §11B) is keyed at `(content_id, language, platform)`
+grain — one row per configured, verified platform per language, for every
+content shape (parent, child-of-parent Short, Solo Short alike; §11B's Check 4
+matrix). `thumbnail_file_path` is set only on the `platform="youtube"` row for
+a parent long-form content item — never on a child-of-parent Short or Solo
+Short row (both are `is_short_episode=True`, and thumbnail generation is
+parent-long-form-only), and never on a non-youtube platform row.
+`thumbnail_text` is a **distinct field from `title`** — the short overlay
+phrase Pillow burns onto the thumbnail image, never the same value as
+`title` and never rendered from `title` — do not assume they are related.
 
 ### 5.3 Key Model Invariants
 
@@ -425,6 +490,7 @@ content-factory/
 │   │   ├── model_routing.py
 │   │   ├── script_checks.py
 │   │   ├── telegram_client.py
+│   │   ├── flux_client.py
 │   │   └── ...
 │   ├── scheduler/
 │   │   └── tasks.py
@@ -433,7 +499,8 @@ content-factory/
 │       ├── agent2_discovery/
 │       ├── agent3_audio/
 │       ├── agent4_visuals/
-│       └── agent5_render/
+│       ├── agent5_render/
+│       └── agent6_metadata/
 ├── remotion/
 │   └── src/
 │       ├── compositions/
@@ -942,6 +1009,62 @@ Rules:
 - Do not fork a second copy of the extraction regex/stopword list — extend
   this file if a new field or rule is ever needed, and update both callers'
   documentation (§11.4, §11A.4) if the change affects their behavior.
+
+### 7.8 Shared Flux Client (Agent 6 roadmap Phase A)
+
+File:
+
+```text
+app/services/flux_client.py
+```
+
+`_call_fal()`, `generate_beat_image()`, and the constants they depend on
+(`_ENV_SAFE_PROMPTS`, default width/height, generation/download timeouts)
+were extracted here from `app.agents.agent4_visuals.services.flux_generator`
+— the exact same shared-utility precedent as `app.services.video_sections`
+(§7.5) and `app.services.script_source` (§7.6): a pure, generic,
+beat-agnostic function gets moved to `app/services/` the moment a second
+agent genuinely needs it, never forked. `flux_generator.py` imports and
+re-exports both functions so every pre-existing Agent 4 call site is
+unaffected — callers reaching them as `flux_generator.generate_beat_image(...)`
+keep working unchanged, matching the same re-export convention
+`v3_config_rules.py` already uses for `normalize_script_source` (§8.2).
+
+This exists specifically so Agent 6's thumbnail generation
+(`app.agents.agent6_metadata.services.thumbnail`) can call the one true
+fal.ai integration point without importing Agent 4's private package across
+the §6A ownership boundary — Agent 6 imports `app.services.flux_client`
+directly, never `app.agents.agent4_visuals`. §11.5's "one fal.ai
+integration point" rule still holds exactly: there is still only one
+`_call_fal()` in the whole codebase, just relocated.
+
+`generate_beat_image_with_routing()`, `image_router.py`'s capability table,
+and every beat-specific/pixel-defect-healing function
+(`_ensure_beat_image_healthy()`, `_detect_image_defect()`,
+`_average_pixel_hash()`, `fill_failed_beats_from_neighbors()`) stayed in
+Agent 4 — they are genuinely storyboard-sequence-specific (duplicate-
+across-beats detection, neighbor-fill fallback, composition-slot rotation)
+and do not apply to a single standalone thumbnail with no sequence to be
+consistent within. Agent 6 calls `flux_client.generate_beat_image()`
+directly with an explicit, fixed `model_key` (its own `_resolve_model_key()`
+resolving `"dev"`/`"schnell"` from the same
+`IMAGE_ROUTING_ENABLED`/`IMAGE_ROUTING_ALLOW_DEV` kill switches §11.5's beat
+router already respects) rather than the beat-oriented routing heuristic,
+which reads beat fields (`beat_intensity`, `visual_category`, `script_text`)
+a standalone thumbnail has no equivalent for.
+
+Rules:
+
+- Pure/generic like the rest of §7 — no agent-specific orchestration lives
+  here.
+- Do not add a second fal.ai integration point anywhere — every endpoint
+  selection and payload construction for Flux stays behind this module's
+  `_call_fal()` and `image_router.py`'s capability table.
+- Do not fork a second copy of `generate_beat_image()`/`_call_fal()` for a
+  future agent's needs — extend this module, or add agent-specific routing
+  logic in that agent's own service (as Agent 6's `_resolve_model_key()`
+  and Agent 4's `image_router.py` both already do), never duplicate the
+  fal.ai call itself.
 
 ---
 
@@ -7145,6 +7268,337 @@ Rules:
 
 ---
 
+## 11B. Agent 6 — Thumbnails, Titles & Descriptions
+
+Design record: `code_report/agent6_metadata_roadmap.md` (full Checks 1-6
+investigation, detailed design, and per-phase implementation record).
+
+### 11B.1 Agent 6 Responsibilities
+
+Agent 6 owns:
+
+- Per-platform title/description/hashtag generation, one Claude call per
+  `(language, verified platform)` pair.
+- YouTube thumbnail generation: one shared, language-agnostic Flux base
+  image per content item, plus a per-language Pillow text overlay burned
+  from that language's own `thumbnail_text`.
+- Deterministic, Python-enforced platform limits (title/description/hashtag
+  length caps, thumbnail-overlay word/char caps) — Claude proposes, Python
+  decides, exactly like every other generation stage in this pipeline.
+- The `RENDERED` → `GENERATING_METADATA` → `METADATA_PENDING_APPROVAL` →
+  `METADATA_APPROVED` status sequence, scheduler pickup, and the
+  time-based auto-approve sweep.
+- A minimal backend manual-review API surface (approve early, edit a
+  `VideoMetadata` row) — no operator-facing UI ships with this agent.
+
+Agent 6 must not:
+
+- Publish anything to any platform (YouTube, TikTok, Instagram, Facebook) —
+  it only writes `VideoMetadata` rows; actual publishing is Agent 7's job,
+  not yet built.
+- Own credential verification of any kind.
+- Read or write `PublishSchedule.content_id` — that remains Agent 7's job.
+- Import `app.agents.agent4_visuals` or `app.agents.agent5_render` — Flux
+  access goes through the shared `app.services.flux_client` (§7.8), never
+  Agent 4's private package.
+- Write `RENDERING`/`RENDERED` (Agent 5's statuses) or any visual-stage
+  status.
+- Generate parent short cuts, breakpoints, rehooks, or bridges — none of
+  that concept exists at this stage of the pipeline.
+- Reuse Agent 4's beat-oriented pixel-defect/health-check machinery
+  (`_ensure_beat_image_healthy()` and friends) — a standalone thumbnail is
+  a different problem shape from a 100+-beat storyboard sequence; Agent 6
+  owns its own small, self-contained validation instead (§11B.4).
+
+### 11B.2 Agent 6 Flow
+
+```mermaid
+flowchart TD
+    A[Content RENDERED] --> B[pickup_rendered_content]
+    B --> C[run_agent6_metadata_for_content]
+    C --> C2[Content GENERATING_METADATA]
+    C2 --> D["(a) platform_metadata_generation per language x platform"]
+    C2 --> E["(b) thumbnail base image — parent long-form + verified youtube only"]
+    D --> F["(c) per-language Pillow overlay from thumbnail_text"]
+    E --> F
+    F --> G[persist VideoMetadata rows]
+    G --> H[Content METADATA_PENDING_APPROVAL]
+    H -->|operator POST .../approve| I[Content METADATA_APPROVED]
+    H -->|check_metadata_auto_approve sweep, timer elapsed| I
+```
+
+**Runtime sequencing is not the same as build order and is easy to get
+backwards:** the thumbnail base image (language-agnostic) has no dependency
+on metadata generation and may run before/after/concurrently with it, but
+the per-language Pillow overlay has a hard dependency on that language's
+`thumbnail_text` — an *output* of metadata generation, not of the
+thumbnail-prompt call. `run_metadata_generation_for_content()` therefore
+always sequences (a) metadata generation for every pair first, (b) the base
+image, (c) only once both exist, the per-language overlay. A language whose
+metadata call failed skips its own overlay — logged, non-fatal to every
+other language, the same per-item independent-degrade convention every
+other agent's per-language loop already uses.
+
+### 11B.3 Important Agent 6 Functions
+
+#### `generate_platform_metadata`
+
+File:
+
+```text
+app/agents/agent6_metadata/system_prompt.py
+```
+
+One `call_claude_structured(task="platform_metadata_generation", ...)` call
+per `(platform, language)` pair — no content-quality retry loop (Elimination
+Mandate convention, §9.3/§23); a transport failure returns `None`, never
+raises, and the caller skips that pair non-fatally. `_PLATFORM_STYLE_GUIDANCE`
+gives each of the four platforms a genuinely distinct instruction line — not
+one generic call reused four times. The schema always includes
+`thumbnail_text`, but it is only ever *requested* (and only ever read/used)
+for `platform="youtube"` — the overlay phrase is never generated as a
+separate call, and is never the same value as `title`.
+
+#### `generate_thumbnail_prompt`
+
+File:
+
+```text
+app/agents/agent6_metadata/system_prompt.py
+```
+
+One `call_claude_structured(task="thumbnail_prompt_generation", ...)` call,
+grounded in `story_blueprint.hook`/`.character_descriptors`/`.era_setting` +
+`ChannelConfig.visual_style`/`.image_style`. Appends the same no-text clause
+Agent 4's text-prop sanitization already uses (§11.6) and rejects/retries
+once on a quoted phrase or "sign that says"/"text reads" pattern before
+falling back to a deterministic safe-template prompt — never raises.
+
+#### `generate_thumbnail_base_image`
+
+File:
+
+```text
+app/agents/agent6_metadata/services/thumbnail.py
+```
+
+Stages 1-3 of the thumbnail pipeline: Flux generation at 1280x720 via the
+shared `app.services.flux_client.generate_beat_image()` (§7.8), with
+`model_key` resolved by `_resolve_model_key()` — `"dev"` when
+`settings.image_routing_enabled and settings.image_routing_allow_dev`, else
+`"schnell"` (reuses Agent 4's existing kill switches; no third,
+thumbnail-specific env var). Deterministic validation (file exists, PIL
+decodable, dimensions exactly 1280x720 — hard equality, no tolerance band)
+with exactly one retry on a fresh cache key; a second failure is non-fatal —
+logged, `thumbnail_file_path` stays `NULL`, metadata generation proceeds
+(YouTube falls back to its own platform-default thumbnail selection). Gated
+to parent long-form content (`is_short_episode == False`) with at least one
+verified `platform="youtube"` `ChannelPlatform` row — every child-of-parent
+Short, every Solo Short, and every channel with no YouTube target skips this
+entirely, with zero Flux calls. On success, the validated image is copied to
+the canonical, predictable path
+`{media_path}/thumbnails/{content_id}/base.jpg` — never the raw Flux
+prompt-hash cache filename — which every later idempotency check
+(`_ensure_base_image()`, a PATCH re-composite) keys on directly.
+
+#### `composite_thumbnail_overlay`
+
+File:
+
+```text
+app/agents/agent6_metadata/services/thumbnail.py
+```
+
+Stages 4-5: burns one language's `thumbnail_text` (already
+platform-limit-enforced — never the title) onto a copy of the shared base
+image, Pillow-only, zero paid calls, zero network. Before rendering, checks
+that the bundled font (`assets/fonts/ArchivoBlack-Regular.ttf`, OFL-licensed)
+covers every glyph in the text via a Private-Use-Area bbox-comparison
+heuristic (`_font_covers_text()` — see CLAUDE.md §34's own risk entry for
+this technique's documented limitation); an uncovered glyph skips the
+overlay for that language non-fatally, logged
+`THUMBNAIL_FONT_GLYPH_MISSING`. Final output is re-validated (dimensions
+still exactly 1280x720, re-openable, saved under YouTube's real 2MB upload
+ceiling via a quality-backoff loop) before being returned. Never regenerates
+the base image — this function is also the PATCH-endpoint re-composite's
+single call site (§11B.4), so a `thumbnail_text` edit is always Pillow-only.
+
+#### `run_metadata_generation_for_content`
+
+File:
+
+```text
+app/agents/agent6_metadata/services/metadata_orchestrator.py
+```
+
+The real per-content entrypoint. Deliberately owns **no `Content.status`
+transition of its own** — that is `run_agent6_metadata_for_content()`'s job
+(the Celery task wrapper, below) — so this function stays directly callable
+from tests with no status side effect. Resolves languages from the
+intersection of real `VideoRender` rows (format matching the content's
+shape) and validated `Script` rows (§11B's Check 2 Finding 2.4 — a language
+can have a validated script yet still have failed to render, and Agent 6
+must only describe languages that actually produced a video); resolves
+platforms from every verified `ChannelPlatform` row for the channel, with no
+shape filtering (text metadata is generated for every configured platform
+regardless of render format — only the thumbnail sub-step is
+`is_short_episode`-gated); resolves `story_blueprint` with the same
+child-of-parent-Short-inherits-from-parent fallback
+`agent5_render.services.video._resolve_proper_nouns_for_content()` already
+established (§11A.4) — a Solo Short never attempts this lookup at all,
+since it has no parent.
+
+Sequences (a) metadata generation for every `(language, platform)` pair,
+(b) `_ensure_base_image()` — idempotent, keyed on the canonical
+`thumbnails/{content_id}/base.jpg` path from `generate_thumbnail_base_image()`
+above, never re-derived from a Flux cache hash; a content item whose base
+image already exists on disk from a prior run costs zero additional Flux
+calls, (c) per-language overlay + `VideoMetadata` upsert, only once both (a)
+and (b) exist. YouTube descriptions get real, Python-computed timestamps
+(`build_youtube_timestamps()`, from `VideoSection.audio_start_ms` — never
+Claude-generated) appended before platform-limit enforcement runs, so the
+length check sees the true final text.
+
+**A failure in `platform_limits.enforce_platform_limits()` (e.g. an unknown
+platform from a stale/legacy `ChannelPlatform` row) degrades only that one
+`(language, platform)` pair** — caught, logged
+(`METADATA_PLATFORM_LIMITS_UNKNOWN_PLATFORM`), and skipped via `continue`,
+never aborting the whole content item or discarding every other pair's
+already-generated metadata. This is the general per-pair degrade contract
+every failure mode in this orchestrator follows: a transport failure, a
+missing thumbnail, an uncovered font glyph, or an unknown platform each
+independently costs only their own pair, never the whole run.
+
+Returns `True` if at least one `VideoMetadata` row was produced, `False`
+otherwise — the exact contract `run_agent6_metadata_for_content()` uses to
+define total failure (below).
+
+#### `pickup_rendered_content` / `run_agent6_metadata_for_content` / `check_metadata_auto_approve`
+
+File:
+
+```text
+app/scheduler/tasks.py
+```
+
+`pickup_rendered_content()` dispatches every content item with
+`Content.status == "RENDERED"` — the sole readiness signal (nothing else in
+the repo ever reads or filters on `RENDERED`, so this pickup is purely
+additive). Deliberately excludes `NEEDS_REVIEW` content: that status is a
+distinct, explicit operator-attention flag a content row can end up in
+instead of `RENDERED` even with real `VideoRender` rows present, and
+metadata generation must never silently proceed on a render Agent 5 flagged
+as broken.
+
+`run_agent6_metadata_for_content()` wraps the orchestrator and owns the
+surrounding status machine: `GENERATING_METADATA` before calling, then on
+success `METADATA_PENDING_APPROVAL` + `Content.metadata_generated_at =
+now()`, or on **total failure — defined explicitly as zero `VideoMetadata`
+rows produced for the content item**, `FAILED` (mirroring
+`run_video_generation()`'s `successful > 0` convention exactly, §11A.4). A
+content item with some, but not all, pairs succeeding is *not* a total
+failure and still reaches `METADATA_PENDING_APPROVAL`.
+
+`check_metadata_auto_approve()` mirrors `check_validation_timeouts()`'s
+shape exactly (timestamp column + periodic sweep comparing against `now()`,
+§9.3's Telegram-approval precedent): every 15 minutes, promotes
+`METADATA_PENDING_APPROVAL` content whose `metadata_generated_at` is older
+than `settings.metadata_auto_approve_seconds` (default 3600) to
+`METADATA_APPROVED`. Scoped to `Content` directly, not a new side-table —
+unlike the Telegram sweep's `_apply_limit_policy()`, this transition carries
+no per-channel policy branching, so it is pure status-machine mechanics
+owned directly in `tasks.py` rather than delegated to an agent service.
+
+#### Manual approve/edit API surface
+
+File:
+
+```text
+app/agents/agent6_metadata/routers/metadata.py
+```
+
+Backend only — no operator-facing review screen ships with this agent.
+
+- `POST /api/agent6/content/{content_id}/approve` — sets
+  `Content.status = "METADATA_APPROVED"` early, bypassing the auto-approve
+  timer, exactly the way a human Telegram `APPROVE` reply already bypasses
+  `check_validation_timeouts()`'s sweep. Requires
+  `Content.status == "METADATA_PENDING_APPROVAL"`; any other status is a
+  `400`.
+- `PATCH /api/agent6/video-metadata/{id}` — **not a bare field write.**
+  Every edited field is re-run through the same `platform_limits`
+  enforcement generation already uses before persisting — an operator
+  cannot paste a value past the deterministic cap Python otherwise
+  guarantees everywhere else. A `thumbnail_text` edit on a
+  `platform="youtube"` row additionally triggers a Pillow-only re-composite
+  via `composite_thumbnail_overlay()` from the base image already on disk —
+  zero paid calls, zero Flux interaction — since without it, an edited
+  `thumbnail_text` would sit correctly in the DB row while the
+  already-composited image on disk kept showing the old text. Setting
+  `thumbnail_text` on any non-youtube row is rejected (`400`) — the schema
+  invariant (`thumbnail_text` NULL on every non-youtube row) is enforced at
+  the edit boundary too, not just at generation time.
+
+### 11B.4 Platform Limits — Python Constants, Enforced Deterministically
+
+File:
+
+```text
+app/agents/agent6_metadata/services/platform_limits.py
+```
+
+```python
+PLATFORM_LIMITS = {
+    "youtube":   {"title_max": 100,  "description_max": 5000,  "hashtag_max": None},
+    "tiktok":    {"title_max": 150,  "description_max": 2200,  "hashtag_max": 5},
+    "instagram": {"title_max": 125,  "description_max": 2200,  "hashtag_max": 30},
+    "facebook":  {"title_max": 255,  "description_max": 63206, "hashtag_max": None},
+}
+THUMBNAIL_TEXT_MAX_CHARS = 30
+THUMBNAIL_TEXT_MAX_WORDS = 5
+```
+
+`enforce_platform_limits(platform, title, description, hashtags)` truncates
+at a word boundary (never mid-word), caps hashtags to `hashtag_max` keeping
+Claude's own ordering, logs every truncation
+(`METADATA_LIMIT_ENFORCED platform=... field=... original_len=...
+final_len=...`), and **raises `ValueError` for an unrecognized platform
+key** (fail-loud, mirroring `resolve_model()`'s unknown-task-key
+convention) — callers must catch this per-pair, never let it abort a whole
+content item (§11B.3's orchestrator entry above shows the required catch
+site). `enforce_thumbnail_text_limit(text)` applies the same word-boundary
+shape against `THUMBNAIL_TEXT_MAX_CHARS`/`_MAX_WORDS`, called both at
+generation time and by the PATCH endpoint — one implementation, never
+forked.
+
+### 11B.5 Database Migration
+
+`alembic/versions/017_add_agent6_metadata_fields.py` — additive only:
+
+```python
+op.add_column("content", sa.Column("metadata_generated_at", sa.DateTime(timezone=True), nullable=True))
+op.add_column("video_metadata", sa.Column("generated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False))
+op.add_column("video_metadata", sa.Column("thumbnail_text", sa.String(64), nullable=True))
+```
+
+No new tables.
+
+Rules:
+
+- Do not reintroduce a text-card-style overlay concept here — Agent 6's
+  thumbnail overlay is a static marketing image burned once per language,
+  not a Remotion-rendered video layer (Golden Rule 11/§11.6 governs the
+  video's own text layer, unrelated to this).
+- Do not let `thumbnail_text` and `title` drift toward being treated as the
+  same value anywhere in future code — they are deliberately independent
+  fields with independent limits.
+- Do not add a real per-channel font/styling `ChannelConfig` column under
+  this section without a dedicated design phase — the current bundled font
+  (Archivo Black) and fixed overlay styling are documented defaults, not
+  yet configurable (roadmap's still-open Open Decision item).
+
+---
+
 ## 12. Parent vs Child Short vs Solo Short Comparison
 
 | Dimension | Parent long content | Child short episode | Solo Short (`output_mode="shorts_only"`) |
@@ -7165,6 +7619,7 @@ Rules:
 | Render content ID | parent ID | child ID | its own ID |
 | Status flow | parent flow (§4.1) | child flow (§4.2, may defer `GENERATING_VISUALS`→`AUDIO_DONE` waiting on its parent) | parent-shaped flow (§4.4) — never defers waiting on a parent, since it has none |
 | Part label (`Short.tsx`) | n/a | shown (`settings.short_part_label_enabled`, real `total_parts>1`) | always suppressed (`total_parts=1`, Finding E, §11A.4) |
+| Agent 6 thumbnail (§11B) | generated (`is_short_episode == False`, verified YouTube platform required) | never generated (`is_short_episode == True`) — text metadata only | never generated (`is_short_episode == True`) — text metadata only, same as a child short episode |
 
 ---
 
@@ -7372,6 +7827,9 @@ Important tasks:
 | `run_agent4_visual_generation_for_content` | generate storyboard/Flux visuals or child remap; persist `VideoSection` rows |
 | `pickup_visual_ready` | enqueue Agent 5 render once status is `PARENT_VISUALS_DONE`/`CHILD_SHORT_VISUALS_DONE` |
 | `run_agent5_render_for_content` | render video; requires visual-done status and existing `AudioFile`/`VideoSection` rows |
+| `pickup_rendered_content` | enqueue Agent 6 metadata generation once status is `RENDERED` (never `NEEDS_REVIEW`) |
+| `run_agent6_metadata_for_content` | generate titles/descriptions/hashtags/thumbnail; persist `VideoMetadata` rows |
+| `check_metadata_auto_approve` | promote `METADATA_PENDING_APPROVAL` content past `settings.metadata_auto_approve_seconds` to `METADATA_APPROVED` |
 
 Rules:
 
@@ -8078,6 +8536,14 @@ High-quality/complex tasks:
   expansion, §9.5) — original creative fiction or an explicitly requested,
   accuracy-bound historical narrative becomes the sole source material for
   the rest of the pipeline, same quality bar as a real discovered story
+- `thumbnail_prompt_generation` (Agent 6, §11B) — a weak Flux prompt
+  directly costs click-through, the same "quality matters" bar as
+  storyboard/story_blueprint
+- `platform_metadata_generation` (Agent 6, §11B) — titles/descriptions
+  directly affect audience acquisition/SEO, the same bar `channel_suggestion`
+  already uses ("poor suggestions harm onboarding quality"); title/thumbnail
+  quality has no downstream corrective pass the way `shorts_planner`'s
+  output does, unlike the fast/cheap tier below
 
 Fast/cheap tasks:
 
@@ -8441,6 +8907,7 @@ TELEGRAM_BOT_TOKEN
 TELEGRAM_CHAT_ID
 FERNET_KEY
 REMOTION_PATH
+METADATA_AUTO_APPROVE_SECONDS
 ```
 
 Rules:
@@ -8505,6 +8972,8 @@ These are current engineering risks to monitor, not future feature promises.
 | Legacy fields | Breakpoint/bookend fields still exist and could be misused |
 | Concurrency | VideoSection delete/insert patterns need care under parallel runs |
 | Deferral loops | Child video can defer forever if parent visual pass fails |
+| Metadata auto-approve sweep | A channel with a persistently-`NEEDS_REVIEW` render (or any render that never reaches `RENDERED`) never reaches Agent 6 and therefore never auto-approves metadata — intentional by design (`pickup_rendered_content()` filters on `Content.status == "RENDERED"` only, never on `VideoRender` row existence, per roadmap Check 2 Finding 2.3), not a bug, but worth naming so a future audit doesn't mistake it for one |
+| Thumbnail font-glyph-coverage heuristic | `thumbnail.py`'s `_font_covers_text()` is a bbox-equality probe against a Private-Use-Area codepoint (U+E000), not a real cmap membership check (no `fontTools` dependency exists in this codebase). It assumes the probe codepoint is itself undefined in the bundled font — true for the current Archivo Black text face, but not guaranteed for an icon/symbol font (e.g. Font Awesome) that deliberately assigns real glyphs into the Private Use Area. Any future per-channel font-choice phase (§8.1's still-open pattern, roadmap Open decisions) must re-verify this probe against whichever font it adds, not assume it transfers unchanged |
 
 ---
 

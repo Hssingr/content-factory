@@ -38,6 +38,20 @@ _STALE_RECOVERY_MINUTES: dict[str, int] = {
     "GENERATING_AUDIO":   60,
     "GENERATING_VISUALS": 120,
     "RENDERING":          180,
+    # Real worst case is languages x verified platforms `platform_metadata_
+    # generation` Claude calls (up to ~6 languages x 4 platforms = 24, not
+    # the two calls an earlier draft of this comment assumed), plus one
+    # thumbnail Flux generation. Per-call ceiling with retries: a structured
+    # call (claude_client._MAX_RETRIES=3, _BACKOFF_BASE=2) worst-realistic
+    # is roughly 3 attempts + ~7s of backoff sleep — call it ~1.5 min/call
+    # generously, so 24 calls ~= 36 min. The thumbnail's 3-tier fal.ai
+    # cascade (flux_client.GENERATION_TIMEOUT_SEC=60s, up to 2 attempts per
+    # thumbnail.py's own one-retry convention) adds up to ~4 min. Worst
+    # realistic legitimate total ~40 min; 90 min leaves genuine margin
+    # above that, matching every other entry's "must exceed the stage's
+    # worst-case legitimate runtime" rule rather than reusing GENERATING_
+    # VISUALS'/RENDERING's numbers by analogy.
+    "GENERATING_METADATA": 90,
 }
 
 
@@ -867,3 +881,163 @@ def run_agent5_render_for_content(self, content_id: str) -> None:
             logger.error("Max retries reached for Agent 5 render of %s", content_id)
     finally:
         db.close()
+
+
+# ── Agent 6 — Metadata (thumbnails, titles, descriptions) ───────────────────
+
+@celery_app.task(name="app.scheduler.tasks.pickup_rendered_content")
+def pickup_rendered_content() -> int:
+    """Trigger Agent 6 metadata generation for every content with status RENDERED.
+
+    Runs every 15 minutes. ``Content.status == "RENDERED"`` is the sole
+    readiness signal (roadmap Check 2, Finding 2.2 — nothing else in the
+    repo ever queries or filters on RENDERED, so this is purely additive).
+    Deliberately does **not** pick up ``NEEDS_REVIEW`` content (Finding
+    2.3) — that status is a distinct, explicit operator-attention flag a
+    content row can end up in instead of RENDERED, and metadata generation
+    must not silently proceed on a render Agent 5 flagged as broken.
+
+    Returns:
+        Number of metadata generation tasks dispatched.
+    """
+    from app.database import _get_session_factory
+    from app.models import Content
+
+    db = _get_session_factory()()
+    dispatched = 0
+    try:
+        ready = db.query(Content).filter(Content.status == "RENDERED").all()
+        for content in ready + _stale_in_progress(db, "GENERATING_METADATA"):
+            run_agent6_metadata_for_content.delay(str(content.id))
+            dispatched += 1
+    finally:
+        db.close()
+
+    if dispatched:
+        logger.info("pickup_rendered_content: %d task(s) dispatched", dispatched)
+    return dispatched
+
+
+@celery_app.task(
+    name="app.scheduler.tasks.run_agent6_metadata_for_content",
+    bind=True,
+    max_retries=2,
+    default_retry_delay=120,
+)
+def run_agent6_metadata_for_content(self, content_id: str) -> None:
+    """Run the Agent 6 metadata generation pipeline for one content item.
+
+    Wraps ``run_metadata_generation_for_content()`` (which owns no status of
+    its own — see its docstring — by design, so it stays directly callable
+    from tests without a status side effect). This task owns the surrounding
+    status machine:
+
+      1. ``content.status = "GENERATING_METADATA"`` before calling the
+         orchestrator.
+      2. On success (**total failure is defined explicitly as zero
+         VideoMetadata rows produced for the content item** — the exact
+         ``successful > 0`` convention ``run_video_generation()`` already
+         uses, CLAUDE.md §4.3/§9.6; a content item with, say, 3 of 4
+         platforms succeeding for one language is NOT a total failure, per
+         every per-pair degrade contract this agent's design already
+         establishes): ``content.status = "METADATA_PENDING_APPROVAL"`` and
+         ``content.metadata_generated_at = now()`` — the timestamp
+         ``check_metadata_auto_approve()`` compares against.
+      3. On total failure: ``content.status = "FAILED"``, logged.
+
+    Args:
+        content_id: UUID string of content with status ``RENDERED``.
+    """
+    from app.database import _get_session_factory
+    from app.models import Content
+    from app.agents.agent6_metadata.services.metadata_orchestrator import (
+        run_metadata_generation_for_content,
+    )
+
+    cid = uuid.UUID(content_id)
+    db = _get_session_factory()()
+    try:
+        content: Content | None = db.get(Content, cid)
+        if not content:
+            logger.warning("Content %s not found — skipping", content_id)
+            return
+        if content.status not in ("RENDERED", "GENERATING_METADATA"):
+            logger.debug(
+                "Content %s status=%s — skipping metadata generation",
+                content_id, content.status,
+            )
+            return
+
+        content.status = "GENERATING_METADATA"
+        db.commit()
+
+        success = run_metadata_generation_for_content(cid, db)
+
+        if success:
+            content.status = "METADATA_PENDING_APPROVAL"
+            content.metadata_generated_at = datetime.now(timezone.utc)
+        else:
+            content.status = "FAILED"
+            logger.error(
+                "METADATA_GENERATION_TOTAL_FAILURE content=%s — zero VideoMetadata "
+                "rows produced across every (language, platform) pair, marking FAILED",
+                content_id,
+            )
+        db.commit()
+
+    except Exception as exc:
+        logger.error(
+            "run_agent6_metadata_for_content error for %s: %s", content_id, exc,
+        )
+        db.rollback()
+        try:
+            raise self.retry(exc=exc)
+        except self.MaxRetriesExceededError:
+            logger.error("Max retries reached for Agent 6 metadata generation of %s", content_id)
+    finally:
+        db.close()
+
+
+@celery_app.task(name="app.scheduler.tasks.check_metadata_auto_approve")
+def check_metadata_auto_approve() -> int:
+    """Auto-approve every METADATA_PENDING_APPROVAL content item whose review
+    window has elapsed.
+
+    Runs every 15 minutes — mirrors ``check_validation_timeouts()``'s shape
+    exactly (timestamp column + periodic sweep comparing against ``now()``,
+    CLAUDE.md §9's Check 6 precedent), scoped to ``Content`` directly rather
+    than a new side-table since this transition carries no per-channel
+    policy branching (unlike the Telegram validation sweep's
+    ``_apply_limit_policy()``) — pure status-machine mechanics, owned here
+    rather than delegated to an agent service.
+
+    Returns:
+        Number of content items auto-approved.
+    """
+    from app.database import _get_session_factory
+    from app.models import Content
+
+    now = datetime.now(timezone.utc)
+    db = _get_session_factory()()
+    count = 0
+    try:
+        cutoff = now - timedelta(seconds=settings.metadata_auto_approve_seconds)
+        expired = (
+            db.query(Content)
+            .filter(
+                Content.status == "METADATA_PENDING_APPROVAL",
+                Content.metadata_generated_at < cutoff,
+            )
+            .all()
+        )
+        for content in expired:
+            content.status = "METADATA_APPROVED"
+            count += 1
+        if count:
+            db.commit()
+    finally:
+        db.close()
+
+    if count:
+        logger.info("check_metadata_auto_approve: %d content item(s) auto-approved", count)
+    return count

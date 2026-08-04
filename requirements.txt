@@ -5,6 +5,11 @@ uvicorn[standard]==0.32.1
 # Database
 sqlalchemy==2.0.36
 alembic==1.14.0
+# alembic's own transitive dependency (its migration-file template engine) —
+# not previously pinned here, which left `alembic` uninstallable/unusable in
+# any environment that didn't happen to already have it (surfaced by Agent 6
+# roadmap Phase B/C's migration verification, code_report/agent6_metadata_roadmap.md).
+mako==1.3.12
 psycopg2-binary==2.9.10
 
 # Queue / Workers

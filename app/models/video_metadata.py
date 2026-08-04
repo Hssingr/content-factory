@@ -21,6 +21,16 @@ class VideoMetadata(Base):
     hashtags: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     thumbnail_file_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     thumbnail_uploaded: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Short overlay phrase Pillow burns onto the platform="youtube" row's
+    # thumbnail image — distinct from `title`, never rendered onto the image
+    # itself (Agent 6 roadmap Check 1 v2 decision,
+    # code_report/agent6_metadata_roadmap.md). NULL on every non-youtube
+    # platform row and on any youtube row whose thumbnail generation was
+    # skipped/failed.
+    thumbnail_text: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    # Optional telemetry parity with AudioFile.generated_at (migration 013) —
+    # not load-bearing for any decision.
+    generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     content: Mapped["Content"] = relationship("Content", back_populates="metadata_entries")

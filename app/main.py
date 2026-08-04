@@ -32,6 +32,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.agents.agent1_setup.routers import users_router, channels_router, suggest_router, voices_router
 from app.agents.agent2_discovery.routers import discovery_router, telegram_router
+from app.agents.agent6_metadata.routers import metadata_router
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +98,9 @@ app.include_router(voices_router)
 # Agent 2 — Content Discovery
 app.include_router(discovery_router)
 app.include_router(telegram_router)
+
+# Agent 6 — Metadata (thumbnails, titles & descriptions)
+app.include_router(metadata_router)
 
 
 @app.get("/api/health")

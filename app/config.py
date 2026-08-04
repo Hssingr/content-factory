@@ -135,5 +135,13 @@ class Settings(BaseSettings):
     # operator explicitly raises this.
     image_routing_max_pro_per_content: int = 0
 
+    # Agent 6 roadmap (code_report/agent6_metadata_roadmap.md), Check 6 /
+    # Phase E: metadata sits in METADATA_PENDING_APPROVAL, reviewable/editable
+    # by the operator, until check_metadata_auto_approve()'s periodic sweep
+    # promotes it to METADATA_APPROVED once this many seconds have passed
+    # since Content.metadata_generated_at. Default 3600 (1 hour) — operator-
+    # confirmed, mirrors the TODO brief's original suggestion.
+    metadata_auto_approve_seconds: int = 3600
+
 
 settings = Settings()
