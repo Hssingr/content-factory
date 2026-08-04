@@ -1,7 +1,13 @@
 """Agent 4 provider wrapper for fal.ai Flux image generation.
 
-This is the only allowed direct `fal_client` integration point; other modules must
-call this wrapper instead of instantiating fal.ai clients directly.
+The raw fal.ai HTTP call site (`_call_fal()`) and the generic 3-tier cascade
+wrapper (`generate_beat_image()`) moved to the shared `app.services.flux_client`
+module (Agent 6 roadmap, Phase A, `code_report/agent6_metadata_roadmap.md`) so
+a second agent can reuse them without importing this package — re-imported
+below (aliased to their original names) so every function in this file that
+still calls them needs zero changes. `app.services.flux_client` remains the
+only allowed direct `fal_client` integration point in the whole codebase;
+nothing in this file talks to `fal_client` directly anymore.
 
 Flux Schnell image generator — one image per storyboard beat via fal.ai.
 
@@ -28,30 +34,28 @@ fallback (explicit operator preference: regenerate with a changed prompt
 rather than duplicate a neighbor's image).
 """
 
-import hashlib
 import logging
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-import fal_client
-import httpx
 from PIL import Image, ImageStat, UnidentifiedImageError
 
 from app.config import settings
 from app.agents.agent4_visuals.services import image_router
 from app.agents.agent4_visuals.subagents.storyboard_validator import composition_slot_variation
+from app.services.flux_client import (
+    DEFAULT_MODEL_KEY as _DEFAULT_MODEL_KEY,
+    DEFAULT_WIDTH as _DEFAULT_WIDTH,
+    DEFAULT_HEIGHT as _DEFAULT_HEIGHT,
+    ENV_SAFE_PROMPTS as _ENV_SAFE_PROMPTS,
+    generate_beat_image,
+)
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_MODEL_KEY: image_router.ModelKey = "schnell"
-_DEFAULT_WIDTH = 1920
-_DEFAULT_HEIGHT = 1080
-_RETRY_DELAY_SEC = 2.0
 _INTER_BEAT_SLEEP_SEC = 0.5  # conservative until rate limits confirmed
-_GENERATION_TIMEOUT_SEC = 60.0
-_DOWNLOAD_TIMEOUT_SEC = 20.0
 _PIXEL_HASH_SIZE = 8
 _PIXEL_HASH_COLLISION_MAX_DISTANCE = 3
 
@@ -76,71 +80,6 @@ _FULL_BLEED_REROLL_CLAUSE = (
     "no black bars, no letterboxing, no cinematic bars, no borders or "
     "frame around the image"
 )
-
-# ── Safe fallback prompts by environment ───────────────────────────────────────
-# Used as attempt 3 when the Claude-written flux_prompt and its shortened form both
-# fail. These are guaranteed-safe (no content-policy edge cases, no mood words, pure
-# physical description) so they should always succeed.
-_ENV_SAFE_PROMPTS: dict[str, str] = {
-    "underwater":       (
-        "Sunlit underwater view of empty swimming pool, turquoise water caustics on "
-        "tiled bottom, overhead sun filtered through clear water, wide shot, "
-        "photorealistic, sharp focus, no people"
-    ),
-    "indoor_office":    (
-        "Empty office desk with scattered papers and a desk lamp, morning side light "
-        "through window blinds casting parallel shadows, neutral tones, photorealistic, "
-        "sharp focus, no people, no text visible"
-    ),
-    "indoor_domestic":  (
-        "Living room with sofa and coffee table, warm afternoon window light casting "
-        "long shadows across wooden floor, photorealistic, sharp focus, no people"
-    ),
-    "forest_nature":    (
-        "Sunlit forest path between tall trees, dappled light through green leaf canopy, "
-        "moss-covered ground, wide shot, photorealistic, sharp focus, no people"
-    ),
-    "urban_street":     (
-        "Empty city street corner in early morning, parked cars along wet sidewalk, "
-        "shop fronts closed, soft overcast daylight, wide shot, photorealistic, "
-        "sharp focus, no people"
-    ),
-    "corridor_interior": (
-        "Long empty corridor with polished tiled floor, fluorescent overhead panels, "
-        "closed doors on both sides, long receding perspective, photorealistic, "
-        "sharp focus, no people"
-    ),
-    "abstract_dark":    (
-        "Close-up of weathered concrete wall surface, geometric grid pattern from "
-        "expansion joints, soft raking side light revealing texture, grey neutral tones, "
-        "macro shot, photorealistic, sharp focus"
-    ),
-    "open_landscape":   (
-        "Wide open field under partly cloudy sky, green grass and wildflowers in "
-        "foreground, horizon line in distance, soft diffuse natural daylight, "
-        "wide establishing shot, photorealistic, sharp focus, no people"
-    ),
-    "laboratory":       (
-        "Empty laboratory bench with glass beakers and equipment, clean white surface, "
-        "overhead fluorescent light, clinical white and brushed steel, photorealistic, "
-        "sharp focus, no people"
-    ),
-    "industrial":       (
-        "Large empty industrial warehouse interior, concrete floor, steel support beams, "
-        "diffuse overhead skylight panels, wide shot, photorealistic, sharp focus, "
-        "no people"
-    ),
-    "vehicle":          (
-        "Interior of empty car looking through windshield at straight road ahead, "
-        "morning daylight, dashboard and steering wheel visible, photorealistic, "
-        "sharp focus, no people"
-    ),
-    "other":            (
-        "Empty wooden table in neutral room, simple object composition, soft window "
-        "light from left, photorealistic, sharp focus, clean background, no people, "
-        "no text"
-    ),
-}
 
 # ── Text-prop detection and sanitization (Phase 14.7, prompt half) ──────────
 # Ordinary generated beats (visual_type e.g. "document", "screenshot",
@@ -221,167 +160,6 @@ def derive_text_prop_prompt(beat: dict) -> str:
     if not original:
         return _TEXT_PROP_NO_TEXT_CLAUSE
     return f"{original}, {_TEXT_PROP_NO_TEXT_CLAUSE}"
-
-
-def _call_fal(
-    prompt: str,
-    cache_dir: Path,
-    media_path: Path,
-    cache_key_extra: str = "",
-    model_key: image_router.ModelKey = _DEFAULT_MODEL_KEY,
-    width: int = _DEFAULT_WIDTH,
-    height: int = _DEFAULT_HEIGHT,
-) -> str | None:
-    """Call one fal.ai Flux endpoint with a single prompt and save the result.
-
-    The endpoint and request payload are selected from
-    ``image_router.MODEL_CAPABILITIES[model_key]`` and built by
-    ``image_router.build_fal_payload()`` — this is the only place that talks
-    to `fal_client` for image generation; the payload itself is model-aware
-    so Pro-family/Flux-2-Pro requests never receive a Schnell-shaped field
-    they do not support.
-
-    ``width``/``height`` default to the repo's pre-existing landscape values
-    so every caller that does not pass them gets identical behavior and an
-    identical cache key to before (see
-    ``image_router.build_cache_key_material()``). Passing a non-default size
-    (e.g. 1080x1920 for a child Short beat) both requests portrait pixels
-    from fal.ai and produces a distinct cache key so it can never collide
-    with a landscape cache entry for the same prompt text.
-
-    Returns local path relative to media_path on success, None on any API/network error.
-    Does NOT retry — callers implement the cascade retry strategy.
-    """
-    caps = image_router.MODEL_CAPABILITIES[model_key]
-    cache_material = image_router.build_cache_key_material(
-        model_key, prompt,
-        width=width, height=height, cache_key_extra=cache_key_extra,
-    )
-    prompt_hash = hashlib.sha256(cache_material.encode()).hexdigest()[:24]
-    local_path  = cache_dir / f"{prompt_hash}.jpg"
-
-    if local_path.exists():
-        return str(local_path.relative_to(media_path))
-
-    payload = image_router.build_fal_payload(
-        model_key, prompt, width=width, height=height,
-    )
-    logger.debug(
-        "FAL_IMAGE_REQUEST_PREPARED model=%s endpoint=%s payload_keys=%s",
-        model_key, caps["endpoint"], sorted(payload.keys()),
-    )
-
-    client = fal_client.SyncClient(key=settings.fal_key)
-    try:
-        result = client.run(
-            caps["endpoint"],
-            arguments=payload,
-            timeout=_GENERATION_TIMEOUT_SEC,
-        )
-        images = result.get("images") or []
-        if not images or not images[0].get("url"):
-            return None
-        img_resp = httpx.get(images[0]["url"], timeout=_DOWNLOAD_TIMEOUT_SEC, follow_redirects=True)
-        img_resp.raise_for_status()
-        local_path.write_bytes(img_resp.content)
-        local_path_str = str(local_path.relative_to(media_path))
-        logger.info(
-            "FAL_IMAGE_GENERATED model=%s endpoint=%s media_url=%s",
-            model_key, caps["endpoint"], local_path_str,
-        )
-        return local_path_str
-    except (fal_client.FalClientError, httpx.HTTPStatusError, Exception) as exc:
-        logger.error(
-            "FAL_IMAGE_FAILED model=%s endpoint=%s exception_type=%s exception_message=%s",
-            model_key, caps["endpoint"], type(exc).__name__, str(exc),
-        )
-        return None
-
-
-def generate_beat_image(
-    flux_prompt: str,
-    beat_index: int,
-    content_id: str,
-    environment: str = "other",
-    cache_key_extra: str = "",
-    model_key: image_router.ModelKey = _DEFAULT_MODEL_KEY,
-    width: int = _DEFAULT_WIDTH,
-    height: int = _DEFAULT_HEIGHT,
-) -> str | None:
-    """Generate a Flux image for one storyboard beat via a 3-tier cascade.
-
-    Cascade strategy (None is returned only on hard API/auth failure, never on
-    prompt issues):
-      Attempt 1 — full Claude-written flux_prompt.
-      Attempt 2 — first 40 words of flux_prompt (simplified; avoids edge cases).
-      Attempt 3 — hardcoded safe fallback from _ENV_SAFE_PROMPTS[environment].
-    ``None`` is returned only when FAL_KEY is missing or all three prompts fail
-    with a hard network/auth error — callers then run the neighbour-reuse
-    fallback (``fill_failed_beats_from_neighbors``), never a text card.
-
-    Args:
-        flux_prompt:  Rich cinematic image generation prompt (written by Claude).
-        beat_index:   Beat index for logging only.
-        content_id:   Content UUID string for logging only.
-        environment:  Beat's environment field — selects the safe fallback prompt.
-        cache_key_extra: Optional cache namespace; used so text-card backgrounds do not reuse a prior beat image.
-        model_key:    Which fal.ai Flux model/endpoint to use for every tier of this
-                       cascade. Defaults to ``"schnell"`` — every pre-Phase-14.6 caller
-                       (including text-card backgrounds, which never pass this argument)
-                       gets exactly the prior behavior unchanged.
-        width, height: Requested pixel dimensions for every cascade tier. Default to
-                       the repo's landscape default (1920x1080) — every pre-existing
-                       caller gets identical pixels and an identical cache key.
-                       Child Short generation passes 1080x1920 (roadmap 3.1).
-
-    Returns:
-        Local path relative to ``media_path`` on success, ``None`` on hard failure.
-    """
-    if not settings.fal_key:
-        logger.error("FAL_KEY not set — cannot generate Flux image for beat=%d", beat_index)
-        return None
-
-    cache_dir  = Path(settings.media_path) / "cache" / content_id
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    media_path = Path(settings.media_path)
-
-    # Build the 3-tier prompt cascade
-    short_prompt = " ".join(flux_prompt.split()[:40]) if flux_prompt else ""
-    safe_prompt  = _ENV_SAFE_PROMPTS.get(environment, _ENV_SAFE_PROMPTS["other"])
-
-    cascade = [
-        ("full",      flux_prompt   if flux_prompt else safe_prompt),
-        ("shortened", short_prompt  if short_prompt else safe_prompt),
-        ("safe",      safe_prompt),
-    ]
-
-    endpoint = image_router.MODEL_CAPABILITIES[model_key]["endpoint"]
-    for tier, prompt in cascade:
-        if not prompt:
-            continue
-        logger.debug(
-            "Flux beat=%d content=%s endpoint=%s model=%s tier=%s prompt_words=%d "
-            "size=%dx%d",
-            beat_index, content_id, endpoint, model_key, tier, len(prompt.split()),
-            width, height,
-        )
-        path = _call_fal(
-            prompt, cache_dir, media_path, cache_key_extra=cache_key_extra,
-            model_key=model_key, width=width, height=height,
-        )
-        if path:
-            logger.debug("Flux beat=%d tier=%s: saved %s", beat_index, tier, path)
-            return path
-        logger.warning(
-            "Flux beat=%d tier=%s failed — trying next tier", beat_index, tier,
-        )
-        time.sleep(_RETRY_DELAY_SEC)
-
-    logger.error(
-        "Flux beat=%d content=%s: all 3 tiers failed (hard API/network error)",
-        beat_index, content_id,
-    )
-    return None
 
 
 def generate_beat_image_with_routing(

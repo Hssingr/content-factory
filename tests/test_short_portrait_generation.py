@@ -9,10 +9,11 @@ repo's established pattern in test_flux_failure_logging.py), that:
 
   1. image_router.build_cache_key_material() is backward-compatible at the
      Schnell landscape default, and size-disambiguates any other size.
-  2. flux_generator._call_fal()/generate_beat_image()/
-     generate_beat_image_with_routing() actually request portrait pixels
-     end-to-end when given width/height, and produce a cache key distinct
-     from the landscape default for the identical prompt.
+  2. flux_client._call_fal()/generate_beat_image() (moved from flux_generator —
+     Agent 6 roadmap Phase A, code_report/agent6_metadata_roadmap.md) and
+     flux_generator.generate_beat_image_with_routing() actually request
+     portrait pixels end-to-end when given width/height, and produce a
+     cache key distinct from the landscape default for the identical prompt.
   3. The real storyboard.generate_pending_beat_images() regenerates EVERY
      beat (both previously-"pending" and previously-"reused") fresh under
      the CHILD's own cache directory at portrait size — never leaving a
@@ -29,6 +30,7 @@ from unittest.mock import patch
 
 from app.agents.agent4_visuals.services import flux_generator, image_router
 from app.agents.agent4_visuals.subagents import storyboard
+from app.services import flux_client
 
 
 # ── Stub fal.ai boundary (paid API) — never internal logic ────────────────
@@ -64,11 +66,13 @@ _STUB_FAL_CLIENT = types.SimpleNamespace(
 )
 
 
-def _patched_flux_generator():
-    """Context manager stack patching only the paid-API boundary."""
+def _patched_flux_client():
+    """Context manager stack patching only the paid-API boundary
+    (``fal_client``/``httpx`` live in ``app.services.flux_client`` since
+    Agent 6 roadmap Phase A — ``code_report/agent6_metadata_roadmap.md``)."""
     return (
-        patch.object(flux_generator, "fal_client", _STUB_FAL_CLIENT),
-        patch.object(flux_generator.httpx, "get", _fake_httpx_get),
+        patch.object(flux_client, "fal_client", _STUB_FAL_CLIENT),
+        patch.object(flux_client.httpx, "get", _fake_httpx_get),
     )
 
 
@@ -115,7 +119,7 @@ class TestCacheKeyMaterialSizeAwareness(unittest.TestCase):
 
 class TestCallFalRequestsPortraitPixels(unittest.TestCase):
     def test_call_fal_default_size_matches_pre_existing_behavior(self):
-        p1, p2 = _patched_flux_generator()
+        p1, p2 = _patched_flux_client()
         p1.start()
         p2.start()
         orig_fal_key = flux_generator.settings.fal_key
@@ -126,7 +130,7 @@ class TestCallFalRequestsPortraitPixels(unittest.TestCase):
                 media_path = Path(tmpdir)
                 cache_dir = media_path / "cache" / "content-1"
                 cache_dir.mkdir(parents=True)
-                path = flux_generator._call_fal(
+                path = flux_client._call_fal(
                     "a forest path at dawn", cache_dir, media_path, model_key="schnell",
                 )
                 self.assertIsNotNone(path)
@@ -138,7 +142,7 @@ class TestCallFalRequestsPortraitPixels(unittest.TestCase):
             p1.stop()
 
     def test_call_fal_portrait_size_is_requested_and_cached_separately(self):
-        p1, p2 = _patched_flux_generator()
+        p1, p2 = _patched_flux_client()
         p1.start()
         p2.start()
         orig_fal_key = flux_generator.settings.fal_key
@@ -150,11 +154,11 @@ class TestCallFalRequestsPortraitPixels(unittest.TestCase):
                 cache_dir = media_path / "cache" / "content-1"
                 cache_dir.mkdir(parents=True)
 
-                landscape_path = flux_generator._call_fal(
+                landscape_path = flux_client._call_fal(
                     "a forest path at dawn", cache_dir, media_path,
                     model_key="schnell", width=1920, height=1080,
                 )
-                portrait_path = flux_generator._call_fal(
+                portrait_path = flux_client._call_fal(
                     "a forest path at dawn", cache_dir, media_path,
                     model_key="schnell", width=1080, height=1920,
                 )
@@ -172,7 +176,7 @@ class TestCallFalRequestsPortraitPixels(unittest.TestCase):
             p1.stop()
 
     def test_generate_beat_image_with_routing_threads_portrait_size(self):
-        p1, p2 = _patched_flux_generator()
+        p1, p2 = _patched_flux_client()
         p1.start()
         p2.start()
         # Force the conservative-by-default routing contract regardless of
@@ -239,7 +243,7 @@ class TestGeneratePendingBeatImagesPortraitChain(unittest.TestCase):
     the fal.ai boundary stubbed."""
 
     def test_reused_and_pending_beats_both_regenerate_at_portrait_in_child_cache(self):
-        p1, p2 = _patched_flux_generator()
+        p1, p2 = _patched_flux_client()
         p1.start()
         p2.start()
         # Force the conservative-by-default routing contract regardless of
@@ -295,7 +299,7 @@ class TestGeneratePendingBeatImagesPortraitChain(unittest.TestCase):
             ),
             FalClientError=Exception,
         )
-        p1 = patch.object(flux_generator, "fal_client", failing_client)
+        p1 = patch.object(flux_client, "fal_client", failing_client)
         p1.start()
         orig_fal_key = flux_generator.settings.fal_key
         orig_media_path = flux_generator.settings.media_path

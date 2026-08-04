@@ -1,8 +1,7 @@
 """Agent 4 — capability-based visual source/model router (Phase 14.6 foundation).
 
 This module owns the *decision* of which image source/model a beat should use
-(reuse / stock / Schnell / Dev / Pro-family) and the *payload normalization*
-for whichever fal.ai Flux endpoint is selected. It does not call fal.ai itself
+(reuse / stock / Schnell / Dev / Pro-family). It does not call fal.ai itself
 — `flux_generator.py` remains the only direct `fal_client` integration point
 (CLAUDE.md §27.1/§7.1-style boundary: provider calls stay behind one wrapper).
 
@@ -18,6 +17,17 @@ Routing contract (Tier 5 R16 was explicitly enabled by the operator):
 See `code_report/phase_14_5_model_routing_feasibility.md` for the research
 this design is based on, and `code_report/phase_14_6_unified_visual_router.md`
 for this phase's own report.
+
+The model-capability table and fal.ai payload/cache-key construction
+(`MODEL_CAPABILITIES`, `ModelKey`, `SizeMode`, `SafetyMode`,
+`build_fal_payload()`, `build_cache_key_material()`) moved to the shared
+`app.services.flux_client` module (Agent 6 roadmap, Phase A,
+`code_report/agent6_metadata_roadmap.md`) — they are provider-integration
+details `_call_fal()` itself depends on, not beat-routing decisions, and a
+second agent (Agent 6) needed them without importing this package. Re-exported
+below so every existing caller of `image_router.MODEL_CAPABILITIES` /
+`image_router.build_fal_payload` / `image_router.build_cache_key_material` /
+`image_router.ModelKey` is unaffected.
 """
 
 from __future__ import annotations
@@ -26,87 +36,30 @@ import logging
 from dataclasses import dataclass
 from typing import Literal
 
+from app.services.flux_client import (
+    MODEL_CAPABILITIES,
+    ModelKey,
+    SafetyMode,
+    SizeMode,
+    build_cache_key_material,
+    build_fal_payload,
+)
+
 logger = logging.getLogger(__name__)
 
-ModelKey = Literal["schnell", "dev", "pro_1_1", "pro_1_1_ultra", "flux_2_pro"]
-SizeMode = Literal["image_size", "aspect_ratio"]
-SafetyMode = Literal["enable_safety_checker", "safety_tolerance", "both"]
 RouteSource = Literal["reuse", "stock", "generated", "fallback"]
 
-# ── Model capability table ──────────────────────────────────────────────────
-# Endpoints verified against official fal.ai docs during Phase 14.5
-# (code_report/phase_14_5_model_routing_feasibility.md). Defaults intentionally
-# preserve the repo's existing Schnell behavior (8 steps) rather than fal.ai's
-# own documented Schnell default (4) — constraint: preserve existing behavior.
-MODEL_CAPABILITIES: dict[ModelKey, dict] = {
-    "schnell": {
-        # Intentionally NOT updated to fal.ai's current documented endpoint
-        # name ("fal-ai/flux/schnell", per Phase 14.5's research) — this is
-        # the exact literal string used in real production calls since before
-        # Phase 14.6 introduced this table. Changing it would be a
-        # live-behavior change this phase cannot verify (no live fal.ai calls
-        # are permitted here; Phase 14.5 flagged this exact endpoint-name
-        # discrepancy as needing an operator-run live canary before ever
-        # changing it). Preserve-default-behavior wins.
-        "endpoint": "fal-ai/flux-1/schnell",
-        "size_mode": "image_size",
-        "supports_steps": True,
-        "default_steps": 8,
-        "supports_guidance": False,
-        "default_guidance": None,
-        "supports_seed": True,
-        "safety_mode": "enable_safety_checker",
-        "output_formats": ("jpeg", "png"),
-    },
-    "dev": {
-        "endpoint": "fal-ai/flux/dev",
-        "size_mode": "image_size",
-        "supports_steps": True,
-        "default_steps": 28,
-        "supports_guidance": True,
-        "default_guidance": 3.5,
-        "supports_seed": True,
-        "safety_mode": "enable_safety_checker",
-        "output_formats": ("jpeg", "png"),
-    },
-    "pro_1_1": {
-        "endpoint": "fal-ai/flux-pro/v1.1",
-        "size_mode": "image_size",
-        "supports_steps": True,
-        "default_steps": 28,
-        "supports_guidance": True,
-        "default_guidance": 3.5,
-        "supports_seed": True,
-        "safety_mode": "safety_tolerance",
-        "output_formats": ("jpeg", "png"),
-        "max_side": 1440,
-    },
-    "pro_1_1_ultra": {
-        "endpoint": "fal-ai/flux-pro/v1.1-ultra",
-        "size_mode": "aspect_ratio",
-        "supports_steps": False,
-        "default_steps": None,
-        "supports_guidance": False,
-        "default_guidance": None,
-        "supports_seed": True,
-        "safety_mode": "safety_tolerance",
-        "output_formats": ("jpeg", "png"),
-    },
-    "flux_2_pro": {
-        "endpoint": "fal-ai/flux-2-pro",
-        "size_mode": "image_size",
-        "supports_steps": False,
-        "default_steps": None,
-        "supports_guidance": False,
-        "default_guidance": None,
-        "supports_seed": True,
-        "safety_mode": "both",
-        "output_formats": ("jpeg", "png"),
-    },
-}
-
-_DEFAULT_SAFETY_TOLERANCE = "2"  # fal.ai Pro-family enum (1=strictest .. 6=most permissive)
-_FAL_SIZE_MULTIPLE = 16
+__all__ = [
+    "MODEL_CAPABILITIES",
+    "ModelKey",
+    "SafetyMode",
+    "SizeMode",
+    "build_cache_key_material",
+    "build_fal_payload",
+    "RouteSource",
+    "ImageRoute",
+    "select_route",
+]
 
 # Beats that already qualify for Dev/Pro under the heuristic (kept narrow and
 # additive — Phase 14.5's recommended first pass, not a quality/cost policy).
@@ -219,128 +172,3 @@ def select_route(
         content_id, beat_order, route.model_key, route.source, route.reason,
     )
     return route
-
-
-def build_fal_payload(
-    model_key: ModelKey,
-    prompt: str,
-    *,
-    width: int = 1920,
-    height: int = 1080,
-    aspect_ratio: str = "16:9",
-    seed: int | None = None,
-    output_format: Literal["jpeg", "png"] = "jpeg",
-) -> dict:
-    """Build a fal.ai request payload containing only the fields the chosen
-    model's capability entry supports — never a fixed Schnell-shaped dict.
-
-    Pure function: no network call, no fal_client import.
-    """
-    caps = MODEL_CAPABILITIES[model_key]
-
-    payload: dict = {
-        "prompt": prompt,
-        "num_images": 1,
-        "output_format": output_format,
-    }
-
-    if caps["size_mode"] == "image_size":
-        payload["image_size"] = _legal_image_size_for_model(model_key, width, height)
-    else:  # "aspect_ratio"
-        payload["aspect_ratio"] = _resolve_aspect_ratio(width, height, aspect_ratio)
-
-    if caps["supports_steps"]:
-        payload["num_inference_steps"] = caps["default_steps"]
-
-    if caps["supports_guidance"]:
-        payload["guidance_scale"] = caps["default_guidance"]
-
-    if caps["supports_seed"] and seed is not None:
-        payload["seed"] = seed
-
-    safety_mode = caps["safety_mode"]
-    if safety_mode == "enable_safety_checker":
-        payload["enable_safety_checker"] = True
-    elif safety_mode == "safety_tolerance":
-        payload["safety_tolerance"] = _DEFAULT_SAFETY_TOLERANCE
-    elif safety_mode == "both":
-        payload["enable_safety_checker"] = True
-        payload["safety_tolerance"] = _DEFAULT_SAFETY_TOLERANCE
-
-    logger.debug(
-        "FAL_IMAGE_REQUEST_PREPARED model=%s endpoint=%s payload_keys=%s",
-        model_key, caps["endpoint"], sorted(payload.keys()),
-    )
-    return payload
-
-
-def _round_to_multiple(value: float, multiple: int = _FAL_SIZE_MULTIPLE) -> int:
-    return max(multiple, int(round(value / multiple)) * multiple)
-
-
-def _legal_image_size_for_model(model_key: ModelKey, width: int, height: int) -> dict[str, int]:
-    """Return fal-legal pixel dimensions for image_size endpoints.
-
-    Flux Pro v1.1 silently clamps oversized custom dimensions to its own
-    max-side envelope and can change aspect ratio while doing it. Keep the
-    requested aspect and scale only that tier into its legal max-side window.
-    Schnell/Dev/Flux 2 Pro preserve their existing requested dimensions.
-    """
-    caps = MODEL_CAPABILITIES[model_key]
-    max_side = caps.get("max_side")
-    if not max_side or max(width, height) <= max_side:
-        return {"width": width, "height": height}
-
-    if width >= height:
-        legal_width = int(max_side)
-        legal_height = _round_to_multiple(legal_width * height / width)
-    else:
-        legal_height = int(max_side)
-        legal_width = _round_to_multiple(legal_height * width / height)
-    return {"width": legal_width, "height": legal_height}
-
-
-def _resolve_aspect_ratio(width: int, height: int, requested: str) -> str:
-    """Resolve aspect_ratio-mode payloads from the actual requested frame."""
-    if width == height:
-        return "1:1"
-    requested = (requested or "").strip()
-    if width > height:
-        return "16:9" if requested in {"", "16:9"} else requested
-    return "9:16" if requested in {"", "16:9"} else requested
-
-
-_DEFAULT_SCHNELL_SIZE = (1920, 1080)  # matches flux_generator._DEFAULT_WIDTH/_HEIGHT
-
-
-def build_cache_key_material(
-    model_key: ModelKey,
-    prompt: str,
-    *,
-    width: int = 1920,
-    height: int = 1080,
-    cache_key_extra: str = "",
-) -> str:
-    """Build the hash input for the local Flux cache filename.
-
-    Backward-compatible by construction: for the Schnell tier at its
-    pre-existing default landscape size (1920x1080 — the tier and size every
-    pre-Phase-14.6 caller used, including Phase 14.4's text-card backgrounds),
-    this reproduces the exact pre-Phase-14.6 material — ``prompt`` alone, or
-    ``f"{cache_key_extra}\\n{prompt}"`` when a namespace is given — so every
-    existing cached image (parent beats, child beats, and Phase 14.4
-    text-card backgrounds) keeps being reused with zero cache invalidation.
-
-    A ``size=`` prefix is added whenever the requested size differs from that
-    default (Phase-roadmap-3.1: portrait 1080x1920 Short generation) or the
-    model tier is not Schnell — both cases have no pre-existing cache to
-    preserve and would otherwise collide with the landscape Schnell cache
-    entry for the identical prompt text.
-    """
-    if model_key == "schnell" and (width, height) == _DEFAULT_SCHNELL_SIZE:
-        return f"{cache_key_extra}\n{prompt}" if cache_key_extra else prompt
-
-    parts = [f"model={model_key}", f"size={width}x{height}"]
-    if cache_key_extra:
-        parts.append(cache_key_extra)
-    return "\n".join(parts) + "\n" + prompt

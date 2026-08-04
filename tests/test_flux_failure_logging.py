@@ -1,12 +1,14 @@
 """Runtime smoke proof for Flux failure logging.
 
 No live API calls: the fal.ai client boundary is stubbed by patching the
-ALREADY-IMPORTED ``flux_generator`` module's ``fal_client`` attribute — not by
-seeding ``sys.modules`` before import, which is order-dependent: when another
-test file imports ``flux_generator`` first (any full-suite run), the module's
-globals already hold the real ``fal_client`` and a late ``sys.modules`` swap
-does nothing, letting ``client.run`` reach the real network. ``httpx.get`` is
-replaced before any download can happen. The real ``_call_fal`` function is
+ALREADY-IMPORTED ``app.services.flux_client`` module's ``fal_client``
+attribute (``_call_fal()`` moved there — Agent 6 roadmap Phase A,
+`code_report/agent6_metadata_roadmap.md`) — not by seeding ``sys.modules``
+before import, which is order-dependent: when another test file imports
+``flux_client`` first (any full-suite run), the module's globals already
+hold the real ``fal_client`` and a late ``sys.modules`` swap does nothing,
+letting ``client.run`` reach the real network. ``httpx.get`` is replaced
+before any download can happen. The real ``_call_fal`` function is
 exercised; only paid/external boundaries are stubbed.
 """
 
@@ -19,6 +21,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.agents.agent4_visuals.services import flux_generator
+from app.services import flux_client
 
 
 class StubFalClientError(Exception):
@@ -44,11 +47,11 @@ class FluxFailureLoggingTest(unittest.TestCase):
         def fail_if_downloaded(*args, **kwargs):
             raise AssertionError("httpx.get should not run after a fal client failure")
 
-        stack = patch.object(flux_generator, "fal_client", _STUB_FAL_CLIENT)
+        stack = patch.object(flux_client, "fal_client", _STUB_FAL_CLIENT)
         stack.start()
-        orig_httpx_get = flux_generator.httpx.get
+        orig_httpx_get = flux_client.httpx.get
         orig_fal_key = flux_generator.settings.fal_key
-        flux_generator.httpx.get = fail_if_downloaded
+        flux_client.httpx.get = fail_if_downloaded
         flux_generator.settings.fal_key = "stub-key-never-used"
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -57,17 +60,17 @@ class FluxFailureLoggingTest(unittest.TestCase):
                 cache_dir.mkdir(parents=True)
 
                 with self.assertLogs(
-                    "app.agents.agent4_visuals.services.flux_generator",
+                    "app.services.flux_client",
                     level="ERROR",
                 ) as logs:
-                    result = flux_generator._call_fal(
+                    result = flux_client._call_fal(
                         "empty office desk, morning light",
                         cache_dir,
                         media_path,
                         model_key="schnell",
                     )
         finally:
-            flux_generator.httpx.get = orig_httpx_get
+            flux_client.httpx.get = orig_httpx_get
             flux_generator.settings.fal_key = orig_fal_key
             stack.stop()
 

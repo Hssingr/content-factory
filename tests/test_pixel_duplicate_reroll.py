@@ -16,6 +16,7 @@ from PIL import Image
 
 from app.agents.agent4_visuals.services import flux_generator
 from app.agents.agent4_visuals.subagents.storyboard_validator import composition_slot_variation
+from app.services import flux_client
 
 
 def _beat(order: int, prompt: str) -> dict:
@@ -67,7 +68,7 @@ class PixelDuplicateRerollTest(unittest.TestCase):
             ]
             with patch("app.agents.agent4_visuals.services.flux_generator.settings.media_path", tmp), \
                  patch("app.agents.agent4_visuals.services.flux_generator.settings.fal_key", "test-key"), \
-                 patch("app.agents.agent4_visuals.services.flux_generator._call_fal", side_effect=fake_call_fal):
+                 patch("app.services.flux_client._call_fal", side_effect=fake_call_fal):
                 result = flux_generator.generate_all_beat_images(beats, "content-1")
 
         self.assertEqual(len(calls), 3)

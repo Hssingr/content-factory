@@ -3,10 +3,12 @@ video-output audit — a real production run shipped a beat whose Flux
 generation was a 100% black JPEG; nothing before this fix inspected pixel
 content).
 
-Only the external paid fal wrapper boundary (``_call_fal``) is stubbed. The
-generation loop, routing, local image writes, real luminance measurement via
-PIL, the one-shot well-lit reroll, and neighbor-fill hand-off all execute
-for real — mirrors the existing pattern in ``test_pixel_duplicate_reroll.py``.
+Only the external paid fal wrapper boundary (``_call_fal``, which lives in
+the shared ``app.services.flux_client`` module — Agent 6 roadmap Phase A,
+`code_report/agent6_metadata_roadmap.md`) is stubbed. The generation loop,
+routing, local image writes, real luminance measurement via PIL, the
+one-shot well-lit reroll, and neighbor-fill hand-off all execute for real —
+mirrors the existing pattern in ``test_pixel_duplicate_reroll.py``.
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ from PIL import Image
 from app.agents.agent4_visuals.services import flux_generator
 from app.agents.agent4_visuals.services import media_validation
 from app.agents.agent4_visuals.subagents import storyboard
+from app.services import flux_client
 
 
 def _beat(order: int, prompt: str) -> dict:
@@ -80,7 +83,7 @@ class LuminanceGateGenerationTest(unittest.TestCase):
             with (
                 patch("app.agents.agent4_visuals.services.flux_generator.settings.media_path", tmp),
                 patch("app.agents.agent4_visuals.services.flux_generator.settings.fal_key", "test-key"),
-                patch("app.agents.agent4_visuals.services.flux_generator._call_fal", side_effect=fake_call_fal),
+                patch("app.services.flux_client._call_fal", side_effect=fake_call_fal),
             ):
                 result = flux_generator.generate_all_beat_images(beats, "content-1")
 
@@ -117,7 +120,7 @@ class LuminanceGateGenerationTest(unittest.TestCase):
             with (
                 patch("app.agents.agent4_visuals.services.flux_generator.settings.media_path", tmp),
                 patch("app.agents.agent4_visuals.services.flux_generator.settings.fal_key", "test-key"),
-                patch("app.agents.agent4_visuals.services.flux_generator._call_fal", side_effect=fake_call_fal),
+                patch("app.services.flux_client._call_fal", side_effect=fake_call_fal),
             ):
                 result = flux_generator.generate_all_beat_images(beats, "content-1")
 
@@ -146,7 +149,7 @@ class LuminanceGateGenerationTest(unittest.TestCase):
             with (
                 patch("app.agents.agent4_visuals.services.flux_generator.settings.media_path", tmp),
                 patch("app.agents.agent4_visuals.services.flux_generator.settings.fal_key", "test-key"),
-                patch("app.agents.agent4_visuals.services.flux_generator._call_fal", side_effect=fake_call_fal),
+                patch("app.services.flux_client._call_fal", side_effect=fake_call_fal),
             ):
                 result = flux_generator.generate_all_beat_images(beats, "content-1")
 
@@ -182,7 +185,7 @@ class ChildShortLuminanceGateTest(unittest.TestCase):
             with (
                 patch("app.agents.agent4_visuals.services.flux_generator.settings.media_path", tmp),
                 patch("app.agents.agent4_visuals.services.flux_generator.settings.fal_key", "test-key"),
-                patch("app.agents.agent4_visuals.services.flux_generator._call_fal", side_effect=fake_call_fal),
+                patch("app.services.flux_client._call_fal", side_effect=fake_call_fal),
             ):
                 result = storyboard.generate_pending_beat_images(beats, "child-content-1")
 

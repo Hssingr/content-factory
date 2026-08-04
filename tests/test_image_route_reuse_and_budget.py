@@ -8,7 +8,9 @@
    per-content cap really stops the second qualifying beat from selecting
    Pro even when it qualifies.
 
-Only the paid fal.ai boundary (fal_client + httpx.get) is stubbed — the real
+Only the paid fal.ai boundary (fal_client + httpx.get, living in the shared
+app.services.flux_client module since Agent 6 roadmap Phase A —
+code_report/agent6_metadata_roadmap.md) is stubbed — the real
 select_route()/generate_beat_image_with_routing()/generate_beat_image()
 chain runs, following tests/test_short_portrait_generation.py's precedent.
 """
@@ -22,6 +24,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.agents.agent4_visuals.services import flux_generator
+from app.services import flux_client
 
 
 class _RecordingSyncClient:
@@ -68,8 +71,8 @@ class _FluxHarness(unittest.TestCase):
 
     def setUp(self):
         self._patches = [
-            patch.object(flux_generator, "fal_client", _STUB_FAL_CLIENT),
-            patch.object(flux_generator.httpx, "get", lambda *a, **k: _FakeHttpxResponse()),
+            patch.object(flux_client, "fal_client", _STUB_FAL_CLIENT),
+            patch.object(flux_client.httpx, "get", lambda *a, **k: _FakeHttpxResponse()),
         ]
         for p in self._patches:
             p.start()
