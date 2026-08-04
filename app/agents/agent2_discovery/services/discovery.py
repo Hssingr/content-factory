@@ -71,8 +71,19 @@ def run_discovery(
                           so the retry context is complete from the first call).
 
     Returns:
-        ``(Content, Story, assessment)`` on success, or ``None`` if all retries exhausted
-        (manual fallback Telegram message already sent in that case).
+        ``(Content, Story, story_score)`` on success — ``story_score`` is the
+        WEIGHTED dict from ``score_story_assessment()``
+        (``overall_score``/``dimension_scores``/``failed_gates``/
+        ``operator_review_flags``), not the raw pre-weighting assessment.
+        ``None`` only when no candidate could be found/produced at all
+        (dedup or source-material-floor exhaustion — manual fallback
+        Telegram message already sent in that case). **The score gate never
+        causes a ``None`` return** — a candidate that fails
+        ``decide_story_acceptance()`` still returns normally with a
+        persisted ``Content`` row; the score is surfaced in the Telegram
+        approval message instead, and the human operator decides via
+        APPROVE/CHANGE (operator decision: the gate is informational only,
+        it must never auto-block the pipeline).
     """
     channel = db.get(Channel, channel_id)
     if not channel:
@@ -217,7 +228,7 @@ def run_discovery(
         )
         return None
 
-    # ── Score the accepted story ──────────────────────────────────────────────
+    # ── Score the story — informational only, never blocks (see docstring) ────
     try:
         assessment = score_story_for_gate(
             story=story,
@@ -239,10 +250,11 @@ def run_discovery(
 
     accepted, reason = decide_story_acceptance(story_score)
     logger.info(
-        "Discovery: title=%r overall_score=%.1f rights_ip_risk=%d decision=%s reason=%s",
+        "Discovery: title=%r overall_score=%.1f rights_ip_risk=%d gate_verdict=%s reason=%s "
+        "— always sent to Telegram (operator decides, the gate never auto-blocks)",
         story.title[:60], story_score["overall_score"],
         story_score.get("dimension_scores", {}).get("rights_ip_risk", 0),
-        "ACCEPTED" if accepted else "REJECTED", reason,
+        "PASSED" if accepted else "BELOW_FLOOR", reason,
     )
     for flag in story_score.get("operator_review_flags", []):
         logger.warning(
@@ -250,11 +262,13 @@ def run_discovery(
             story.title[:60], flag,
         )
 
-    if not accepted:
-        logger.warning("Discovery: story rejected — exiting cleanly, no Content created")
-        return None
-
-    # ── Persist Content + ContentValidation ──────────────────────────────────
+    # ── Persist Content + ContentValidation — always, regardless of gate verdict ──
+    # Operator decision: the score gate must never block the pipeline. Every
+    # candidate that clears dedup + the source-material floor reaches
+    # Telegram with its score attached (build_telegram_message() surfaces
+    # overall_score/failed_gates/top dimensions) — the human operator, not
+    # an automated verdict, decides whether to APPROVE or ask for a
+    # different story (CHANGE).
     content = Content(
         channel_id=channel_id,
         source_url=story.url,
@@ -286,10 +300,10 @@ def run_discovery(
     db.refresh(content)
 
     logger.info(
-        "Content %s created for channel %s — '%s'",
-        content.id, channel_id, story.title[:80],
+        "Content %s created for channel %s — '%s' (gate_verdict=%s)",
+        content.id, channel_id, story.title[:80], "PASSED" if accepted else "BELOW_FLOOR",
     )
-    return content, story, assessment
+    return content, story, story_score
 
 
 # ── Private helpers ───────────────────────────────────────────────────────────

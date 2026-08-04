@@ -47,10 +47,16 @@ class StoryGateRightsIpTest(unittest.TestCase):
         scores["visual_storytelling_potential"] = 88
         scores["social_media_clickability"] = 87
 
+        # build_telegram_message() takes the WEIGHTED story_score dict (the
+        # score gate never blocks the pipeline; this is the one place its
+        # verdict reaches the operator) — not the raw {"scores": {...}}
+        # shape score_story_for_gate() returns.
+        story_score = scoring.score_story_assessment({"scores": scores})
+
         message = system_prompt.build_telegram_message(
             title="Known Authored Story",
             url="https://example.test/story",
-            assessment={"scores": scores},
+            assessment=story_score,
             target_languages=["en"],
             user_language="en",
         )

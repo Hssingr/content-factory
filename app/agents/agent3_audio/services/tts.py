@@ -4,6 +4,7 @@ import logging
 import re
 import time
 
+from elevenlabs.core import ApiError as ElevenLabsApiError
 from elevenlabs.types import VoiceSettings
 
 from app.services.elevenlabs_client import get_client
@@ -1487,6 +1488,43 @@ def _wav_to_mp3(wav_bytes: bytes) -> bytes:
 _TTS_TRANSPORT_ATTEMPTS = 3
 _TTS_TRANSPORT_BACKOFF_SEC = (2.0, 5.0)
 
+# Account-level ElevenLabs error codes that cannot succeed on retry — the
+# request itself is fine, the account isn't. Distinct from a transport
+# failure (timeout, connection reset, transient 5xx), which genuinely can
+# succeed a moment later.
+_PERMANENT_ELEVENLABS_ERROR_CODES = {
+    "quota_exceeded",
+    "invalid_api_key",
+    "authentication_failed",
+}
+
+
+def is_permanent_tts_provider_error(exc: Exception) -> bool:
+    """True for a provider error that is account/credential-level, not
+    transport-level — e.g. an ElevenLabs quota exhaustion or an invalid API
+    key. Retrying one of these is guaranteed to reproduce the identical
+    failure every time; only fixing the account (add credits, fix the key)
+    can change the outcome, so retrying it only burns real API calls and
+    wall-clock time for no chance of success.
+    """
+    if isinstance(exc, ElevenLabsApiError):
+        body = exc.body
+        code = None
+        if isinstance(body, dict):
+            detail = body.get("detail")
+            if isinstance(detail, dict):
+                code = detail.get("code")
+            elif isinstance(detail, str):
+                code = detail
+        if code in _PERMANENT_ELEVENLABS_ERROR_CODES:
+            return True
+        # A bare 401 with no recognized body still means the request was
+        # rejected on credentials/account grounds, not a network hiccup —
+        # ElevenLabs uses 401 for both invalid keys and quota exhaustion.
+        if exc.status_code == 401:
+            return True
+    return False
+
 
 def _call_tts_with_transport_retry(request_fn, *, provider: str, unit_label: str):
     """Bounded transport retry around ONE provider TTS request.
@@ -1501,7 +1539,11 @@ def _call_tts_with_transport_retry(request_fn, *, provider: str, unit_label: str
 
     ``TypeError`` propagates immediately: it is the Cartesia SDK
     request-shape incompatibility signal (`CARTESIA_REQUEST_FORMAT_UNSUPPORTED`)
-    and retrying an identical malformed call can never succeed.
+    and retrying an identical malformed call can never succeed. A permanent
+    provider error (`is_permanent_tts_provider_error()` — ElevenLabs quota
+    exhaustion or an invalid API key) propagates immediately for the same
+    reason: it is not a transport failure, and no amount of retrying fixes
+    an exhausted account.
     """
     last_exc: Exception | None = None
     for attempt in range(1, _TTS_TRANSPORT_ATTEMPTS + 1):
@@ -1510,6 +1552,13 @@ def _call_tts_with_transport_retry(request_fn, *, provider: str, unit_label: str
         except TypeError:
             raise
         except Exception as exc:
+            if is_permanent_tts_provider_error(exc):
+                logger.error(
+                    "TTS_PERMANENT_PROVIDER_ERROR provider=%s unit=%s error=%s "
+                    "— not retrying (account/credential issue, not transport)",
+                    provider, unit_label, exc,
+                )
+                raise
             last_exc = exc
             if attempt == _TTS_TRANSPORT_ATTEMPTS:
                 raise

@@ -2137,10 +2137,41 @@ Responsibilities:
 - Fetch a candidate story (`fetch_batch()` for `"reddit"`,
   `generate_story_premise()` for `"ai_generated"` — see §9.5).
 - Deduplicate.
-- Score story.
-- Persist parent content if accepted.
-- Trigger manual fallback if discovery fails (wording branches on
-  `script_source` — see §9.5).
+- Score story (informational only — see below; never gates persistence).
+- Persist parent content and send it for Telegram approval, for every
+  candidate that clears dedup + the source-material floor, **regardless of
+  the score-gate verdict**.
+- Trigger manual fallback only when no candidate could be found/produced at
+  all (dedup or floor exhaustion — wording branches on `script_source`, see
+  §9.5).
+
+**The score gate never blocks the pipeline (operator decision, supersedes
+two earlier designs in sequence — first silent auto-reject, then a
+notify-but-still-block fix — both replaced by this one).** A verdict from
+`decide_story_acceptance()` is still computed and logged
+(`gate_verdict=PASSED`/`BELOW_FLOOR`), but `run_discovery()` no longer
+branches on it for persistence: **every** candidate that clears dedup + the
+source-material floor is persisted as `Content` (`status="PENDING_APPROVAL"`)
+and sent to Telegram, whether it scored 95 or 30. Regenerating a candidate
+because an AI judge scored the first one poorly remains forbidden by the
+Agent 2 no-quality-retry rule (unchanged) — but rejecting outright is a
+distinct, separate decision this codebase no longer makes automatically
+either. The human operator is the sole decision-maker: `build_telegram_message()`
+(`system_prompt.py`) renders the real `overall_score`, a ✅/⚠️ verdict icon,
+every failed gate by name (e.g. `emotional_stakes 45 < 55`) when present,
+and the top-2 dimension scores — the operator replies `APPROVE` to proceed
+with a low-scoring story anyway, or `CHANGE` (with feedback) to reject it
+and trigger rediscovery, using the exact same APPROVE/CHANGE mechanism
+every other story already goes through. `run_discovery()`'s 3rd return
+value is the **weighted** `story_score` dict from `score_story_assessment()`
+(`overall_score`/`dimension_scores`/`failed_gates`/`operator_review_flags`)
+— not the raw pre-weighting `{"scores": {...}}` shape `score_story_for_gate()`
+returns; `build_telegram_message()`'s `assessment` parameter requires this
+weighted shape to render anything (a raw dict has no `overall_score` key
+and is silently skipped). `run_discovery()` still returns `None` only when
+no candidate could be found/produced at all (dedup/floor exhaustion, or a
+hard scoring-call exception) — never because of a low score. Runtime proof:
+`tests/test_discovery_never_blocks_on_score.py`.
 
 #### `fetch_batch`
 
@@ -3472,11 +3503,14 @@ once, near the top, and branches on it:
   upvotes/comments/`published_at` metadata line for an honest "no
   real-world engagement signal exists for this story" note, so
   `scroll_stopper_potential`/`social_media_clickability` are not penalized
-  for an absence that isn't real. A score rejection remains terminal for
-  that discovery call: the logged `attempt=N/3` budget covers duplicate or
-  thin-source replacement, not AI-quality re-rolls. Generating another
-  premise because an AI judge scored the first one poorly would violate the
-  Agent 2 no-quality-retry rule.
+  for an absence that isn't real. A low score does **not** trigger
+  regenerating a new premise — the logged `attempt=N/3` budget covers
+  duplicate or thin-source replacement only, never AI-quality re-rolls
+  (would violate the Agent 2 no-quality-retry rule) — but a low score also
+  no longer aborts the discovery call the way it once did: the gate never
+  blocks the pipeline (see the general `run_discovery` entry above), so the
+  premise is persisted and sent to Telegram with its score attached
+  regardless, and the operator decides.
 - **Manual fallback wording:** `_create_manual_fallback()` takes a new
   `is_ai_generated: bool = False` parameter and sends a different Telegram
   message on exhaustion ("send a story premise or full story text

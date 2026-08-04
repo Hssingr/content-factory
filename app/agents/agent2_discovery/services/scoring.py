@@ -1,17 +1,26 @@
-"""Story Scoring Gate — rejects boring or visually weak stories before scripting.
+"""Story Scoring Gate — scores every discovered/synthesized candidate before
+it reaches the operator for approval.
 
 Replaces the old "relevance + engagement + substance" selection (which never
 checked narrative tension, visual potential, or retention potential, and had
-no reject path) with a deterministic scoring gate:
+no scoring signal at all) with a deterministic scoring gate:
 
   Claude scores fixed performance dimensions plus an unweighted rights/IP risk
   signal for operator review. Python computes the weighted overall score and
-  makes the accept/reject call —
-  Claude never decides ACCEPTED/REJECTED directly (CLAUDE.md determinism rules:
-  business rules belong in Python, prompts only generate/classify content).
+  the gate verdict (``decide_story_acceptance()``) — Claude never decides
+  PASSED/BELOW_FLOOR directly (CLAUDE.md determinism rules: business rules
+  belong in Python, prompts only generate/classify content).
 
-Rejected candidates are never persisted as ``Content`` and never sent to
-Telegram — only a story that clears every gate proceeds to script generation.
+**The gate verdict is informational only and never blocks the pipeline**
+(operator decision, superseding an earlier "auto-reject" design): every
+candidate that clears dedup + the source-material floor is persisted as
+``Content`` and sent to Telegram with its score attached
+(``build_telegram_message()``, ``discovery.py``'s ``system_prompt.py``) —
+the human operator decides via APPROVE/CHANGE, not an automated verdict.
+``decide_story_acceptance()`` still computes a real accept/reject verdict;
+``run_discovery()`` uses it only for logging (`gate_verdict=PASSED` /
+`BELOW_FLOOR`) and to let the operator see the same call the gate would
+have made, never to gate persistence or the Telegram send.
 
 Fetch + score + gate orchestration for one candidate at a time lives in
 ``run_discovery()`` (``discovery.py``), which calls ``score_story_for_gate()``

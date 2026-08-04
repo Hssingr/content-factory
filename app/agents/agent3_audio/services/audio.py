@@ -8,7 +8,7 @@ from app.models import (
     AudioFile, Channel, ChannelVoice,
     Content, Script,
 )
-from app.agents.agent3_audio.services.tts import generate_audio
+from app.agents.agent3_audio.services.tts import generate_audio, is_permanent_tts_provider_error
 from app.agents.agent3_audio.services.storage import audio_path, save_audio, measure_audio_duration_ms
 from app.agents.agent3_audio.services.whisper import transcribe
 from app.services.local_run_paths import ensure_run_dirs
@@ -329,7 +329,7 @@ def run_audio_generation(content_id: uuid.UUID, db: Session) -> bool:
                 lang, attempt, _MAX_LANGUAGE_ATTEMPTS, exc,
             )
             db.rollback()
-            if attempt < _MAX_LANGUAGE_ATTEMPTS:
+            if attempt < _MAX_LANGUAGE_ATTEMPTS and not is_permanent_tts_provider_error(exc):
                 logger.warning(
                     "AUDIO_LANGUAGE_RETRY content_id=%s language=%s — queueing one "
                     "full second attempt at the end of this run",
@@ -337,6 +337,13 @@ def run_audio_generation(content_id: uuid.UUID, db: Session) -> bool:
                 )
                 work.append((lang, script, attempt + 1))
             else:
+                if is_permanent_tts_provider_error(exc):
+                    logger.error(
+                        "AUDIO_LANGUAGE_PERMANENT_ERROR content_id=%s language=%s "
+                        "— account/credential issue (%s), skipping the second-chance "
+                        "retry since it cannot succeed without fixing the account",
+                        content_id, lang, exc,
+                    )
                 missing_langs.add(lang)
             continue
 

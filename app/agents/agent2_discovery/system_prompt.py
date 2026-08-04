@@ -1098,6 +1098,8 @@ _TELEGRAM_TEMPLATES: dict[str, dict[str, str]] = {
         "title_lbl":   "Titre",
         "source_lbl":  "Source",
         "preview_lbl": "Aperçu",
+        "score_lbl":   "Score",
+        "failed_lbl":  "Seuils non atteints",
         "signals_lbl": "Signaux principaux",
         "langs_lbl":   "Langues",
         "rights_lbl":  "Revue droits/IP",
@@ -1108,6 +1110,8 @@ _TELEGRAM_TEMPLATES: dict[str, dict[str, str]] = {
         "title_lbl":   "Title",
         "source_lbl":  "Source",
         "preview_lbl": "Preview",
+        "score_lbl":   "Score",
+        "failed_lbl":  "Below floor",
         "signals_lbl": "Top signals",
         "langs_lbl":   "Languages",
         "rights_lbl":  "Rights/IP review",
@@ -1118,6 +1122,8 @@ _TELEGRAM_TEMPLATES: dict[str, dict[str, str]] = {
         "title_lbl":   "Título",
         "source_lbl":  "Fuente",
         "preview_lbl": "Vista previa",
+        "score_lbl":   "Puntuación",
+        "failed_lbl":  "Umbrales no alcanzados",
         "signals_lbl": "Señales principales",
         "langs_lbl":   "Idiomas",
         "rights_lbl":  "Revisión derechos/IP",
@@ -1128,6 +1134,8 @@ _TELEGRAM_TEMPLATES: dict[str, dict[str, str]] = {
         "title_lbl":   "Titolo",
         "source_lbl":  "Fonte",
         "preview_lbl": "Anteprima",
+        "score_lbl":   "Punteggio",
+        "failed_lbl":  "Soglie non raggiunte",
         "signals_lbl": "Segnali principali",
         "langs_lbl":   "Lingue",
         "rights_lbl":  "Revisione diritti/IP",
@@ -1196,8 +1204,17 @@ def build_telegram_message(
     Args:
         title:            Story/content title.
         url:              Source URL of the story.
-        assessment:       Optional scoring dict (``{"scores": {dim: int}}``) — used
-                          to surface top-2 dimensions. Omitted from message if None.
+        assessment:       Optional WEIGHTED story-score dict from
+                          ``score_story_assessment()`` — ``{"overall_score": float,
+                          "dimension_scores": {dim: int}, "failed_gates": [str],
+                          "operator_review_flags": [str]}``. **Not** the raw
+                          pre-weighting ``{"scores": {...}}`` shape
+                          ``score_story_for_gate()`` returns — that shape has no
+                          ``overall_score``/``failed_gates`` keys and would silently
+                          render nothing useful here. The score gate never blocks
+                          the pipeline (operator decision): this is the one place
+                          its verdict is surfaced, so the human can decide via
+                          APPROVE/CHANGE. Omitted from message if None.
         target_languages: Optional list of BCP-47 language codes. Omitted if None.
         user_language:    BCP-47 code of the channel owner (determines template language).
         source_excerpt:   Optional story/premise body text (``Content.source_excerpt``).
@@ -1231,26 +1248,28 @@ def build_telegram_message(
     if preview:
         lines.append(f"*{t['preview_lbl']}:* {preview}")
 
-    if assessment and isinstance(assessment.get("scores"), dict):
-        dims: list[tuple[str, int]] = []
-        rights_ip_risk: int | None = None
-        for name, val in assessment["scores"].items():
-            if isinstance(val, (int, float)):
-                score = int(val)
-            elif isinstance(val, dict):
-                score = int(val.get("score", 0))
-            else:
-                continue
-            if name == "rights_ip_risk":
-                rights_ip_risk = score
-                continue
-            dims.append((name, score))
+    if assessment and "overall_score" in assessment:
+        overall = assessment.get("overall_score")
+        failed_gates = assessment.get("failed_gates") or []
+        verdict_icon = "✅" if not failed_gates else "⚠️"
+        lines.append(f"*{t['score_lbl']}:* {overall}/100 {verdict_icon}")
+        if failed_gates:
+            lines.append(f"*{t['failed_lbl']}:* {'; '.join(failed_gates)}")
+
+        dimension_scores = assessment.get("dimension_scores") or {}
+        dims = [
+            (name, score) for name, score in dimension_scores.items()
+            if name != "rights_ip_risk"
+        ]
         dims.sort(key=lambda x: x[1], reverse=True)
         top2 = " · ".join(
             f"{name.replace('_', ' ').title()} ({score}/100)"
             for name, score in dims[:2]
         )
-        lines.append(f"*{t['signals_lbl']}:* {top2}")
+        if top2:
+            lines.append(f"*{t['signals_lbl']}:* {top2}")
+
+        rights_ip_risk = dimension_scores.get("rights_ip_risk")
         if rights_ip_risk is not None and rights_ip_risk >= 70:
             lines.append(
                 f"*{t['rights_lbl']}:* rights_ip_risk {rights_ip_risk}/100 — operator decision required"
