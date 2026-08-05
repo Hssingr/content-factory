@@ -141,6 +141,11 @@ Rules:
 - Frame debated traditions as attributed tradition (for example, "later chroniclers claimed")
   rather than settled fact. Introduce every named person by role or relationship on first
   mention (for example, "my brother Mago" or "Maharbal, commander of his cavalry").
+- Treat disputed figures, quotations, and anecdotes the same way: use attribution such as
+  reportedly, according to surviving accounts, or historians disagree. Prefer precise,
+  supported quantities over superlatives (roughly one third rather than the entire market;
+  several people rather than everyone). Do not sanitize morally significant context from a
+  real entity's description: state what it traded, did, or harmed honestly and age-appropriately.
 - Rights/IP safe: long-deceased historical figures are permitted only under the accuracy rule
   above. Never use a living/recent public figure, real named franchise/character, or fictional
   world, and never present invented biography as fact.
@@ -188,6 +193,11 @@ Rules:
 - Frame debated traditions as attributed tradition (for example, "later chroniclers claimed")
   rather than settled fact. Introduce every named person by role or relationship on first
   mention (for example, "my brother Mago" or "Maharbal, commander of his cavalry").
+- Attribute disputed figures, quotations, and anecdotes; prefer precise supported quantities
+  over superlatives; and retain morally significant context about what a real institution,
+  group, or experiment actually did. For example, write roughly one third rather than the
+  entire market, reportedly for a contested quote, and name harmful conduct rather than
+  replacing it with a flattering generic description.
 - Rights/IP safe: long-deceased historical figures are permitted only under the accuracy rule
   above. Never use a living/recent public figure, real named franchise/character, or fictional
   world, and never present invented biography as fact.
@@ -337,6 +347,10 @@ Rules:
 - Frame debated traditions as attributed tradition (for example, "later chroniclers claimed")
   rather than settled fact. Introduce every named person by role or relationship on first
   mention (for example, "my brother Mago" or "Maharbal, commander of his cavalry").
+- Attribute disputed figures, quotations, and anecdotes; prefer precise supported quantities
+  over superlatives; and preserve morally significant context about what a real entity did,
+  traded, or harmed. Examples: reportedly for a contested anecdote, roughly one third instead
+  of the entire market, and an honest age-appropriate description of harmful conduct.
 - Rights/IP safe: long-deceased historical figures are permitted only under the accuracy rule
   above. Never use a living/recent public figure, real named franchise/character, or fictional
   world, and never present invented biography as fact.

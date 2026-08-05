@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from app.agents.agent2_discovery.services.scripts import (
     _collect_short_script_major_issues,
     _script_trace,
+    _MAX_SHORT_WORDS,
     _MIN_SHORT_WORDS,
     generate_multilingual_scripts,
     generate_script_sections,
@@ -416,13 +417,36 @@ def _run_solo_short_script_workflow(content: Content, db: Session) -> None:
                 content.id, word_count, _MIN_SHORT_WORDS,
             )
 
+    # B2: objective, single-call ceiling regeneration. This is the exact
+    # inverse of the floor path above: no judgment loop, and the shorter of
+    # the two drafts is retained deterministically.
+    if word_count > _MAX_SHORT_WORDS * 1.10:
+        logger.warning(
+            "SOLO_SHORT_WORD_CEILING_REGEN content=%s words=%d cap=%d — regenerating once",
+            content.id, word_count, _MAX_SHORT_WORDS,
+        )
+        retry_draft = generate_solo_short_script(
+            story, blueprint, context.channel, context.source_voice,
+            visual_style=context.visual_style,
+            image_style=context.image_style,
+            narration_pov=context.narration_pov,
+            word_ceiling_note=(
+                f"Your previous draft was {word_count} words — above the hard "
+                f"{_MAX_SHORT_WORDS}-word ceiling. Rewrite it to no more than "
+                f"{_MAX_SHORT_WORDS} words while preserving the hook, reveal, and payoff."
+            ),
+        )
+        retry_words = len((retry_draft.get("voice_script") or "").split())
+        if retry_words < word_count:
+            draft, word_count = retry_draft, retry_words
+
     # Structural checks — telemetry only (Elimination Mandate); the same
     # function run_shorts_planner()'s per-part path already uses. No parent
     # script exists to run detect_parent_child_overlap() against — skipped
     # entirely, same as the existing PARENT_CHILD_OVERLAP_SKIPPED no-op path.
     issues = _collect_short_script_major_issues(
         draft.get("voice_script") or "", content.source_language,
-        part_n=1, correction_round=1,
+        part_n=1, correction_round=1, caller_label="solo_short",
     )
     if issues:
         logger.warning(

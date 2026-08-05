@@ -5126,9 +5126,11 @@ Anchor span sanity + proportional interpolation (second frozen-frame guard):
 
 Visual hold cap (third frozen-frame guard — the last-line guarantee):
 
-- Even if a bad anchor slips past BOTH guards above, no non-terminal parent
-  beat may hold one image longer than `settings.parent_visual_max_hold_ms`
-  (default 9000 ms). A lowered value of 7000 ms (independent review of real
+- Even if a bad anchor slips past BOTH guards above, no non-terminal direct-
+  storyboard beat may exceed its content-shape ceiling: parents use
+  `settings.parent_visual_max_hold_ms` (default 9000 ms), while Solo Shorts
+  use `settings.short_visual_max_hold_ms` (default 6000 ms). A lowered parent
+  value of 7000 ms (independent review of real
   output, `code_report/8abd7fea_independent_video_output_review.md` finding
   9) was tried and reverted: a real run
   (`code_report/36e0ec63-3ce1-467e-aaba-251a9a85844c_logs.txt`) showed the
@@ -5148,7 +5150,8 @@ Visual hold cap (third frozen-frame guard — the last-line guarantee):
   floor added alongside the revert so this cascading-collapse class of bug
   can't recur even if either cap is tuned again in the future; a clamp
   engaging is logged (`*_CASCADE_CLAMPED`), never silent.
-- The cap is deliberately applied in `split_into_beats()` (parent path) and
+- The cap is deliberately selected from `is_short_episode` and applied in
+  `split_into_beats()` (parent and Solo Short direct-storyboard paths) and
   `remap_beats_for_short()` (child path), after the shared
   `map_storyboard_beats_to_timestamps()` cleanup/micro-merge step — the two
   paths need different ceilings and both must cap after cleanup.
@@ -5651,6 +5654,28 @@ Rules:
 
 - `media_url` must always be local, usually `cache/...`.
 - Never pass HTTP URLs to Remotion props.
+
+### Phase A′ runtime contracts (2026-08-05)
+
+- Agent 5 converts beat millisecond starts into one shared 30-fps boundary
+  array in `remotion_builder._tile_section_frame_ranges()`. Props carry
+  `render_start_frame`/`render_end_frame`; adjacent nominal ranges must satisfy
+  `left.render_end_frame == right.render_start_frame`. Remotion may extend an
+  incoming Sequence backward for a crossfade, but its nominal start is fully
+  opaque and its nominal end remains the shared boundary.
+- Agent 4's deterministic text-prop fallback preserves the image-style clause
+  first, removes meta-rule vocabulary, and selects generic physical-detail
+  variants by `beat_order`. Storyboard prompts own contextual variation and
+  era/locale correctness; Python remains a deterministic fallback only.
+- Solo Shorts above 110% of `_MAX_SHORT_WORDS` receive one and only one
+  ceiling-constrained regeneration. `SOLO_SHORT_WORD_CEILING_REGEN` records the
+  trigger and the shorter draft is retained; this is not a quality loop.
+- A storyboard batch delivering fewer than `ceil(0.70 * requested)` beats gets
+  one follow-up call for exactly `requested - delivered`. The same segment and
+  continuity context and the existing in-call truncation retry are reused.
+  `STORYBOARD_SHORTFALL_TOPUP` records the bounded call; an under-delivering or
+  failed follow-up is accepted and logged as `STORYBOARD_SHORTFALL_ACCEPTED`.
+  Never top up the top-up.
 - Cache reuse must not create obvious visual repetition.
 - Subtitles-only rendering (audit G-0/G-8): text cards are removed. Every
   beat is a Flux-generated image. On a hard generation failure the beat gets
@@ -5777,6 +5802,14 @@ callers share one implementation instead of forking it:
   got — see §9.6).
 - `width=1080, height=1920` — portrait, threaded into
   `generate_all_beat_images()`.
+- `solo_person_anchor_reuse=True` — when the blueprint has a valid primary
+  `character_descriptors` entry, the exact descriptor is prepended to matching
+  `visual_category="person"` prompts. The first healthy generated image becomes
+  an anchor; at most two later matching person beats reuse its local image before
+  the next matching person beat generates fresh and replaces the anchor. Beat 0
+  always generates fresh. This decision happens before fal.ai and therefore
+  reduces paid calls. It is never enabled for parents or child remap Shorts, and
+  is a no-op for stories without a dominant character.
 - `allow_legacy_fallback=False` — hardcoded; this dead toggle is never set
   by the UI for any content shape (§11.4's `split_into_beats` entry).
 - Milestone logs are `SOLO_SHORT_VISUALS_START`/`SOLO_SHORT_VISUALS_DONE`
@@ -6228,7 +6261,7 @@ What remains — prompt-side sanitization (the surviving half of Phase 14.7):
   "the text reads …", "label reading …", "sign that says …", or any other
   literal-text-rendering instruction.
 - **Text-bearing narration moments are designed as physical scenes without
-  legible text, using a named, generalizable technique taxonomy** (v4.2,
+  legible text, using a named, generalizable technique taxonomy** (v5.2,
   roadmap 2.9 / audit G-3) — the storyboard prompt's "Every beat is a
   generated image" section teaches four reusable framing techniques rather
   than a fixed example list, so Claude can apply the rule to any
@@ -6250,23 +6283,16 @@ What remains — prompt-side sanitization (the surviving half of Phase 14.7):
   Word-boundary matters: plain substring matching once made "document"
   match inside "documentary photograph", silently rewriting valid prompts.
 - Sanitization — `flux_generator.derive_text_prop_prompt(beat)`, wired into
-  `storyboard._build_beat_section()` (shared by parent and child paths).
-  **Simplified by the Elimination Mandate (D2.2/D2.3,
-  `code_report/forensic_output_audit_borrasca_run.md`):** the previous
-  version discarded Claude's own `flux_prompt` and rebuilt a new one from
-  `visual_intent` plus a detected prop label and environment scene words,
-  injected a second copy of the ANGLE/DISTANCE/LIGHTING/DETAIL taxonomy as a
-  framing clause, and appended a 10-clause negative-style wall
-  (`_TEXT_PROP_NO_TEXT_CLAUSE`) — this produced broken English,
-  self-contradictory prompts, and duplicate images in production. The
-  function now keeps Claude's `flux_prompt` **verbatim** and appends exactly
-  **one** short clause (`"no readable text or legible words in the frame"`).
-  It never rewrites the subject and never re-derives framing — the taxonomy
-  above is taught to Claude directly in the storyboard system prompt (still
-  unchanged) rather than re-injected here after the fact. It still falls
-  back to `visual_intent` only when `flux_prompt` is genuinely empty, and it
-  still fires for a child-remap beat (no storyboard-prompt pass of its own).
-  Logged as `TEXT_PROP_PROMPT_SANITIZED`.
+  `storyboard._build_beat_section()` (shared by parent and child paths). Phase
+  A3.1 replaces ineffective clause stacking with a small deterministic mapping
+  from generic text-object classes (document/board/sign/screen/newspaper/map/
+  poster/calendar/book) to material details such as paper edges, seals, chalk
+  dust, screen glow, or hands. The original text-bearing subject is omitted so
+  Schnell is not asked to draw it again, and exactly one consolidated no-text/
+  no-artifact clause is appended. `_build_defect_rewrite_prompt()` uses the same
+  reframe, so the existing heal ladder does not reintroduce the bad subject.
+  It still fires for a child-remap beat (no storyboard-prompt pass of its own)
+  and is logged as `TEXT_PROP_PROMPT_SANITIZED`.
 - Validator — check 19 (`ai_text_rendering_requested`, MAJOR) in
   `validate_storyboard()` fires on any beat whose prompt contains a quoted
   phrase or a literal-text-rendering instruction. No exemptions exist (text

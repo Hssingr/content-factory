@@ -7,7 +7,9 @@ from app.services.script_checks import split_sentences
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "5.6"  # v5.6: AI-premise scoring distinguishes the plain
+PROMPT_VERSION = "5.7"  # v5.7: Short Quality Roadmap Phase A3 — explicit Solo
+                        #        Short ceiling and factual-framing guidance.
+                        # v5.6: AI-premise scoring distinguishes the plain
                         # operator pitch from the future video's opening.
                         # v5.5: long-form budgets, native grammar agreement,
                         # exclusive Short spans, and content-specific phrasing.
@@ -1708,6 +1710,9 @@ Rules:
   (260 words ≈ 89 seconds at the measured ~175 wpm compressed Short narration rate —
   calibrated from production audio after interior-silence compression, not the raw
   "words per second" of the TTS voice.)
+- HARD CEILING: voice_script must never exceed 270 words. Scripts over 270 words
+  exceed the calibrated Short render window and risk being cut off mid-sentence;
+  remove the least essential sentences before returning, never the payoff.
 - First sentence uses the opening_hook from the plan, ≤15 words, and starts at a
   high-tension story moment. It must also pass the cold-open deletion test: read it as
   the first thing a viewer ever hears, with no title, part number, previous part, or
@@ -1769,6 +1774,13 @@ Rules:
   consequence; never ask a scope-less question about "all of history".
 - Any sunk-cost reasoning must be framed as my/the character's rationalization
   under pressure, never as objective wisdom or advice endorsed by the narration.
+- For real-world factual material, attribute disputed figures, quotations, and
+  anecdotes instead of presenting them as documented fact (for example,
+  reportedly, according to surviving accounts, or historians disagree). Prefer
+  precise supported quantities over superlatives: roughly one third, not the
+  entire market; several victims, not everyone. Never sanitize morally important
+  context from a real entity: state what an institution traded, what a group did,
+  or what an experiment harmed in age-appropriate but honest language.
 - ORIGINALITY — this is the most strictly enforced rule in this prompt: you will be
   given the long-form voice script for story grounding only. You must NEVER lift a
   run of 6 or more consecutive words directly from it, even when the long-form
@@ -1904,6 +1916,9 @@ Rules:
   (260 words ≈ 89 seconds at the measured ~175 wpm compressed narration rate —
   calibrated from production audio after interior-silence compression, not the raw
   "words per second" of the TTS voice.)
+- HARD CEILING: voice_script must never exceed 270 words. Scripts over 270 words
+  exceed the calibrated Short render window and risk being cut off mid-sentence;
+  remove the least essential sentences before returning, never the payoff.
 - First sentence is the hook: ≤15 words, starts at the highest-tension moment you can
   find in the source material. It must also pass the cold-open deletion test: read it
   as the first thing a viewer ever hears, with no title, no context, nothing before it.
@@ -1957,6 +1972,13 @@ Rules:
   the person's name or concrete role is available.
 - Any sunk-cost reasoning must be framed as my/the character's rationalization
   under pressure, never as objective wisdom or advice endorsed by the narration.
+- For real-world factual material, attribute disputed figures, quotations, and
+  anecdotes instead of presenting them as documented fact (for example,
+  reportedly, according to surviving accounts, or historians disagree). Prefer
+  precise supported quantities over superlatives: roughly one third, not the
+  entire market; several victims, not everyone. Never sanitize morally important
+  context from a real entity: state what an institution traded, what a group did,
+  or what an experiment harmed in age-appropriate but honest language.
 - ORIGINALITY — this is the most strictly enforced rule in this prompt: you are given
   the raw source material for FACT GROUNDING ONLY. You must NEVER lift a run of 6 or
   more consecutive words directly from it, even when the source phrasing is already
@@ -1992,6 +2014,7 @@ def generate_solo_short_script(
     image_style: str = "",
     narration_pov: str = "third_person",
     word_floor_note: str = "",
+    word_ceiling_note: str = "",
 ) -> dict:
     """Generate a complete, standalone short episode script directly from
     discovered/generated source material — no parent, no plan, no siblings.
@@ -2012,6 +2035,8 @@ def generate_solo_short_script(
                             (operator-approved Elimination Mandate exception,
                             2026-07-16): an objective word-count trigger, never
                             an AI quality judgment.
+        word_ceiling_note: Optional prepended constraint line used only by the
+                           single objective ceiling regeneration.
 
     Returns:
         Dict with keys ``title`` (str) and ``voice_script`` (str).
@@ -2027,7 +2052,8 @@ def generate_solo_short_script(
     import json
     bp_json = json.dumps(blueprint, ensure_ascii=False)
 
-    floor_line = f"{word_floor_note}\n\n" if word_floor_note else ""
+    length_note = word_ceiling_note or word_floor_note
+    floor_line = f"{length_note}\n\n" if length_note else ""
     user_message = (
         f"{floor_line}"
         f"Channel niche: {channel.niche}\n"

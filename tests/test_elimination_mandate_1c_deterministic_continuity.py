@@ -214,12 +214,10 @@ class TestVisualBibleLayerFullyRemoved(unittest.TestCase):
         self.assertFalse(hasattr(visual_orchestrator, "_FINAL_PROMPT_VALIDATION_CHECKS"))
 
 
-class TestTextPropSanitizerNeverRewritesSubject(unittest.TestCase):
-    """D2.2/D2.3: Claude's own flux_prompt survives verbatim; exactly one
-    short no-readable-text clause is appended. No framing taxonomy
-    injection, no 10-clause negative wall, no environment reconstruction."""
+class TestTextPropSanitizerMaterialReframe(unittest.TestCase):
+    """Roadmap A3.1: text objects become physical material details."""
 
-    def test_verbatim_prompt_plus_one_clause(self):
+    def test_reframes_subject_without_repeating_text_object(self):
         beat = {
             "flux_prompt": "A weathered case file left open on a warehouse desk, dust in the air",
             "visual_intent": "evidence of the cover-up",
@@ -227,16 +225,18 @@ class TestTextPropSanitizerNeverRewritesSubject(unittest.TestCase):
         }
         self.assertTrue(flux_generator.is_text_prop_beat(beat))
         result = flux_generator.derive_text_prop_prompt(beat)
-        self.assertTrue(result.startswith(beat["flux_prompt"]))
-        self.assertIn("no readable text", result)
+        self.assertTrue(result.startswith("paper texture"))
+        self.assertNotIn("case file", result)
+        self.assertNotIn("no readable text", result)
         # No old framing/negative-wall artifacts.
         self.assertNotIn("blank and unmarked", result)
         self.assertNotIn("illegible or blank surface only", result)
 
-    def test_falls_back_to_visual_intent_only_when_prompt_empty(self):
+    def test_reframes_visual_intent_when_prompt_empty(self):
         beat = {"flux_prompt": "", "visual_intent": "a case file on a desk", "motif": "document"}
         result = flux_generator.derive_text_prop_prompt(beat)
-        self.assertTrue(result.startswith("a case file on a desk"))
+        self.assertTrue(result.startswith("paper texture"))
+        self.assertNotIn("case file", result)
 
     def test_helper_functions_for_old_rewrite_mechanism_are_gone(self):
         for name in (

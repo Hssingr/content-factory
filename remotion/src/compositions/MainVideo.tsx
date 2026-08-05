@@ -22,6 +22,7 @@ export const mainVideoCalculateMetadata: CalculateMetadataFunction<MainVideoProp
 
 export const MainVideo: React.FC<MainVideoProps> = ({
   audio_file,
+  duration_ms,
   sections,
   subtitles,
   leading_transition,
@@ -34,7 +35,12 @@ export const MainVideo: React.FC<MainVideoProps> = ({
       <Audio src={audioSrc} />
 
       {sections.map((section, idx) => {
-        const sectionDurMs = section.audio_end_ms - section.audio_start_ms;
+        const nominalFrom = section.render_start_frame
+          ?? Math.round((section.audio_start_ms / 1000) * fps);
+        const nominalEnd = section.render_end_frame
+          ?? (idx + 1 < sections.length
+            ? Math.round((sections[idx + 1].audio_start_ms / 1000) * fps)
+            : Math.ceil((duration_ms / 1000) * fps));
         // The PREVIOUS section's transition_to_next decides how long this section
         // overlaps with it (and which entrance style MediaSection plays). For a
         // chunked render, this chunk's own first section (idx === 0) has no local
@@ -50,23 +56,21 @@ export const MainVideo: React.FC<MainVideoProps> = ({
         // well above the longest possible crossfade), but the render layer should not
         // silently produce an overlap reaching past the previous section's own start
         // if that upstream invariant is ever violated by a future change.
-        const ownDurFrames = Math.max(1, Math.round((sectionDurMs / 1000) * fps));
+        const ownDurFrames = Math.max(1, nominalEnd - nominalFrom);
         const prevDurFrames = idx > 0
-          ? Math.max(1, Math.round(
-              ((sections[idx - 1].audio_end_ms - sections[idx - 1].audio_start_ms) / 1000) * fps,
-            ))
+          ? Math.max(1,
+              (sections[idx - 1].render_end_frame ?? nominalFrom)
+              - (sections[idx - 1].render_start_frame
+                ?? Math.round((sections[idx - 1].audio_start_ms / 1000) * fps)))
           : 0;
         const crossfadeIn = idx > 0
           ? Math.min(rawCrossfadeIn, ownDurFrames, prevDurFrames)
           : 0;
         const from = Math.max(
           0,
-          Math.round((section.audio_start_ms / 1000) * fps) - crossfadeIn,
+          nominalFrom - crossfadeIn,
         );
-        const dur = Math.max(
-          1,
-          Math.round((sectionDurMs / 1000) * fps) + crossfadeIn,
-        );
+        const dur = Math.max(1, nominalEnd - from);
 
         return (
           <Sequence key={section.order} from={from} durationInFrames={dur}>

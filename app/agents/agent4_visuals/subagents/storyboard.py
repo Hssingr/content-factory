@@ -357,6 +357,11 @@ _MOTIF_MAX_PER_WINDOW = 2
 # failure point while only rarely triggering a split for normal segments.
 _MAX_BEATS_PER_BATCH = 20
 
+# Phase B1: one objective, bounded follow-up is allowed only when a storyboard
+# batch delivers less than 70% of its requested beats. This is a count gate,
+# never an AI quality judgment.
+_BEAT_SHORTFALL_TOPUP_FLOOR = 0.70
+
 # ── Deterministic continuity line (Elimination Mandate, D2.1) ───────────────
 # Replaces the entire visual-bible layer (Claude generation call, compaction,
 # injection, cinematic-prompt enrichment, first-15 enhancement/validation) —
@@ -625,7 +630,62 @@ def split_into_beats(
                 _truncation_count += 1
                 _retry_count      += 1
             _requested_beats += sub_target_beat_count
-            beats = storyboard.get("beats") or []
+            beats = _normalize_beat_order(storyboard.get("beats") or [])
+
+            delivered = len(beats)
+            delivery_floor = math.ceil(
+                _BEAT_SHORTFALL_TOPUP_FLOOR * sub_target_beat_count
+            )
+            if delivered < delivery_floor:
+                topup_target = sub_target_beat_count - delivered
+                logger.warning(
+                    "STORYBOARD_SHORTFALL_TOPUP requested=%s delivered=%s topup=%s "
+                    "cost_tracked_via=STORYBOARD_RETRY_COST",
+                    sub_target_beat_count, delivered, topup_target,
+                )
+                try:
+                    topup_storyboard, topup_usage, topup_diag = generate_storyboard_batch(
+                        segment_label=sub_label,
+                        segment_text=sub_text,
+                        segment_index=index,
+                        segment_count=len(segments),
+                        channel=channel,
+                        script_format=script_format,
+                        previous_segment_summary=previous_summary,
+                        target_beat_count=topup_target,
+                        visual_style=visual_style,
+                        image_style=image_style,
+                        continuity_line=continuity_line,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "STORYBOARD_SHORTFALL_ACCEPTED requested=%s delivered=%s "
+                        "topup_requested=%s topup_delivered=0 reason=topup_failed error=%s",
+                        sub_target_beat_count, delivered, topup_target, exc,
+                    )
+                else:
+                    total_output_tokens += topup_usage.get("output_tokens", 0)
+                    total_input_tokens += topup_diag.get("input_tokens", 0)
+                    total_generation_time_ms += topup_diag.get("elapsed_ms", 0)
+                    total_claude_calls += topup_diag.get("attempt_count", 1)
+                    if topup_diag.get("was_truncated"):
+                        _truncation_count += 1
+                        _retry_count += 1
+                    topup_beats = _normalize_beat_order(
+                        topup_storyboard.get("beats") or []
+                    )
+                    # A follow-up batch numbers itself from zero. Offset it so
+                    # the existing per-batch normalization cannot discard it as
+                    # duplicate local beat_order values.
+                    beats.extend({**beat, "beat_order": delivered + offset}
+                                 for offset, beat in enumerate(topup_beats))
+                    if len(topup_beats) < topup_target:
+                        logger.warning(
+                            "STORYBOARD_SHORTFALL_ACCEPTED requested=%s delivered=%s "
+                            "topup_requested=%s topup_delivered=%s final=%s",
+                            sub_target_beat_count, delivered, topup_target,
+                            len(topup_beats), len(beats),
+                        )
             if not beats:
                 logger.warning(
                     "Storyboard batch for segment %s (%d/%d) returned no beats — aborting "
@@ -710,24 +770,38 @@ def split_into_beats(
             _hint_total, _hint_valid, _hint_invalid, _inv_rate,
         )
 
+    # Solo Shorts use the tighter Short hold ceiling.  They enter this direct
+    # storyboard path (not remap_beats_for_short), so selecting the cap here is
+    # the only way both density planning and the final hold clamp agree on the
+    # content shape.
+    _hold_cap_ms = (
+        _SHORT_VISUAL_MAX_HOLD_MS
+        if is_short_episode
+        else _PARENT_VISUAL_MAX_HOLD_MS
+    )
+
     mapped = map_storyboard_beats_to_timestamps(
         beats, whisper_transcript, duration_ms,
         allow_legacy_fallback=allow_legacy_fallback,
         language=language,
-        max_hold_ms=_PARENT_VISUAL_MAX_HOLD_MS,
+        max_hold_ms=_hold_cap_ms,
     )
     if mapped is None:
         return None
 
-    # Last-line frozen-frame guarantee for the parent path: even if a bad
+    # Last-line frozen-frame guarantee: even if a bad
     # anchor slips past the proximity window AND the span sanity check, no
     # non-terminal beat may hold one image beyond the configured ceiling.
     return _apply_visual_hold_cap(
         mapped,
-        max_hold_ms=_PARENT_VISUAL_MAX_HOLD_MS,
+        max_hold_ms=_hold_cap_ms,
         content_id=content_id,
         language=language,
-        log_prefix="PARENT_VISUAL_HOLD_CAP",
+        log_prefix=(
+            "SHORT_VISUAL_HOLD_CAP"
+            if is_short_episode
+            else "PARENT_VISUAL_HOLD_CAP"
+        ),
     )
 
 

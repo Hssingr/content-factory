@@ -97,13 +97,8 @@ class TestBeatBuildDowngrade(unittest.TestCase):
         self.assertEqual(out["color_grade"], "neutral")
 
     def test_sanitized_text_prop_prompt_with_lighting_evidence_keeps_grade(self):
-        # Elimination Mandate (D2.2/D2.3): the text-prop sanitizer no longer
-        # rewrites the subject or appends boilerplate lighting language — it
-        # returns Claude's own flux_prompt verbatim plus one no-readable-text
-        # clause. The guard must still evaluate the FINAL (sanitized) prompt:
-        # since the original prompt already carries lighting evidence, that
-        # evidence survives verbatim through sanitization, so the grade
-        # survives too.
+        # Phase A3.1 rewrites the text-bearing subject but preserves concrete
+        # lighting evidence, so the final-prompt dark-grade guard still sees it.
         raw = _beat(0, color_grade="dark_contrast",
                     flux_prompt="old case file document under a bright desk lamp",
                     visual_intent="a case file document")

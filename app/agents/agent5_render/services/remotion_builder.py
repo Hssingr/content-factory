@@ -42,6 +42,49 @@ logger = logging.getLogger(__name__)
 # Roadmap 2b / audit P0-2 (code_report/forensic_output_audit_borrasca_run.md):
 # mirrors Agent 3's cross-timeline invariant at the props-building layer.
 _TIMELINE_DRIFT_TOLERANCE = 0.02  # 2%
+_REMOTION_FPS = 30
+
+
+def _tile_section_frame_ranges(
+    sections: list[dict], *, timeline_start_ms: int, duration_ms: int,
+    fps: int = _REMOTION_FPS,
+) -> list[tuple[int, int]]:
+    """Convert shared millisecond boundaries to gap-free nominal frame ranges.
+
+    Every internal boundary is rounded exactly once and shared by both adjacent
+    beats. This avoids the one-frame holes caused by independently rounding a
+    beat's start and duration (e.g. 59,680→64,125 ms at 30 fps).
+    """
+    if not sections:
+        return []
+    starts = [
+        round(((int(section.get("audio_start_ms", 0)) - timeline_start_ms) / 1000) * fps)
+        for section in sections
+    ]
+    starts[0] = 0
+    total_frames = max(1, -(-duration_ms * fps // 1000))
+    ranges: list[tuple[int, int]] = []
+    for index, start in enumerate(starts):
+        start = max(0, start)
+        end = starts[index + 1] if index + 1 < len(starts) else total_frames
+        ranges.append((start, max(start + 1, end)))
+    return ranges
+
+
+def _sections_for_remotion(
+    sections: list[dict], *, timeline_start_ms: int, duration_ms: int,
+) -> list[dict]:
+    ranges = _tile_section_frame_ranges(
+        sections, timeline_start_ms=timeline_start_ms, duration_ms=duration_ms,
+    )
+    return [
+        {
+            **_section_for_remotion(section),
+            "render_start_frame": start_frame,
+            "render_end_frame": end_frame,
+        }
+        for section, (start_frame, end_frame) in zip(sections, ranges)
+    ]
 
 
 def _assert_timeline_alignment(
@@ -150,7 +193,9 @@ def build_main_props(
         "language":   language,
         "audio_file": _audio_rel(audio_file_path),   # relative to media_path (Remotion --public-dir)
         "duration_ms": duration_ms,
-        "sections": [_section_for_remotion(s) for s in sections],
+        "sections": _sections_for_remotion(
+            sections, timeline_start_ms=0, duration_ms=duration_ms,
+        ),
         "subtitles": {"style": "standard", "captions": standard_subtitles},
     }
 
@@ -205,7 +250,11 @@ def build_short_props(
         "start_ms":    short_start,
         "end_ms":      short_end,
         "duration_ms": short_end - short_start,
-        "sections":    [_section_for_remotion(s) for s in short.get("sections", [])],
+        "sections":    _sections_for_remotion(
+            short.get("sections", []),
+            timeline_start_ms=short_start,
+            duration_ms=short_end - short_start,
+        ),
         "subtitles":   {"style": "karaoke", "captions": short_captions},
         "part_label":  short.get("part_label", ""),
         "total_parts": short.get("total_parts", 1),

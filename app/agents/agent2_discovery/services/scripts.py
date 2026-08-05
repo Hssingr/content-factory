@@ -1924,6 +1924,7 @@ def generate_script_sections(
 # because the model overshot. New calibration at ~175 wpm compressed:
 _MIN_SHORT_WORDS = 190  # ~65 s — the hard 61 s audio floor needs ≥ ~180 words
 _MAX_SHORT_WORDS = 270  # ~92 s — telemetry-only: an over-cap Short ships, never fails
+_SHORT_CALIBRATED_WPM = 175
 
 # Section markers must never appear in a child Short's narration — flat narration only
 # (CLAUDE.md §5.2). Catches [INTRO], [SECTION N], [OUTRO], or any other bracketed label
@@ -2517,6 +2518,7 @@ def _collect_short_script_major_issues(
     source_language: str,
     part_n: int,
     correction_round: int,
+    caller_label: str = "run_shorts_planner",
 ) -> list[dict]:
     tts_issues = check_tts_compliance(ep_voice_script, source_language)
     first_sent = (
@@ -2549,8 +2551,8 @@ def _collect_short_script_major_issues(
             ),
         })
         logger.warning(
-            "run_shorts_planner: part %d attempt %d contains section marker %r (telemetry only)",
-            part_n, correction_round, marker_match.group(0),
+            "%s: part %d attempt %d contains section marker %r (telemetry only)",
+            caller_label, part_n, correction_round, marker_match.group(0),
         )
 
     ep_wc = len(ep_voice_script.split())
@@ -2565,8 +2567,8 @@ def _collect_short_script_major_issues(
             ),
         })
         logger.warning(
-            "run_shorts_planner: part %d attempt %d word count %d < floor %d (telemetry only)",
-            part_n,
+            "%s: part %d attempt %d word count %d < floor %d (telemetry only)",
+            caller_label, part_n,
             correction_round,
             ep_wc,
             _MIN_SHORT_WORDS,
@@ -2577,14 +2579,15 @@ def _collect_short_script_major_issues(
             "category": "script_too_long",
             "description": (
                 f"voice_script is {ep_wc} words — exceeds the {_MAX_SHORT_WORDS}-word calibrated "
-                f"cap (≈90 s at the measured ~120 wpm Short rate). Target "
+                f"cap (≈{round(_MAX_SHORT_WORDS / _SHORT_CALIBRATED_WPM * 60)} s at the "
+                f"measured ~{_SHORT_CALIBRATED_WPM} wpm Short rate). Target "
                 f"{_MIN_SHORT_WORDS}–{_MAX_SHORT_WORDS} words. "
                 f"Cut {ep_wc - _MAX_SHORT_WORDS} words by removing the least essential sentences."
             ),
         })
         logger.warning(
-            "run_shorts_planner: part %d attempt %d word count %d > cap %d (telemetry only)",
-            part_n,
+            "%s: part %d attempt %d word count %d > cap %d (telemetry only)",
+            caller_label, part_n,
             correction_round,
             ep_wc,
             _MAX_SHORT_WORDS,

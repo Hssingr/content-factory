@@ -58,6 +58,7 @@ logger = logging.getLogger(__name__)
 _INTER_BEAT_SLEEP_SEC = 0.5  # conservative until rate limits confirmed
 _PIXEL_HASH_SIZE = 8
 _PIXEL_HASH_COLLISION_MAX_DISTANCE = 3
+_MAX_CONSECUTIVE_ANCHOR_REUSE = 2
 
 # Luminance gate (operator-confirmed live-canary fix): a real production run
 # shipped a beat whose Flux generation was a 100% black JPEG (mean luminance
@@ -103,7 +104,9 @@ _TEXT_PROP_KEYWORDS: tuple[str, ...] = (
     # parchment-mentioning beats in one run were uncaught — code_report/
     # 8abd7fea_independent_video_output_review.md, finding 2).
     "book", "ledger", "parchment", "scroll", "manuscript", "notice",
-    "notice board", "seal", "wax seal",
+    "notice board", "seal", "wax seal", "checklist", "list", "book cover",
+    "cover", "signage", "storefront", "banknote", "bank note", "bill",
+    "watermark", "artist credit", "credit line",
 )
 _TEXT_PROP_FIELDS: tuple[str, ...] = ("flux_prompt", "visual_intent", "motif")
 
@@ -118,16 +121,72 @@ _TEXT_PROP_KEYWORD_PATTERNS: tuple[tuple[str, "re.Pattern[str]"], ...] = tuple(
     (kw, re.compile(r"\b" + re.escape(kw) + r"\b")) for kw in _TEXT_PROP_KEYWORDS
 )
 
-# Elimination Mandate (code_report/forensic_output_audit_borrasca_run.md,
-# D2.2/D2.3): the previous sanitizer rewrote the subject entirely (environment
-# scene hint + detected prop label + a selected ANGLE/DISTANCE/LIGHTING/DETAIL
-# framing clause + a 10-clause negative wall), which produced broken English
-# ("corkboard-less wide shot"), self-contradictions ("Sam's hands... his
-# expression" alongside "no people"), and identical sanitized prompts for
-# distinct beats (since the template ignored most of the original prompt) —
-# directly causing duplicate images. Claude's own flux_prompt is never
-# rewritten now; exactly one short clause is appended.
-_TEXT_PROP_NO_TEXT_CLAUSE = "no readable text or legible words in the frame"
+# Phase A3.1: Schnell tends to draw gibberish even when a text-bearing object
+# is followed by several negative clauses. Reframe the *object class* into a
+# physical detail instead. The table is deliberately small and generic; it
+# never interprets story meaning. The original text-bearing subject is omitted
+# because retaining it as "context" still causes Schnell to draw the object.
+_TEXT_PROP_MATERIAL_REFRAMES: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
+    (("document", "report", "case file", "file folder", "letter", "diary", "manuscript"),
+     ("paper texture, torn edges, folds, and a wax seal in close-up",
+      "creased paper fibers, period fasteners, ink-stained fingertips, and raking light",
+      "stacked paper edges, worn corners, binding thread, and hands sorting the pages")),
+    (("checklist", "list"),
+     ("a hand marking abstract rows on textured paper, with all marks out of focus",
+      "creased paper, repeated non-legible strokes, a blunt pencil, and strong side light")),
+    (("board", "price board", "notice board", "signage", "storefront"),
+     ("chalk dust and a hand mid-stroke, with the board surface out of focus",
+      "weathered painted surface, mounting brackets, peeling edges, and street context",
+      "shopfront material details, worn trim, reflections, and an oblique unreadable sign face")),
+    (("sign", "street sign", "name tag", "label", "identification card", "id card", "license"),
+     ("weathered material, mounting hardware, edges, and a hand interacting with it",
+      "an edge-on view of the object, scuffed surface, fasteners, and shallow focus")),
+    (("screen", "phone screen", "text message", "phone message"),
+     ("screen glow reflected on a face and hands, with the display itself out of focus",
+      "a face lit by soft device glow, fingers gripping the dark edge, display turned away")),
+    (("newspaper", "article", "headline"),
+     ("newsprint texture, folded paper edges, ink grain, and hands holding the page",
+      "a rolled newspaper edge, coarse fibers, smudged ink texture, and a reader's hands")),
+    (("map", "map caption"),
+     ("creased map paper, route lines as non-legible shapes, a pointing hand, and surrounding terrain tools",)),
+    (("poster", "missing poster", "missing person poster", "wanted poster", "notice"),
+     ("torn paper fibers, fastening pins, weathered edges, and the surrounding wall context",
+      "a curling paper corner, paste residue, rough masonry, and an oblique unreadable surface")),
+    (("calendar",),
+     ("paper layers, a turning page, binding rings, and angled daylight",)),
+    (("book", "book cover", "cover", "ledger", "parchment", "scroll"),
+     ("aged material texture, binding or rolled edges, clasps, and hands interacting with it",
+      "worn cover corners, embossed texture without symbols, page edges, and a hand opening it",
+      "binding thread, deckled page edges, dust, and an edge-on close-up")),
+    (("banknote", "bank note", "bill"),
+     ("period paper currency seen edge-on, fibrous material, folds, and a hand exchanging it",
+      "a worn stack of period notes, frayed edges and ink texture, with faces out of focus")),
+    (("watermark", "artist credit", "credit line"),
+     ("the underlying scene reframed in a tight material-detail close-up with clean image edges",
+      "the main physical subject viewed from an oblique angle with uncluttered negative space")),
+)
+
+_META_RULE_FRAGMENT_RE = re.compile(
+    r"\b(?:title[ -]?card(?: typography)?|no readable text|legible words?|"
+    r"rule phrasing|prompt rule|do not render text)\b",
+    re.IGNORECASE,
+)
+_STYLE_MARKER_RE = re.compile(
+    r"\b(?:photorealistic|cinematic realism|cinematic[_ -]cartoon|dark realistic|"
+    r"vintage film|digital art|oil painting|watercolor|anime|illustration)\b",
+    re.IGNORECASE,
+)
+_STYLE_CONTINUATION_RE = re.compile(
+    r"\b(?:outlines?|color fills?|stylized|palette|grain|render|lighting|sharp focus)\b",
+    re.IGNORECASE,
+)
+
+_MATERIAL_CONTEXT_LIGHTING_RE = re.compile(
+    r"\b(?:under|in|with|lit by)\s+(?:a[n]?\s+)?"
+    r"(?:bright|well-lit|daylight|sunlit|fluorescent|incandescent|golden|overcast)"
+    r"[a-z -]{0,32}(?:light|lamp|lighting|sunlight|daylight)\b",
+    re.IGNORECASE,
+)
 
 # Applied to EVERY generated beat, not just text-prop beats (independent
 # review of real output found a stray "2024." watermark-style mark baked
@@ -150,16 +209,41 @@ def is_text_prop_beat(beat: dict) -> bool:
 
 
 def derive_text_prop_prompt(beat: dict) -> str:
-    """Return Claude's own flux_prompt verbatim, plus one no-readable-text clause.
-
-    Never rewrites the subject — see the Elimination Mandate note above this
-    function. Falls back to visual_intent only if flux_prompt is genuinely
-    empty (never fabricates new subject text).
-    """
-    original = str(beat.get("flux_prompt") or beat.get("visual_intent") or "").strip()
-    if not original:
-        return _TEXT_PROP_NO_TEXT_CLAUSE
-    return f"{original}, {_TEXT_PROP_NO_TEXT_CLAUSE}"
+    """Reframe a text-bearing subject as material detail, deterministically."""
+    descriptive_haystack = " ".join(
+        str(beat.get(field, "") or "")
+        for field in ("flux_prompt", "visual_intent")
+    ).lower()
+    fallback_haystack = str(beat.get("motif", "") or "").lower()
+    beat_order = int(beat.get("beat_order", 0) or 0)
+    reframe = "material texture, edges, and hands interacting with the object in close-up"
+    for keywords, candidates in _TEXT_PROP_MATERIAL_REFRAMES:
+        if any(re.search(r"\b" + re.escape(keyword) + r"\b", descriptive_haystack) for keyword in keywords):
+            reframe = candidates[beat_order % len(candidates)]
+            break
+    else:
+        for keywords, candidates in _TEXT_PROP_MATERIAL_REFRAMES:
+            if any(re.search(r"\b" + re.escape(keyword) + r"\b", fallback_haystack) for keyword in keywords):
+                reframe = candidates[beat_order % len(candidates)]
+                break
+    original_prompt = str(beat.get("flux_prompt") or "")
+    chunks = [chunk.strip() for chunk in original_prompt.split(",") if chunk.strip()]
+    style_chunks: list[str] = []
+    collecting = False
+    for chunk in chunks:
+        if _META_RULE_FRAGMENT_RE.search(chunk):
+            continue
+        if _STYLE_MARKER_RE.search(chunk):
+            collecting = True
+        elif collecting and not _STYLE_CONTINUATION_RE.search(chunk):
+            break
+        if collecting:
+            style_chunks.append(chunk)
+    style_anchor = ", ".join(style_chunks)
+    lighting_match = _MATERIAL_CONTEXT_LIGHTING_RE.search(original_prompt)
+    lighting = f", {lighting_match.group(0)}" if lighting_match else ""
+    body = f"{reframe}{lighting}"
+    return f"{style_anchor}, {body}" if style_anchor else body
 
 
 def generate_beat_image_with_routing(
@@ -409,6 +493,8 @@ def _build_defect_rewrite_prompt(beat: dict, idx: int) -> str:
     no AI call.
     """
     intent = str(beat.get("visual_intent") or "").strip().rstrip(". ")
+    if is_text_prop_beat(beat):
+        intent = derive_text_prop_prompt(beat).rstrip(". ")
     environment = str(beat.get("environment") or "other")
     base = intent if len(intent.split()) >= 4 else _ENV_SAFE_PROMPTS.get(
         environment, _ENV_SAFE_PROMPTS["other"],
@@ -578,6 +664,7 @@ def fill_failed_beats_from_neighbors(beats: list[dict], content_id: str) -> int:
 def generate_all_beat_images(
     beats: list[dict], content_id: str,
     width: int = _DEFAULT_WIDTH, height: int = _DEFAULT_HEIGHT,
+    person_anchor_continuity_line: str = "",
 ) -> list[dict]:
     """Generate Flux images for all beats sequentially (1 worker, 0.5s inter-beat sleep).
 
@@ -603,6 +690,11 @@ def generate_all_beat_images(
                     existing child-remap portrait generation.
         height:     Image height — landscape 1080 (default) or 1920 (Solo
                     Short portrait).
+        person_anchor_continuity_line: Exact primary-character continuity
+                    text present in eligible Solo Short person prompts. When
+                    non-empty, successful person images are reused at most
+                    twice consecutively before a fresh anchor is generated.
+                    Parent and child paths leave this empty.
 
     Returns:
         The same list with each beat's ``media_url`` set.
@@ -621,9 +713,33 @@ def generate_all_beat_images(
     # below because max_workers=1 (beats are generated one at a time).
     tier_counts: dict[str, int] = {}
     pixel_ledger: list[dict] = []
+    person_anchor: dict | None = None
+    consecutive_anchor_reuses = 0
 
     def _generate_one(beat: dict) -> dict:
+        nonlocal person_anchor, consecutive_anchor_reuses
         idx = beat.get("beat_order", beat.get("section_order", 0))
+        prompt = str(beat.get("flux_prompt") or "")
+        eligible_person = (
+            bool(person_anchor_continuity_line)
+            and beat.get("visual_category") == "person"
+            and person_anchor_continuity_line in prompt
+        )
+        if (
+            idx != 0
+            and eligible_person
+            and person_anchor is not None
+            and consecutive_anchor_reuses < _MAX_CONSECUTIVE_ANCHOR_REUSE
+        ):
+            beat["media_url"] = person_anchor["image_path"]
+            beat["media_type"] = "image"
+            consecutive_anchor_reuses += 1
+            logger.info(
+                "SOLO_SHORT_PERSON_ANCHOR_REUSED beat=%s anchor_beat=%s",
+                idx, person_anchor["beat_order"],
+            )
+            return beat
+
         path = generate_beat_image_with_routing(
             beat, content_id, tier_counts, width=width, height=height,
         )
@@ -655,6 +771,13 @@ def generate_all_beat_images(
             if path:
                 beat["media_url"]  = path
                 beat["media_type"] = "image"
+                if eligible_person:
+                    person_anchor = {
+                        "beat_order": idx,
+                        "image_path": path,
+                        "prompt": prompt,
+                    }
+                    consecutive_anchor_reuses = 0
 
         time.sleep(_INTER_BEAT_SLEEP_SEC)
         return beat

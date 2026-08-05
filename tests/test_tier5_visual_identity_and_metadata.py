@@ -89,7 +89,7 @@ class Tier5EraAwareDiversityTest(unittest.TestCase):
         self.assertIn("open_landscape", summary)
 
     def test_storyboard_prompt_documents_historically_honest_other_value(self) -> None:
-        self.assertEqual(system_prompt.PROMPT_VERSION, "5.0")
+        self.assertGreaterEqual(tuple(map(int, system_prompt.PROMPT_VERSION.split("."))), (5, 2))
         self.assertIn("use other", system_prompt._STORYBOARD_SYSTEM_PROMPT)
         self.assertIn("camera distance/angle", system_prompt._STORYBOARD_SYSTEM_PROMPT)
 

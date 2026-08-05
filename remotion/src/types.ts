@@ -36,6 +36,10 @@ export interface SectionData {
   color_grade:    ColorGrade;
   audio_start_ms: number;
   audio_end_ms:   number;
+  // Nominal, gap-free frame range computed from shared ms boundaries by the
+  // Python props builder. Optional only for backward compatibility with old props.
+  render_start_frame?: number;
+  render_end_frame?:   number;
   // Storyboard-beat fields — populated by the Storyboard Agent flow; legacy
   // sections carry neutral defaults ("", "b-roll", "cut", "none").
   visual_intent?:      string;

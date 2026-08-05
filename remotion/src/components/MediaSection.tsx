@@ -68,7 +68,12 @@ export const MediaSection: React.FC<Props> = ({ section, crossfadeIn = 0, incomi
   // Section duration derived from audio timings — NOT from composition durationInFrames,
   // which would be wrong here because useVideoConfig returns the root composition config.
   const sectionDurMs     = section.audio_end_ms - section.audio_start_ms;
-  const sectionDurFrames = Math.max(1, Math.round((sectionDurMs / 1000) * fps));
+  const sectionDurFrames = Math.max(
+    1,
+    section.render_start_frame !== undefined && section.render_end_frame !== undefined
+      ? section.render_end_frame - section.render_start_frame
+      : Math.round((sectionDurMs / 1000) * fps),
+  );
 
   const transitionStyle = getTransitionStyle(incomingTransition, frame, crossfadeIn);
 

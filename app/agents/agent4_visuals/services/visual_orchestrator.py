@@ -72,6 +72,46 @@ logger = logging.getLogger(__name__)
 _VISUAL_LANGUAGE = "__visual__"
 
 
+def _primary_character_continuity_fragment(blueprint: dict | None) -> str:
+    """Return the exact primary descriptor fragment prepended to person prompts.
+
+    Character order in the blueprint is the existing primary/dominant-character
+    convention. An incomplete descriptor disables reuse rather than guessing.
+    """
+    descriptors = (blueprint or {}).get("character_descriptors") or []
+    if not descriptors or not isinstance(descriptors[0], dict):
+        return ""
+    primary = descriptors[0]
+    name = str(primary.get("name") or "").strip()
+    age = str(primary.get("age") or "").strip()
+    description = str(primary.get("description") or "").strip()
+    if not name or not description:
+        return ""
+    return f"{name}{f', {age}' if age else ''} — {description}"
+
+
+def _prepend_primary_character_fragment(
+    beats: list[dict], blueprint: dict | None,
+) -> str:
+    """Stamp the exact primary descriptor onto matching Solo person prompts."""
+    fragment = _primary_character_continuity_fragment(blueprint)
+    if not fragment:
+        return ""
+    primary_name = fragment.split(",", 1)[0].split(" — ", 1)[0].strip().lower()
+    for beat in beats:
+        if beat.get("visual_category") != "person":
+            continue
+        searchable = " ".join((
+            str(beat.get("flux_prompt") or ""),
+            str(beat.get("visual_intent") or ""),
+        )).lower()
+        if primary_name and primary_name in searchable:
+            prompt = str(beat.get("flux_prompt") or "")
+            if fragment not in prompt:
+                beat["flux_prompt"] = f"{fragment}, {prompt}" if prompt else fragment
+    return fragment
+
+
 def run_visual_generation(
     content: Content,
     channel: Channel,
@@ -592,6 +632,7 @@ def _run_visual_pass(
     script_hash: str | None = None,
     blueprint: dict | None = None,
     is_short_episode: bool = False,
+    solo_person_anchor_reuse: bool = False,
     width: int = 1920,
     height: int = 1080,
 ) -> tuple[list[dict] | None, int]:
@@ -690,6 +731,11 @@ def _run_visual_pass(
         )
         return None, 0
 
+    person_anchor_line = (
+        _prepend_primary_character_fragment(beats, blueprint)
+        if solo_person_anchor_reuse else ""
+    )
+
     # The second, flat-2000ms micro-beat cleanup that used to run here is
     # deleted (fresh full-system audit §3.2): it systematically merged away
     # every 1.0-2.0s high-intensity reveal beat the storyboard prompt
@@ -735,7 +781,13 @@ def _run_visual_pass(
     db.commit()
 
     # ── 3. Flux generation ────────────────────────────────────────────────────
-    beats = generate_all_beat_images(beats, cid_str, width=width, height=height)
+    if person_anchor_line:
+        beats = generate_all_beat_images(
+            beats, cid_str, width=width, height=height,
+            person_anchor_continuity_line=person_anchor_line,
+        )
+    else:
+        beats = generate_all_beat_images(beats, cid_str, width=width, height=height)
 
     succeeded = sum(1 for b in beats if (b.get("media_url") or "").startswith("cache/"))
     missing_media = len(beats) - succeeded
@@ -1515,6 +1567,7 @@ def _run_solo_short_visuals(
             image_style=image_style,
             blueprint=content.story_blueprint,
             is_short_episode=True,
+            solo_person_anchor_reuse=True,
             width=1080,
             height=1920,
         )

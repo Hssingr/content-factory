@@ -11,7 +11,12 @@ from app.services.claude_client import (
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "5.1"  # v5.1: independent review of real output (code_report/
+PROMPT_VERSION = "5.3"  # v5.3: Phase A' — preserve style through deterministic
+                        #        reframes; leak-proof meta rules; contextual material
+                        #        variety; era/locale-correct textual props.
+                        # v5.2: Short Quality Roadmap Phase A3 — material-detail
+                        #        reframing, denser Short openings, and action imagery.
+                        # v5.1: independent review of real output (code_report/
                         #        8abd7fea_independent_video_output_review.md) — two
                         #        additive prompt-only rules, no schema change: (1) prefer
                         #        depicting a named, identity-locked character physically
@@ -445,6 +450,13 @@ human-reaction, threatening-space, or consequence/aftermath beat.
 - youtube_long format: place one visual beat every 3–5 seconds of narration.
 - short-form formats (youtube_short / tiktok / reels): one beat every 2–4 seconds.
 - Never let a single still image hold the screen longer than 6 seconds.
+- For every short-form format, cover the first approximately 6 seconds with 2–3
+  distinct beats, never one held image. The first beat depicts the specific
+  subject of the hook — the named person, object, or event in the first sentence —
+  never generic scenery or an unrelated establishing shot. No opening beat may
+  span the entire first sentence: its start_hint/end_hint delimit only its own
+  portion. Examples: show the trader making the purchase, the figure entering
+  the threatened room, or the experiment visibly beginning.
 
 == Dynamic beat duration ==
 
@@ -532,12 +544,35 @@ exactly one Flux-generated image. Image models cannot render legible text —
 any prompt that asks for readable words always comes back as illegible
 gibberish, no matter how the request is worded.
 
-When the narration's content is textual (a chat message, a document, a
-statistic, a headline, a date, a sign, a name tag), do not compose a
-straight-on, readable shot of it. Instead choose a physical framing where
-legible text is naturally impossible or irrelevant, using ONE of these four
-techniques — this is a general rule, apply it to any text-bearing prop, not
-only the examples given:
+Never make a text-bearing object (document, sign, board, screen, newspaper,
+label, or captioned map) the primary subject of a beat, and never compose an
+establishing shot like a captioned or titled documentary card. Depict material
+reality instead: texture, edges, seals, hands interacting with it, or the scene
+around it. Examples: a signed document becomes its wax seal and torn paper edge
+in close-up; a price board becomes chalk dust and a hand mid-stroke with the
+board out of focus; a city establishing shot shows the period-correct street
+itself at eye level, never a location title card.
+
+Write the channel's Global Visual Direction image-style clause FIRST in every
+flux_prompt, verbatim. The flux_prompt describes only what the model should
+depict: never copy instructional vocabulary such as "title card", "no readable
+text", "legible words", or other rule phrasing into it.
+
+Vary the physical reframe with the story context. When the same object class
+recurs, rotate among materially different treatments (for example edge-on
+folds, hands sorting pages, binding thread, fasteners, reflected light) rather
+than repeatedly defaulting to the same wax-seal close-up.
+
+ERA AND LOCALE: every prop, currency item, document, sign, and storefront must
+belong to the story's stated period and place. Describe currency in period
+material terms and never introduce modern currency symbols or designs. For
+example, an eighteenth-century trade story may show worn period paper notes,
+fibers, and an exchange by hand—not a modern dollar symbol; a present-day
+medical story in Seoul may show locally plausible hospital wayfinding and
+architecture at an unreadable angle—not a generic American storefront sign.
+
+When narration is textual, choose a physical framing where legible text is
+naturally impossible or irrelevant, using ONE of these four techniques:
   - ANGLE — shoot the text-bearing surface from the side, from behind, or
     at an oblique angle so a reader's view is blocked or foreshortened (a
     closed folder seen from its spine, a phone face-down on a table, a
@@ -554,6 +589,12 @@ only the examples given:
     letter's contents).
 The narration itself already tells the viewer what the text said — the image
 only needs to establish the physical object, never repeat its content.
+
+When narration describes an action or consequence, depict that action or its
+immediate visible result — never a static portrait, building, or related noun.
+Examples: buying becomes hands exchanging value; fleeing becomes a figure in
+motion through the actual setting; collapsing becomes the visible fall or
+aftermath; discovering becomes the character reacting to the evidence.
 
 == Flux image generation prompt rules ==
 Each beat requires a ``flux_prompt`` — an image generation prompt, written in the
@@ -1053,5 +1094,3 @@ def generate_storyboard_batch(
         "elapsed_ms":    _total_elapsed_ms,
     }
     return storyboard, usage, diag
-
-
