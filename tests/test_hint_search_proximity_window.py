@@ -111,10 +111,13 @@ class TestProximityWindowRegression(unittest.TestCase):
             sections = self._run()
         self.assertIsNotNone(sections)
 
-        # Beat 2 must be a fallback with empty, flagged script_text,
-        # NOT anchored at the 120 s duplicate.
-        self.assertEqual(sections[2]["script_text"], "")
-        self.assertEqual(sections[2]["script_text_source"], "empty_fallback_no_transcript_span")
+        # Beat 2 must be a flagged fallback, NOT anchored at the 120 s
+        # duplicate. Its script_text is now the real transcript words spoken
+        # during its own resolved span (2026-08-05 content 069d8d06 fix) —
+        # still flagged as a non-hint-match via script_text_missing/source,
+        # but no longer forced blank when real span text exists.
+        self.assertNotEqual(sections[2]["script_text"], "")
+        self.assertEqual(sections[2]["script_text_source"], "proportional_fallback_span_text")
         self.assertTrue(sections[2]["script_text_missing"])
         self.assertLess(sections[2]["audio_start_ms"], 30_000)
 
@@ -177,7 +180,7 @@ class TestShrinkPrefixDemotion(unittest.TestCase):
             beats, _transcript(words), duration_ms=200 * _WORD_MS,
             allow_legacy_fallback=True,
         )
-        self.assertEqual(sections[1]["script_text"], "")   # fallback
+        self.assertTrue(sections[1]["script_text_missing"])   # fallback, flagged as such
         # Not anchored at the rejected 28 s match — it gets a proportional
         # position from _resolve_boundaries instead (trailing interpolation).
         self.assertNotEqual(sections[1]["audio_start_ms"], 28_000)

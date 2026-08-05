@@ -50,9 +50,11 @@ from app.agents.agent4_visuals.system_prompt import (
 from app.models import VideoSection
 from app.services.claude_client import call_claude_structured_with_usage
 from app.agents.agent4_visuals.services.flux_generator import (
+    CANONICAL_CHARACTER_DESCRIPTOR_KEY,
     UNIVERSAL_NO_ARTIFACT_CLAUSE,
     _dedupe_generated_image_once,
     _ensure_beat_image_healthy,
+    canonical_character_descriptor,
     derive_text_prop_prompt,
     fill_failed_beats_from_neighbors,
     generate_beat_image_with_routing,
@@ -150,6 +152,18 @@ _HINT_SEARCH_WINDOW_MS = 60_000        # full/5-token matches: expected + 60 s m
 _HINT_SHORT_PREFIX_WINDOW_MS = 15_000  # ≤3-token matches: expected + 15 s max
 _HINT_SHORT_PREFIX_MAX_TOKENS = 3      # candidates this short get the tight window
 
+# ── Bounded fuzzy tolerance for proper nouns ────────────────────────────────
+# An exact token match can still fail on a foreign/accented proper noun even
+# after diacritic folding (normalize_for_matching) — Whisper sometimes spells
+# a name with a genuinely different letter, not just a missing accent (e.g.
+# a transcription variant). Last-resort fallback, tried only after every
+# exact/prefix attempt in _locate_phrase has failed, and only when the hint
+# contains at least one token long enough to plausibly BE a proper noun
+# (_FUZZY_MIN_TOKEN_LEN) — this is not a general fuzzy matcher. Deterministic
+# bounded edit distance, no AI, module constants only.
+_FUZZY_MIN_TOKEN_LEN = 5
+_FUZZY_MAX_EDITS = 1
+
 # ── Anchor span sanity ─────────────────────────────────────────────────────────
 # Second line of defense behind the proximity window above: a wrong match can
 # still land INSIDE the window (a duplicate phrase 30–50 s ahead). After the
@@ -199,6 +213,12 @@ _SHORT_VISUAL_MAX_HOLD_MS = settings.short_visual_max_hold_ms
 # and caps separately with the tighter Short ceiling above).
 _PARENT_VISUAL_MAX_HOLD_MS = settings.parent_visual_max_hold_ms
 _MICRO_MERGE_DISCARD_FAIL_RATIO = 0.30
+
+# Minimum real-time span a beat inside a proportional-fallback cluster may
+# hold before _drop_surplus_fallback_beats() deterministically thins the
+# cluster — see settings.min_fallback_beat_hold_ms for the full rationale
+# (content 069d8d06 diagnostic, 2026-08-05).
+_MIN_FALLBACK_HOLD_MS = settings.min_fallback_beat_hold_ms
 
 
 @dataclass(frozen=True)
@@ -357,6 +377,19 @@ _MOTIF_MAX_PER_WINDOW = 2
 # failure point while only rarely triggering a split for normal segments.
 _MAX_BEATS_PER_BATCH = 20
 
+# Content 069d8d06 diagnostic (2026-08-05): the shortfall top-up call above
+# re-sends the identical segment text with no signal telling the model which
+# beats already exist for it. In production this produced an independent
+# re-telling of the whole segment from its own beginning — 9 topup beats
+# whose hints duplicated beats already delivered by the first call, none of
+# them locatable forward of the transcript cursor the first call's beats had
+# already advanced past. A topup beat is treated as a duplicate retelling
+# (dropped, never appended) when this fraction of its own start_hint+end_hint
+# tokens already appears in a single already-delivered beat's hint tokens —
+# deterministic set overlap, no AI judgment, same style of threshold as
+# `_HOOK_PARAPHRASE_OVERLAP_THRESHOLD` in agent2_discovery/services/scripts.py.
+_TOPUP_DUPLICATE_HINT_OVERLAP = 0.65
+
 # Phase B1: one objective, bounded follow-up is allowed only when a storyboard
 # batch delivers less than 70% of its requested beats. This is a count gate,
 # never an AI quality judgment.
@@ -385,7 +418,7 @@ _MAX_CHARACTER_DESCRIPTORS_LINE = 5  # mirrors _STORY_BLUEPRINT_SCHEMA's charact
 
 def _format_character_descriptors_line(character_descriptors) -> str:
     """Format the blueprint's locked character_descriptors (roadmap Phase C2
-    — name/age/physical-description entries generated once at blueprint
+    — structured fixed-feature entries generated once at blueprint
     time) into one continuity line. Skips any malformed entry rather than
     raising — this is a visual-consistency aid, not load-bearing data.
     """
@@ -395,17 +428,14 @@ def _format_character_descriptors_line(character_descriptors) -> str:
     for entry in character_descriptors[:_MAX_CHARACTER_DESCRIPTORS_LINE]:
         if not isinstance(entry, dict):
             continue
-        name        = str(entry.get("name") or "").strip()
-        age         = str(entry.get("age") or "").strip()
-        description = str(entry.get("description") or "").strip()
-        if not name or not description:
-            continue
-        entries.append(f"{name}{f', {age}' if age else ''} — {description}")
+        descriptor = canonical_character_descriptor(entry)
+        if descriptor:
+            entries.append(descriptor)
     if not entries:
         return ""
     return (
-        "Character identities (use these exact physical descriptions whenever "
-        "depicting them, in every beat, for consistency): " + "; ".join(entries) + "."
+        "Character identities (reference these recurring people by name/role only; "
+        "Python injects these exact physical descriptions): " + "; ".join(entries) + "."
     )
 
 
@@ -461,6 +491,157 @@ def build_continuity_line_from_blueprint(blueprint: dict | None) -> str:
         lines.append(era_line)
 
     return "\n".join(lines)
+
+
+def _beat_hint_tokens(beat: dict, language: str) -> set[str]:
+    text = f"{beat.get('start_hint', '')} {beat.get('end_hint', '')}"
+    return set(_normalize_for_matching(text, language))
+
+
+def _filter_duplicate_topup_beats(
+    topup_beats: list[dict],
+    delivered_beats: list[dict],
+    language: str,
+) -> tuple[list[dict], int]:
+    """Drop shortfall-topup beats that restate content the original delivery
+    for this same segment already covered (content 069d8d06 diagnostic).
+
+    The shortfall top-up call reuses the identical ``segment_text`` as the
+    original batch, with nothing telling the model which beats already exist
+    for it — a real production run showed it independently re-storyboard the
+    whole segment from its own beginning. A topup beat whose start_hint +
+    end_hint tokens overlap any single already-delivered beat's hint tokens
+    by at least ``_TOPUP_DUPLICATE_HINT_OVERLAP`` is a restatement of
+    already-covered narration, not new territory: it can never hint-match
+    forward of the transcript cursor the delivered beats already advanced
+    past, so keeping it only guarantees a proportional-fallback beat showing
+    an unrelated image. Deterministic set overlap — no AI judgment, no retry.
+
+    Returns:
+        ``(kept_beats, dropped_count)``.
+    """
+    delivered_token_sets = [
+        _beat_hint_tokens(beat, language) for beat in delivered_beats
+    ]
+    kept: list[dict] = []
+    dropped = 0
+    for beat in topup_beats:
+        tokens = _beat_hint_tokens(beat, language)
+        if not tokens:
+            kept.append(beat)
+            continue
+        is_duplicate = any(
+            existing and len(tokens & existing) / len(tokens) >= _TOPUP_DUPLICATE_HINT_OVERLAP
+            for existing in delivered_token_sets
+        )
+        if is_duplicate:
+            dropped += 1
+            logger.warning(
+                "STORYBOARD_TOPUP_DUPLICATE_DROPPED start_hint=%r end_hint=%r",
+                str(beat.get("start_hint", ""))[:80], str(beat.get("end_hint", ""))[:80],
+            )
+        else:
+            kept.append(beat)
+    return kept, dropped
+
+
+_TOPUP_CONTINUATION_FRAMING = (
+    "Earlier beats already cover the preceding narration of this segment. "
+    "Generate beats for this remaining passage only — do not re-describe "
+    "anything before it."
+)
+
+# A word-count-derived topup target below this many words isn't worth a
+# second Claude call at all — the uncovered remainder is too thin to need
+# more than the beats already delivered can imply via timestamp fallback.
+_TOPUP_MIN_UNCOVERED_WORDS = 8
+
+
+def _locate_uncovered_span(
+    delivered_beats: list[dict], sub_text: str, language: str,
+) -> tuple[str, int, int]:
+    """Find the largest contiguous stretch of ``sub_text`` no delivered
+    beat's hint could be located in — the real remaining narration a
+    shortfall-topup call should cover, instead of the whole segment again
+    (content 069d8d06 root-cause fix, span-scoping follow-up).
+
+    Locates each delivered beat's ``end_hint`` (falling back to
+    ``start_hint``) as a forward-only word-token subsequence within
+    ``sub_text``'s own words — the same monotonic-cursor contract the real
+    Whisper hint matcher uses (``map_storyboard_beats_to_timestamps``), but
+    at the segment-TEXT level, before any audio timestamp exists. The
+    located positions partition ``sub_text`` into covered/uncovered
+    candidate spans (a leading span before the first location, one span
+    between each consecutive pair, and a trailing span after the last); the
+    single largest is returned — normally the trailing "everything after the
+    last beat" span, but this also naturally covers a large interior gap if
+    one or more beats' hints couldn't be located at all.
+
+    Falls back to the full segment text (byte-identical to the pre-fix
+    behavior) when no delivered beat's hint can be located at all — a
+    conservative default rather than a guess.
+
+    Returns:
+        ``(uncovered_text, span_start_word, span_end_word)`` — word indices
+        are into ``sub_text.split()``, start inclusive / end exclusive.
+    """
+    words = sub_text.split()
+    if not words:
+        return sub_text, 0, 0
+
+    # Every raw word's normalized token(s) (digit expansion/punctuation
+    # stripping can turn one raw word into zero or multiple tokens), plus a
+    # parallel table mapping each normalized-token index back to the raw
+    # word index it came from — needed to translate a token-level match back
+    # into a word-level slice of the original text.
+    norm_tokens: list[str] = []
+    token_word_idx: list[int] = []
+    for i, w in enumerate(words):
+        for tok in _normalize_for_matching(w, language):
+            norm_tokens.append(tok)
+            token_word_idx.append(i)
+
+    def _locate(hint: str, from_token: int) -> tuple[int, int, int] | None:
+        """Forward search from from_token; returns (word_index_of_match_start,
+        word_index_after_match, token_index_after_match), or None if not found."""
+        tokens = _normalize_for_matching(hint, language)
+        if not tokens:
+            return None
+        limit = len(norm_tokens) - len(tokens) + 1
+        for ti in range(max(from_token, 0), max(limit, 0)):
+            if all(norm_tokens[ti + j] == tokens[j] for j in range(len(tokens))):
+                end_token_idx = ti + len(tokens) - 1
+                return token_word_idx[ti], token_word_idx[end_token_idx] + 1, ti + len(tokens)
+        return None
+
+    # Each entry is the (start, end) word range a located beat's hint
+    # matched — NOT just its end. A gap is only genuinely uncovered narration
+    # when it falls BETWEEN one match's end and the NEXT match's start;
+    # using end-to-end distance between consecutive matches would wrongly
+    # count the very words the next beat's own hint covers as "uncovered".
+    covered_spans: list[tuple[int, int]] = []
+    token_cursor = 0
+    for beat in delivered_beats:
+        hint = str(beat.get("end_hint") or beat.get("start_hint") or "")
+        located = _locate(hint, token_cursor)
+        if located is None:
+            continue
+        word_start, word_end, token_cursor = located
+        covered_spans.append((word_start, word_end))
+
+    if not covered_spans:
+        return sub_text, 0, len(words)
+
+    boundaries = [0] + [w for span in covered_spans for w in span] + [len(words)]
+    # boundaries alternates: [0, start_0, end_0, start_1, end_1, ..., len(words)]
+    # — candidate uncovered gaps are every OTHER consecutive pair, starting
+    # from index 0 (leading gap, end_i -> start_(i+1), ..., trailing gap).
+    best_gap_words, span_start, span_end = 0, len(words), len(words)
+    for lo, hi in zip(boundaries[0::2], boundaries[1::2]):
+        if hi - lo > best_gap_words:
+            best_gap_words, span_start, span_end = hi - lo, lo, hi
+
+    return " ".join(words[span_start:span_end]), span_start, span_end
 
 
 def split_into_beats(
@@ -637,55 +818,95 @@ def split_into_beats(
                 _BEAT_SHORTFALL_TOPUP_FLOOR * sub_target_beat_count
             )
             if delivered < delivery_floor:
-                topup_target = sub_target_beat_count - delivered
-                logger.warning(
-                    "STORYBOARD_SHORTFALL_TOPUP requested=%s delivered=%s topup=%s "
-                    "cost_tracked_via=STORYBOARD_RETRY_COST",
-                    sub_target_beat_count, delivered, topup_target,
+                # Span-scoping (content 069d8d06 root-cause follow-up): send
+                # the topup call only the narration the delivered beats have
+                # not already covered, instead of the identical full segment
+                # text — the direct fix for why the old topup call
+                # independently re-told already-delivered narration (see
+                # _filter_duplicate_topup_beats, still kept below as the
+                # safety net behind this).
+                uncovered_text, span_start, span_end = _locate_uncovered_span(
+                    beats, sub_text, language,
                 )
-                try:
-                    topup_storyboard, topup_usage, topup_diag = generate_storyboard_batch(
-                        segment_label=sub_label,
-                        segment_text=sub_text,
-                        segment_index=index,
-                        segment_count=len(segments),
-                        channel=channel,
-                        script_format=script_format,
-                        previous_segment_summary=previous_summary,
-                        target_beat_count=topup_target,
-                        visual_style=visual_style,
-                        image_style=image_style,
-                        continuity_line=continuity_line,
-                    )
-                except Exception as exc:
+                span_words = span_end - span_start
+                sub_word_count = max(len(sub_text.split()), 1)
+                topup_target = max(
+                    1, round(span_words * sub_target_beat_count / sub_word_count)
+                )
+                topup_beats: list[dict] = []
+
+                if span_words < _TOPUP_MIN_UNCOVERED_WORDS:
                     logger.warning(
-                        "STORYBOARD_SHORTFALL_ACCEPTED requested=%s delivered=%s "
-                        "topup_requested=%s topup_delivered=0 reason=topup_failed error=%s",
-                        sub_target_beat_count, delivered, topup_target, exc,
+                        "STORYBOARD_SHORTFALL_TOPUP_SKIPPED requested=%s delivered=%s "
+                        "span_start_word=%s span_end_word=%s span_words=%s "
+                        "reason=uncovered_span_too_thin",
+                        sub_target_beat_count, delivered, span_start, span_end, span_words,
                     )
                 else:
-                    total_output_tokens += topup_usage.get("output_tokens", 0)
-                    total_input_tokens += topup_diag.get("input_tokens", 0)
-                    total_generation_time_ms += topup_diag.get("elapsed_ms", 0)
-                    total_claude_calls += topup_diag.get("attempt_count", 1)
-                    if topup_diag.get("was_truncated"):
-                        _truncation_count += 1
-                        _retry_count += 1
-                    topup_beats = _normalize_beat_order(
-                        topup_storyboard.get("beats") or []
+                    logger.warning(
+                        "STORYBOARD_SHORTFALL_TOPUP requested=%s delivered=%s topup=%s "
+                        "span_start_word=%s span_end_word=%s span_words=%s "
+                        "cost_tracked_via=STORYBOARD_RETRY_COST",
+                        sub_target_beat_count, delivered, topup_target,
+                        span_start, span_end, span_words,
                     )
-                    # A follow-up batch numbers itself from zero. Offset it so
-                    # the existing per-batch normalization cannot discard it as
-                    # duplicate local beat_order values.
-                    beats.extend({**beat, "beat_order": delivered + offset}
-                                 for offset, beat in enumerate(topup_beats))
-                    if len(topup_beats) < topup_target:
+                    try:
+                        topup_storyboard, topup_usage, topup_diag = generate_storyboard_batch(
+                            segment_label=sub_label,
+                            segment_text=uncovered_text,
+                            segment_index=index,
+                            segment_count=len(segments),
+                            channel=channel,
+                            script_format=script_format,
+                            previous_segment_summary=previous_summary,
+                            target_beat_count=topup_target,
+                            visual_style=visual_style,
+                            image_style=image_style,
+                            continuity_line=continuity_line,
+                            continuation_framing=_TOPUP_CONTINUATION_FRAMING,
+                        )
+                    except Exception as exc:
                         logger.warning(
                             "STORYBOARD_SHORTFALL_ACCEPTED requested=%s delivered=%s "
-                            "topup_requested=%s topup_delivered=%s final=%s",
-                            sub_target_beat_count, delivered, topup_target,
-                            len(topup_beats), len(beats),
+                            "topup_requested=%s topup_delivered=0 reason=topup_failed error=%s",
+                            sub_target_beat_count, delivered, topup_target, exc,
                         )
+                    else:
+                        total_output_tokens += topup_usage.get("output_tokens", 0)
+                        total_input_tokens += topup_diag.get("input_tokens", 0)
+                        total_generation_time_ms += topup_diag.get("elapsed_ms", 0)
+                        total_claude_calls += topup_diag.get("attempt_count", 1)
+                        if topup_diag.get("was_truncated"):
+                            _truncation_count += 1
+                            _retry_count += 1
+                        topup_beats = _normalize_beat_order(
+                            topup_storyboard.get("beats") or []
+                        )
+                        topup_delivered_count = len(topup_beats)
+                        topup_beats, _n_topup_duplicates = _filter_duplicate_topup_beats(
+                            topup_beats, beats, language,
+                        )
+                        if _n_topup_duplicates:
+                            logger.warning(
+                                "STORYBOARD_TOPUP_DUPLICATE_SUMMARY segment=%s "
+                                "topup_delivered=%s duplicates_dropped=%s kept=%s",
+                                sub_label, topup_delivered_count,
+                                _n_topup_duplicates, len(topup_beats),
+                            )
+                        if len(topup_beats) < topup_target:
+                            logger.warning(
+                                "STORYBOARD_SHORTFALL_ACCEPTED requested=%s delivered=%s "
+                                "topup_requested=%s topup_delivered=%s final=%s",
+                                sub_target_beat_count, delivered, topup_target,
+                                len(topup_beats), delivered + len(topup_beats),
+                            )
+
+                # A follow-up batch numbers itself from zero. Offset it so
+                # the existing per-batch normalization cannot discard it as
+                # duplicate local beat_order values. A no-op when topup_beats
+                # is empty (skipped, failed, or fully filtered as duplicates).
+                beats.extend({**beat, "beat_order": delivered + offset}
+                             for offset, beat in enumerate(topup_beats))
             if not beats:
                 logger.warning(
                     "Storyboard batch for segment %s (%d/%d) returned no beats — aborting "
@@ -1402,6 +1623,15 @@ def map_storyboard_beats_to_timestamps(
     # before script_text extraction so a wrong match's text never ships.
     _demote_out_of_span_anchors(matches, match_type, beats, flat)
 
+    # Deterministically thin any fallback cluster packed into a span too small
+    # to give every beat in it at least _MIN_FALLBACK_HOLD_MS — see
+    # _drop_surplus_fallback_beats(). Reassigns beat_order via the sections
+    # loop's own enumerate() below (no separate renumbering needed).
+    matches, match_type, beats = _drop_surplus_fallback_beats(
+        matches, match_type, beats, flat, duration_ms, _MIN_FALLBACK_HOLD_MS,
+    )
+    n = len(beats)
+
     n_exact    = sum(1 for t in match_type if t == "exact")
     n_fuzzy    = sum(1 for t in match_type if t == "fuzzy")
     n_fallback = sum(1 for t in match_type if t == "fallback")
@@ -1465,8 +1695,17 @@ def map_storyboard_beats_to_timestamps(
             script_text_source = "whisper_transcript"
             script_text_missing = False
         else:
-            script_text = ""
-            script_text_source = "empty_fallback_no_transcript_span"
+            # No hint match — assign the real narration spoken during this
+            # beat's own resolved [start_ms, end_ms) span instead of leaving
+            # script_text empty, so a downstream repair/review pass sees what
+            # the image actually plays against (content 069d8d06 diagnostic,
+            # 2026-08-05). script_text_missing stays True either way: this is
+            # still not a real hint match, only a best-effort span lookup.
+            script_text = _words_in_ms_span(flat, start_ms, end_ms)
+            script_text_source = (
+                "proportional_fallback_span_text" if script_text
+                else "empty_fallback_no_transcript_span"
+            )
             script_text_missing = True
         beat_for_section = {
             **beat,
@@ -1609,6 +1848,28 @@ def _locate_phrase(
             start_idx, matched_len = found
             return (start_idx, start_idx + matched_len - 1)
 
+    # Bounded fuzzy fallback (proper nouns only): every exact/prefix attempt
+    # above failed. Try once more, tolerating a one-edit near-miss per token,
+    # but only when the phrase carries a token long enough to plausibly be a
+    # proper noun — a generic short phrase gets no fuzzy tolerance.
+    if any(len(t) >= _FUZZY_MIN_TOKEN_LEN for t in tokens):
+        if expected_start_ms is None:
+            fuzzy_max_start_ms = None
+        elif len(tokens) <= _HINT_SHORT_PREFIX_MAX_TOKENS:
+            fuzzy_max_start_ms = int(expected_start_ms + _HINT_SHORT_PREFIX_WINDOW_MS)
+        else:
+            fuzzy_max_start_ms = int(expected_start_ms + _HINT_SEARCH_WINDOW_MS)
+        fuzzy_found = _search_subsequence_fuzzy(
+            flat, from_idx, tokens, max_start_ms=fuzzy_max_start_ms
+        )
+        if fuzzy_found is not None:
+            start_idx, matched_len = fuzzy_found
+            logger.info(
+                "HINT_FUZZY_MATCH phrase=%r match_ms=%d max_edits=%d",
+                phrase[:60], flat[start_idx][2], _FUZZY_MAX_EDITS,
+            )
+            return (start_idx, start_idx + matched_len - 1)
+
     # Diagnostics: did the window reject a match the unbounded search would have
     # taken? This is exactly the failure mode the window exists to prevent (a
     # repeated phrase far downstream) — log it so the guard's firing is visible
@@ -1656,8 +1917,78 @@ def _search_subsequence(
     return None
 
 
+def _edit_distance_at_most(a: str, b: str, max_edits: int) -> bool:
+    """True if the Levenshtein distance between ``a`` and ``b`` is <= ``max_edits``.
+
+    Bounded DP with an early row-min exit — cheap for the small max_edits (1)
+    and short token lengths this module ever calls it with.
+    """
+    if a == b:
+        return True
+    la, lb = len(a), len(b)
+    if abs(la - lb) > max_edits:
+        return False
+    prev = list(range(lb + 1))
+    for i, ca in enumerate(a, start=1):
+        cur = [i] + [0] * lb
+        row_min = cur[0]
+        for j, cb in enumerate(b, start=1):
+            cost = 0 if ca == cb else 1
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+            row_min = min(row_min, cur[j])
+        if row_min > max_edits:
+            return False
+        prev = cur
+    return prev[lb] <= max_edits
+
+
+def _tokens_fuzzy_equal(a: str, b: str) -> bool:
+    """Tolerant token equality for proper nouns: exact match, or <= _FUZZY_MAX_EDITS
+    apart when both tokens are at least _FUZZY_MIN_TOKEN_LEN characters."""
+    if a == b:
+        return True
+    if len(a) < _FUZZY_MIN_TOKEN_LEN or len(b) < _FUZZY_MIN_TOKEN_LEN:
+        return False
+    return _edit_distance_at_most(a, b, _FUZZY_MAX_EDITS)
+
+
+def _search_subsequence_fuzzy(
+    flat: list[tuple[str, str, int, int]],
+    from_idx: int,
+    tokens: list[str],
+    max_start_ms: int | None = None,
+) -> tuple[int, int] | None:
+    """Like ``_search_subsequence`` but tolerates a bounded per-token edit-distance
+    near-miss (``_tokens_fuzzy_equal``) instead of requiring literal equality.
+
+    Last-resort tolerance for foreign/accented proper nouns Whisper spelled
+    differently from the hint even after diacritic folding — deterministic,
+    bounded, no AI. Matches the full ``tokens`` sequence only (no shrinking
+    prefixes) to keep the added search cost bounded to one extra pass.
+    """
+    limit = len(flat) - len(tokens) + 1
+    for i in range(max(from_idx, 0), max(limit, 0)):
+        if max_start_ms is not None and flat[i][2] > max_start_ms:
+            return None  # time-ordered — nothing further can qualify
+        if all(_tokens_fuzzy_equal(flat[i + j][0], tokens[j]) for j in range(len(tokens))):
+            return (i, len(tokens))
+    return None
+
+
 def _join_words(flat: list[tuple[str, str, int, int]], start_idx: int, end_idx: int) -> str:
     return " ".join(flat[i][1] for i in range(start_idx, end_idx + 1))
+
+
+def _words_in_ms_span(flat: list[tuple[str, str, int, int]], start_ms: int, end_ms: int) -> str:
+    """Real transcript words whose token start falls within ``[start_ms, end_ms)``.
+
+    Used only for a fallback (unmatched) beat's script_text: the narration
+    actually playing during its resolved span, even though no hint match
+    anchored it there.
+    """
+    return " ".join(
+        original for _, original, tok_start, _ in flat if start_ms <= tok_start < end_ms
+    )
 
 
 def _suggested_ms(beat: dict) -> float:
@@ -1717,6 +2048,114 @@ def _demote_out_of_span_anchors(
         last_idx, last_ms = j, anchor_ms
 
     return demoted
+
+
+def _drop_surplus_fallback_beats(
+    matches: list[tuple[int, int] | None],
+    match_type: list[str],
+    beats: list[dict],
+    flat: list[tuple[str, str, int, int]],
+    duration_ms: int,
+    floor_ms: int,
+) -> tuple[list[tuple[int, int] | None], list[str], list[dict]]:
+    """Deterministically thin a fallback-beat cluster packed into too small a span.
+
+    Content 069d8d06 diagnostic (2026-08-05): proportional interpolation
+    (``_resolve_boundaries``) divides the real time gap between two trusted
+    anchors across every beat inside it, weighted by ``suggested_duration_sec``.
+    When a run of consecutive unmatched ("fallback") beats lands in a gap too
+    small to give each beat at least ``floor_ms``, the result is a rapid-fire
+    run of sub-floor holds — each one showing an image unrelated to the
+    instant of narration it plays against (the reviewer-observed 1.0/2.0/3.0s
+    flashes). A beat that plays for one second against the wrong image is
+    worse than simply not having a dedicated beat there: this keeps only an
+    evenly-spaced subset of each offending run — as many as the real span can
+    give at least ``floor_ms`` each — and drops the rest before boundary
+    resolution ever runs, so the surviving beats' shares (and any real,
+    correctly-matched beat downstream) are never squeezed by
+    ``_cleanup_micro_beats`` absorbing time on their behalf.
+
+    Runs are identified exactly the way ``_resolve_boundaries`` will later
+    interpolate them (same trusted-anchor walk): the leading run before the
+    first trusted anchor, each gap between two consecutive trusted anchors,
+    and the trailing run after the last trusted anchor. A "trusted" anchor
+    (``match_type != "fallback"``) is never itself a drop candidate.
+
+    Returns:
+        ``(matches, match_type, beats)`` — new lists, index-aligned, with
+        ``beat_order`` renumbered contiguously (mirrors ``_merge_batches``'s
+        own global renumbering convention) so dropping beats never leaves
+        gaps in the persisted ``section_order`` sequence.
+    """
+    n = len(beats)
+    if n == 0 or floor_ms <= 0:
+        return matches, match_type, beats
+
+    anchors_ms: list[float | None] = [
+        float(flat[match[0]][2]) if match is not None else None
+        for match in matches
+    ]
+    trusted = [i for i, a in enumerate(anchors_ms) if a is not None]
+
+    # (lo, hi, span_start_ms, span_end_ms): each maximal run of consecutive
+    # fallback beats plus the real time span it shares — identical run
+    # boundaries to what _resolve_boundaries interpolates across.
+    runs: list[tuple[int, int, float, float]] = []
+    if not trusted:
+        runs.append((0, n, 0.0, float(duration_ms)))
+    else:
+        first = trusted[0]
+        if first > 0:
+            runs.append((0, first, 0.0, anchors_ms[first]))
+        for a, b in zip(trusted, trusted[1:]):
+            if b - a > 1:
+                runs.append((a + 1, b, anchors_ms[a], anchors_ms[b]))
+        last = trusted[-1]
+        if last < n - 1:
+            runs.append((last + 1, n, anchors_ms[last], float(duration_ms)))
+
+    drop_indices: set[int] = set()
+    for lo, hi, span_start, span_end in runs:
+        run_len = hi - lo
+        if run_len <= 1:
+            continue
+        span_ms = max(span_end - span_start, 0.0)
+        # A run that is not the leading run (lo > 0) is always immediately
+        # preceded by a trusted anchor at index lo-1 — and _resolve_boundaries
+        # includes that anchor beat in the SAME weighted interpolation pool
+        # as the fallback beats after it (its own suggested_duration share is
+        # drawn from this same span). One extra slot must be reserved for it
+        # so the estimate below reflects what the fallback beats will actually
+        # receive, not the anchor+fallback combined average.
+        anchor_tax = 0 if lo == 0 else 1
+        divisor = run_len + anchor_tax
+        if span_ms / divisor >= floor_ms:
+            continue
+        keep_count = max(1, int(span_ms // floor_ms) - anchor_tax)
+        if keep_count >= run_len:
+            continue
+        step = run_len / keep_count
+        keep_local = {min(int(round(k * step)), run_len - 1) for k in range(keep_count)}
+        dropped_local = [i for i in range(run_len) if i not in keep_local]
+        for local_idx in dropped_local:
+            drop_indices.add(lo + local_idx)
+        logger.warning(
+            "STORYBOARD_FALLBACK_CLUSTER_THINNED run_beats=%d span_ms=%d floor_ms=%d "
+            "kept=%d dropped=%d beat_orders_dropped=%s",
+            run_len, int(span_ms), floor_ms, keep_count, len(dropped_local),
+            [beats[lo + i].get("beat_order", lo + i) for i in dropped_local],
+        )
+
+    if not drop_indices:
+        return matches, match_type, beats
+
+    kept_matches = [m for i, m in enumerate(matches) if i not in drop_indices]
+    kept_types   = [t for i, t in enumerate(match_type) if i not in drop_indices]
+    kept_beats   = [
+        {**b, "beat_order": new_order}
+        for new_order, b in enumerate(b for i, b in enumerate(beats) if i not in drop_indices)
+    ]
+    return kept_matches, kept_types, kept_beats
 
 
 def _resolve_boundaries(
@@ -2046,6 +2485,9 @@ def _build_beat_section(beat: dict, index: int, start_ms: int, end_ms: int, scri
         "media_type":           beat.get("media_type", "image"),
         "start_hint":           str(beat.get("start_hint", "")),
         "end_hint":             str(beat.get("end_hint", "")),
+        CANONICAL_CHARACTER_DESCRIPTOR_KEY: list(
+            beat.get(CANONICAL_CHARACTER_DESCRIPTOR_KEY, []) or []
+        ),
     }
 
 

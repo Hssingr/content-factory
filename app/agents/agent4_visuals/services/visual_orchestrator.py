@@ -30,6 +30,7 @@ Render preparation (subtitles, Remotion props, rendering, verification,
 import hashlib
 import json
 import logging
+import re
 import uuid
 
 from sqlalchemy.orm import Session
@@ -43,11 +44,14 @@ from app.agents.agent4_visuals.subagents.storyboard_validator import (
     validate_storyboard, repair_duplicate_flux_prompts,
 )
 from app.agents.agent4_visuals.services.flux_generator import (
+    CANONICAL_CHARACTER_DESCRIPTOR_KEY,
     _append_full_bleed_clause,
     _append_well_lit_clause,
     _build_defect_rewrite_prompt,
+    canonical_character_descriptor,
     generate_all_beat_images,
     generate_beat_image,
+    preserve_character_descriptor_lines,
 )
 from app.agents.agent4_visuals.services.media_validation import (
     REPAIRABLE_MEDIA_CODES,
@@ -72,44 +76,57 @@ logger = logging.getLogger(__name__)
 _VISUAL_LANGUAGE = "__visual__"
 
 
-def _primary_character_continuity_fragment(blueprint: dict | None) -> str:
-    """Return the exact primary descriptor fragment prepended to person prompts.
-
-    Character order in the blueprint is the existing primary/dominant-character
-    convention. An incomplete descriptor disables reuse rather than guessing.
-    """
-    descriptors = (blueprint or {}).get("character_descriptors") or []
-    if not descriptors or not isinstance(descriptors[0], dict):
-        return ""
-    primary = descriptors[0]
-    name = str(primary.get("name") or "").strip()
-    age = str(primary.get("age") or "").strip()
-    description = str(primary.get("description") or "").strip()
-    if not name or not description:
-        return ""
-    return f"{name}{f', {age}' if age else ''} — {description}"
+_CHARACTER_APPEARANCE_CLAUSE_RE = re.compile(
+    r"\b(?:young|old|elderly|teen|adult|tall|short|slim|stocky|build|hair|"
+    r"beard|mustache|moustache|facial|face|scar|freckles|wearing|dressed|"
+    r"coat|shirt|dress|robe|uniform|hat|glasses|accessory)\b",
+    re.IGNORECASE,
+)
 
 
-def _prepend_primary_character_fragment(
-    beats: list[dict], blueprint: dict | None,
-) -> str:
-    """Stamp the exact primary descriptor onto matching Solo person prompts."""
-    fragment = _primary_character_continuity_fragment(blueprint)
-    if not fragment:
-        return ""
-    primary_name = fragment.split(",", 1)[0].split(" — ", 1)[0].strip().lower()
+def _strip_character_paraphrase(prompt: str, name: str) -> str:
+    """Remove the named mention clause and adjacent appearance-only clauses."""
+    chunks = [chunk.strip() for chunk in str(prompt or "").split(",") if chunk.strip()]
+    name_re = re.compile(rf"(?<!\w){re.escape(name)}(?!\w)", re.IGNORECASE)
+    found = next((index for index, chunk in enumerate(chunks) if name_re.search(chunk)), None)
+    if found is None:
+        return prompt
+    del chunks[found]
+    while found < len(chunks) and _CHARACTER_APPEARANCE_CLAUSE_RE.search(chunks[found]):
+        del chunks[found]
+    return ", ".join(chunks)
+
+
+def _inject_character_descriptors(beats: list[dict], blueprint: dict | None) -> list[dict]:
+    """Inject every referenced recurring character's canonical line verbatim."""
+    descriptors = [
+        (str(entry.get("name") or "").strip(), canonical_character_descriptor(entry))
+        for entry in ((blueprint or {}).get("character_descriptors") or [])
+        if isinstance(entry, dict)
+    ]
+    descriptors = [(name, line) for name, line in descriptors if name and line]
+    if not descriptors:
+        return beats
     for beat in beats:
         if beat.get("visual_category") != "person":
             continue
-        searchable = " ".join((
-            str(beat.get("flux_prompt") or ""),
-            str(beat.get("visual_intent") or ""),
-        )).lower()
-        if primary_name and primary_name in searchable:
-            prompt = str(beat.get("flux_prompt") or "")
-            if fragment not in prompt:
-                beat["flux_prompt"] = f"{fragment}, {prompt}" if prompt else fragment
-    return fragment
+        original_prompt = str(beat.get("flux_prompt") or "")
+        searchable = " ".join((original_prompt, str(beat.get("visual_intent") or "")))
+        matched = [
+            (name, line) for name, line in descriptors
+            if re.search(rf"(?<!\w){re.escape(name)}(?!\w)", searchable, re.IGNORECASE)
+        ]
+        if not matched:
+            continue
+        cleaned = original_prompt
+        cleaned_intent = str(beat.get("visual_intent") or "")
+        for name, _line in matched:
+            cleaned = _strip_character_paraphrase(cleaned, name)
+            cleaned_intent = _strip_character_paraphrase(cleaned_intent, name)
+        beat[CANONICAL_CHARACTER_DESCRIPTOR_KEY] = [line for _name, line in matched]
+        beat["visual_intent"] = cleaned_intent
+        beat["flux_prompt"] = preserve_character_descriptor_lines(beat, cleaned)
+    return beats
 
 
 def run_visual_generation(
@@ -632,7 +649,6 @@ def _run_visual_pass(
     script_hash: str | None = None,
     blueprint: dict | None = None,
     is_short_episode: bool = False,
-    solo_person_anchor_reuse: bool = False,
     width: int = 1920,
     height: int = 1080,
 ) -> tuple[list[dict] | None, int]:
@@ -731,10 +747,10 @@ def _run_visual_pass(
         )
         return None, 0
 
-    person_anchor_line = (
-        _prepend_primary_character_fragment(beats, blueprint)
-        if solo_person_anchor_reuse else ""
-    )
+    # Canonical character appearance is Python-owned. Every matching person
+    # beat receives the same structured blueprint line before any later prompt
+    # mutation; images remain independently generated.
+    beats = _inject_character_descriptors(beats, blueprint)
 
     # The second, flat-2000ms micro-beat cleanup that used to run here is
     # deleted (fresh full-system audit §3.2): it systematically merged away
@@ -781,13 +797,7 @@ def _run_visual_pass(
     db.commit()
 
     # ── 3. Flux generation ────────────────────────────────────────────────────
-    if person_anchor_line:
-        beats = generate_all_beat_images(
-            beats, cid_str, width=width, height=height,
-            person_anchor_continuity_line=person_anchor_line,
-        )
-    else:
-        beats = generate_all_beat_images(beats, cid_str, width=width, height=height)
+    beats = generate_all_beat_images(beats, cid_str, width=width, height=height)
 
     succeeded = sum(1 for b in beats if (b.get("media_url") or "").startswith("cache/"))
     missing_media = len(beats) - succeeded
@@ -1567,7 +1577,6 @@ def _run_solo_short_visuals(
             image_style=image_style,
             blueprint=content.story_blueprint,
             is_short_episode=True,
-            solo_person_anchor_reuse=True,
             width=1080,
             height=1920,
         )
@@ -1674,4 +1683,5 @@ def _beat_extras(s: dict) -> dict:
         # Stale-visuals guard, audio side (roadmap 2d / audit P0-3) — see
         # _check_audio_duration_staleness().
         "source_audio_duration_ms": s.get("source_audio_duration_ms", 0),
+        CANONICAL_CHARACTER_DESCRIPTOR_KEY: s.get(CANONICAL_CHARACTER_DESCRIPTOR_KEY, []),
     }

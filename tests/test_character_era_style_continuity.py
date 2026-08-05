@@ -74,7 +74,11 @@ class BlueprintSchemaGainedFieldsTest(unittest.TestCase):
             "character_descriptors"
         ]["items"]
         self.assertEqual(
-            set(entry_schema["required"]), {"name", "age", "description"},
+            set(entry_schema["required"]), {
+                "name", "apparent_age_band", "build", "hair_color", "hair_length",
+                "hair_style", "facial_hair", "distinguishing_facial_features",
+                "clothing_garment", "clothing_colors", "signature_accessory",
+            },
         )
         self.assertEqual(
             agent2_system_prompt._STORY_BLUEPRINT_SCHEMA["properties"][

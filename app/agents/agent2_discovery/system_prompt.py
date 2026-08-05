@@ -7,7 +7,9 @@ from app.services.script_checks import split_sentences
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "5.7"  # v5.7: Short Quality Roadmap Phase A3 — explicit Solo
+PROMPT_VERSION = "5.8"  # v5.8: structured full recurring-character feature set
+                        #        for deterministic verbatim prompt injection.
+                        # v5.7: Short Quality Roadmap Phase A3 — explicit Solo
                         #        Short ceiling and factual-framing guidance.
                         # v5.6: AI-premise scoring distinguishes the plain
                         # operator pitch from the future video's opening.
@@ -50,7 +52,7 @@ PROMPT_VERSION = "5.7"  # v5.7: Short Quality Roadmap Phase A3 — explicit Solo
                         # consumed by Agent 3 for gender-aware voice selection
                         # (app/agents/agent3_audio/services/audio.py).
                         # v4.8: roadmap Phase C2/C3 — _STORY_BLUEPRINT_SCHEMA gained
-                        # character_descriptors (locked name/age/physical-description
+                        # character_descriptors (locked structured appearance
                         # entries) and era_setting (period/place phrase), both generated
                         # once at blueprint time, zero extra AI calls — consumed by
                         # Agent 4's build_continuity_line_from_blueprint() for
@@ -567,9 +569,11 @@ Rules:
   about the story's people using third-person pronouns and names, as usual.
 - character_descriptors: identify this story's recurring NAMED characters — people
   who appear more than once and matter to the plot, not every person mentioned.
-  For each, provide name (as used in the story), age (approximate — e.g. "mid-30s",
-  "elderly", "teenager"), and description (ONE concrete visual sentence: build, hair,
-  clothing style, distinguishing features). Ground every detail in what the story
+  For each, fill EVERY structured appearance field: name as used in the story;
+  apparent_age_band; build; hair_color; hair_length; hair_style; facial_hair
+  (use "none" when clean-shaven); distinguishing_facial_features; clothing_garment;
+  clothing_colors; and one signature_accessory (use a period-appropriate ordinary
+  item, never omit the field). Ground every detail in what the story
   states, or what is plausible for its setting/era where the story is silent — never
   invent a detail that contradicts the story. This locks each character's visual
   identity so every generated image depicts them consistently. Maximum 5 characters.
@@ -607,11 +611,23 @@ _STORY_BLUEPRINT_SCHEMA: dict = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "name":        {"type": "string"},
-                    "age":         {"type": "string"},
-                    "description": {"type": "string"},
+                    "name":                           {"type": "string", "minLength": 1},
+                    "apparent_age_band":              {"type": "string", "minLength": 1},
+                    "build":                          {"type": "string", "minLength": 1},
+                    "hair_color":                     {"type": "string", "minLength": 1},
+                    "hair_length":                    {"type": "string", "minLength": 1},
+                    "hair_style":                     {"type": "string", "minLength": 1},
+                    "facial_hair":                    {"type": "string", "minLength": 1},
+                    "distinguishing_facial_features": {"type": "string", "minLength": 1},
+                    "clothing_garment":               {"type": "string", "minLength": 1},
+                    "clothing_colors":                {"type": "string", "minLength": 1},
+                    "signature_accessory":             {"type": "string", "minLength": 1},
                 },
-                "required": ["name", "age", "description"],
+                "required": [
+                    "name", "apparent_age_band", "build", "hair_color", "hair_length",
+                    "hair_style", "facial_hair", "distinguishing_facial_features",
+                    "clothing_garment", "clothing_colors", "signature_accessory"
+                ],
                 "additionalProperties": False,
             },
             "maxItems": 5,
@@ -656,8 +672,8 @@ def generate_story_blueprint(
     Returns:
         Dict with keys: hook, central_question, major_turns, final_payoff,
         comment_trigger, suggested_section_count, suggested_title,
-        character_descriptors (roadmap Phase C2 — list of {name, age,
-        description}, possibly empty), era_setting (roadmap Phase C3 — one
+        character_descriptors (full structured fixed-feature entries, possibly
+        empty), era_setting (roadmap Phase C3 — one
         phrase, possibly empty string), protagonist_gender (roadmap Phase
         D1 — "feminine" | "masculine" | "unspecified", consumed by Agent 3
         for gender-aware voice selection; never normalized here — callers

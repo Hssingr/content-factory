@@ -11,7 +11,12 @@ from app.services.claude_client import (
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "5.3"  # v5.3: Phase A' — preserve style through deterministic
+PROMPT_VERSION = "5.5"  # v5.5: channel-agnostic rule — depict any period/regime/conflict
+                        #        context through architecture, dress, objects, and setting
+                        #        only; never regime insignia, flags, uniform emblems, or
+                        #        extremist/hate symbols of any era (code_report/TODO Task 2b).
+                        # v5.4: Python-owned verbatim recurring-character descriptors.
+                        # v5.3: Phase A' — preserve style through deterministic
                         #        reframes; leak-proof meta rules; contextual material
                         #        variety; era/locale-correct textual props.
                         # v5.2: Short Quality Roadmap Phase A3 — material-detail
@@ -351,14 +356,13 @@ Never add an "Avoid:" suffix or a negative-prompt list to flux_prompt; describe
 only what the image should contain.
 
 When a "Character identities:" line appears, it gives you the story's own locked
-name/age/physical-description for its recurring characters — generated once at
-blueprint time, grounded in the story. Use these EXACT descriptions whenever a
-beat depicts one of these people; do not invent a conflicting appearance, and do
-not silently drop a described detail (hair, build, clothing) in a later beat
-showing the same person. This is the deterministic replacement for keeping one
-character looking like the same person across 100+ beats — a real production
-run showed a story's protagonist rendered as 6+ visually different women with
-nothing enforcing consistency.
+names and roles. In visual_intent and flux_prompt, reference a recurring character
+by that name/role ONLY. Do NOT describe or paraphrase their age, build, hair,
+facial features, clothing, colors, or accessory: deterministic Python injects the
+complete canonical appearance line after your response. Continue describing the
+character's action, camera, setting, and lighting normally. This ownership split
+ensures every independently generated image receives byte-identical appearance
+wording rather than Claude variations.
 
 When a beat's narration centers on a NAMED character who has a locked
 "Character identities:" description, prefer depicting that person physically
@@ -384,6 +388,13 @@ For an era-locked story, never choose a laboratory, industrial, vehicle, office,
 or other environment merely to increase label diversity. If none of the fixed
 environment values honestly fits the period/location shown, use other and
 create diversity through motif, camera distance/angle, composition, and effect.
+
+Depict any period, regime, or conflict context — of any era, any nation, any
+side — through architecture, dress, objects, and setting only. Never depict
+regime insignia, flags, uniform emblems, or extremist/hate symbols of any
+era, real or fictionalized. This applies regardless of whether the era/
+setting is historical or contemporary, and regardless of which side of a
+conflict a beat is depicting.
 
 == Global Visual Direction (operator-configured) ==
 When "Global visual direction:" and "Global image style:" lines appear in the user
@@ -792,6 +803,7 @@ def generate_storyboard_batch(
     visual_style: str = "",
     image_style: str = "",
     continuity_line: str = "",
+    continuation_framing: str = "",
 ) -> tuple[dict, dict, dict]:
     """Ask Claude to design the storyboard for ONE narration segment only.
 
@@ -814,6 +826,14 @@ def generate_storyboard_batch(
             as a plain line in the user message. No AI call, no compaction;
             replaces the deleted visual-bible layer (Elimination Mandate,
             code_report/forensic_output_audit_borrasca_run.md, D2.1).
+        continuation_framing: Optional one-line note used only by the
+            shortfall-topup call (``storyboard._locate_uncovered_span()``) —
+            explains that ``segment_text`` is the still-uncovered remainder
+            of a segment other beats already storyboarded, not the whole
+            segment. Deliberately a distinct line from
+            ``previous_segment_summary`` (which is about the PRIOR segment,
+            a different concept) so neither reader — Claude or a human
+            debugging the prompt — has to guess which "previous" is meant.
 
     Returns:
         ``(storyboard, usage, diag)`` — storyboard has keys ``storyboard_status``,
@@ -841,6 +861,7 @@ def generate_storyboard_batch(
             if style_constraint:
                 direction_lines += f"Style constraints (this image style must NOT look like): {style_constraint}\n"
         continuity_lines = f"{continuity_line}\n" if continuity_line else ""
+        continuation_lines = f"{continuation_framing}\n" if continuation_framing else ""
         return (
             f"Channel niche: {channel.niche}\n"
             f"Channel tone: {channel.tone}\n"
@@ -854,6 +875,7 @@ def generate_storyboard_batch(
                 f"{previous_segment_summary}\n"
                 if previous_segment_summary else ""
             )
+            + continuation_lines
             + f"\nNarration for THIS segment only (design beats for this text alone):\n{segment_text}"
         )
 

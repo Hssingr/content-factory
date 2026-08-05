@@ -58,7 +58,37 @@ logger = logging.getLogger(__name__)
 _INTER_BEAT_SLEEP_SEC = 0.5  # conservative until rate limits confirmed
 _PIXEL_HASH_SIZE = 8
 _PIXEL_HASH_COLLISION_MAX_DISTANCE = 3
-_MAX_CONSECUTIVE_ANCHOR_REUSE = 2
+CANONICAL_CHARACTER_DESCRIPTOR_KEY = "canonical_character_descriptor_lines"
+
+
+def canonical_character_descriptor(entry: dict) -> str:
+    """Serialize one blueprint descriptor in one immutable field order."""
+    if not isinstance(entry, dict):
+        return ""
+    name = str(entry.get("name") or "").strip()
+    # Read compatibility for persisted pre-5.8 blueprints.
+    if "description" in entry:
+        description = str(entry.get("description") or "").strip()
+        age = str(entry.get("age") or "").strip()
+        return f"{name}{f', {age}' if age else ''} — {description}" if name and description else ""
+    fields = {
+        key: str(entry.get(key) or "").strip()
+        for key in (
+            "apparent_age_band", "build", "hair_color", "hair_length", "hair_style",
+            "facial_hair", "distinguishing_facial_features", "clothing_garment",
+            "clothing_colors", "signature_accessory",
+        )
+    }
+    if not name or not all(fields.values()):
+        return ""
+    return (
+        f"{name} — apparent age: {fields['apparent_age_band']}; build: {fields['build']}; "
+        f"hair: {fields['hair_color']}, {fields['hair_length']}, {fields['hair_style']}; "
+        f"facial hair: {fields['facial_hair']}; distinguishing facial features: "
+        f"{fields['distinguishing_facial_features']}; clothing: "
+        f"{fields['clothing_garment']} in {fields['clothing_colors']}; signature accessory: "
+        f"{fields['signature_accessory']}"
+    )
 
 # Luminance gate (operator-confirmed live-canary fix): a real production run
 # shipped a beat whose Flux generation was a 100% black JPEG (mean luminance
@@ -181,6 +211,44 @@ _STYLE_CONTINUATION_RE = re.compile(
     re.IGNORECASE,
 )
 
+
+def _style_anchor_chunks(prompt: str) -> list[str]:
+    """Return the leading configured style clause without paraphrasing it."""
+    chunks = [chunk.strip() for chunk in str(prompt or "").split(",") if chunk.strip()]
+    style_chunks: list[str] = []
+    collecting = False
+    for chunk in chunks:
+        if _META_RULE_FRAGMENT_RE.search(chunk):
+            continue
+        if _STYLE_MARKER_RE.search(chunk):
+            collecting = True
+        elif collecting and not _STYLE_CONTINUATION_RE.search(chunk):
+            break
+        if collecting:
+            style_chunks.append(chunk)
+    return style_chunks
+
+
+def preserve_character_descriptor_lines(beat: dict, prompt: str) -> str:
+    """Insert stored canonical descriptor lines verbatim after the style prefix."""
+    lines = [
+        str(line).strip() for line in beat.get(CANONICAL_CHARACTER_DESCRIPTOR_KEY, [])
+        if str(line).strip()
+    ]
+    if not lines:
+        return prompt
+    remainder = str(prompt or "").strip(" ,")
+    for line in lines:
+        remainder = remainder.replace(line, "").strip(" ,")
+    style_chunks = _style_anchor_chunks(remainder)
+    if not style_chunks:
+        style_chunks = _style_anchor_chunks(str(beat.get("flux_prompt") or ""))
+    style_anchor = ", ".join(style_chunks)
+    if style_anchor and remainder.startswith(style_anchor):
+        remainder = remainder[len(style_anchor):].strip(" ,")
+    parts = [part for part in (style_anchor, *lines, remainder) if part]
+    return ", ".join(parts)
+
 _MATERIAL_CONTEXT_LIGHTING_RE = re.compile(
     r"\b(?:under|in|with|lit by)\s+(?:a[n]?\s+)?"
     r"(?:bright|well-lit|daylight|sunlit|fluorescent|incandescent|golden|overcast)"
@@ -199,24 +267,129 @@ UNIVERSAL_NO_ARTIFACT_CLAUSE = (
     "no watermark, no signature, no visible date or timestamp, no logos"
 )
 
+# Task 2a (code_report/TODO, 2026-08-05): a text-bearing keyword merely
+# PRESENT somewhere in the scene ("...a market scene, newspapers stacked on
+# a nearby cart...") used to trigger the same full material-texture reframe
+# as a keyword that IS the prompt's own primary subject — discarding a
+# perfectly fine background/context prompt for no reason. A keyword counts
+# as the primary subject only when a structured field already says so
+# (visual_type/motif == "document") or it falls within the first
+# _PRIMARY_SUBJECT_WINDOW_WORDS of the prompt body — where every real
+# storyboard prompt's own "of a/an/the <subject>" clause sits (e.g.
+# "cinematic cartoon illustration of a rough hand-carved mine tunnel
+# entrance"), right after the leading style-anchor clause.
+_PRIMARY_SUBJECT_WINDOW_WORDS = 8
+
+# Human-readable phrase per storyboard.py's _VALID_ENVIRONMENTS enum, used to
+# keep the beat's own environment in the rewritten prompt instead of
+# discarding it (Task 2a: "rewrite output preserves the original environment
+# ... descriptors"). "" for values with no natural standalone phrasing.
+_ENVIRONMENT_PHRASES: dict[str, str] = {
+    "underwater": "underwater",
+    "indoor_office": "in an office interior",
+    "indoor_domestic": "in a domestic interior",
+    "forest_nature": "outdoors in a natural forest setting",
+    "urban_street": "on an urban street",
+    "corridor_interior": "in an interior corridor",
+    "abstract_dark": "against a dark abstract backdrop",
+    "open_landscape": "in an open outdoor landscape",
+    "laboratory": "in a laboratory interior",
+    "industrial": "in an industrial interior",
+    "vehicle": "inside a vehicle",
+    "other": "",
+}
+
+# Best-effort, deterministic era/period phrase extraction from the ORIGINAL
+# prompt, so a full reframe doesn't silently drop a period the storyboard
+# prompt's own era/setting lock (CLAUDE.md §11.4 build_continuity_line_from_
+# blueprint) put there. Heuristic, not exhaustive — same accepted tradeoff as
+# every other deterministic keyword check in this codebase.
+_ERA_DESCRIPTOR_RE = re.compile(
+    r"\b(?:\d{1,2}(?:st|nd|rd|th)[- ]century|medieval|ancient|victorian|"
+    r"edwardian|renaissance|colonial|prehistoric|byzantine|roman|greek|"
+    r"[12]\d{3}s)\b",
+    re.IGNORECASE,
+)
+
+
+def _matched_text_prop_keyword(beat: dict) -> str | None:
+    """First text-prop keyword found anywhere across the detection fields, or
+    None. Shared by is_text_prop_beat() (detection) and
+    derive_text_prop_prompt() (so the de-emphasis fallback can name the same
+    keyword the detector matched, instead of a generic placeholder)."""
+    haystack = " ".join(str(beat.get(f, "") or "") for f in _TEXT_PROP_FIELDS).lower()
+    for keyword, pattern in _TEXT_PROP_KEYWORD_PATTERNS:
+        if pattern.search(haystack):
+            return keyword
+    return None
+
 
 def is_text_prop_beat(beat: dict) -> bool:
     """True for a beat whose prop would naturally carry readable text —
     a document, poster, calendar, sign, name tag, etc. (word-boundary match;
-    see _TEXT_PROP_KEYWORD_PATTERNS)."""
-    haystack = " ".join(str(beat.get(f, "") or "") for f in _TEXT_PROP_FIELDS).lower()
-    return any(pattern.search(haystack) for _, pattern in _TEXT_PROP_KEYWORD_PATTERNS)
+    see _TEXT_PROP_KEYWORD_PATTERNS). This is the overall on/off gate for
+    text-prop handling; see _is_primary_subject_text_prop() for the separate
+    full-reframe-vs-de-emphasis-only decision inside derive_text_prop_prompt()."""
+    return _matched_text_prop_keyword(beat) is not None
+
+
+def _is_primary_subject_text_prop(beat: dict) -> bool:
+    """True when the text-bearing keyword is the prompt's own primary
+    subject (head noun phrase), not merely present somewhere in the scene —
+    see _PRIMARY_SUBJECT_WINDOW_WORDS above for the deterministic rule.
+
+    Uses _STYLE_MARKER_RE directly (not _style_anchor_chunks, which is
+    comma-chunk-granular: a real prompt's leading style words and its own
+    subject clause typically sit in the SAME first comma-chunk, e.g.
+    "cinematic cartoon illustration of a rough hand-carved mine tunnel
+    entrance" has no comma before "entrance" — chunk-level stripping would
+    discard the subject clause along with the style words). Instead this
+    slices right after the style-marker match itself, wherever it falls.
+    """
+    if str(beat.get("visual_type", "") or "").lower() == "document":
+        return True
+    if str(beat.get("motif", "") or "").lower() == "document":
+        return True
+
+    prompt = str(beat.get("flux_prompt", "") or "")
+    style_match = _STYLE_MARKER_RE.search(prompt)
+    body = prompt[style_match.end():].strip(" ,") if style_match else prompt
+    window_text = " ".join(body.lower().split()[:_PRIMARY_SUBJECT_WINDOW_WORDS])
+    return any(pattern.search(window_text) for _, pattern in _TEXT_PROP_KEYWORD_PATTERNS)
+
+
+def _derive_deemphasis_prompt(beat: dict, matched_keyword: str) -> str:
+    """Keep the original prompt, only de-emphasizing the text-bearing
+    element — used for a peripheral mention (not the primary subject) or
+    when the primary subject is text-bearing but no known material reframe
+    exists for it. Never fabricates a generic "the object" placeholder;
+    names the actual matched keyword instead."""
+    original = str(beat.get("flux_prompt", "") or "").rstrip(". ")
+    clause = f"{matched_keyword} out of focus and unreadable in the background"
+    rewritten = f"{original}, {clause}" if original else clause
+    return preserve_character_descriptor_lines(beat, rewritten)
 
 
 def derive_text_prop_prompt(beat: dict) -> str:
-    """Reframe a text-bearing subject as material detail, deterministically."""
+    """Reframe a text-bearing subject as material detail, deterministically.
+
+    Only a PRIMARY-subject text prop with a known material reframe gets the
+    full texture-reframe rewrite. A peripheral mention, or a primary subject
+    this module has no reframe table entry for, is de-emphasized in place
+    instead — the original prompt is kept, never replaced with a generic
+    "the object" placeholder (Task 2a, code_report/TODO, 2026-08-05).
+    """
+    matched_keyword = _matched_text_prop_keyword(beat)
+    if not _is_primary_subject_text_prop(beat):
+        return _derive_deemphasis_prompt(beat, matched_keyword or "text")
+
     descriptive_haystack = " ".join(
         str(beat.get(field, "") or "")
         for field in ("flux_prompt", "visual_intent")
     ).lower()
     fallback_haystack = str(beat.get("motif", "") or "").lower()
     beat_order = int(beat.get("beat_order", 0) or 0)
-    reframe = "material texture, edges, and hands interacting with the object in close-up"
+    reframe = None
     for keywords, candidates in _TEXT_PROP_MATERIAL_REFRAMES:
         if any(re.search(r"\b" + re.escape(keyword) + r"\b", descriptive_haystack) for keyword in keywords):
             reframe = candidates[beat_order % len(candidates)]
@@ -226,24 +399,34 @@ def derive_text_prop_prompt(beat: dict) -> str:
             if any(re.search(r"\b" + re.escape(keyword) + r"\b", fallback_haystack) for keyword in keywords):
                 reframe = candidates[beat_order % len(candidates)]
                 break
+
+    if reframe is None:
+        # Primary subject, but this module has no reframe entry for it —
+        # de-emphasize the original rather than fabricate a generic line.
+        return _derive_deemphasis_prompt(beat, matched_keyword or "text")
+
     original_prompt = str(beat.get("flux_prompt") or "")
-    chunks = [chunk.strip() for chunk in original_prompt.split(",") if chunk.strip()]
-    style_chunks: list[str] = []
-    collecting = False
-    for chunk in chunks:
-        if _META_RULE_FRAGMENT_RE.search(chunk):
-            continue
-        if _STYLE_MARKER_RE.search(chunk):
-            collecting = True
-        elif collecting and not _STYLE_CONTINUATION_RE.search(chunk):
-            break
-        if collecting:
-            style_chunks.append(chunk)
+    style_chunks = _style_anchor_chunks(original_prompt)
     style_anchor = ", ".join(style_chunks)
+    # _style_anchor_chunks is comma-chunk-granular: when the style words and
+    # the subject clause share one chunk with no comma between them
+    # ("cinematic cartoon illustration of an open ledger on a wooden desk"),
+    # it sweeps the subject INTO the anchor too — leaking the very
+    # text-bearing noun this reframe exists to remove. Fall back to slicing
+    # right after the style-marker match itself whenever the chunk-level
+    # anchor still contains the matched keyword.
+    if matched_keyword and re.search(r"\b" + re.escape(matched_keyword) + r"\b", style_anchor.lower()):
+        style_match = _STYLE_MARKER_RE.search(original_prompt)
+        style_anchor = original_prompt[:style_match.end()].strip(" ,") if style_match else ""
     lighting_match = _MATERIAL_CONTEXT_LIGHTING_RE.search(original_prompt)
     lighting = f", {lighting_match.group(0)}" if lighting_match else ""
-    body = f"{reframe}{lighting}"
-    return f"{style_anchor}, {body}" if style_anchor else body
+    env_phrase = _ENVIRONMENT_PHRASES.get(str(beat.get("environment", "") or "").lower(), "")
+    environment_clause = f", {env_phrase}" if env_phrase else ""
+    era_matches = dict.fromkeys(m.lower() for m in _ERA_DESCRIPTOR_RE.findall(original_prompt))
+    era_clause = f", {', '.join(era_matches)}" if era_matches else ""
+    body = f"{reframe}{lighting}{environment_clause}{era_clause}"
+    rewritten = f"{style_anchor}, {body}" if style_anchor else body
+    return preserve_character_descriptor_lines(beat, rewritten)
 
 
 def generate_beat_image_with_routing(
@@ -499,10 +682,11 @@ def _build_defect_rewrite_prompt(beat: dict, idx: int) -> str:
     base = intent if len(intent.split()) >= 4 else _ENV_SAFE_PROMPTS.get(
         environment, _ENV_SAFE_PROMPTS["other"],
     )
-    return (
+    rewritten = (
         f"{base}, {composition_slot_variation(idx)}, "
         f"{_WELL_LIT_REROLL_CLAUSE}, {_FULL_BLEED_REROLL_CLAUSE}."
     )
+    return preserve_character_descriptor_lines(beat, rewritten)
 
 
 def _ensure_beat_image_healthy(
@@ -664,7 +848,6 @@ def fill_failed_beats_from_neighbors(beats: list[dict], content_id: str) -> int:
 def generate_all_beat_images(
     beats: list[dict], content_id: str,
     width: int = _DEFAULT_WIDTH, height: int = _DEFAULT_HEIGHT,
-    person_anchor_continuity_line: str = "",
 ) -> list[dict]:
     """Generate Flux images for all beats sequentially (1 worker, 0.5s inter-beat sleep).
 
@@ -690,12 +873,6 @@ def generate_all_beat_images(
                     existing child-remap portrait generation.
         height:     Image height — landscape 1080 (default) or 1920 (Solo
                     Short portrait).
-        person_anchor_continuity_line: Exact primary-character continuity
-                    text present in eligible Solo Short person prompts. When
-                    non-empty, successful person images are reused at most
-                    twice consecutively before a fresh anchor is generated.
-                    Parent and child paths leave this empty.
-
     Returns:
         The same list with each beat's ``media_url`` set.
     """
@@ -713,33 +890,8 @@ def generate_all_beat_images(
     # below because max_workers=1 (beats are generated one at a time).
     tier_counts: dict[str, int] = {}
     pixel_ledger: list[dict] = []
-    person_anchor: dict | None = None
-    consecutive_anchor_reuses = 0
-
     def _generate_one(beat: dict) -> dict:
-        nonlocal person_anchor, consecutive_anchor_reuses
         idx = beat.get("beat_order", beat.get("section_order", 0))
-        prompt = str(beat.get("flux_prompt") or "")
-        eligible_person = (
-            bool(person_anchor_continuity_line)
-            and beat.get("visual_category") == "person"
-            and person_anchor_continuity_line in prompt
-        )
-        if (
-            idx != 0
-            and eligible_person
-            and person_anchor is not None
-            and consecutive_anchor_reuses < _MAX_CONSECUTIVE_ANCHOR_REUSE
-        ):
-            beat["media_url"] = person_anchor["image_path"]
-            beat["media_type"] = "image"
-            consecutive_anchor_reuses += 1
-            logger.info(
-                "SOLO_SHORT_PERSON_ANCHOR_REUSED beat=%s anchor_beat=%s",
-                idx, person_anchor["beat_order"],
-            )
-            return beat
-
         path = generate_beat_image_with_routing(
             beat, content_id, tier_counts, width=width, height=height,
         )
@@ -771,13 +923,6 @@ def generate_all_beat_images(
             if path:
                 beat["media_url"]  = path
                 beat["media_type"] = "image"
-                if eligible_person:
-                    person_anchor = {
-                        "beat_order": idx,
-                        "image_path": path,
-                        "prompt": prompt,
-                    }
-                    consecutive_anchor_reuses = 0
 
         time.sleep(_INTER_BEAT_SLEEP_SEC)
         return beat

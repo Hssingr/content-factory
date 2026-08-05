@@ -102,6 +102,18 @@ class Settings(BaseSettings):
     # beat at the new value.
     parent_visual_max_hold_ms: int = 9000
 
+    # Minimum real-time span a beat inside a proportional-fallback cluster may
+    # hold before it is deterministically thinned (content 069d8d06 diagnostic,
+    # 2026-08-05): when several consecutive beats fail hint matching and land
+    # in the same short gap between two trusted anchors, proportional
+    # interpolation can pack them into sub-second/low-second slices — each one
+    # showing an image unrelated to the instant of narration it plays against.
+    # _drop_surplus_fallback_beats() (agent4_visuals/subagents/storyboard.py)
+    # keeps only as many evenly-spaced beats from such a cluster as this floor
+    # allows, dropping the rest, rather than shipping a rapid-fire run of
+    # mismatched flashes.
+    min_fallback_beat_hold_ms: int = 1600
+
     # Post-render verification: run ffprobe/blackdetect/silencedetect after every render.
     # Set VERIFY_RENDERS=false to skip (e.g. in CI or when ffmpeg is unavailable).
     verify_renders: bool = True

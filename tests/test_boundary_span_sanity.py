@@ -113,10 +113,12 @@ class TestSpanSanityDemotion(unittest.TestCase):
             any("ANCHOR_SPAN_SANITY_DROPPED" in m for m in logs.output), logs.output
         )
 
-        # Beat 2 was demoted: its script_text is empty, flagged, and it
-        # is NOT anchored at the 40 s duplicate.
-        self.assertEqual(sections[2]["script_text"], "")
-        self.assertEqual(sections[2]["script_text_source"], "empty_fallback_no_transcript_span")
+        # Beat 2 was demoted: it is flagged as a non-hint-match fallback and
+        # is NOT anchored at the 40 s duplicate. script_text now carries the
+        # real transcript words spoken during its own resolved span (2026-08-05
+        # content 069d8d06 fix) instead of being forced blank.
+        self.assertNotEqual(sections[2]["script_text"], "")
+        self.assertEqual(sections[2]["script_text_source"], "proportional_fallback_span_text")
         self.assertTrue(sections[2]["script_text_missing"])
         self.assertLess(sections[2]["audio_start_ms"], 40_000)
 

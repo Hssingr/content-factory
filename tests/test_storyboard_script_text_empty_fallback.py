@@ -25,7 +25,11 @@ class StoryboardScriptTextFallbackTest(unittest.TestCase):
     def test_static_no_visual_intent_script_text_fallback_remains(self):
         source = inspect.getsource(storyboard.map_storyboard_beats_to_timestamps)
         self.assertNotIn('else str(beat.get("visual_intent"', source)
-        self.assertIn('script_text = ""', source)
+        # 2026-08-05 (content 069d8d06 fix): a fallback beat's script_text is
+        # now the real transcript span it plays against when one exists
+        # (_words_in_ms_span), not unconditionally "" — but it must never
+        # silently become the beat's own visual_intent/prompt language.
+        self.assertIn('_words_in_ms_span(flat, start_ms, end_ms)', source)
         self.assertIn('STORYBOARD_SCRIPT_TEXT_EMPTY_FALLBACK', source)
 
     def test_runtime_fallback_uses_empty_script_text_and_persisted_flag(self):

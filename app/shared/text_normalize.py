@@ -7,6 +7,7 @@ string comparison numeral-proof and language-aware.
 
 import re
 import logging
+import unicodedata
 
 logger = logging.getLogger(__name__)
 
@@ -27,11 +28,29 @@ _PUNCT_RE = re.compile(r"[^\w\s]")
 _SPACE_RE = re.compile(r"\s+")
 
 
+def _strip_diacritics(text: str) -> str:
+    """Fold accented characters to their unaccented base form (NFD, drop combining marks).
+
+    A real production run (content 069d8d06, story mentioning "Potosí") showed
+    this module's hint-side normalization left accents in place while the
+    transcript-side word normalizer (``_normalize_word`` in
+    ``agent4_visuals/subagents/storyboard.py``) already stripped them via the
+    same NFD technique — an asymmetry that silently fails hint matching for
+    any accented/foreign proper noun whenever Whisper's own transcription
+    happens to drop (or add) the accent. Applying the identical fold on both
+    sides here removes the asymmetry for every caller of this shared function,
+    not just the storyboard path — language-agnostic, deterministic, no AI.
+    """
+    nfd = unicodedata.normalize("NFD", text)
+    return "".join(ch for ch in nfd if unicodedata.category(ch) != "Mn")
+
+
 def normalize_for_matching(text: str, language: str) -> list[str]:
     """Normalize text for fuzzy phrase matching across agents.
 
-    Converts to lowercase, expands digit runs to words in the target language
-    (using ``num2words``), strips punctuation, and splits on whitespace.
+    Converts to lowercase, folds accented characters to their base form,
+    expands digit runs to words in the target language (using ``num2words``),
+    strips punctuation, and splits on whitespace.
 
     Designed for matching Whisper transcripts (which contain spoken-form numbers)
     against Claude-returned phrases (which may contain digit-form numbers).
@@ -42,17 +61,20 @@ def normalize_for_matching(text: str, language: str) -> list[str]:
                   subtag is used for the num2words language lookup.
 
     Returns:
-        List of lowercase, punctuation-free word tokens, with digit runs expanded
-        to their spoken form. Empty tokens are excluded.
+        List of lowercase, accent-folded, punctuation-free word tokens, with
+        digit runs expanded to their spoken form. Empty tokens are excluded.
 
     Example::
         normalize_for_matching("In 1984, he was 24.", "en")
         # → ["in", "nineteen", "eighty", "four", "he", "was", "twenty", "four"]
+        normalize_for_matching("Potosí", "en")
+        # → ["potosi"]
     """
     lang_key = language.lower().split("-")[0]
     num2words_lang = _LANG_MAP.get(lang_key, "en")
 
     text = text.lower()
+    text = _strip_diacritics(text)
     text = _DIGIT_RE.sub(lambda m: _expand_number(m.group(), num2words_lang), text)
     text = _PUNCT_RE.sub(" ", text)
     text = _SPACE_RE.sub(" ", text).strip()

@@ -6,7 +6,7 @@ import uuid
 from sqlalchemy.orm import Session
 
 from app.models import Channel, ChannelConfig, ChannelLanguage, ChannelVoice, Content, Script
-from app.services.script_estimator import estimate_duration_sec
+from app.services.script_estimator import compute_measured_wpm, estimate_duration_sec
 from app.agents.agent2_discovery.services.narration_pov import normalize_narration_pov
 from app.agents.agent2_discovery.system_prompt import (
     generate_native_script,
@@ -1925,6 +1925,56 @@ def generate_script_sections(
 _MIN_SHORT_WORDS = 190  # ~65 s — the hard 61 s audio floor needs ≥ ~180 words
 _MAX_SHORT_WORDS = 270  # ~92 s — telemetry-only: an over-cap Short ships, never fails
 _SHORT_CALIBRATED_WPM = 175
+
+# Target seconds the word floor/ceiling are meant to land inside — the same
+# 61 s hard floor / ~90 s soft ceiling the operator has always stated, just
+# named explicitly so _resolve_short_word_bounds() below can derive word
+# counts from a measured rate instead of only the one-time 175 wpm assumption
+# _MIN_SHORT_WORDS/_MAX_SHORT_WORDS above were hardcoded from.
+_SHORT_TARGET_MIN_SEC = 65
+_SHORT_TARGET_MAX_SEC = 90
+
+
+def _resolve_short_word_bounds(
+    db: "Session | None", language: str, channel_id: object | None,
+) -> tuple[int, int]:
+    """Per-(channel, language) calibrated Short word floor/ceiling.
+
+    A real production run (content f71183e3, 2026-08-04) measured this
+    channel's actual configured voice (ElevenLabs eleven_v3) at ~142 wpm
+    (302 Whisper words / 127.1 s) — 19% slower than the ~175 wpm
+    ``_SHORT_CALIBRATED_WPM`` the static ``_MIN_SHORT_WORDS``/
+    ``_MAX_SHORT_WORDS`` constants above were derived from (run 41f7eeb8,
+    a different voice). A 270-word script at the assumed 175 wpm is ~92 s;
+    at this channel's real 142 wpm it is ~114 s — exactly the "video is
+    2 minutes+" symptom, even with the word-count ceiling regeneration
+    working exactly as designed.
+
+    This reuses ``script_estimator.compute_measured_wpm()`` — the same
+    rolling-average-of-real-``AudioFile``-rows mechanism already used for
+    section-duration estimates and storyboard wpm diagnostics (CLAUDE.md
+    §7.4) — scoped to ``is_short_episode=True`` and this channel, so a
+    slow or fast configured voice self-corrects the word target instead of
+    the pipeline trusting one historical measurement forever.
+
+    Returns the static ``(_MIN_SHORT_WORDS, _MAX_SHORT_WORDS)`` unchanged
+    when ``db`` is ``None`` or fewer than
+    ``script_estimator._MIN_SAMPLES_FOR_CALIBRATION`` (3) real Shorts have
+    completed for this exact (channel, language) pair yet — cold start is
+    byte-identical to the pre-calibration behavior, so the first couple of
+    Shorts for a brand-new channel still use the documented static
+    assumption until real data exists to correct it.
+    """
+    if db is not None:
+        wpm = compute_measured_wpm(
+            db, language, is_short_episode=True, channel_id=channel_id,
+        )
+        if wpm and wpm > 0:
+            floor = max(150, round(wpm * _SHORT_TARGET_MIN_SEC / 60))
+            ceiling = max(floor + 20, round(wpm * _SHORT_TARGET_MAX_SEC / 60))
+            return floor, ceiling
+    return _MIN_SHORT_WORDS, _MAX_SHORT_WORDS
+
 
 # Section markers must never appear in a child Short's narration — flat narration only
 # (CLAUDE.md §5.2). Catches [INTRO], [SECTION N], [OUTRO], or any other bracketed label

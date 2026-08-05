@@ -309,6 +309,20 @@ def validate_storyboard(beats: list[dict]) -> list[StoryboardIssue]:
         # Check "dark" co-occurrence with atmospheric words
         if "dark" in prompt_words and (_DARK_REQUIRES_COOCCURRENCE & prompt_words):
             found_forbidden = found_forbidden | {"dark"}
+        # "cinematic" is also the first half of the "cinematic_cartoon"
+        # image_style — an operator-approved style name (system_prompt.py's
+        # own style vocabulary instructs Claude to write "cinematic cartoon
+        # illustration ..." at the start of essentially every beat for a
+        # channel using that style). A real production run measured this
+        # check flagging 38/38 beats MAJOR for exactly that reason — the
+        # style-name usage, not an actual mood-only prompt with no physical
+        # subject, which is what this check exists to catch (Task 2e,
+        # code_report/TODO, 2026-08-05). Only flag "cinematic" when it is
+        # NOT part of that style phrase, in either spelling.
+        if "cinematic" in found_forbidden and (
+            "cinematic cartoon" in prompt_lower or "cinematic_cartoon" in prompt_lower
+        ):
+            found_forbidden = found_forbidden - {"cinematic"}
 
         if found_forbidden:
             issues.append(StoryboardIssue(

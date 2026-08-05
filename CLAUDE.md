@@ -2599,9 +2599,12 @@ calls, and NOT a revert of the deleted visual bible (Elimination Mandate
 D2.1, §11.4) — deterministic, blueprint-derived data consumed by Python, no
 per-batch generation call.
 
-- `character_descriptors`: up to 5 `{name, age, description}` entries for
-  the story's recurring NAMED characters (not every mentioned person) — a
-  locked, one-line physical description each. Required in the schema, but a
+- `character_descriptors`: up to 5 structured entries for recurring NAMED
+  characters. Each requires name, apparent age band, build, hair color/length/
+  style, facial hair, distinguishing facial features, clothing garment/colors,
+  and one signature accessory. Python serializes these fields in a fixed order
+  and injects that exact line into every matching person beat. Required in the
+  schema, but a
   legitimately empty list (`[]`) is valid for an event-focused/ensemble
   story with no describable individual character — never forced.
 - `era_setting`: one phrase naming the story's historical period AND
@@ -5670,12 +5673,153 @@ Rules:
 - Solo Shorts above 110% of `_MAX_SHORT_WORDS` receive one and only one
   ceiling-constrained regeneration. `SOLO_SHORT_WORD_CEILING_REGEN` records the
   trigger and the shorter draft is retained; this is not a quality loop.
+- The word floor/ceiling this ceiling-regen (and the mirror floor-regen)
+  gates on is no longer only the static `_MIN_SHORT_WORDS`/`_MAX_SHORT_WORDS`
+  (190/270, calibrated from one historical run at ~175 wpm). A real
+  production run (content f71183e3) measured a different configured voice
+  at ~142 wpm, which let a 270-word-compliant Short still land at ~114s
+  instead of the assumed ~92s. `scripts._resolve_short_word_bounds(db,
+  language, channel_id)` now computes the floor/ceiling from
+  `script_estimator.compute_measured_wpm(..., is_short_episode=True,
+  channel_id=...)` — the same rolling real-`AudioFile`-average mechanism
+  §7.4 already defines — once at least 3 completed Shorts exist for that
+  exact (channel, language); below that sample count it returns the static
+  190/270 unchanged (cold-start fallback, byte-identical to the prior
+  behavior). `_run_solo_short_script_workflow()` calls this once per run and
+  threads the result through both the floor and ceiling regen checks in
+  place of the module constants. The per-part planner path
+  (`_generate_short_script()`/`run_shorts_planner()`) still reads the static
+  constants directly — not yet wired to per-channel calibration.
 - A storyboard batch delivering fewer than `ceil(0.70 * requested)` beats gets
   one follow-up call for exactly `requested - delivered`. The same segment and
   continuity context and the existing in-call truncation retry are reused.
   `STORYBOARD_SHORTFALL_TOPUP` records the bounded call; an under-delivering or
   failed follow-up is accepted and logged as `STORYBOARD_SHORTFALL_ACCEPTED`.
   Never top up the top-up.
+- **The shortfall-topup call can restate content the original delivery
+  already covered (content 069d8d06 diagnostic, 2026-08-05).** A real
+  production Solo Short (a Potosí/mita history) shipped 9 consecutive beats
+  (beat_order 11-19) holding for round-number 1.0/2.0/3.0 s intervals with
+  images unrelated to the narration playing at that instant — the reviewer-
+  observed 47-65 s misalignment. Root cause, confirmed by re-deriving the
+  content's own persisted `beat_review_metadata.json`: the segment's
+  `target_beat_count` exceeded `_MAX_BEATS_PER_BATCH` and was pre-split into
+  two parts (`_split_segment_for_batching`); part 1 under-delivered (11 of
+  ~17-20 requested beats), triggering the shortfall topup above — which
+  re-sends the *identical* `segment_text` with nothing telling the model
+  which beats already exist for it. The topup call independently re-told
+  part 1's narration from its own beginning; its beats' `start_hint`/
+  `end_hint` values were near-verbatim restatements of beats already
+  delivered (e.g. topup beat 12's hint "That mountain is Cerro Rico, high in
+  the" vs. delivered beat 1's own hint "That mountain is Cerro Rico, high in"
+  — 93% token overlap), so none of them could hint-match forward of the
+  transcript cursor the original delivery's own beats had already advanced
+  past — every one fell back to proportional interpolation, packing a real
+  ~11 s gap between two correctly-matched anchors with beats showing the
+  wrong images. **Explicitly not a diacritics/normalization bug** — that was
+  the initial hypothesis (the story's proper nouns Potosí/asientos/Genoese)
+  and was investigated first per this codebase's own "verify the hypothesis
+  before fixing" convention (§9.3's John Law diagnostic precedent above); it
+  was not confirmed as this incident's primary cause, though a real,
+  independent diacritic-folding bug was found and fixed alongside it (next
+  bullet) since `normalize_for_matching` genuinely needed it regardless.
+  Three independent fixes, each a deterministic, no-AI safety net:
+  - **Duplicate-topup rejection** (the direct root-cause fix) —
+    `storyboard._filter_duplicate_topup_beats(topup_beats, delivered_beats,
+    language)`: a topup beat whose `start_hint` + `end_hint` token set
+    overlaps any single already-delivered beat's hint tokens by at least
+    `_TOPUP_DUPLICATE_HINT_OVERLAP` (0.65, module constant) is dropped
+    before being appended, logged `STORYBOARD_TOPUP_DUPLICATE_DROPPED` per
+    beat and `STORYBOARD_TOPUP_DUPLICATE_SUMMARY` once per topup call.
+    Re-deriving the real 069d8d06 hints through this exact check confirms it
+    catches the clearest restatements (beats 11/12/15/16, 91-100% overlap)
+    but not every one (beats 13/14/17 sat at 0.38/0.46/0.60 — genuine
+    partial paraphrase, under threshold by design rather than tuned to this
+    one sample) — the two mechanisms below are the remaining defense for
+    whatever a hint-overlap check alone does not catch.
+  - **Diacritic-folding symmetry** — `app.shared.text_normalize
+    .normalize_for_matching()` (hint side, shared with Agent 3) did not fold
+    accented characters, while `storyboard._normalize_word()` (transcript
+    side) already did via NFD decomposition — a real, independently
+    confirmed asymmetry bug (not this incident's primary cause, but a
+    genuine defect regardless): a hint spelled "Potosí" could fail to match
+    a transcript spelled "Potosi" or vice versa. `normalize_for_matching()`
+    now strips diacritics (NFD, drop combining marks) before anything else,
+    fixing every caller, every language, not just this one story.
+  - **Bounded fuzzy tolerance for proper nouns** —
+    `storyboard._search_subsequence_fuzzy()`, wired into `_locate_phrase()`
+    as a last-resort attempt after every exact/prefix attempt fails: tokens
+    of at least `_FUZZY_MIN_TOKEN_LEN` (5) characters may match with up to
+    `_FUZZY_MAX_EDITS` (1) Levenshtein edit — deterministic bounded DP, no
+    AI, same proximity-window bound as the exact search. Logged
+    `HINT_FUZZY_MATCH`.
+  - **Fallback-cluster thinning** — `storyboard._drop_surplus_fallback_beats()`,
+    called between anchor-demotion and boundary resolution in
+    `map_storyboard_beats_to_timestamps()`: when a run of consecutive
+    unmatched beats shares a real anchor-to-anchor span too small to give
+    each one at least `settings.min_fallback_beat_hold_ms` (1 600 ms
+    default, settings-configurable), the run is deterministically thinned to
+    as many evenly-spaced beats as the span can support (accounting for the
+    preceding anchor's own weighted share of that same interpolated span),
+    dropping the rest and renumbering `beat_order` contiguously — logged
+    `STORYBOARD_FALLBACK_CLUSTER_THINNED`. A beat that plays for one second
+    against the wrong image is worse than one fewer beat over that gap.
+  - **Fallback script_text inheritance** — a beat that still falls back
+    (matches `None`) no longer persists `script_text=""`; it is assigned the
+    real transcript words spoken during its own resolved
+    `[audio_start_ms, audio_end_ms)` span via `storyboard._words_in_ms_span()`
+    (`script_text_source="proportional_fallback_span_text"` when non-empty,
+    the pre-existing `"empty_fallback_no_transcript_span"` only when the span
+    genuinely has no transcript coverage) — `script_text_missing` stays
+    `True` either way, so a downstream repair/review pass can see what the
+    beat's image actually plays against instead of nothing.
+  Runtime proof: `tests/test_storyboard_topup_duplicate_rejection.py`,
+  `tests/test_hint_matching_diacritics.py`,
+  `tests/test_fallback_min_hold_floor.py`; `tests/test_hint_search_proximity_window.py`
+  and `tests/test_boundary_span_sanity.py` updated for the script_text
+  inheritance change (both already asserted a specific fallback beat's
+  `script_text`/`script_text_source`, now updated to the new, non-empty
+  contract); `tests/test_storyboard_script_text_empty_fallback.py`'s static
+  source check updated from a literal `script_text = ""` string match to the
+  new `_words_in_ms_span(...)` call it replaced.
+- **Shortfall top-up is now span-scoped, not full-segment-rescoped (follow-up
+  root-cause fix, 2026-08-05)** — the duplicate-topup-rejection filter above
+  stopped the 069d8d06 misalignment from shipping, but the topup call still
+  wastefully re-sent the *entire* segment text and relied on the 65%-overlap
+  filter to discard whatever came back duplicated (which measurably missed
+  partial-paraphrase beats, e.g. the 0.38/0.46/0.60-overlap beats noted
+  above). `storyboard._locate_uncovered_span(delivered_beats, sub_text,
+  language)` locates each delivered beat's `end_hint` (falling back to
+  `start_hint`) as a forward-only word-token subsequence within the
+  segment's own text — mirroring the real Whisper hint matcher's monotonic-
+  cursor contract, but at the text level, before any audio timestamp
+  exists — and returns the single largest uncovered gap between what was
+  successfully located (normally the trailing "everything after the last
+  beat" span, but this also naturally captures a large interior gap if one
+  or more beats' hints couldn't be located at all). The topup call then
+  receives `segment_text=<uncovered span only>`, a `target_beat_count`
+  derived from the span's own word count at the segment's original
+  words-per-beat ratio (not the raw `sub_target_beat_count - delivered`
+  shortfall), and a new one-line `continuation_framing` parameter on
+  `generate_storyboard_batch()` ("Earlier beats already cover the preceding
+  narration of this segment. Generate beats for this remaining passage
+  only...") — deliberately a separate line from `previous_segment_summary`
+  (which is about the PRIOR segment, a different concept). When the
+  uncovered span is under `_TOPUP_MIN_UNCOVERED_WORDS` (8) words, no topup
+  call is made at all (logged `STORYBOARD_SHORTFALL_TOPUP_SKIPPED
+  reason=uncovered_span_too_thin`) — there is nothing real left to ask for.
+  The 65%-overlap duplicate filter (`_filter_duplicate_topup_beats`) stays
+  wired in unchanged as the safety net *behind* span-scoping, not replaced by
+  it. `STORYBOARD_SHORTFALL_TOPUP` now also logs `span_start_word`/
+  `span_end_word`/`span_words`. Runtime proof:
+  `tests/test_storyboard_shortfall_topup.py` (span-scoped call receives only
+  the uncovered words, never the already-covered ones; target derived from
+  span length; the too-thin-span skip path; duplicate filter still exercised
+  downstream) and `tests/test_storyboard_topup_duplicate_rejection.py`
+  (updated — its own fixture's disconnected `voice_script` has no real hint
+  text to locate, so span-scoping correctly falls back to the full segment
+  for that file's fixtures; the duplicate-filter behavior it tests is
+  unaffected).
 - Cache reuse must not create obvious visual repetition.
 - Subtitles-only rendering (audit G-0/G-8): text cards are removed. Every
   beat is a Flux-generated image. On a hard generation failure the beat gets
@@ -5757,6 +5901,84 @@ languages.
   end-to-end. Defaults match the pre-existing landscape call exactly, so
   every existing caller (the parent path) is unaffected.
 
+### Merge-status sweep follow-up (2026-08-05, code_report/TODO Task 2)
+
+Five smaller, independent fixes from the same session as the beat-sync
+work above. Channel-agnostic, deterministic, no new AI-judged loops:
+
+- **Text-prop sanitizer now scoped to the PRIMARY subject** —
+  `flux_generator.is_text_prop_beat()` still detects a text-bearing keyword
+  anywhere (the overall on/off gate), but `derive_text_prop_prompt()` now
+  only applies the full material-texture reframe when
+  `_is_primary_subject_text_prop(beat)` is true: a structured
+  `visual_type`/`motif == "document"` classification, or the keyword falling
+  within the first `_PRIMARY_SUBJECT_WINDOW_WORDS` (8) words of the prompt
+  body right after the style-marker match (`_STYLE_MARKER_RE.search()`, not
+  the coarser comma-chunk-granular `_style_anchor_chunks()` — a real prompt's
+  style words and subject clause typically share one comma-chunk with no
+  separator, e.g. "cinematic cartoon illustration of a rough hand-carved
+  mine tunnel entrance", so chunk-level stripping would discard the subject
+  along with the style words). A keyword merely present elsewhere in the
+  scene ("...a folded newspaper tucked under a passerby's arm...") is left
+  alone. Every non-full-reframe path (peripheral mention, or primary subject
+  but no `_TEXT_PROP_MATERIAL_REFRAMES` table entry) goes through the new
+  `_derive_deemphasis_prompt()` — keeps the ORIGINAL prompt, appends one
+  `"{keyword} out of focus and unreadable in the background"` clause — never
+  the old generic `"...interacting with the object in close-up"` fallback
+  line, which the task's own audit flagged as a literal `"the object"`
+  placeholder. The full-reframe path also now preserves the beat's
+  `environment` field (`_ENVIRONMENT_PHRASES` lookup) and any era/period
+  phrase already in the original prompt (`_ERA_DESCRIPTOR_RE`, best-effort)
+  instead of discarding them — and, since `_style_anchor_chunks()`'s
+  chunk-level anchor can itself still contain the leaking subject noun for
+  the same fused-clause reason, the reframe's own style-anchor extraction
+  falls back to the `_STYLE_MARKER_RE`-based slice whenever the chunk-level
+  anchor still contains the matched keyword. Runtime proof:
+  `tests/test_text_prop_sanitizer_scope.py`.
+- **Regime-insignia / hate-symbol rule added to the storyboard prompt**
+  (`PROMPT_VERSION` 5.4 → 5.5) — a channel-agnostic rule next to the
+  existing era/anachronism paragraph: depict any period, regime, or
+  conflict context, of any era or side, through architecture, dress,
+  objects, and setting only — never regime insignia, flags, uniform
+  emblems, or extremist/hate symbols. Prompt-only, no schema change.
+  Runtime proof: `tests/test_storyboard_regime_insignia_rule.py`.
+- **Adjacent-beat perceptual-hash reroll — already present, broader in
+  scope than asked** — `flux_generator._dedupe_generated_image_once()` /
+  `_find_pixel_collision()` (§11.4's `validate_storyboard` checks table
+  area) already compare every newly generated image's 64-bit average pixel
+  hash (`_PIXEL_HASH_SIZE=8`) against a running `pixel_ledger` of every
+  prior accepted image in the same generation call — a Hamming distance
+  `<= _PIXEL_HASH_COLLISION_MAX_DISTANCE` (3) triggers exactly one
+  deterministic composition-variation reroll. This is a strict superset of
+  "compare each beat to its immediate neighbor only" (the ledger includes
+  the immediate neighbor as its most recent entry); implementing a narrower
+  adjacent-only check alongside would be redundant. No change made.
+- **B2 ceiling-regen instruction now states an explicit target below the
+  cap, with consequence framing** — `script_workflow.py`'s
+  `_CEILING_REGEN_TARGET_MARGIN` (15 words) is subtracted from `max_words`
+  to produce the regen call's real target (255 words at the static
+  270-word default, scaling proportionally under per-channel calibration,
+  §7.4/roadmap-3.8-style) — the prior wording asked for "no more than
+  {max_words}", which left a retry with zero margin against ordinary
+  pacing variance. The injected note now also states why: landing right at
+  the ceiling risks tipping back over it and pushing the Short past its
+  target watch time. Runtime proof:
+  `tests/test_b2_ceiling_regen_target_wording.py`.
+- **`forbidden_flux_word` "cinematic" false-positive fixed** — a real
+  production run flagged this check MAJOR on 38/38 beats for a
+  `image_style="cinematic_cartoon"` channel, because
+  `system_prompt.py`'s own style vocabulary instructs Claude to open nearly
+  every beat with "cinematic cartoon illustration of ..." — the word
+  "cinematic" is in `FORBIDDEN_FLUX_WORDS` (intended to catch genuinely
+  mood-only prompts with no physical subject), but here it was the
+  operator-approved style NAME, not evidence of a subjectless prompt.
+  `storyboard_validator.py`'s check 4 now drops "cinematic" from a beat's
+  `found_forbidden` set specifically when `"cinematic cartoon"` or
+  `"cinematic_cartoon"` appears in the prompt (either spelling) — a
+  genuinely mood-only "a cinematic, atmospheric shot..." prompt unconnected
+  to that style name is still flagged. Runtime proof:
+  `tests/test_forbidden_flux_word_cinematic_exemption.py`.
+
 #### `_run_solo_short_visuals` — original storyboard generation for a Solo Short (output_mode `shorts_only` roadmap)
 
 File:
@@ -5802,14 +6024,12 @@ callers share one implementation instead of forking it:
   got — see §9.6).
 - `width=1080, height=1920` — portrait, threaded into
   `generate_all_beat_images()`.
-- `solo_person_anchor_reuse=True` — when the blueprint has a valid primary
-  `character_descriptors` entry, the exact descriptor is prepended to matching
-  `visual_category="person"` prompts. The first healthy generated image becomes
-  an anchor; at most two later matching person beats reuse its local image before
-  the next matching person beat generates fresh and replaces the anchor. Beat 0
-  always generates fresh. This decision happens before fal.ai and therefore
-  reduces paid calls. It is never enabled for parents or child remap Shorts, and
-  is a no-op for stories without a dominant character.
+- Recurring-character image reuse is retired. Every person beat makes its own
+  normal image-generation call. Deterministic Python matches recurring names in
+  person beats, strips Claude-authored appearance clauses, and injects the
+  blueprint's canonical descriptor verbatim after the channel style prefix.
+  The stored canonical line is preserved through text-prop sanitization, defect
+  rewrite, child remapping, persistence/reload, and duplicate-prompt repair.
 - `allow_legacy_fallback=False` — hardcoded; this dead toggle is never set
   by the UI for any content shape (§11.4's `split_into_beats` entry).
 - Milestone logs are `SOLO_SHORT_VISUALS_START`/`SOLO_SHORT_VISUALS_DONE`
@@ -8694,6 +8914,10 @@ CHILD_SHORT_VISUALS_FINGERPRINT_BACKFILLED
 STORYBOARD_DURATION_OUT_OF_TIER
 STORYBOARD_DUPLICATE_HINT_RUN_COLLAPSED
 STORYBOARD_HINT_EXPANDED
+STORYBOARD_TOPUP_DUPLICATE_DROPPED
+STORYBOARD_TOPUP_DUPLICATE_SUMMARY
+STORYBOARD_FALLBACK_CLUSTER_THINNED
+HINT_FUZZY_MATCH
 NARRATION_POV_NORMALIZED
 TTS_SECTION_DELIVERY_SELECTED
 TTS_SECTION_DELIVERY_FALLBACK
@@ -9026,7 +9250,7 @@ These are current engineering risks to monitor, not future feature promises.
 |---|---|
 | Duplicate task dispatch | Beat and inline orchestration may enqueue same child if guards fail |
 | Stale props | Mitigated (roadmap 2d / audit P0-3): `_props_are_stale()` rebuilds when the props file's duration/section-count/last-section-end no longer match the current DB beats. Heuristic, not a full content hash — a change that doesn't move any of those three proxies (e.g. `flux_prompt` text edited with identical timing) would not be caught |
-| Visual quality | Mitigated (roadmap Phase C2): blueprint-derived `character_descriptors`/`era_setting` lock each recurring character's physical identity and the story's period/setting into every storyboard batch. Still a prompt-level instruction, not an enforced constraint — Claude can still drift on a given beat; no deterministic validator checks character-appearance consistency across beats (would require image analysis, not just text) |
+| Visual quality | Mitigated: Python injects a byte-identical full blueprint descriptor into every matching person prompt, while `era_setting` locks period/place in each storyboard batch. Images are independently sampled, so the provider can still drift despite identical text; no image-analysis consistency validator exists. |
 | Storyboard cost | Storyboard output tokens per beat can be high |
 | Child short script quality | Short scripts must not validate with remaining MAJOR TTS issues |
 | Legacy fields | Breakpoint/bookend fields still exist and could be misused |

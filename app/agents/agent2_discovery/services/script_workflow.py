@@ -8,9 +8,8 @@ from sqlalchemy.orm import Session
 
 from app.agents.agent2_discovery.services.scripts import (
     _collect_short_script_major_issues,
+    _resolve_short_word_bounds,
     _script_trace,
-    _MAX_SHORT_WORDS,
-    _MIN_SHORT_WORDS,
     generate_multilingual_scripts,
     generate_script_sections,
     run_script_quality_gate,
@@ -27,6 +26,14 @@ from app.services.script_estimator import estimate_duration_sec
 from app.services.script_source import normalize_script_source
 
 logger = logging.getLogger(__name__)
+
+# B2 ceiling-regen (Task 2d, code_report/TODO, 2026-08-05): the retry target
+# is this many words BELOW the real cap (static or per-channel calibrated),
+# not the cap itself — a retry that lands exactly at the ceiling has no
+# margin left for ordinary TTS/pacing variance and risks tipping back over
+# it. At the static default (_MAX_SHORT_WORDS=270) this is a 255-word
+# target, scaling proportionally for a calibrated cap.
+_CEILING_REGEN_TARGET_MARGIN = 15
 
 
 @dataclass(frozen=True)
@@ -385,15 +392,26 @@ def _run_solo_short_script_workflow(content: Content, db: Session) -> None:
         narration_pov=context.narration_pov,
     )
 
+    # Calibrated per (channel, language) from real completed Shorts once
+    # enough exist (script_estimator.compute_measured_wpm(),
+    # _MIN_SAMPLES_FOR_CALIBRATION=3); falls back to the static
+    # (_MIN_SHORT_WORDS, _MAX_SHORT_WORDS) below that. See
+    # _resolve_short_word_bounds() docstring — a real production run showed
+    # the static 175 wpm assumption doesn't hold for every configured voice,
+    # which let a 270-word-capped Short still land at ~114s instead of ~92s.
+    min_words, max_words = _resolve_short_word_bounds(
+        db, content.source_language, content.channel_id,
+    )
+
     # Word-floor regeneration (operator-approved Elimination Mandate
     # exception, 2026-07-16) — mirrors _generate_short_script()'s single-
     # retry pattern in scripts.py verbatim: a deterministic count-triggered
     # regeneration, never an AI quality judgment, and never more than once.
     word_count = len((draft.get("voice_script") or "").split())
-    if word_count < _MIN_SHORT_WORDS:
+    if word_count < min_words:
         logger.warning(
             "SOLO_SHORT_WORD_FLOOR_REGEN content=%s words=%d floor=%d — regenerating once",
-            content.id, word_count, _MIN_SHORT_WORDS,
+            content.id, word_count, min_words,
         )
         retry_draft = generate_solo_short_script(
             story, blueprint, context.channel, context.source_voice,
@@ -402,29 +420,30 @@ def _run_solo_short_script_workflow(content: Content, db: Session) -> None:
             narration_pov=context.narration_pov,
             word_floor_note=(
                 f"Your previous draft was only {word_count} words — well under the "
-                f"required {_MIN_SHORT_WORDS}-word minimum. Write a longer, more "
+                f"required {min_words}-word minimum. Write a longer, more "
                 f"complete script this time, at least 210 words."
             ),
         )
         retry_words = len((retry_draft.get("voice_script") or "").split())
         if retry_words > word_count:
             draft, word_count = retry_draft, retry_words
-        if word_count < _MIN_SHORT_WORDS:
+        if word_count < min_words:
             logger.warning(
                 "SOLO_SHORT_SCRIPT_STILL_UNDER_FLOOR content=%s words=%d floor=%d — "
                 "proceeding with the longer draft; Agent 3's 61s audio gate is the "
                 "final enforcement",
-                content.id, word_count, _MIN_SHORT_WORDS,
+                content.id, word_count, min_words,
             )
 
     # B2: objective, single-call ceiling regeneration. This is the exact
     # inverse of the floor path above: no judgment loop, and the shorter of
     # the two drafts is retained deterministically.
-    if word_count > _MAX_SHORT_WORDS * 1.10:
+    if word_count > max_words * 1.10:
         logger.warning(
             "SOLO_SHORT_WORD_CEILING_REGEN content=%s words=%d cap=%d — regenerating once",
-            content.id, word_count, _MAX_SHORT_WORDS,
+            content.id, word_count, max_words,
         )
+        ceiling_target = max(min_words, max_words - _CEILING_REGEN_TARGET_MARGIN)
         retry_draft = generate_solo_short_script(
             story, blueprint, context.channel, context.source_voice,
             visual_style=context.visual_style,
@@ -432,8 +451,11 @@ def _run_solo_short_script_workflow(content: Content, db: Session) -> None:
             narration_pov=context.narration_pov,
             word_ceiling_note=(
                 f"Your previous draft was {word_count} words — above the hard "
-                f"{_MAX_SHORT_WORDS}-word ceiling. Rewrite it to no more than "
-                f"{_MAX_SHORT_WORDS} words while preserving the hook, reveal, and payoff."
+                f"{max_words}-word ceiling. Rewrite it to at most {ceiling_target} "
+                f"words, not just under {max_words} — a draft that lands right at "
+                f"the ceiling has no margin left and risks tipping back over it "
+                f"after ordinary pacing variance, pushing this Short past its "
+                f"target watch time. Preserve the hook, reveal, and payoff."
             ),
         )
         retry_words = len((retry_draft.get("voice_script") or "").split())
