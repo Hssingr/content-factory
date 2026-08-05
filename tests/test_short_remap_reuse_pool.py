@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 sys.modules.setdefault("fal_client", SimpleNamespace(SyncClient=None, FalClientError=Exception))
 
+from app.agents.agent4_visuals.services.flux_generator import UNIVERSAL_NO_ARTIFACT_CLAUSE
 from app.agents.agent4_visuals.subagents import storyboard
 from app.agents.agent4_visuals.subagents.storyboard import remap_beats_for_short
 
@@ -200,12 +201,19 @@ class ShortRemapReusePoolTest(unittest.TestCase):
         # Scores >= 70 inherit the parent beat's prompt; below 70 use the new prompt.
         for i, score in enumerate(scores):
             if score >= 70:
+                # _build_beat_section() unconditionally appends
+                # UNIVERSAL_NO_ARTIFACT_CLAUSE to every beat's flux_prompt
+                # (independent review of real output, finding 3) — assert its
+                # presence explicitly rather than an exact-equality check that
+                # doesn't account for it.
                 self.assertEqual(
                     beats[i]["flux_prompt"],
-                    f"Parent image prompt {i}, practical lamp, no readable text",
+                    f"Parent image prompt {i}, practical lamp, no readable text, "
+                    f"{UNIVERSAL_NO_ARTIFACT_CLAUSE}",
                 )
             else:
                 self.assertIn("Vertical hallway clue close-up", beats[i]["flux_prompt"])
+                self.assertIn(UNIVERSAL_NO_ARTIFACT_CLAUSE, beats[i]["flux_prompt"])
 
 
     def test_low_score_child_new_image_uses_real_new_prompt(self) -> None:
@@ -260,7 +268,9 @@ class ShortRemapReusePoolTest(unittest.TestCase):
 
         self.assertEqual(len(beats), 1)
         self.assertEqual(beats[0]["media_url"], "")
-        self.assertEqual(beats[0]["flux_prompt"], child_prompt)
+        # UNIVERSAL_NO_ARTIFACT_CLAUSE is unconditionally appended by
+        # _build_beat_section() — assert its presence explicitly.
+        self.assertEqual(beats[0]["flux_prompt"], f"{child_prompt}, {UNIVERSAL_NO_ARTIFACT_CLAUSE}")
         self.assertNotIn(rejected_parent_prompt, beats[0]["flux_prompt"])
         self.assertNotEqual(beats[0]["flux_prompt"], beats[0]["script_text"])
 

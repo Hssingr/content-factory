@@ -30,17 +30,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.modules.setdefault("fal_client", SimpleNamespace(SyncClient=None, FalClientError=Exception))
-sys.modules.setdefault("elevenlabs", SimpleNamespace(ElevenLabs=object))
-sys.modules.setdefault("elevenlabs.types", SimpleNamespace(VoiceSettings=object))
-# tts.py does `from elevenlabs.core import ApiError` unconditionally — a bare
-# sys.modules["elevenlabs"] stub with no "elevenlabs.core" entry makes that
-# raise ModuleNotFoundError("'elevenlabs' is not a package") the moment this
-# file's real imports reach app.agents.agent3_audio.services.audio, in any
-# environment (independent of whether the real elevenlabs package happens to
-# be installed) — confirmed by actually running this suite under pytest,
-# 2026-08-05 (Task 0, code_report/TODO).
-sys.modules.setdefault("elevenlabs.core", SimpleNamespace(ApiError=Exception))
-sys.modules.setdefault("openai", SimpleNamespace(OpenAI=object))
+# elevenlabs / elevenlabs.types / elevenlabs.core / openai are stubbed in
+# tests/conftest.py, which pytest loads before this module — no local
+# duplication needed here (Task 2, code_report/TODO, 2026-08-05).
 
 from app.config import settings
 from app.agents.agent2_discovery.services import script_workflow

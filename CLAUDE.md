@@ -5942,17 +5942,42 @@ work above. Channel-agnostic, deterministic, no new AI-judged loops:
   objects, and setting only — never regime insignia, flags, uniform
   emblems, or extremist/hate symbols. Prompt-only, no schema change.
   Runtime proof: `tests/test_storyboard_regime_insignia_rule.py`.
-- **Adjacent-beat perceptual-hash reroll — already present, broader in
-  scope than asked** — `flux_generator._dedupe_generated_image_once()` /
-  `_find_pixel_collision()` (§11.4's `validate_storyboard` checks table
-  area) already compare every newly generated image's 64-bit average pixel
-  hash (`_PIXEL_HASH_SIZE=8`) against a running `pixel_ledger` of every
-  prior accepted image in the same generation call — a Hamming distance
-  `<= _PIXEL_HASH_COLLISION_MAX_DISTANCE` (3) triggers exactly one
-  deterministic composition-variation reroll. This is a strict superset of
-  "compare each beat to its immediate neighbor only" (the ledger includes
-  the immediate neighbor as its most recent entry); implementing a narrower
-  adjacent-only check alongside would be redundant. No change made.
+- **Adjacent-beat perceptual-hash reroll — upgraded from average-hash to
+  difference-hash after empirical verification (follow-up, same date)** —
+  the "already present, broader in scope" read above was only half right:
+  `flux_generator._dedupe_generated_image_once()`/`_find_pixel_collision()`
+  were correctly wired into the right code path (a single `pixel_ledger`
+  per `generate_all_beat_images()` call, sequential processing, every new
+  image compared against every earlier one in the run — a strict superset
+  of "adjacent only"), but the "Lords of Finance" run (content ce1cd671, 38
+  `cinematic_cartoon` beats) still shipped near-identical adjacent image
+  pairs with this mechanism already in the tree. Direct measurement against
+  that run's real cached images settled it: the technique was
+  average-hash (resize to 8x8, threshold each pixel against the image's own
+  mean) — the weakest common perceptual-hash variant — and the old
+  threshold (`_PIXEL_HASH_COLLISION_MAX_DISTANCE=3`) was calibrated
+  optimistically for it. The CLOSEST adjacent pair in that entire 38-beat
+  run scored aHash distance=10 (already past the old threshold), yet visual
+  inspection showed those two images (a mansion exterior at sunset vs. a
+  man on a ship gangway in fog) are not remotely similar — aHash's
+  average-brightness-only signal doesn't track real compositional
+  similarity for this pipeline's stylized-illustration output.
+  `_perceptual_pixel_hash()` (renamed from `_average_pixel_hash()`) now
+  computes a difference-hash instead (resize to 9x8, one bit per pixel for
+  "brighter than its right-hand neighbor" — gradient-based, not
+  average-brightness-based). The same run's own images validate the
+  upgrade: dHash cleanly separated two beats sharing one verbatim recurring-
+  character prompt and thus one literal cache file (distance=0, correctly
+  identified as identical) from every genuinely-different adjacent pair in
+  the run (all >=25). `_PIXEL_HASH_COLLISION_MAX_DISTANCE` is now `10`,
+  calibrated against that real separation rather than guessed. Everything
+  else — the ledger, the one-reroll-max contract, the heal-ladder
+  integration, `PIXEL_DUPLICATE_REROLL`/`_STILL_COLLIDES`/`_FAILED` logging
+  — is unchanged. Runtime proof: `tests/test_adjacent_image_phash_reroll.py`
+  (near-identical images trigger exactly one reroll; visually distinct
+  images trigger none; a still-colliding reroll is accepted and logged, not
+  retried again) plus the pre-existing `tests/test_pixel_duplicate_reroll.py`
+  (unaffected).
 - **B2 ceiling-regen instruction now states an explicit target below the
   cap, with consequence framing** — `script_workflow.py`'s
   `_CEILING_REGEN_TARGET_MARGIN` (15 words) is subtracted from `max_words`
@@ -5964,20 +5989,41 @@ work above. Channel-agnostic, deterministic, no new AI-judged loops:
   the ceiling risks tipping back over it and pushing the Short past its
   target watch time. Runtime proof:
   `tests/test_b2_ceiling_regen_target_wording.py`.
-- **`forbidden_flux_word` "cinematic" false-positive fixed** — a real
-  production run flagged this check MAJOR on 38/38 beats for a
-  `image_style="cinematic_cartoon"` channel, because
-  `system_prompt.py`'s own style vocabulary instructs Claude to open nearly
-  every beat with "cinematic cartoon illustration of ..." — the word
-  "cinematic" is in `FORBIDDEN_FLUX_WORDS` (intended to catch genuinely
-  mood-only prompts with no physical subject), but here it was the
-  operator-approved style NAME, not evidence of a subjectless prompt.
-  `storyboard_validator.py`'s check 4 now drops "cinematic" from a beat's
-  `found_forbidden` set specifically when `"cinematic cartoon"` or
-  `"cinematic_cartoon"` appears in the prompt (either spelling) — a
-  genuinely mood-only "a cinematic, atmospheric shot..." prompt unconnected
-  to that style name is still flagged. Runtime proof:
-  `tests/test_forbidden_flux_word_cinematic_exemption.py`.
+- **`forbidden_flux_word` false-positive fixed, then generalized to every
+  style preset (follow-up, same date)** — a real production run flagged
+  this check MAJOR on 38/38 beats for a `image_style="cinematic_cartoon"`
+  channel, because `system_prompt.py`'s own style vocabulary instructs
+  Claude to open nearly every beat with "cinematic cartoon illustration of
+  ..." — the word "cinematic" is in `FORBIDDEN_FLUX_WORDS` (intended to
+  catch genuinely mood-only prompts with no physical subject), but here it
+  was the operator-approved style NAME, not evidence of a subjectless
+  prompt. The first fix hardcoded an exemption for the literal string pair
+  `"cinematic cartoon"`/`"cinematic_cartoon"` — too narrow: the same
+  collision also exists for `image_style="cinematic_realism"` and for bare
+  `visual_style="cinematic"` (system_prompt.py's own "Recognized values"
+  vocabulary), neither covered by the hardcoded pair. `validate_storyboard()`
+  now takes optional `image_style`/`visual_style` params (default `""` —
+  exempts nothing, so any caller that doesn't have these values keeps the
+  pre-exemption behavior unchanged) and check 4 calls
+  `_style_vocabulary_exemptions(found_forbidden, prompt_lower, image_style,
+  visual_style)`: a forbidden word is exempted only when it is a token of
+  the CHANNEL'S OWN configured style value (split on `_`) *and* that
+  value's own phrase (tried as both the underscore and space-joined form)
+  literally appears in the prompt — never every known preset in the whole
+  vocabulary, so a channel configured with e.g. `image_style="anime"` gets
+  no free pass on an unrelated "cinematic" mention. Threaded from the two
+  real production call sites — `visual_orchestrator._run_visual_pass()`
+  (parent/Solo Short) and the child-remap loop — via `_collect_storyboard_
+  issues()`/`_check_storyboard_issues()`/`_run_storyboard_validation()`,
+  all of which gained the same two optional, default-`""` parameters.
+  Runtime proof: `tests/test_forbidden_flux_word_style_prefix_exemption.py`
+  (renamed from `test_forbidden_flux_word_cinematic_exemption.py`) —
+  covers `cinematic_cartoon`, `cinematic_realism`, and bare `visual_style=
+  "cinematic"` all exempting correctly; the configured phrase must actually
+  appear (a bare "cinematic" mention elsewhere in the prompt with no
+  matching phrase still flags); an unrelated channel style gets no
+  exemption; and the no-style-configured case is byte-identical to
+  pre-exemption behavior.
 
 #### `_run_solo_short_visuals` — original storyboard generation for a Solo Short (output_mode `shorts_only` roadmap)
 

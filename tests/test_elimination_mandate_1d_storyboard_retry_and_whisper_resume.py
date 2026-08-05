@@ -145,8 +145,16 @@ class TestRetryMachineryFullyRemoved(unittest.TestCase):
         self.assertNotIn("existing_beats", params)
 
     def test_run_storyboard_validation_no_longer_accepts_retry_params(self):
-        params = inspect.signature(vo._run_storyboard_validation).parameters
-        self.assertEqual(list(params), ["beats"])
+        # image_style/visual_style (Task 3, code_report/TODO, 2026-08-05) are
+        # NOT retry-machinery params — they feed the forbidden_flux_word
+        # check's style-vocabulary exemption, unrelated to the deleted
+        # segment-retry mechanism this test guards against reintroducing.
+        # The guarantee that matters here is that no retry-shaped param
+        # (retry_segment_constraints, existing_beats, etc.) is present.
+        params = set(inspect.signature(vo._run_storyboard_validation).parameters)
+        self.assertEqual(params, {"beats", "image_style", "visual_style"})
+        self.assertNotIn("retry_segment_constraints", params)
+        self.assertNotIn("existing_beats", params)
 
 
 # ── Fake DB (in-memory, no SQL) — same precedent as test_stale_visuals_guard.py ──

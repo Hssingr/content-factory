@@ -57,7 +57,26 @@ logger = logging.getLogger(__name__)
 
 _INTER_BEAT_SLEEP_SEC = 0.5  # conservative until rate limits confirmed
 _PIXEL_HASH_SIZE = 8
-_PIXEL_HASH_COLLISION_MAX_DISTANCE = 3
+# Difference-hash (dHash), not average-hash — upgraded 2026-08-05 (code_report/TODO
+# Task 1) after the "Lords of Finance" run (content ce1cd671, 38 stylized-cartoon
+# beats) shipped near-identical adjacent image pairs with this dedup mechanism
+# already in the tree. Root cause was NOT "exact hash" (there was no byte-exact
+# check to begin with) and NOT "path not reached" (the ledger/reroll code was
+# correctly wired and ran for every beat) — it was that the old technique
+# (average-hash: resize to 8x8, threshold each pixel against the image's own
+# mean) is the weakest common perceptual-hash variant, and threshold=3 was
+# calibrated for it optimistically. Direct empirical measurement against this
+# run's real cached images: the CLOSEST adjacent pair scored aHash distance=10
+# (already above the old threshold=3), yet visual inspection showed those two
+# images (a mansion exterior at sunset vs. a man on a ship gangway in fog) are
+# not remotely similar — aHash's average-brightness-only signal doesn't track
+# real compositional similarity for this pipeline's stylized-illustration
+# output. dHash (gradient-based: compare each pixel to its right-hand
+# neighbor) cleanly separated known-identical images (two beats sharing one
+# verbatim recurring-character prompt and thus one cache file: distance=0)
+# from every genuinely-different adjacent pair in the same run (all >=25).
+# Threshold below is calibrated against that real separation, not guessed.
+_PIXEL_HASH_COLLISION_MAX_DISTANCE = 10
 CANONICAL_CHARACTER_DESCRIPTOR_KEY = "canonical_character_descriptor_lines"
 
 
@@ -505,12 +524,20 @@ def _append_composition_variation(prompt: str, occurrence: int) -> tuple[str, st
     return (f"{base}, {variation}." if base else f"{variation}.", variation)
 
 
-def _average_pixel_hash(media_url: str, media_path: Path) -> int | None:
+def _perceptual_pixel_hash(media_url: str, media_path: Path) -> int | None:
+    """Difference-hash (dHash): resize to (_PIXEL_HASH_SIZE+1) x _PIXEL_HASH_SIZE
+    grayscale, then one bit per pixel for whether it is brighter than its
+    right-hand neighbor. Gradient-based, not average-brightness-based (the
+    prior average-hash technique) — empirically much better at separating
+    genuinely similar compositions from genuinely different ones for this
+    pipeline's stylized-illustration output (code_report/TODO Task 1,
+    2026-08-05 "Lords of Finance" investigation; see the module-level comment
+    above _PIXEL_HASH_COLLISION_MAX_DISTANCE for the measurement)."""
     path = Path(media_url)
     image_path = path if path.is_absolute() else media_path / path
     try:
         with Image.open(image_path) as image:
-            gray = image.convert("L").resize((_PIXEL_HASH_SIZE, _PIXEL_HASH_SIZE))
+            gray = image.convert("L").resize((_PIXEL_HASH_SIZE + 1, _PIXEL_HASH_SIZE))
             pixels = list(gray.getdata())
     except (FileNotFoundError, UnidentifiedImageError, OSError, ValueError) as exc:
         logger.warning(
@@ -519,10 +546,14 @@ def _average_pixel_hash(media_url: str, media_path: Path) -> int | None:
         )
         return None
 
-    avg = sum(pixels) / len(pixels)
+    width = _PIXEL_HASH_SIZE + 1
     value = 0
-    for pixel in pixels:
-        value = (value << 1) | int(pixel >= avg)
+    for row in range(_PIXEL_HASH_SIZE):
+        row_start = row * width
+        for col in range(_PIXEL_HASH_SIZE):
+            left = pixels[row_start + col]
+            right = pixels[row_start + col + 1]
+            value = (value << 1) | int(left > right)
     return value
 
 
@@ -536,7 +567,7 @@ def _find_pixel_collision(
     *,
     media_path: Path,
 ) -> tuple[int, dict, int] | None:
-    image_hash = _average_pixel_hash(media_url, media_path)
+    image_hash = _perceptual_pixel_hash(media_url, media_path)
     if image_hash is None:
         return None
     for entry in pixel_ledger:
@@ -553,7 +584,7 @@ def _record_pixel_hash(
     media_path: Path,
     beat_order: int,
 ) -> None:
-    image_hash = _average_pixel_hash(media_url, media_path)
+    image_hash = _perceptual_pixel_hash(media_url, media_path)
     if image_hash is not None:
         pixel_ledger.append({"hash": image_hash, "media_url": media_url, "beat_order": beat_order})
 

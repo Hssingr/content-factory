@@ -43,11 +43,12 @@ def _write_solid(path: Path, *, luminance: int, seed: int = 0, size: tuple[int, 
     """Write a real JPEG whose mean grayscale value is ~``luminance``.
 
     Deliberately NOT a perfectly uniform fill: a flat single-color image
-    always hashes identically under _average_pixel_hash() regardless of its
-    absolute brightness (average-hash only encodes relative pattern —
-    "pixel >= own mean" is trivially true everywhere on a flat image), so
-    two solid images at very different luminance levels would incorrectly
-    collide as pixel-duplicates. A small per-pixel seeded noise band (kept
+    always hashes identically under _perceptual_pixel_hash() (dHash)
+    regardless of its absolute brightness — every "left pixel > right
+    pixel" gradient comparison is trivially false on a flat image, giving an
+    all-zero hash — so two solid images at very different luminance levels
+    would incorrectly collide as pixel-duplicates. A small per-pixel seeded
+    noise band (kept
     tight enough to leave the mean within the caller's target band) gives
     each fixture a distinct pattern while keeping luminance controllable —
     same tradeoff a real photographed/generated frame's texture provides.

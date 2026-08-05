@@ -233,7 +233,46 @@ class StoryboardIssue(TypedDict):
     description: str
 
 
-def validate_storyboard(beats: list[dict]) -> list[StoryboardIssue]:
+def _style_vocabulary_exemptions(
+    found_forbidden: set[str],
+    prompt_lower: str,
+    image_style: str,
+    visual_style: str,
+) -> set[str]:
+    """Forbidden words that are also tokens of the channel's OWN configured
+    image_style/visual_style value, whose own phrase genuinely appears in
+    this prompt — see the call site in check 4 above for the full rationale.
+
+    A style value is split on "_" into tokens (e.g. "cinematic_cartoon" ->
+    {"cinematic", "cartoon"}); only tokens that are BOTH in FORBIDDEN_FLUX_WORDS
+    and found in this beat's own found_forbidden set are candidates. The
+    style value's own phrase — tried as both the underscore form and the
+    space-joined form ("cinematic_cartoon" / "cinematic cartoon") — must
+    literally appear in the prompt; a bare single-token value (e.g.
+    visual_style="cinematic") has no separate phrase form to require beyond
+    the token itself.
+    """
+    exempt: set[str] = set()
+    for style_value in (image_style, visual_style):
+        if not style_value:
+            continue
+        style_value = style_value.strip().lower()
+        if not style_value:
+            continue
+        tokens = set(style_value.split("_")) & found_forbidden
+        if not tokens:
+            continue
+        phrase_space = style_value.replace("_", " ")
+        if style_value in prompt_lower or phrase_space in prompt_lower:
+            exempt |= tokens
+    return exempt
+
+
+def validate_storyboard(
+    beats: list[dict],
+    image_style: str = "",
+    visual_style: str = "",
+) -> list[StoryboardIssue]:
     """Run all storyboard quality checks on a merged beat list.
 
     Pure Python — no API calls, no I/O. Returns every issue found; empty list
@@ -242,6 +281,14 @@ def validate_storyboard(beats: list[dict]) -> list[StoryboardIssue]:
 
     Args:
         beats: Merged, timestamp-mapped beat dicts from split_into_beats().
+        image_style: The channel's configured ChannelConfig.image_style, used
+            only to exempt check 4 (forbidden_flux_word) from flagging the
+            channel's own configured style vocabulary — see
+            _style_vocabulary_exemptions(). "" (the default) exempts nothing,
+            preserving the check's original behavior for any caller that
+            doesn't have this value at hand.
+        visual_style: The channel's configured ChannelConfig.visual_style,
+            same purpose as image_style above.
 
     Returns:
         List of StoryboardIssue dicts, each with severity, beat_order, check,
@@ -309,20 +356,24 @@ def validate_storyboard(beats: list[dict]) -> list[StoryboardIssue]:
         # Check "dark" co-occurrence with atmospheric words
         if "dark" in prompt_words and (_DARK_REQUIRES_COOCCURRENCE & prompt_words):
             found_forbidden = found_forbidden | {"dark"}
-        # "cinematic" is also the first half of the "cinematic_cartoon"
-        # image_style — an operator-approved style name (system_prompt.py's
-        # own style vocabulary instructs Claude to write "cinematic cartoon
-        # illustration ..." at the start of essentially every beat for a
-        # channel using that style). A real production run measured this
-        # check flagging 38/38 beats MAJOR for exactly that reason — the
-        # style-name usage, not an actual mood-only prompt with no physical
-        # subject, which is what this check exists to catch (Task 2e,
-        # code_report/TODO, 2026-08-05). Only flag "cinematic" when it is
-        # NOT part of that style phrase, in either spelling.
-        if "cinematic" in found_forbidden and (
-            "cinematic cartoon" in prompt_lower or "cinematic_cartoon" in prompt_lower
-        ):
-            found_forbidden = found_forbidden - {"cinematic"}
+        # A forbidden word that is also a token of the CHANNEL'S OWN
+        # configured image_style/visual_style value is operator-approved
+        # style vocabulary, not evidence of a mood-only prompt — Claude was
+        # explicitly instructed (system_prompt.py's "Global visual
+        # direction"/"Global image style" injection) to weave that exact
+        # value into every beat. Generalizes the original single-preset
+        # "cinematic cartoon" exemption (Task 2e — a real production run
+        # flagged 38/38 beats MAJOR purely from that one style's own name)
+        # to every configured style value, not just one hardcoded string
+        # (Task 3, code_report/TODO, 2026-08-05) — e.g. image_style=
+        # "cinematic_realism" or visual_style="cinematic" hit the exact same
+        # false-positive shape and were not covered by the earlier fix.
+        # Scoped to only the ACTUAL configured value (never every known
+        # preset in the vocabulary) so a channel using a different style
+        # gets no free pass on a genuinely mood-only "cinematic" mention.
+        found_forbidden -= _style_vocabulary_exemptions(
+            found_forbidden, prompt_lower, image_style, visual_style,
+        )
 
         if found_forbidden:
             issues.append(StoryboardIssue(

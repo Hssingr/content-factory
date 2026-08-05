@@ -774,7 +774,7 @@ def _run_visual_pass(
     # full validator (and its always-on diagnostics) runs exactly once per
     # path (fresh full-system audit §3.3 — it used to run twice, double-
     # logging every diagnostic).
-    issues = _collect_storyboard_issues(beats)
+    issues = _collect_storyboard_issues(beats, image_style=image_style, visual_style=visual_style)
     _log_storyboard_major_issues(issues)
 
     # ── 1c. Duplicate-prompt repair (audit G-5.3) — last mutation of
@@ -863,9 +863,18 @@ def _repair_duplicate_prompts(
     return repaired
 
 
-def _collect_storyboard_issues(beats: list[dict]) -> list[dict]:
-    """Run validate_storyboard() once and log MINOR findings."""
-    issues = validate_storyboard(beats)
+def _collect_storyboard_issues(
+    beats: list[dict], image_style: str = "", visual_style: str = "",
+) -> list[dict]:
+    """Run validate_storyboard() once and log MINOR findings.
+
+    image_style/visual_style: the channel's configured values, forwarded to
+    validate_storyboard() so its forbidden_flux_word check can exempt the
+    channel's own style vocabulary (Task 3, code_report/TODO, 2026-08-05) —
+    "" (the default) exempts nothing, matching the pre-existing behavior for
+    any caller that doesn't have these values at hand.
+    """
+    issues = validate_storyboard(beats, image_style=image_style, visual_style=visual_style)
     for issue in [i for i in issues if i["severity"] == "MINOR"]:
         logger.warning(
             "Storyboard MINOR: beat=%d check=%s — %s",
@@ -874,7 +883,9 @@ def _collect_storyboard_issues(beats: list[dict]) -> list[dict]:
     return issues
 
 
-def _check_storyboard_issues(beats: list[dict]) -> list[dict]:
+def _check_storyboard_issues(
+    beats: list[dict], image_style: str = "", visual_style: str = "",
+) -> list[dict]:
     """Run validate_storyboard() and log MINOR findings; return the MAJOR ones.
 
     This is the single call site for ``validate_storyboard()`` shared by both
@@ -887,7 +898,8 @@ def _check_storyboard_issues(beats: list[dict]) -> list[dict]:
     Returns:
         The MAJOR issues found (empty list if the storyboard is clean).
     """
-    return [i for i in _collect_storyboard_issues(beats) if i["severity"] == "MAJOR"]
+    issues = _collect_storyboard_issues(beats, image_style=image_style, visual_style=visual_style)
+    return [i for i in issues if i["severity"] == "MAJOR"]
 
 
 def _log_storyboard_major_issues(issues: list[dict]) -> None:
@@ -901,7 +913,9 @@ def _log_storyboard_major_issues(issues: list[dict]) -> None:
         )
 
 
-def _run_storyboard_validation(beats: list[dict]) -> list[dict]:
+def _run_storyboard_validation(
+    beats: list[dict], image_style: str = "", visual_style: str = "",
+) -> list[dict]:
     """Run the storyboard validation gate as telemetry only.
 
     Elimination Mandate D1.5: MAJOR findings are logged and the storyboard is
@@ -912,7 +926,9 @@ def _run_storyboard_validation(beats: list[dict]) -> list[dict]:
     itself so the same issues list can feed the duplicate-prompt repair
     without a second full validation run (fresh full-system audit §3.3).
     """
-    _log_storyboard_major_issues(_collect_storyboard_issues(beats))
+    _log_storyboard_major_issues(
+        _collect_storyboard_issues(beats, image_style=image_style, visual_style=visual_style)
+    )
     return beats
 
 
@@ -1452,7 +1468,7 @@ def _run_child_short_visuals(
         # (Elimination Mandate D1.5): MAJOR findings are logged and the child
         # proceeds unchanged. The issues list feeds the duplicate-prompt repair
         # directly so the validator runs exactly once (audit §3.3).
-        issues = _collect_storyboard_issues(beats)
+        issues = _collect_storyboard_issues(beats, image_style=image_style, visual_style=visual_style)
         major_issues = [i for i in issues if i["severity"] == "MAJOR"]
         if major_issues:
             logger.error(

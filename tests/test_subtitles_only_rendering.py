@@ -22,6 +22,7 @@ from unittest.mock import patch
 from app.config import settings
 from app.agents.agent4_visuals.services import flux_generator
 from app.agents.agent4_visuals.services.flux_generator import (
+    UNIVERSAL_NO_ARTIFACT_CLAUSE,
     fill_failed_beats_from_neighbors,
 )
 from app.agents.agent4_visuals.subagents.storyboard import (
@@ -245,27 +246,34 @@ class TestBeatBuildNormalization(unittest.TestCase):
         # match inside "documentary photograph" — a phrase the storyboard
         # prompt itself recommends — silently rewriting valid prompts (and
         # mutating kept beats during segment-level retry re-mapping).
+        # UNIVERSAL_NO_ARTIFACT_CLAUSE is unconditionally appended to every
+        # beat's flux_prompt by _build_beat_section() (independent review of
+        # real output, finding 3) — assert its presence explicitly rather
+        # than an exact-equality check that predates that clause.
         raw = _beat(0, flux_prompt=(
             "Interior office drawer, brass handle, documentary photograph, "
             "sharp focus, no readable text"
         ))
         out = _build_beat_section(raw, 0, 0, 3000, "narration")
-        self.assertEqual(out["flux_prompt"], raw["flux_prompt"])
+        self.assertEqual(out["flux_prompt"], f"{raw['flux_prompt']}, {UNIVERSAL_NO_ARTIFACT_CLAUSE}")
 
     def test_text_prop_sanitized_without_overlay(self):
-        # Elimination Mandate (D2.2/D2.3): the sanitizer no longer rewrites
-        # the subject — it appends one no-readable-text clause to Claude's
-        # own flux_prompt verbatim. A literal quote in the original prompt is
-        # a separate concern owned by validate_storyboard() check 19
-        # (ai_text_rendering_requested) and the storyboard prompt's own
-        # quote-ban rule, not by this sanitizer.
+        # Task 2a (code_report/TODO, 2026-08-05) scoped the sanitizer to the
+        # PRIMARY subject: "poster" here sits within the first
+        # _PRIMARY_SUBJECT_WINDOW_WORDS of the prompt body (no style-marker
+        # prefix in this fixture, so the whole 6-word prompt is the body),
+        # so this is a full material-texture reframe, not the older
+        # append-a-clause-to-the-original-prompt behavior. The reframed
+        # output must never contain the original readable-text-bearing
+        # subject, must never contain the "the object" placeholder, and must
+        # still carry the universal no-artifact clause.
         raw = _beat(0, flux_prompt="missing person poster on a pole",
                     visual_intent="a missing person poster on a pole")
         out = _build_beat_section(raw, 0, 0, 3000, "narration")
-        # Prompt sanitization survives (Phase 14.7 prompt half)…
-        self.assertIn("no readable text", out["flux_prompt"])
-        self.assertIn("missing person poster on a pole", out["flux_prompt"])
-        # …but the overlay-derivation half is gone: no "MISSING" label.
+        self.assertNotIn("poster", out["flux_prompt"].lower())
+        self.assertNotIn("the object", out["flux_prompt"])
+        self.assertIn(UNIVERSAL_NO_ARTIFACT_CLAUSE, out["flux_prompt"])
+        # …the overlay-derivation half remains gone: no "MISSING" label.
         self.assertEqual(out["overlay_text"], "")
 
 
