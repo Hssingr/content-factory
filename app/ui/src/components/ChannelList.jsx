@@ -23,6 +23,16 @@ export default function ChannelList({ onEdit, onCreate }) {
     }
   }
 
+  const handleDeactivate = async (ch) => {
+    if (!window.confirm(`Deactivate channel "${ch.name}"? Agent 2 will stop picking it up for new discovery cycles until you reactivate it.`)) return
+    try {
+      await api.deactivateChannel(ch.id)
+      setChannels(prev => prev.map(c => c.id === ch.id ? { ...c, active: false } : c))
+    } catch (e) {
+      setError(e.message)
+    }
+  }
+
   return (
     <div className="channel-list-view">
       <div className="channel-list-header">
@@ -69,6 +79,16 @@ export default function ChannelList({ onEdit, onCreate }) {
                   >
                     {ch.active ? 'View' : 'Edit'}
                   </button>
+                  {ch.active && (
+                    <button
+                      type="button"
+                      className="btn-secondary btn-sm"
+                      onClick={() => handleDeactivate(ch)}
+                      title="Pause pipeline pickup for this channel"
+                    >
+                      Deactivate
+                    </button>
+                  )}
                   <button
                     type="button"
                     className="btn-secondary btn-sm btn-danger"

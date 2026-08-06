@@ -1312,6 +1312,18 @@ renders inline as a checklist, and the Activate button is disabled until `ready=
 The `POST .../activate` route still calls `check_activation_readiness()` internally, so the
 backend remains the sole enforcement point regardless of what the UI shows.
 
+**Deactivation:** `POST /api/agent1/channels/{id}/deactivate` sets `Channel.active = False`
+via `channels_service.deactivate()` — the symmetric counterpart to `activate()`, with no
+readiness precondition of its own (deactivating must always succeed for an existing channel,
+regardless of its current configuration state). `Channel.active` is the same flag every
+scheduler pickup query filters on (`pickup-discovery`, etc.), so this is a real pause of Agent
+2 pickup, not just a UI label — and it is also the only way to satisfy `delete_channel()`'s
+"Cannot delete an active channel — deactivate it first" precondition. The frontend exposes it
+in two places: `ChannelList.jsx` (a "Deactivate" button next to View/Delete for any row with
+`active=True`) and `ActivationStep.jsx` (a "Deactivate Channel" card shown whenever the
+channel being edited is already active, distinct from the one-time post-activate success
+screen).
+
 Rules:
 
 - **Platform credential verification itself remains fully stubbed** — this
@@ -4792,7 +4804,7 @@ clothing) inside a 6th-century Byzantine story.
 **Style-negative-constraints per `image_style` (roadmap Phase C2):** the same
 run also shipped ONE video mixing photoreal-cinematic, flat cartoon, and
 anime-style beats. `_IMAGE_STYLE_NEGATIVE_CONSTRAINTS` (a deterministic
-Python dict keyed by the 9 canonical `image_style` values, kept in sync with
+Python dict keyed by the 10 canonical `image_style` values, kept in sync with
 `app/ui/src/constants.js`'s `IMAGE_STYLE_OPTIONS` per §8.4) adds one more
 `direction_lines` entry whenever `image_style` matches a known key:
 

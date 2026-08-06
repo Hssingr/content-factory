@@ -40,6 +40,7 @@ export const api = {
   verifyCredential:    (id, body)   => req('POST',   `/channels/${id}/verify`, body),
   getReadiness:        (id)         => req('GET',    `/channels/${id}/readiness`),
   activateChannel:     (id)         => req('POST',   `/channels/${id}/activate`),
+  deactivateChannel:   (id)         => req('POST',   `/channels/${id}/deactivate`),
   suggestTiming:       (id)         => req('POST',   `/channels/${id}/suggest-timing`),
 
   // Voices — browse a TTS provider's real voice catalog (paginated, filtered

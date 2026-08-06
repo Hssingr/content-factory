@@ -264,3 +264,20 @@ def activate_channel(
         raise HTTPException(status_code=400, detail=detail)
 
     return channels_service.activate(db, channel_id)
+
+
+@router.post("/{channel_id}/deactivate", response_model=ChannelResponse)
+def deactivate_channel(
+    channel_id: uuid.UUID,
+    user_id: uuid.UUID = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    """Deactivate a channel, pausing scheduler pickup without deleting anything.
+
+    No readiness precondition — deactivation must always succeed for an
+    existing channel. This is also the required first step before deleting
+    an active channel (see delete_channel's "deactivate it first" error).
+    """
+    channel = channels_service.get_by_id(db, channel_id)
+    _or_404(channel, channel_id)
+    return channels_service.deactivate(db, channel_id)

@@ -227,3 +227,20 @@ def activate(db: Session, channel_id: uuid.UUID) -> Channel | None:
     channel.active = True
     db.commit()
     return _load(db, channel_id)
+
+
+def deactivate(db: Session, channel_id: uuid.UUID) -> Channel | None:
+    """Pause pipeline pickup for a channel without deleting anything.
+
+    Unlike activate(), this carries no readiness precondition — an active
+    channel must always be deactivatable regardless of its current
+    configuration state. `Channel.active` is the same flag every scheduler
+    pickup query filters on (e.g. `pickup-discovery`), so this is a real
+    pause, not just a UI label.
+    """
+    channel = db.get(Channel, channel_id)
+    if channel is None:
+        return None
+    channel.active = False
+    db.commit()
+    return _load(db, channel_id)

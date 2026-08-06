@@ -60,7 +60,7 @@ function ReadinessChecklist({ readiness, loading, error }) {
   )
 }
 
-export default function ActivationStep({ channelId, proposal, onBack, onReset }) {
+export default function ActivationStep({ channelId, proposal, active, onBack, onReset, onActiveChange }) {
   const [preflight, setPreflight] = useState(null)
   const [preflightLoading, setPreflightLoading] = useState(true)
   const [preflightError, setPreflightError] = useState('')
@@ -69,6 +69,16 @@ export default function ActivationStep({ channelId, proposal, onBack, onReset })
   const [activated, setActivated] = useState(false)
   const [activationIssues, setActivationIssues] = useState([])
   const [activationError, setActivationError] = useState('')
+
+  // The channel's real, server-side active flag — distinct from `activated`
+  // above, which only tracks "just activated in this session" for the
+  // celebratory success screen. `isActive` drives the persistent
+  // "currently active / Deactivate" affordance an operator sees every time
+  // they revisit this step for an already-active channel.
+  const [isActive, setIsActive] = useState(Boolean(active))
+  useEffect(() => { setIsActive(Boolean(active)) }, [active])
+  const [deactivating, setDeactivating] = useState(false)
+  const [deactivateError, setDeactivateError] = useState('')
 
   // Load readiness pre-flight check on mount (and after failed activation)
   const loadReadiness = async () => {
@@ -94,6 +104,8 @@ export default function ActivationStep({ channelId, proposal, onBack, onReset })
     try {
       await api.activateChannel(channelId)
       setActivated(true)
+      setIsActive(true)
+      onActiveChange?.(true)
     } catch (e) {
       // Backend returns "Channel is not ready to activate: <issue 1>; ..."
       const msg = e.message ?? ''
@@ -107,6 +119,21 @@ export default function ActivationStep({ channelId, proposal, onBack, onReset })
       loadReadiness()
     } finally {
       setActivating(false)
+    }
+  }
+
+  const deactivate = async () => {
+    setDeactivating(true)
+    setDeactivateError('')
+    try {
+      await api.deactivateChannel(channelId)
+      setIsActive(false)
+      setActivated(false)
+      onActiveChange?.(false)
+    } catch (e) {
+      setDeactivateError(e.message)
+    } finally {
+      setDeactivating(false)
     }
   }
 
@@ -145,6 +172,27 @@ export default function ActivationStep({ channelId, proposal, onBack, onReset })
         The backend verifies every requirement before activating. Resolve any items below first.
       </p>
 
+      {isActive && (
+        <div className="activation-card glow-card-green" style={{ marginTop: 22 }}>
+          <div className="activation-success-icon">✓</div>
+          <h3 className="mode-title" style={{ fontSize: '1.1rem' }}>This channel is currently active</h3>
+          <p className="step-shell-subtitle" style={{ margin: '8px auto 0' }}>
+            Agent 2 is picking this channel up for new discovery cycles. Deactivate it to pause the
+            pipeline without deleting any configuration.
+          </p>
+          {deactivateError && <div className="error-banner" style={{ marginTop: 12 }}>{deactivateError}</div>}
+          <button
+            type="button"
+            className="btn-secondary btn-danger"
+            onClick={deactivate}
+            disabled={deactivating}
+            style={{ marginTop: 14 }}
+          >
+            {deactivating ? 'Deactivating…' : 'Deactivate Channel'}
+          </button>
+        </div>
+      )}
+
       <div className="activation-card glow-card" style={{ marginTop: 22 }}>
         <div className="activation-icon-ring">🚀</div>
         <h3 className="mode-title" style={{ fontSize: '1.1rem' }}>Pre-flight checklist</h3>
@@ -182,14 +230,17 @@ export default function ActivationStep({ channelId, proposal, onBack, onReset })
           type="button"
           className="btn-activate"
           onClick={activate}
-          disabled={activating || !canActivate}
+          disabled={activating || !canActivate || isActive}
           style={{ marginTop: 18 }}
-          title={!canActivate && !preflightLoading ? 'Resolve all blocking issues above first' : undefined}
+          title={
+            isActive ? 'Already active — deactivate above first to reconfigure and reactivate'
+              : (!canActivate && !preflightLoading ? 'Resolve all blocking issues above first' : undefined)
+          }
         >
-          {activating ? 'Activating…' : 'Activate Channel'}
+          {activating ? 'Activating…' : isActive ? 'Already active' : 'Activate Channel'}
         </button>
 
-        {!canActivate && !preflightLoading && !preflightError && (
+        {!isActive && !canActivate && !preflightLoading && !preflightError && (
           <p className="voice-description" style={{ marginTop: 8, fontSize: '0.78rem' }}>
             Go back and fix the items above, then return here to activate.
           </p>

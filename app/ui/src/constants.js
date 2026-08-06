@@ -91,6 +91,16 @@ export const OUTPUT_MODES = [
   { value: 'shorts_only',        label: 'Shorts only',                 executable: true },
 ]
 
+// Which target platforms actually make sense for a given output_mode.
+// `youtube_long_only` (CLAUDE.md §8.1/§9.3) only ever produces a long-form
+// MainVideo render (VideoRender format="main") — no vertical Short asset is
+// ever generated for that channel, so TikTok/Instagram/Facebook (short-form
+// platforms) have nothing to publish. Omit an output_mode here to leave
+// every platform freely selectable (youtube_and_shorts, shorts_only).
+export const OUTPUT_MODE_PLATFORM_RESTRICTIONS = {
+  youtube_long_only: ['youtube'],
+}
+
 // Structured preset options for visual/image style dropdowns (Item 17).
 // Values are free-form strings persisted to ChannelConfig.visual_style / .image_style
 // (see CLAUDE.md §8.1) and injected into Agent 2 script prompts (blueprint, sections,
@@ -140,6 +150,8 @@ export const IMAGE_STYLE_OPTIONS = [
     description: 'Soft, painterly images with translucent washes of colour. Suits nostalgic, historical, or emotionally gentle storytelling.' },
   { value: 'anime',             label: 'Anime',
     description: 'Japanese animation style with bold outlines, expressive characters, and vibrant colour palettes.' },
+  { value: 'caricature',        label: 'Caricature',
+    description: 'Exaggerated, satirical illustration with playful oversized features and expressive proportions — not a realistic likeness. Suits humorous, personality-driven, or lighthearted storytelling.' },
 ]
 
 // Narration perspective/register (roadmap 4a / audit P1-9). Persisted to

@@ -11,7 +11,15 @@ from app.services.claude_client import (
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "5.5"  # v5.5: channel-agnostic rule — depict any period/regime/conflict
+PROMPT_VERSION = "5.6"  # v5.6: added "caricature" to the image_style vocabulary (operator
+                        #        request) — the "Recognized values" list now describes
+                        #        caricature rendering (exaggerated, satirical proportions, not
+                        #        a realistic likeness), "caricature" is added to the TECHNICAL
+                        #        step's illustrated/painted-styles list (never suffixed with
+                        #        "sharp focus, no motion blur" or "photorealistic"), and it
+                        #        gains a _IMAGE_STYLE_NEGATIVE_CONSTRAINTS entry — same pattern
+                        #        v4.6 established for "cinematic_cartoon".
+                        # v5.5: channel-agnostic rule — depict any period/regime/conflict
                         #        context through architecture, dress, objects, and setting
                         #        only; never regime insignia, flags, uniform emblems, or
                         #        extremist/hate symbols of any era (code_report/TODO Task 2b).
@@ -274,6 +282,7 @@ _IMAGE_STYLE_NEGATIVE_CONSTRAINTS: dict[str, str] = {
     "oil_painting":       "no photorealistic photography, no clean digital/vector look, no anime, no flat cartoon shading",
     "watercolor":         "no photorealistic photography, no clean digital/vector look, no anime, no flat cartoon shading, no heavy black outlines",
     "anime":              "no photorealistic photography, no live-action imagery, no Western flat-cartoon look, no painterly oil/watercolor texture",
+    "caricature":         "no photorealistic photography, no live-action imagery, no anime linework, no flat clean digital-art look — exaggerated, satirical caricature proportions and features, not a realistic likeness",
 }
 
 
@@ -421,7 +430,8 @@ message, apply them as consistent stylistic constraints across every beat:
     color fills, stylized (not anime, not comic-panel) — friendlier and less
     detailed than digital_art; "oil_painting" → textured classical brushwork;
     "watercolor" → soft translucent washes; "anime" → anime-influenced rendering,
-    bold outlines.
+    bold outlines; "caricature" → exaggerated, satirical caricature illustration with
+    playful oversized features and expressive proportions, not a realistic likeness.
   - Weave these as stylistic constraints into flux_prompt (append one short style
     clause, e.g. "documentary photography, naturalistic lighting"), color_grade
     (match the mood), and effect choices — NEVER at the cost of Principle A
@@ -637,7 +647,7 @@ Build every flux_prompt in this exact order (50–80 words total):
      photorealistic). For photographic styles ("photorealistic", "cinematic_realism",
      "dark_realistic", "vintage_film") end with "sharp focus, no motion blur"; for
      illustrated/painted styles ("digital_art", "cinematic_cartoon", "oil_painting", "watercolor",
-     "anime") name the medium instead and NEVER write "photorealistic". Always: no people unless
+     "anime", "caricature") name the medium instead and NEVER write "photorealistic". Always: no people unless
      motif=face/hands; no logos, no text in frame, no brand names.
 
 Color grade integration — the flux_prompt MUST produce a base image compatible with the grade:

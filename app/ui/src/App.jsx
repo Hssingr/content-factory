@@ -13,6 +13,7 @@ import LanguagesSection from './components/tab1/LanguagesSection'
 import VoicesSection from './components/tab1/VoicesSection'
 import ScheduleSection from './components/tab1/ScheduleSection'
 import PlatformsSection from './components/tab1/PlatformsSection'
+import { OUTPUT_MODE_PLATFORM_RESTRICTIONS } from './constants'
 
 const STEPS = [
   { id: 'mode',        label: 'Mode' },
@@ -30,6 +31,7 @@ export default function App() {
   const [currentStep, setCurrentStep] = useState('mode')
   const [completedSteps, setCompletedSteps] = useState([])
   const [channelId, setChannelId] = useState(null)
+  const [channelActive, setChannelActive] = useState(false)
   const [userLanguage, setUserLanguage] = useState('en')
   const [error, setError] = useState('')
   const [saving, setSaving] = useState(false)
@@ -63,7 +65,11 @@ export default function App() {
   const [outputMode, setOutputMode] = useState('')
   const [visualStyle, setVisualStyle] = useState('')
   const [imageStyle, setImageStyle] = useState('')
-  const [narrationPov, setNarrationPov] = useState('')
+  // Narration POV defaults to third_person — the standard narrator voice is
+  // the right default for almost every channel; first-person storytime is
+  // an intentional opt-in, not something an operator should have to notice
+  // and pick every time.
+  const [narrationPov, setNarrationPov] = useState('third_person')
 
   // ── Sources ──────────────────────────────────────────────────
   const [sources, setSources] = useState([])
@@ -94,6 +100,7 @@ export default function App() {
       setName(ch.name ?? '')
       setNiche(ch.niche ?? '')
       setTone(ch.tone ?? 'documentary')
+      setChannelActive(Boolean(ch.active))
 
       const langs = ch.languages.map(l => l.language)
       setLanguages(langs)
@@ -168,6 +175,15 @@ export default function App() {
         const hasTimings = Array.isArray(ch.publish_timings) && ch.publish_timings.length > 0
         if (uniquePlatforms.length > 0 || hasTimings) next.add('schedule')
         if (uniquePlatforms.length > 0) next.add('platforms')
+        // Bug fix: an existing channel whose saved credentials are all
+        // already verified (which is guaranteed true for any active
+        // channel — the backend's activate() readiness check requires
+        // every ChannelPlatform row to be verified) must show Credentials
+        // as done in the step nav, not disabled/unconfirmed. Likewise,
+        // Activation itself is done whenever the channel is active.
+        const allPlatformsVerified = ch.platforms.length > 0 && ch.platforms.every(p => p.verified)
+        if (allPlatformsVerified) next.add('credentials')
+        if (ch.active) next.add('activation')
         return [...next]
       })
     }).catch(e => setError(e.message))
@@ -391,6 +407,19 @@ export default function App() {
   const toggleLang = code => setLanguages(p => p.includes(code) ? p.filter(c => c !== code) : [...p, code])
   const togglePlatform = id => setPlatforms(p => p.includes(id) ? p.filter(x => x !== id) : [...p, id])
 
+  // Bug fix: "YouTube long-form only" never produces a Short, so
+  // TikTok/Instagram/Facebook have nothing to publish for this channel.
+  // Whenever outputMode settles on that value — whether picked manually in
+  // Concept, restored from an existing channel, or applied from a research
+  // recommendation — drop any already-selected platform outside that
+  // restriction so Step 6 (and everything downstream) can't carry a
+  // disallowed platform forward.
+  useEffect(() => {
+    const allowed = OUTPUT_MODE_PLATFORM_RESTRICTIONS[outputMode]
+    if (!allowed) return
+    setPlatforms(prev => prev.filter(p => allowed.includes(p)))
+  }, [outputMode])
+
   const openCreate = () => {
     setChannelId(null)
     setCompletedSteps([])
@@ -403,8 +432,9 @@ export default function App() {
     setTimings([])
     setContentMode('single_story')
     setName(''); setDescription(''); setNiche(''); setTone('')
-    setScriptSource(''); setOutputMode(''); setVisualStyle(''); setImageStyle(''); setNarrationPov('')
+    setScriptSource(''); setOutputMode(''); setVisualStyle(''); setImageStyle(''); setNarrationPov('third_person')
     setConceptPlatforms([])
+    setChannelActive(false)
     setBasicsReady(false)
     setBasicsLoading(false)
     setCurrentStep('mode')
@@ -593,7 +623,7 @@ export default function App() {
               onNext={handlePlatforms}
               nextDisabled={platforms.length === 0}
             >
-              <PlatformsSection selected={platforms} onToggle={togglePlatform} allowedPlatforms={conceptPlatforms} />
+              <PlatformsSection selected={platforms} onToggle={togglePlatform} allowedPlatforms={conceptPlatforms} outputMode={outputMode} />
             </StepShell>
           )}
 
@@ -611,6 +641,8 @@ export default function App() {
             <ActivationStep
               channelId={channelId}
               proposal={proposal}
+              active={channelActive}
+              onActiveChange={setChannelActive}
               onBack={() => setCurrentStep('credentials')}
               onReset={backToList}
             />

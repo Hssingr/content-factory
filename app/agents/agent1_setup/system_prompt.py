@@ -6,7 +6,12 @@ from app.services.claude_client import call_claude, call_claude_structured
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "1.6"  # v1.6: research_channel_ideas() split into two sequential structured calls
+PROMPT_VERSION = "1.7"  # v1.7: added "caricature" image_style preset (operator request).
+                        #        _IMAGE_STYLE_VALUES gains "caricature", mirrored in
+                        #        app/ui/src/constants.js IMAGE_STYLE_OPTIONS and Agent 4's
+                        #        storyboard prompt vocabulary/negative-constraints table
+                        #        (agent4_visuals/system_prompt.py).
+                        # v1.6: research_channel_ideas() split into two sequential structured calls
                         #        (channel_concept_validation -> channel_research) — the single
                         #        ~30-required-leaf-field call was unreliable under Anthropic's
                         #        forced tool-use (the "required" list is not strictly enforced);
@@ -246,6 +251,7 @@ _VISUAL_STYLE_VALUES = [
 _IMAGE_STYLE_VALUES = [
     "photorealistic", "cinematic_realism", "dark_realistic", "vintage_film",
     "digital_art", "cinematic_cartoon", "oil_painting", "watercolor", "anime",
+    "caricature",
 ]
 # Mirrors app/ui/src/constants.js TONES exactly, same reason as the two style
 # lists above: recommended_tone/editable_config.tone were previously free
