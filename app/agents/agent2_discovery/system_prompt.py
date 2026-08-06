@@ -705,7 +705,15 @@ def generate_story_blueprint(
         # that. Raised 1024 -> 1536 (roadmap Phase C2) for character_descriptors
         # (up to 5 entries) + era_setting — max_tokens is a cap, not a spend,
         # this is free headroom against a truncated forced-tool-use response.
-        max_tokens=1536,
+        # Live-canary fix: a real --confirm run hit output_tokens=1536 exactly
+        # (a Solo Short blueprint, not even an unusually rich one) and raised
+        # ValueError: response truncated at max_tokens for task='story_blueprint'.
+        # character_descriptors alone can legitimately need up to 5 entries x 11
+        # required string fields each, on top of major_turns (up to 5) and every
+        # other required field — 1536 was never enough headroom for that shape.
+        # Raised 1536 -> 4096, matching the generous-headroom convention this
+        # codebase already applies elsewhere (e.g. story_research's 16384).
+        max_tokens=4096,
     )
     major_turns = result.get("major_turns") or []
     if len(major_turns) < 2:

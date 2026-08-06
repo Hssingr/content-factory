@@ -2606,10 +2606,14 @@ shipped modern anachronisms (a modern flag, a modern waterfront, contemporary
 clothing) inside a 6th-century Byzantine story — nothing locked character
 appearance or period/setting across the storyboard. Both fields are generated
 ONCE at blueprint time, piggybacking on the existing blueprint Claude call
-(`max_tokens` raised 1024 → 1536 for the added headroom) — zero extra AI
-calls, and NOT a revert of the deleted visual bible (Elimination Mandate
-D2.1, §11.4) — deterministic, blueprint-derived data consumed by Python, no
-per-batch generation call.
+(`max_tokens` raised 1024 → 1536 for the added headroom, then **1536 → 4096**
+— live-canary fix: a real `--confirm` run truncated at exactly
+`output_tokens=1536` on an unremarkable Solo Short blueprint, not even an
+unusually rich one — up to 5 `character_descriptors` entries × 11 required
+string fields each, on top of `major_turns`, easily exceeds 1536) — zero
+extra AI calls, and NOT a revert of the deleted visual bible (Elimination
+Mandate D2.1, §11.4) — deterministic, blueprint-derived data consumed by
+Python, no per-batch generation call.
 
 - `character_descriptors`: up to 5 structured entries for recurring NAMED
   characters. Each requires name, apparent age band, build, hair color/length/
